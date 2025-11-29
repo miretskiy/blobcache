@@ -36,7 +36,8 @@ func TestIndex_PutGet(t *testing.T) {
 	}
 
 	// Get it back
-	entry, err := idx.Get(ctx, key)
+	var entry Entry
+	err = idx.Get(ctx, key, &entry)
 	if err != nil {
 		t.Fatalf("Get failed: %v", err)
 	}
@@ -74,7 +75,8 @@ func TestIndex_GetNotFound(t *testing.T) {
 	defer idx.Close()
 
 	key := blobcache.NewKey([]byte("nonexistent"), 256)
-	_, err = idx.Get(context.Background(), key)
+	var entry Entry
+	err = idx.Get(context.Background(), key, &entry)
 
 	if err != blobcache.ErrNotFound {
 		t.Errorf("Get() error = %v, want ErrNotFound", err)
@@ -126,7 +128,8 @@ func TestIndex_Delete(t *testing.T) {
 	}
 
 	// Verify gone
-	_, err = idx.Get(ctx, key)
+	var entry Entry
+	err = idx.Get(ctx, key, &entry)
 	if err != blobcache.ErrNotFound {
 		t.Errorf("After delete, Get() = %v, want ErrNotFound", err)
 	}
@@ -201,7 +204,8 @@ func TestIndex_Persistence(t *testing.T) {
 	}
 	defer idx2.Close()
 
-	entry, err := idx2.Get(ctx, key)
+	var entry Entry
+	err = idx2.Get(ctx, key, &entry)
 	if err != nil {
 		t.Fatalf("After reopen, Get failed: %v", err)
 	}

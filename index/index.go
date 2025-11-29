@@ -108,18 +108,16 @@ func (idx *Index) Put(ctx context.Context, key blobcache.Key, size int, ctime, m
 	return err
 }
 
-// Get retrieves an entry
-func (idx *Index) Get(ctx context.Context, key blobcache.Key) (*Entry, error) {
-	var entry Entry
-
+// Get retrieves an entry (caller provides Entry to avoid allocation)
+func (idx *Index) Get(ctx context.Context, key blobcache.Key, entry *Entry) error {
 	err := idx.stmtGet.QueryRowContext(ctx, key.Raw()).Scan(
 		&entry.ShardID, &entry.FileID, &entry.Size, &entry.CTime, &entry.MTime)
 
 	if err == sql.ErrNoRows {
-		return nil, blobcache.ErrNotFound
+		return blobcache.ErrNotFound
 	}
 
-	return &entry, err
+	return err
 }
 
 // Delete removes an entry

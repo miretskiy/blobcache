@@ -1,0 +1,11 @@
+# Vim swap files
+*.swp
+*.swo
+*~
+
+# Test artifacts
+*.test
+*.out
+
+# Temporary directories
+/tmp/

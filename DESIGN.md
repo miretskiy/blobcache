@@ -1,26 +1,91 @@
 # BlobCache Design Document
 
-## Project Scope
+## Motivation
 
-**What it is:** High-performance blob cache with bloom filter optimization for fast negative lookups.
+### Production Problem Analysis
 
-**What it is NOT:** General-purpose storage engine.
+**Service:** logs-event-store-reader (logs-storage namespace)
+**RocksDB Config:** FIFO compaction, 960 MB memtables, 455 L0 files at peak
+**Fleet Cost:** 5,200 cores for 10B queries/day across ~10K pods
 
-**Use case:** Time-series blob cache (logs, metrics, traces) with size-bounded FIFO eviction.
+**Root cause analysis:**
+- 52% negative lookups (keys not found)
+- Each negative: 455 bloom filter checks × 100ns = 45 µs CPU
+- Fleet-wide: 5.2B negative lookups/day × 45 µs = 5,000 cores
+- Write path: ~200 cores (memtable + compaction)
+
+**Attempts to optimize RocksDB:**
+- ❌ Block cache: Values too large (400 KB avg), no benefit
+- ❌ Leveled compaction: 10-15× write amp exceeds disk capacity (1,048 MB/s NVMe)
+- ❌ Universal compaction: 5-8× write amp still exceeds disk
+- ❌ Aggressive intra-L0: Creates larger files that never compact again (worse read amp)
+- ✅ RocksDB FIFO is already optimal for these constraints
+
+**Conclusion:** Need different architecture, not RocksDB tuning.
 
 ---
 
 ## Design Goals
 
-1. **Extremely high write throughput** (800+ MB/s on NVMe)
-2. **Extremely fast negative lookups** (<1 µs via bloom filter)
-3. **Minimal locking** (locks OK, excessive locking not OK)
-4. **Fast startup** (<100ms for 4M keys)
-5. **Simple implementation** (no compaction, no range queries)
+**Target: 75% fleet CPU reduction** (5,200 → 1,300 cores)
 
-**Target:** 98% CPU reduction vs RocksDB FIFO (5,000 → 100 cores fleet-wide)
+Primary optimization: Single bloom filter check (1 ns) vs 455 checks (45 µs)
+
+**What it is:** High-performance blob cache with bloom filter optimization
+**What it is NOT:** General-purpose storage engine
 
 ---
+
+## High-Level Design
+
+### Core Architecture
+
+**Three components working together:**
+
+1. **Global Bloom Filter (Lock-Free)**
+   - Single filter for all keys (not per-shard)
+   - Lock-free atomic operations (1 ns reads, 12 ns writes)
+   - Rebuilt periodically from index (configurable: 5-10min or on FP rate threshold) (40 ms for 4M keys)
+   - Stored in DuckDB (not separate files)
+
+2. **DuckDB Index (Analytical)**
+   - Key → (shardID, fileID, size, ctime, mtime)
+   - Exceptional query performance (0.1-0.5s for FIFO scans)
+   - ACID transactions, crash recovery via WAL
+   - Zero-alloc Get() API (caller-provided Entry)
+
+3. **Sharded Blob Storage (NVMe-Optimized)**
+   - Sharded directories (default 256, configurable) (filesystem performance)
+   - One blob per file (immutable, deterministic filename from hash)
+   - Designed for high-performance NVMe (1+ GB/s)
+   - Temp + rename for atomic writes
+
+**Data flow:**
+
+```
+Put:  Hash key → Write blob file → Update index → Update bloom (lock-free, immediate)
+Get:  Bloom check (1 ns) → Read file directly (2-3 ms) - No index lookup needed!
+```
+
+### Design Decisions Optimized for Hot Path
+
+**Prioritize read speed:**
+- ✅ Lock-free bloom (no mutex contention on reads)
+- ✅ Single bloom check (not 455 like RocksDB)
+- ✅ Deterministic fileID (no counter, no locking)
+- ✅ Zero-alloc Get() (caller-provided Entry)
+
+**Accept trade-offs for simplicity:**
+- ✅ Deletes don't update bloom (accept FPs, rebuild periodically)
+- ✅ One blob per file (simple, no offsets, no packing)
+- ✅ Daily orphan cleanup (not on startup)
+- ✅ Crash between DB/FS delete (orphans cleaned later)
+
+**Hardware assumptions:**
+- High-performance NVMe (1+ GB/s write, <1 ms latency)
+- Filesystem handles millions of small files well
+- Sharded directories (default 256, configurable) keep each directory manageable
+
 
 ## Architecture
 
@@ -29,22 +94,17 @@
 ```
 /data/blobcache/
 ├── db/
-│   └── index.duckdb          # DuckDB index
-├── blooms/
-│   └── global.bloom          # Single bloom filter (~6 MB)
+│   ├── index.duckdb          # DuckDB index + bloom filter storage
+│   └── wal/                  # DuckDB WAL (crash recovery)
 └── blobs/
     ├── shard-000/
-    │   ├── 1.blob            # One blob per file (immutable)
-    │   ├── 2.blob
-    │   └── ...               # ~16K files per shard
+    │   ├── 123456789.blob    # One blob per file (deterministic from key hash)
+    │   └── ...
     ├── shard-001/
-    └── ...                   # 256 shards total
+    └── ...                   # 256 shards (filesystem sharding)
 ```
 
-**Sharding:** Filesystem performance (not lock contention)
-- NVMe handles small files well
-- 256 shards × 16K files = filesystem happy
-- Shard count configurable ONLY for new database
+**Note:** Bloom filter stored IN DuckDB (as BLOB column), not separate files.
 
 ---
 
@@ -54,652 +114,306 @@
 CREATE TABLE entries (
     key BLOB PRIMARY KEY,
     shard_id INTEGER NOT NULL,
-    file_id INTEGER NOT NULL,
+    file_id BIGINT NOT NULL,     -- Deterministic from key hash
     size INTEGER NOT NULL,
-    ctime BIGINT NOT NULL,     -- Creation time
-    mtime BIGINT NOT NULL      -- Last modification time
+    ctime BIGINT NOT NULL,        -- Creation time
+    mtime BIGINT NOT NULL         -- Last modification
 );
 
-CREATE INDEX idx_ctime ON entries(ctime);  -- For ctime-based FIFO
-CREATE INDEX idx_mtime ON entries(mtime);  -- For mtime-based FIFO
+CREATE INDEX idx_ctime ON entries(ctime);  -- For FIFO by creation
+CREATE INDEX idx_mtime ON entries(mtime);  -- For FIFO by LRU
+
+-- Bloom filter storage (single global filter)
+CREATE TABLE bloom_filter (
+    version INTEGER PRIMARY KEY,  -- For versioning
+    data BLOB NOT NULL,           -- Serialized bloom filter
+    created_at BIGINT NOT NULL
+);
 ```
 
-**File mapping:** `blobs/shard-{shardID}/{fileID}.blob` = one blob
+**Why DuckDB:**
+- Embedded (no separate process)
+- Exceptional analytical performance:
+  - Scans 4M rows in ~40 ms
+  - `SELECT MIN(ctime) ... GROUP BY shard_id, file_id` in 0.1-0.5s
+  - Perfect for FIFO eviction queries
+- ACID transactions
+- Built-in WAL (crash recovery)
+- Can store bloom filter (BLOB column)
 
-**No offsets:** Each blob is its own file (immutable)
+**File mapping:** `blobs/shard-{shardID}/{fileID}.blob`
+- shardID: `hash % 256`
+- fileID: `hash` itself (deterministic, no counter needed)
 
 ---
 
-## API
+## Bloom Filter Implementation
 
-### Core Operations
-
+**Lock-free design** (NOT mutex-based):
 ```go
-// Write (caller handles compression if needed)
-Put(ctx context.Context, key, value []byte) error
+type Filter struct {
+    data []uint32  // Bit vector
+}
 
-// Write streaming (for huge blobs)
-PutReader(ctx context.Context, key string, reader io.Reader) error
+// Lock-free read (atomic.Load)
+func Test(key) bool {
+    word := atomic.LoadUint32(&data[index])
+    return word & mask != 0
+}
 
-// Read
-Get(ctx context.Context, key []byte) ([]byte, error)
-
-// Delete individual key
-Delete(ctx context.Context, key []byte) error
-
-// Close (graceful shutdown, saves bloom filter)
-Close() error
+// Lock-free write (atomic.CompareAndSwap)
+func Add(key) {
+    for {
+        orig := atomic.LoadUint32(&data[index])
+        if atomic.CompareAndSwapUint32(&data[index], orig, orig|mask) {
+            break
+        }
+    }
+}
 ```
 
-**Errors:**
-- `ErrNotFound` - Key doesn't exist
-- `ErrCorrupted` - Checksum mismatch (if verification enabled)
+**Performance (benchmarked):**
+- Test: 1 ns/op (1000× faster than RocksDB's 100 ns!)
+- Add: 12 ns/op
+- Concurrent test: 0.95 ns/op (perfect scaling)
+- **4× faster than bits-and-blooms library**
 
-### Configuration (Options Pattern)
+**Combines:**
+- fastbloom: Atomic operations for lock-free
+- RocksDB: Golden ratio probing (h *= 0x9e3779b9)
+- xxHash: 7 GB/s hashing
+
+**Storage:** Serialized and stored in DuckDB bloom_filter table (not separate files)
+
+**Rebuild:** Query all keys from DuckDB (40 ms for 4M keys), build new filter, atomic swap
+
+---
+
+## API Design
 
 ```go
-// Zero-config (sensible defaults)
-cache, err := blobcache.Open()
+// Required argument (not optional)
+func NewBlobCache(path string, opts ...Option) (*BlobCache, error)
 
-// With options
-cache, err := blobcache.Open(
-    blobcache.WithPath("/data/cache"),
-    blobcache.WithMaxSize(1 * blobcache.TB),
-    blobcache.WithShards(256),
-    blobcache.WithEvictionStrategy(blobcache.EvictByCTime),
-    blobcache.WithChecksums(true),        // Default
-    blobcache.WithFsync(false),           // Default
-    blobcache.WithVerifyOnRead(false),    // Default
-    blobcache.WithMetrics(datadogClient), // Datadog integration
-)
+// Core operations
+Put(ctx context.Context, key, value []byte) error
+Get(ctx context.Context, key []byte) ([]byte, error)
+Delete(ctx context.Context, key []byte) error
+Close() error
+
+// Options (functional pattern)
+WithMaxSize(int64) Option
+WithShards(int) Option
+WithEvictionStrategy(EvictionStrategy) Option
+WithChecksums(bool) Option  // Default: true
+WithFsync(bool) Option       // Default: false
+WithVerifyOnRead(bool) Option // Default: false
 ```
 
 **Defaults:**
-- Path: `./blobcache-data`
-- MaxSize: 80% of disk capacity
+- MaxSize: 80% of disk capacity (auto-detected)
 - Shards: 256
 - Eviction: EvictByCTime (oldest first)
-- Checksums: true (detect corruption)
-- Fsync: false (cache semantics, fast)
-- VerifyOnRead: false (opt-in for paranoid)
+- Checksums: Enabled (detect corruption)
+- Fsync: Disabled (cache semantics, fast)
+- VerifyOnRead: Disabled (opt-in)
 
 ---
 
 ## Write Path
 
 ```go
-func (c *BlobCache) Put(ctx context.Context, key, value []byte) error {
-    // 1. Add checksum if enabled
-    data := value
-    if c.opts.Checksums {
-        checksum := crc32.ChecksumIEEE(value)
-        data = append(value, make([]byte, 4)...)
-        binary.LittleEndian.PutUint32(data[len(value):], checksum)
-    }
-
-    // 2. Select shard (filesystem sharding)
-    shardID := int(xxhash.Sum64(key) % uint64(c.opts.Shards))
-    shard := c.shards[shardID]
-    shardDir := filepath.Join(c.opts.Path, "blobs", fmt.Sprintf("shard-%03d", shardID))
-
-    // 3. Write to temporary file
-    tempPath := filepath.Join(shardDir, randomID()+".tmp")
-    if err := os.WriteFile(tempPath, data, 0644); err != nil {
-        return err
-    }
-
-    // 4. Generate unique file ID (atomic, lock-free)
-    fileID := shard.nextFileID.Add(1)
-    finalPath := filepath.Join(shardDir, fmt.Sprintf("%d.blob", fileID))
-
-    // 5. Atomic rename (crash-safe)
-    if err := os.Rename(tempPath, finalPath); err != nil {
-        os.Remove(tempPath)
-        return err
-    }
-
-    if c.opts.Fsync {
-        syncDirectory(shardDir)  // Persist metadata
-    }
-
-    // 6. Update index (DuckDB thread-safe)
-    now := time.Now().UnixNano()
-    _, err := c.index.db.ExecContext(ctx,
-        `INSERT INTO entries (key, shard_id, file_id, size, ctime, mtime)
-         VALUES (?, ?, ?, ?, ?, ?)
-         ON CONFLICT(key) DO UPDATE SET
-           shard_id = excluded.shard_id,
-           file_id = excluded.file_id,
-           size = excluded.size,
-           mtime = excluded.mtime`,
-        key, shardID, fileID, len(data), now, now)
-
-    if err != nil {
-        // Blob file orphaned (cleaned up by daily scanner)
-        return err
-    }
-
-    // 7. Update bloom filter
-    c.bloom.mu.Lock()
-    c.bloom.filter.Add(key)
-    c.bloom.mu.Unlock()
-
-    // 8. Emit metrics
-    if c.metrics != nil {
-        c.metrics.RecordPut(len(data))
-    }
-
-    return nil
-}
+Put(key, value):
+1. Hash key → shardID, fileID (deterministic)
+2. Write to temp file
+3. Atomic rename (crash-safe)
+4. Insert into DuckDB index
+5. Add to bloom filter (lock-free CAS)
 ```
+
+**Atomicity:** Temp + rename ensures file is complete or doesn't exist
+
+**Crash scenarios:**
+- Before rename: Temp file orphaned (cleaned daily)
+- After rename, before DB: Blob orphaned (cleaned daily)
+- After DB: Complete ✓
 
 ---
 
 ## Read Path
 
 ```go
-func (c *BlobCache) Get(ctx context.Context, key []byte) ([]byte, error) {
-    // 1. Bloom filter check (~0.1 µs)
-    c.bloom.mu.RLock()
-    maybe := c.bloom.filter.Test(key)
-    c.bloom.mu.RUnlock()
-
-    if !maybe {
-        c.metrics.RecordBloomReject()
-        return nil, ErrNotFound
-    }
-
-    // 2. Index lookup
-    var shardID, fileID, size int
-    err := c.index.db.QueryRowContext(ctx,
-        "SELECT shard_id, file_id, size FROM entries WHERE key = ?",
-        key).Scan(&shardID, &fileID, &size)
-
-    if err == sql.ErrNoRows {
-        c.metrics.RecordBloomFalsePositive()
-        return nil, ErrNotFound
-    }
-    if err != nil {
-        return nil, err
-    }
-
-    // 3. Read blob file
-    path := filepath.Join(c.opts.Path, "blobs",
-        fmt.Sprintf("shard-%03d", shardID),
-        fmt.Sprintf("%d.blob", fileID))
-
-    data, err := os.ReadFile(path)
-    if err != nil {
-        if os.IsNotExist(err) {
-            c.metrics.RecordEvictionRace()
-            return nil, ErrNotFound  // File evicted (benign race)
-        }
-        return nil, err
-    }
-
-    // 4. Verify checksum (if opted in)
-    if c.opts.VerifyOnRead && c.opts.Checksums {
-        if len(data) < 4 {
-            return nil, ErrCorrupted
-        }
-        stored := binary.LittleEndian.Uint32(data[len(data)-4:])
-        computed := crc32.ChecksumIEEE(data[:len(data)-4])
-        if stored != computed {
-            c.metrics.RecordCorruption()
-            return nil, ErrCorrupted
-        }
-        data = data[:len(data)-4]  // Strip checksum
-    }
-
-    c.metrics.RecordGet(len(data))
-    return data, nil
-}
+Get(key):
+1. Bloom filter check (~1 ns, lock-free load)
+   → If no: return ErrNotFound (fast rejection!)
+2. Query DuckDB index (~50 µs)
+   → If not found: return ErrNotFound (bloom FP)
+3. Read blob file (~2-3 ms for 400 KB)
+4. Verify checksum if opted in
 ```
+
+**Performance:**
+- Negative: ~1 ns (vs RocksDB's 45 µs) - **45× faster**
+- Positive: ~2-3 ms (same as RocksDB, disk I/O limited)
 
 ---
 
-## Eviction
+## Eviction & Cleanup
 
-### Background Worker
+### Eviction (Background Worker)
 
-```go
-func (c *BlobCache) evictionWorker() {
-    ticker := time.NewTicker(60 * time.Second)
-    defer ticker.Stop()
-
-    for {
-        select {
-        case <-ticker.C:
-            c.evictIfNeeded(context.Background())
-        case <-c.stopCh:
-            return
-        }
-    }
-}
-```
-
-### Eviction Logic
+**NOT atomic** - manages race conditions with trade-offs:
 
 ```go
-func (c *BlobCache) evictIfNeeded(ctx context.Context) error {
-    // 1. Get current size (DuckDB aggregation)
-    var totalSize int64
-    c.index.db.QueryRow("SELECT COALESCE(SUM(size), 0) FROM entries").Scan(&totalSize)
-
-    if totalSize <= c.opts.MaxSize {
-        return nil
-    }
-
-    bytesToFree := totalSize - c.opts.MaxSize
-
-    // 2. Query oldest files (configurable strategy)
-    orderBy := "ctime"
-    if c.opts.EvictionStrategy == EvictByMTime {
-        orderBy = "mtime"
-    }
-
-    rows, _ := c.index.db.QueryContext(ctx, fmt.Sprintf(`
-        SELECT shard_id, file_id, SUM(size) as file_size
-        FROM entries
-        GROUP BY shard_id, file_id
-        ORDER BY MIN(%s) ASC
-    `, orderBy))
-
-    defer rows.Close()
-
-    // 3. Collect files until enough space freed
-    var toDelete []struct{ shardID, fileID int }
-    var freed int64
-
-    for rows.Next() && freed < bytesToFree {
-        var shardID, fileID int
-        var fileSize int64
-        rows.Scan(&shardID, &fileID, &fileSize)
-        toDelete = append(toDelete, struct{ shardID, fileID int }{shardID, fileID})
-        freed += fileSize
-    }
-
-    // 4. Delete (atomic)
-    c.metrics.RecordEviction(len(toDelete), freed)
-    return c.deleteFiles(ctx, toDelete)
-}
+evictIfNeeded():
+1. Query DuckDB for total size (fast aggregate)
+2. If over limit, query oldest files:
+   SELECT shard_id, file_id, SUM(size)
+   FROM entries
+   GROUP BY shard_id, file_id
+   ORDER BY MIN(ctime) ASC  -- or mtime for LRU
+   
+3. Delete entries from DB (transaction)
+4. Delete blob files from filesystem
+5. Bloom filter: NOT updated (accept FPs, rebuild periodically)
 ```
 
-### Atomic Deletion
+**Order:** DB first, then filesystem
+- Get() returns ErrNotFound immediately after DB delete
+- Orphaned blobs if crash (cleaned daily)
+- Acceptable for cache semantics
 
-```go
-func (c *BlobCache) deleteFiles(ctx context.Context, files []struct{ shardID, fileID int }) error {
-    // CRITICAL ORDER: Database first, then filesystem
-    //
-    // Why:
-    //   1. DB delete → Get() returns ErrNotFound (correct)
-    //   2. FS delete → Frees disk space
-    //
-    // If reversed:
-    //   - Get() would return I/O errors instead of ErrNotFound
-    //
-    // Crash between steps:
-    //   - Orphaned blob files (cleaned up by daily scanner)
-    //   - No correctness issue
+**Race condition:** Read between DB delete and FS delete → ErrNotFound (acceptable)
 
-    // 1. Delete from database (atomic transaction)
-    tx, _ := c.index.db.BeginTx(ctx, nil)
-    defer tx.Rollback()
+### Orphan Cleanup (Daily, Not Startup)
 
-    for _, f := range files {
-        tx.Exec("DELETE FROM entries WHERE shard_id = ? AND file_id = ?",
-            f.shardID, f.fileID)
-    }
+Runs in background once per day:
+- Compare filesystem to DB
+- Delete orphaned temp files
+- Delete orphaned blobs
 
-    tx.Commit()
-
-    // 2. Delete from filesystem
-    for _, f := range files {
-        path := filepath.Join(c.opts.Path, "blobs",
-            fmt.Sprintf("shard-%03d", f.shardID),
-            fmt.Sprintf("%d.blob", f.fileID))
-        os.Remove(path)
-    }
-
-    return nil
-}
-```
-
-**Bloom filter:** NOT updated on delete (accept false positives, rebuild periodically)
-
----
-
-## Bloom Filter Management
-
-### Global Filter
-
-```go
-type BloomFilter struct {
-    filter *bloom.BloomFilter  // github.com/bits-and-blooms/bloom
-    mu     sync.RWMutex
-}
-
-func newBloomFilter(estimatedKeys int, fpRate float64) *BloomFilter {
-    filter := bloom.NewWithEstimates(uint(estimatedKeys), fpRate)
-    // 4M keys @ 1% FP = ~6 MB memory
-
-    return &BloomFilter{filter: filter}
-}
-```
-
-### Rebuild & Persist
-
-```go
-func (c *BlobCache) rebuildBloom(ctx context.Context) error {
-    // Scan all keys (DuckDB: 4M rows in ~40ms)
-    rows, _ := c.index.db.QueryContext(ctx, "SELECT key FROM entries")
-    defer rows.Close()
-
-    newFilter := bloom.NewWithEstimates(uint(c.opts.BloomEstimatedKeys), c.opts.BloomFPRate)
-    for rows.Next() {
-        var key []byte
-        rows.Scan(&key)
-        newFilter.Add(key)
-    }
-
-    // Atomic swap
-    c.bloom.mu.Lock()
-    c.bloom.filter = newFilter
-    c.bloom.mu.Unlock()
-
-    // Persist immediately
-    c.persistBloom()
-    return nil
-}
-
-func (c *BlobCache) persistBloom() error {
-    c.bloom.mu.RLock()
-    data, _ := c.bloom.filter.MarshalBinary()
-    c.bloom.mu.RUnlock()
-
-    path := filepath.Join(c.opts.Path, "blooms", "global.bloom")
-    return os.WriteFile(path, data, 0644)
-}
-```
-
-**Frequency:**
-- Persist: Every 5 minutes
-- Rebuild: Every 24 hours (or on significant FP rate increase)
-
----
-
-## Crash Recovery & Startup
-
-### Fast Startup (<100ms)
-
-```go
-func Open(opts ...Option) (*BlobCache, error) {
-    options := defaultOptions()
-    for _, opt := range opts {
-        opt(&options)
-    }
-
-    // 1. Open DuckDB (auto-recovery via WAL)
-    db, _ := sql.Open("duckdb", dbPath)
-
-    // 2. Load bloom filter
-    bloomPath := filepath.Join(options.Path, "blooms", "global.bloom")
-    data, err := os.ReadFile(bloomPath)
-    if err != nil {
-        // Rebuild from index (40ms for 4M keys)
-        rebuildBloom()
-    } else {
-        bloom.filter.UnmarshalBinary(data)
-    }
-
-    // 3. Start background workers
-    go c.evictionWorker()
-    go c.bloomPersistWorker()
-    go c.orphanScannerWorker()
-
-    // Ready! No filesystem scan.
-    return c, nil
-}
-```
-
-### Orphan Cleanup (Background, Not Startup)
-
-```go
-func (c *BlobCache) orphanScannerWorker() {
-    // Run once per day
-    ticker := time.NewTicker(24 * time.Hour)
-
-    for {
-        select {
-        case <-ticker.C:
-            c.cleanOrphans()
-        case <-c.stopCh:
-            return
-        }
-    }
-}
-
-func (c *BlobCache) cleanOrphans() {
-    for shardID := 0; shardID < c.opts.Shards; shardID++ {
-        shardDir := filepath.Join(c.opts.Path, "blobs", fmt.Sprintf("shard-%03d", shardID))
-        files, _ := os.ReadDir(shardDir)
-
-        for _, file := range files {
-            // Remove temp files
-            if strings.HasSuffix(file.Name(), ".tmp") {
-                os.Remove(filepath.Join(shardDir, file.Name()))
-                continue
-            }
-
-            // Check if blob file exists in index
-            var fileID int
-            fmt.Sscanf(file.Name(), "%d.blob", &fileID)
-
-            var exists int
-            c.index.db.QueryRow(
-                "SELECT 1 FROM entries WHERE shard_id = ? AND file_id = ? LIMIT 1",
-                shardID, fileID).Scan(&exists)
-
-            if exists == 0 {
-                // Orphaned blob (crash between write and DB insert)
-                os.Remove(filepath.Join(shardDir, file.Name()))
-                c.metrics.RecordOrphanCleaned()
-            }
-        }
-    }
-}
-```
-
-**System is immediately usable on startup. Cleanup happens in background.**
-
----
-
-## Metrics Integration (Datadog)
-
-```go
-type Metrics interface {
-    RecordPut(bytes int)
-    RecordGet(bytes int)
-    RecordBloomReject()
-    RecordBloomFalsePositive()
-    RecordEviction(files int, bytes int64)
-    RecordEvictionRace()
-    RecordCorruption()
-    RecordOrphanCleaned()
-}
-
-// Datadog implementation
-type DatadogMetrics struct {
-    client *statsd.Client
-}
-
-func (m *DatadogMetrics) RecordPut(bytes int) {
-    m.client.Count("blobcache.put", 1, nil, 1)
-    m.client.Count("blobcache.bytes_written", int64(bytes), nil, 1)
-}
-
-// ... more methods
-
-// Usage:
-ddClient, _ := statsd.New("127.0.0.1:8125")
-cache, _ := blobcache.Open(
-    blobcache.WithMetrics(&DatadogMetrics{client: ddClient}),
-)
-```
-
-**Metrics exported:**
-- `blobcache.put` - Put operations
-- `blobcache.get` - Get operations
-- `blobcache.bloom_rejects` - Bloom filter fast rejections
-- `blobcache.bloom_false_positives` - Bloom FPs
-- `blobcache.evictions` - Files evicted
-- `blobcache.bytes_written` - Total bytes written
-- `blobcache.bytes_read` - Total bytes read
-- `blobcache.corruption_detected` - Checksum failures
-
----
-
-## Concurrency & Locking
-
-### Read Path (High Concurrency)
-
-```
-Bloom: RWMutex (many readers, single writer on rebuild)
-Index: DuckDB internal locking
-Blob files: Read-only, no locking
-```
-
-**Scalability:** O(cores)
-
-### Write Path (Sharded)
-
-```
-File ID: Atomic increment (lock-free)
-Temp write: No lock (unique temp names)
-Index: DuckDB locking (optimized)
-Bloom: Mutex on Add (brief)
-```
-
-**256 shards = 256 concurrent writers.**
-
-### Benign Races (Acceptable)
-
-```
-✓ Read during eviction → ErrNotFound
-✓ Bloom stale during rebuild → Extra index queries
-✓ Orphans between write and DB → Daily cleanup
-✓ Duplicate reads of same key → Extra I/O (fine)
-
-✗ NOT acceptable:
-  - Data corruption
-  - Lost writes
-  - Crashes
-```
-
----
-
-## Future Extensions
-
-### Custom Eviction Logic
-
-```go
-type EvictionPolicy interface {
-    ShouldEvict(entry Entry) bool
-}
-
-blobcache.WithCustomEviction(policy EvictionPolicy)
-
-// Example: Evict by size + age combo
-type SizeAgePolicy struct {
-    maxAge time.Duration
-    minSize int
-}
-
-func (p *SizeAgePolicy) ShouldEvict(e Entry) bool {
-    age := time.Now().UnixNano() - e.CTime
-    return age > p.maxAge.Nanoseconds() && e.Size < p.minSize
-}
-```
-
-### Bloom Hash Tracking (For Individual Deletes)
-
-```sql
-ALTER TABLE entries ADD COLUMN bloom_hash BIGINT;
-
--- On delete:
-SELECT COUNT(*) FROM entries WHERE bloom_hash = ?;
--- If 1: Clear bloom bits
--- If >1: Keep (collision)
-```
-
-**When useful:** High-frequency individual Delete() operations.
+**Startup is fast (<100 ms)** - no filesystem scan!
 
 ---
 
 ## Performance Projections
 
-### vs RocksDB FIFO (Production Workload)
+**Conservative estimate: 75% fleet reduction**
 
-| Metric | RocksDB | BlobCache | Improvement |
-|--------|---------|-----------|-------------|
-| **Negative lookup** | 45 µs | 0.1 µs | 450× faster |
-| **Positive lookup** | 2-3 ms | 2-3 ms | Same |
-| **Write throughput** | 800 MB/s | 800 MB/s | Same |
-| **CPU (reads)** | 5,000 cores | 100 cores | **98% reduction** |
-| **Memory** | 6 GB memtables | 6 MB bloom | **99.9% reduction** |
-| **Complexity** | High (compaction) | Low (FIFO delete) | Simpler |
+| Component | RocksDB | BlobCache | Reduction |
+|-----------|---------|-----------|-----------|
+| Reads (negative) | 3,000 cores | 60 cores | 98% |
+| Reads (positive) | 2,000 cores | 1,000 cores | 50% |
+| Writes | 200 cores | 240 cores | -20% (worse) |
+| **Total** | **5,200 cores** | **1,300 cores** | **75%** |
 
----
+**Why conservative:**
+- Index queries may be slower than expected
+- Filesystem overhead may be higher
+- DuckDB insert latency TBD
 
-## Implementation Phases
-
-### Phase 1: Core (2 weeks)
-- Options pattern
-- DuckDB index layer
-- Single-shard Put/Get
-- Checksums
-- Unit tests
-
-### Phase 2: Scaling (2 weeks)
-- Multi-shard support
-- Global bloom filter
-- FIFO eviction
-- Benchmarks
-
-### Phase 3: Production (4 weeks)
-- Crash recovery
-- Orphan cleanup
-- Metrics integration (Datadog)
-- Stress tests
-- Documentation
-
-**Total: 2-3 months**
+**Realistic target: 3,900 cores saved**
 
 ---
 
-## Out of Scope
+## Implementation Status
 
-**Not implemented:**
-- ❌ Range queries (not needed for blob cache)
-- ❌ Sorted iteration (not needed)
-- ❌ Compression (caller-controlled)
-- ❌ Compaction (FIFO deletion only)
-- ❌ Resharding existing data (require empty DB)
+**Completed (~40% done, 4-5 hours):**
+- ✅ Design doc
+- ✅ Options pattern
+- ✅ Key (hash-based deterministic fileID)
+- ✅ Index layer (DuckDB, zero-alloc, tested)
+- ✅ Bloom filter (lock-free, 4× faster than alternatives, benchmarked)
+
+**Next (~40% remaining, ~6-8 hours):**
+- [ ] Complete Put/Get/Delete (blob file operations)
+- [ ] Eviction worker
+- [ ] File iterator
+- [ ] Crash recovery
+- [ ] End-to-end tests
+
+**Final (~20%, ~2-3 hours):**
+- [ ] Metrics integration
+- [ ] Stress tests (4M keys, 1 TB)
+- [ ] Documentation
+- [ ] Production validation plan
+
+**Total realistic estimate: 15-20 hours over 2-3 weeks**
+(Not 2-3 months - that was wildly pessimistic!)
 
 ---
 
 ## Decision Log
 
-**Reviewed decisions:**
-1. ✅ One blob per file (no offsets, no packing)
-2. ✅ Global bloom filter (not per-shard)
-3. ✅ Checksums enabled by default (CRC32)
-4. ✅ Fsync disabled by default (cache semantics)
+**Key decisions:**
+1. ✅ One blob per file (no offsets/packing)
+2. ✅ Deterministic fileID from hash (no counter)
+3. ✅ Lock-free bloom (atomic CAS, not mutex)
+4. ✅ Bloom stored in DuckDB (not separate files)
 5. ✅ DB-first deletion order (then filesystem)
-6. ✅ Fast startup (no filesystem scan)
-7. ✅ Daily orphan cleanup (not on startup)
-8. ✅ Datadog metrics integration
-9. ✅ filepath.Join for all paths
-10. ✅ Simple over clever
+6. ✅ Daily orphan cleanup (not on startup)
+7. ✅ Zero-alloc Get() API (caller-provided Entry)
+8. ✅ xxHash (7 GB/s, proven)
 
-**Design approved for implementation.**
+**Out of scope:**
+- ❌ Range queries
+- ❌ Sorted iteration
+- ❌ Compression (caller-controlled)
+- ❌ Compaction (FIFO only)
+- ❌ Resharding existing data
+
+**Design validated through:**
+- Production RocksDB analysis (455 L0 files, 1M keys, 450 GB)
+- Simulator validation (matched production behavior)
+- Bloom filter benchmarks (4× faster than alternatives)
+
+---
+
+## Optional: Access Time Tracking (atime)
+
+**For LRU eviction by access time:**
+
+### Schema Extension
+
+```sql
+ALTER TABLE entries ADD COLUMN atime BIGINT;
+CREATE INDEX idx_atime ON entries(atime);
+```
+
+### Get() with atime
+
+```go
+// If WithTrackAccessTime(true):
+Get(key):
+1. Bloom check (1 ns)
+2. Read file directly (2-3 ms)
+3. Update index: UPDATE entries SET atime = ? WHERE key = ?  (50 µs)
+   → Only if tracking enabled
+```
+
+**Trade-off:**
+- ✓ Enables FIFO by access time (true LRU)
+- ✗ Adds 50 µs to Get() (2% overhead on positive lookups)
+- ✗ Write overhead on every successful read
+
+### Eviction Strategies
+
+```go
+type EvictionStrategy int
+
+const (
+    EvictByCTime  // Oldest created (no atime needed)
+    EvictByMTime  // Least recently modified (updated on Put)
+    EvictByATime  // Least recently accessed (requires WithTrackAccessTime)
+)
+```
+
+**Options:**
+```go
+blobcache.WithEvictionStrategy(EvictByATime)
+blobcache.WithTrackAccessTime(true)  // Enables atime updates
+```
+
+**Default:** EvictByCTime (no atime tracking, fastest Get())
+
+**Use case:** When access patterns matter more than insertion order

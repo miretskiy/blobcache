@@ -6,7 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/miretskiy/blobcache"
+	"github.com/miretskiy/blobcache/base"
+	"github.com/stretchr/testify/require"
 )
 
 func TestIndex_PutGet(t *testing.T) {
@@ -27,13 +28,11 @@ func TestIndex_PutGet(t *testing.T) {
 	ctx := context.Background()
 
 	// Put an entry
-	key := blobcache.NewKey([]byte("test-key"), 256)
+	key := base.NewKey([]byte("test-key"), 256)
 	now := time.Now().UnixNano()
 
 	err = idx.Put(ctx, key, 1024, now, now)
-	if err != nil {
-		t.Fatalf("Put failed: %v", err)
-	}
+	require.NoError(t, err)
 
 	// Get it back
 	var entry Entry
@@ -74,37 +73,43 @@ func TestIndex_GetNotFound(t *testing.T) {
 	}
 	defer idx.Close()
 
-	key := blobcache.NewKey([]byte("nonexistent"), 256)
+	key := base.NewKey([]byte("nonexistent"), 256)
 	var entry Entry
 	err = idx.Get(context.Background(), key, &entry)
 
-	if err != blobcache.ErrNotFound {
+	if err != ErrNotFound {
 		t.Errorf("Get() error = %v, want ErrNotFound", err)
 	}
 }
 
-func TestIndex_DuplicateKey(t *testing.T) {
-	tmpDir, _ := os.MkdirTemp("", "blobcache-test-*")
+func TestIndex_UpdateSameKey(t *testing.T) {
+	tmpDir, _ := os.MkdirTemp("", "index-test-*")
 	defer os.RemoveAll(tmpDir)
 
-	idx, _ := New(tmpDir)
+	idx, err := New(tmpDir)
+	require.NoError(t, err)
 	defer idx.Close()
 
 	ctx := context.Background()
-	key := blobcache.NewKey([]byte("dup-key"), 256)
-	now := time.Now().UnixNano()
+	key := base.NewKey([]byte("same-key"), 256)
+	ctime := time.Now().UnixNano()
 
 	// Insert
-	err := idx.Put(ctx, key, 100, now, now)
-	if err != nil {
-		t.Fatalf("First Put failed: %v", err)
-	}
+	err = idx.Put(ctx, key, 100, ctime, ctime)
+	require.NoError(t, err)
 
-	// Insert same key again - should fail (no ON CONFLICT)
-	err = idx.Put(ctx, key, 200, now, now)
-	if err == nil {
-		t.Error("Second Put should fail with duplicate key, but succeeded")
-	}
+	// Update same key (should succeed with ON CONFLICT)
+	mtime := ctime + 1000
+	err = idx.Put(ctx, key, 200, ctime, mtime)
+	require.NoError(t, err, "Update should succeed")
+
+	// Verify
+	var entry Entry
+	err = idx.Get(ctx, key, &entry)
+	require.NoError(t, err)
+	require.Equal(t, 200, entry.Size, "Size should be updated to 200")
+	// Note: REPLACE deletes+inserts, so timestamps may change slightly
+	// Just verify entry exists with new size
 }
 
 func TestIndex_Delete(t *testing.T) {
@@ -115,7 +120,7 @@ func TestIndex_Delete(t *testing.T) {
 	defer idx.Close()
 
 	ctx := context.Background()
-	key := blobcache.NewKey([]byte("delete-me"), 256)
+	key := base.NewKey([]byte("delete-me"), 256)
 
 	// Insert
 	now := time.Now().UnixNano()
@@ -130,13 +135,13 @@ func TestIndex_Delete(t *testing.T) {
 	// Verify gone
 	var entry Entry
 	err = idx.Get(ctx, key, &entry)
-	if err != blobcache.ErrNotFound {
+	if err != ErrNotFound {
 		t.Errorf("After delete, Get() = %v, want ErrNotFound", err)
 	}
 
 	// Delete again should return ErrNotFound
 	err = idx.Delete(ctx, key)
-	if err != blobcache.ErrNotFound {
+	if err != ErrNotFound {
 		t.Errorf("Delete nonexistent = %v, want ErrNotFound", err)
 	}
 }
@@ -162,9 +167,9 @@ func TestIndex_TotalSizeOnDisk(t *testing.T) {
 
 	// Add entries
 	now := time.Now().UnixNano()
-	idx.Put(ctx, blobcache.NewKey([]byte("key1"), 256), 100, now, now)
-	idx.Put(ctx, blobcache.NewKey([]byte("key2"), 256), 200, now, now)
-	idx.Put(ctx, blobcache.NewKey([]byte("key3"), 256), 300, now, now)
+	idx.Put(ctx, base.NewKey([]byte("key1"), 256), 100, now, now)
+	idx.Put(ctx, base.NewKey([]byte("key2"), 256), 200, now, now)
+	idx.Put(ctx, base.NewKey([]byte("key3"), 256), 300, now, now)
 
 	total, err = idx.TotalSizeOnDisk(ctx)
 	if err != nil {
@@ -176,7 +181,7 @@ func TestIndex_TotalSizeOnDisk(t *testing.T) {
 	}
 
 	// Delete one
-	idx.Delete(ctx, blobcache.NewKey([]byte("key2"), 256))
+	idx.Delete(ctx, base.NewKey([]byte("key2"), 256))
 
 	total, _ = idx.TotalSizeOnDisk(ctx)
 	if total != 400 {
@@ -189,7 +194,7 @@ func TestIndex_Persistence(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	ctx := context.Background()
-	key := blobcache.NewKey([]byte("persist-key"), 256)
+	key := base.NewKey([]byte("persist-key"), 256)
 	now := time.Now().UnixNano()
 
 	// Create index and insert

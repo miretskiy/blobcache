@@ -7,16 +7,17 @@ import (
 
 // config holds internal configuration
 type config struct {
-	Path                 string
-	MaxSize              int64
-	Shards               int
-	EvictionStrategy     EvictionStrategy
-	BloomFPRate          float64
-	BloomEstimatedKeys   int
-	BloomRefreshInterval time.Duration
-	Checksums            bool
-	Fsync                bool
-	VerifyOnRead         bool
+	Path                  string
+	MaxSize               int64
+	Shards                int
+	EvictionStrategy      EvictionStrategy
+	BloomFPRate           float64
+	BloomEstimatedKeys    int
+	BloomRefreshInterval  time.Duration
+	OrphanCleanupInterval time.Duration
+	Checksums             bool
+	Fsync                 bool
+	VerifyOnRead          bool
 }
 
 // Option configures BlobCache
@@ -55,9 +56,10 @@ func WithEvictionStrategy(strategy EvictionStrategy) Option {
 
 // WithBloomFPRate sets the bloom filter false positive rate (default: 0.01 = 1%)
 // Bloom filter size estimates (for 1M keys):
-//   FP Rate 0.01 (1%):    ~9.6 bits/key  → 1.2 MB
-//   FP Rate 0.001 (0.1%): ~14.4 bits/key → 1.8 MB
-//   FP Rate 0.0001:       ~19.2 bits/key → 2.4 MB
+//
+//	FP Rate 0.01 (1%):    ~9.6 bits/key  → 1.2 MB
+//	FP Rate 0.001 (0.1%): ~14.4 bits/key → 1.8 MB
+//	FP Rate 0.0001:       ~19.2 bits/key → 2.4 MB
 func WithBloomFPRate(rate float64) Option {
 	return funcOpt(func(c *config) {
 		c.BloomFPRate = rate
@@ -99,12 +101,19 @@ func WithVerifyOnRead(enabled bool) Option {
 	})
 }
 
+// WithOrphanCleanupInterval sets how often orphaned files are cleaned (default: 24h, 0 = disabled)
+func WithOrphanCleanupInterval(d time.Duration) Option {
+	return funcOpt(func(c *config) {
+		c.OrphanCleanupInterval = d
+	})
+}
+
 // EvictionStrategy determines how files are selected for eviction
 type EvictionStrategy int
 
 const (
-	EvictByCTime EvictionStrategy = iota  // Oldest created (FIFO)
-	EvictByMTime                           // Least recently modified (LRU)
+	EvictByCTime EvictionStrategy = iota // Oldest created (FIFO)
+	EvictByMTime                         // Least recently modified (LRU)
 )
 
 func (e EvictionStrategy) String() string {
@@ -127,15 +136,16 @@ var (
 // defaultConfig returns sensible defaults (path set by caller)
 func defaultConfig(path string) config {
 	return config{
-		Path:                 path,
-		MaxSize:              0,  // TODO: Auto-detect 80% of disk capacity
-		Shards:               256,
-		EvictionStrategy:     EvictByCTime,
-		BloomFPRate:          0.01,        // 1% FP rate
-		BloomEstimatedKeys:   1_000_000,   // 1M keys → ~1.2 MB bloom
-		BloomRefreshInterval: 24 * time.Hour,
-		Checksums:            true,
-		Fsync:                false,
-		VerifyOnRead:         false,
+		Path:                  path,
+		MaxSize:               0, // TODO: Auto-detect 80% of disk capacity
+		Shards:                256,
+		EvictionStrategy:      EvictByCTime,
+		BloomFPRate:           0.01,      // 1% FP rate
+		BloomEstimatedKeys:    1_000_000, // 1M keys → ~1.2 MB bloom
+		BloomRefreshInterval:  24 * time.Hour,
+		OrphanCleanupInterval: 24 * time.Hour, // Daily, 0 = disabled
+		Checksums:             true,
+		Fsync:                 false,
+		VerifyOnRead:          false,
 	}
 }

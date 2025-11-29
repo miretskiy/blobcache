@@ -1,4 +1,4 @@
-package blobcache
+package base
 
 import (
 	"github.com/cespare/xxhash/v2"

@@ -3,12 +3,13 @@ package index
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 
-	"github.com/miretskiy/blobcache"
 	_ "github.com/marcboeker/go-duckdb"
+	"github.com/miretskiy/blobcache/base"
 )
 
 // Index manages the DuckDB key-value index
@@ -22,7 +23,7 @@ type Index struct {
 // Entry represents a cached blob's metadata
 type Entry struct {
 	ShardID int
-	FileID  int64  // Signed to avoid DuckDB uint64 high-bit issues
+	FileID  int64 // Signed to avoid DuckDB uint64 high-bit issues
 	Size    int
 	CTime   int64
 	MTime   int64
@@ -79,8 +80,10 @@ func (idx *Index) initSchema() error {
 func (idx *Index) prepareStatements() error {
 	var err error
 
+	// Note: Can't use ON CONFLICT DO UPDATE with DuckDB when columns are in indexes
+	// Use REPLACE instead (delete + insert)
 	idx.stmtPut, err = idx.db.Prepare(`
-		INSERT INTO entries (key, shard_id, file_id, size, ctime, mtime)
+		INSERT OR REPLACE INTO entries (key, shard_id, file_id, size, ctime, mtime)
 		VALUES (?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
@@ -102,26 +105,26 @@ func (idx *Index) prepareStatements() error {
 }
 
 // Put inserts or updates an entry
-func (idx *Index) Put(ctx context.Context, key blobcache.Key, size int, ctime, mtime int64) error {
+func (idx *Index) Put(ctx context.Context, key base.Key, size int, ctime, mtime int64) error {
 	_, err := idx.stmtPut.ExecContext(ctx,
 		key.Raw(), key.ShardID(), int64(key.FileID()), size, ctime, mtime)
 	return err
 }
 
 // Get retrieves an entry (caller provides Entry to avoid allocation)
-func (idx *Index) Get(ctx context.Context, key blobcache.Key, entry *Entry) error {
+func (idx *Index) Get(ctx context.Context, key base.Key, entry *Entry) error {
 	err := idx.stmtGet.QueryRowContext(ctx, key.Raw()).Scan(
 		&entry.ShardID, &entry.FileID, &entry.Size, &entry.CTime, &entry.MTime)
 
 	if err == sql.ErrNoRows {
-		return blobcache.ErrNotFound
+		return ErrNotFound
 	}
 
 	return err
 }
 
 // Delete removes an entry
-func (idx *Index) Delete(ctx context.Context, key blobcache.Key) error {
+func (idx *Index) Delete(ctx context.Context, key base.Key) error {
 	result, err := idx.stmtDelete.ExecContext(ctx, key.Raw())
 	if err != nil {
 		return err
@@ -129,11 +132,16 @@ func (idx *Index) Delete(ctx context.Context, key blobcache.Key) error {
 
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
-		return blobcache.ErrNotFound
+		return ErrNotFound
 	}
 
 	return nil
 }
+
+// Common errors
+var (
+	ErrNotFound = errors.New("key not found")
+)
 
 // TotalSizeOnDisk returns sum of all blob sizes
 func (idx *Index) TotalSizeOnDisk(ctx context.Context) (int64, error) {

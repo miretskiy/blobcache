@@ -210,9 +210,25 @@ func (c *Cache) loadBloom(ctx context.Context) error {
 
 // rebuildBloom scans all keys from index and builds new bloom filter
 func (c *Cache) rebuildBloom(ctx context.Context) error {
-	// TODO: Add index.GetAllKeys() method
-	// For now, create empty bloom
-	filter := bloom.New(uint(c.cfg.BloomEstimatedKeys), c.cfg.BloomFPRate)
+	// Get all keys from index
+	keys, err := c.index.GetAllKeys(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get keys from index: %w", err)
+	}
+
+	// Create new bloom filter with estimated size
+	estimatedKeys := len(keys)
+	if estimatedKeys < c.cfg.BloomEstimatedKeys {
+		estimatedKeys = c.cfg.BloomEstimatedKeys
+	}
+
+	filter := bloom.New(uint(estimatedKeys), c.cfg.BloomFPRate)
+
+	// Add all keys
+	for _, key := range keys {
+		filter.Add(key)
+	}
+
 	c.bloom.Store(filter)
 	return nil
 }
@@ -245,11 +261,86 @@ func (c *Cache) evictionWorker() {
 	for {
 		select {
 		case <-ticker.C:
-			// TODO: Implement eviction
+			c.runEviction(context.Background())
 		case <-c.stopCh:
 			return
 		}
 	}
+}
+
+// runEviction evicts oldest entries if cache size exceeds limit
+func (c *Cache) runEviction(ctx context.Context) error {
+	// Check if eviction needed
+	if c.cfg.MaxSize <= 0 {
+		return nil // Eviction disabled
+	}
+
+	totalSize, err := c.index.TotalSizeOnDisk(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get total size: %w", err)
+	}
+
+	if totalSize <= c.cfg.MaxSize {
+		return nil // Under limit
+	}
+
+	// Need to evict - calculate how much to remove with hysteresis
+	// Hysteresis prevents thrashing at the boundary
+	toEvictBytes := totalSize - c.cfg.MaxSize
+	toEvictBytes += int64(float64(c.cfg.MaxSize) * c.cfg.EvictionHysteresis)
+
+	evictedBytes := int64(0)
+	evictedCount := 0
+
+	// Evict in batches until target reached
+	batchSize := 1000
+	for evictedBytes < toEvictBytes {
+		// Get next batch of oldest entries
+		it := c.index.GetOldestEntries(ctx, batchSize)
+		if it.Err() != nil {
+			return fmt.Errorf("failed to get oldest entries: %w", it.Err())
+		}
+
+		batchEvicted := 0
+		for it.Next() && evictedBytes < toEvictBytes {
+			entry, err := it.Entry()
+			if err != nil {
+				it.Close()
+				return fmt.Errorf("failed to get entry: %w", err)
+			}
+
+			// Delete blob file
+			blobPath := filepath.Join(c.cfg.Path, "blobs",
+				fmt.Sprintf("shard-%03d", entry.ShardID),
+				fmt.Sprintf("%d.blob", entry.FileID))
+			os.Remove(blobPath) // Best effort - ignore errors
+
+			// Delete from index
+			k := base.NewKey(entry.Key, c.cfg.Shards)
+			if err := c.index.Delete(ctx, k); err != nil {
+				// Log warning but continue
+				fmt.Printf("Warning: failed to delete key from index: %v\n", err)
+			}
+
+			evictedBytes += int64(entry.Size)
+			evictedCount++
+			batchEvicted++
+		}
+
+		if err := it.Err(); err != nil {
+			it.Close()
+			return fmt.Errorf("iteration error: %w", err)
+		}
+		it.Close()
+
+		// If batch was empty, we're done (no more entries)
+		if batchEvicted == 0 {
+			break
+		}
+	}
+
+	fmt.Printf("Evicted %d entries (%d MB)\n", evictedCount, evictedBytes/(1024*1024))
+	return nil
 }
 
 // bloomRefreshWorker periodically rebuilds bloom filter from index

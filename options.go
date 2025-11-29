@@ -11,6 +11,7 @@ type config struct {
 	MaxSize               int64
 	Shards                int
 	EvictionStrategy      EvictionStrategy
+	EvictionHysteresis    float64 // Percentage over MaxSize to evict (e.g., 0.1 = evict 10% extra)
 	BloomFPRate           float64
 	BloomEstimatedKeys    int
 	BloomRefreshInterval  time.Duration
@@ -51,6 +52,15 @@ func WithShards(n int) Option {
 func WithEvictionStrategy(strategy EvictionStrategy) Option {
 	return funcOpt(func(c *config) {
 		c.EvictionStrategy = strategy
+	})
+}
+
+// WithEvictionHysteresis sets extra percentage to evict beyond target (default: 0.1 = 10%)
+// This prevents thrashing at the eviction boundary by creating a buffer zone.
+// Example: With MaxSize=100MB and Hysteresis=0.1, eviction will remove 110MB when triggered.
+func WithEvictionHysteresis(pct float64) Option {
+	return funcOpt(func(c *config) {
+		c.EvictionHysteresis = pct
 	})
 }
 
@@ -140,6 +150,7 @@ func defaultConfig(path string) config {
 		MaxSize:               0, // TODO: Auto-detect 80% of disk capacity
 		Shards:                256,
 		EvictionStrategy:      EvictByCTime,
+		EvictionHysteresis:    0.1,       // Evict 10% extra to prevent thrashing
 		BloomFPRate:           0.01,      // 1% FP rate
 		BloomEstimatedKeys:    1_000_000, // 1M keys → ~1.2 MB bloom
 		BloomRefreshInterval:  24 * time.Hour,

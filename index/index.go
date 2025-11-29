@@ -22,6 +22,7 @@ type Index struct {
 
 // Entry represents a cached blob's metadata
 type Entry struct {
+	Key     []byte // Raw key (for eviction/iteration)
 	ShardID int
 	FileID  int64 // Signed to avoid DuckDB uint64 high-bit issues
 	Size    int
@@ -159,6 +160,77 @@ func (idx *Index) TotalSizeOnDisk(ctx context.Context) (int64, error) {
 	}
 
 	return total.Int64, nil
+}
+
+// EntryIterator provides iteration over entries
+type EntryIterator struct {
+	rows *sql.Rows
+	err  error
+}
+
+// Next advances to the next entry and returns true if available
+func (it *EntryIterator) Next() bool {
+	if it.err != nil {
+		return false
+	}
+	return it.rows.Next()
+}
+
+// Entry returns the current entry
+func (it *EntryIterator) Entry() (Entry, error) {
+	var entry Entry
+	err := it.rows.Scan(&entry.Key, &entry.ShardID, &entry.FileID, &entry.Size, &entry.CTime, &entry.MTime)
+	return entry, err
+}
+
+// Err returns any error that occurred during iteration
+func (it *EntryIterator) Err() error {
+	if it.err != nil {
+		return it.err
+	}
+	return it.rows.Err()
+}
+
+// Close closes the iterator
+func (it *EntryIterator) Close() error {
+	if it.rows != nil {
+		return it.rows.Close()
+	}
+	return nil
+}
+
+// GetOldestEntries returns iterator over N oldest entries by mtime for eviction
+func (idx *Index) GetOldestEntries(ctx context.Context, limit int) *EntryIterator {
+	rows, err := idx.db.QueryContext(ctx,
+		"SELECT key, shard_id, file_id, size, ctime, mtime FROM entries ORDER BY mtime ASC LIMIT ?",
+		limit)
+	return &EntryIterator{rows: rows, err: err}
+}
+
+// GetAllKeys returns all keys for bloom filter reconstruction
+func (idx *Index) GetAllKeys(ctx context.Context) ([][]byte, error) {
+	rows, err := idx.db.QueryContext(ctx, "SELECT key FROM entries")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var keys [][]byte
+	for rows.Next() {
+		var key []byte
+		if err := rows.Scan(&key); err != nil {
+			return nil, err
+		}
+		keys = append(keys, key)
+	}
+
+	return keys, rows.Err()
+}
+
+// TestingGetDB returns the underlying database for testing/benchmarking only
+// DO NOT use in production code
+func (idx *Index) TestingGetDB() *sql.DB {
+	return idx.db
 }
 
 // Close closes prepared statements and database

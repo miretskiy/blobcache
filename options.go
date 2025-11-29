@@ -2,7 +2,6 @@ package blobcache
 
 import (
 	"errors"
-	"os/exec"
 	"time"
 )
 
@@ -121,7 +120,7 @@ func (e EvictionStrategy) String() string {
 
 // Common errors
 var (
-	ErrNotFound  = exec.ErrNotFound
+	ErrNotFound  = errors.New("key not found")
 	ErrCorrupted = errors.New("data corruption detected")
 )
 

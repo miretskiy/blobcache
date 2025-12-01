@@ -496,8 +496,7 @@ func TestCache_MemTableBuffered(t *testing.T) {
 	tmpDir, _ := os.MkdirTemp("", "blobcache-test-*")
 	defer os.RemoveAll(tmpDir)
 
-	// Enable memtable with capacity 100
-	cache, err := New(tmpDir, WithMemTableCapacity(100))
+	cache, err := New(tmpDir)
 	require.NoError(t, err)
 
 	require.NotNil(t, cache.memTable, "Memtable should be created")
@@ -533,8 +532,7 @@ func TestCache_MemTableUnbuffered(t *testing.T) {
 	tmpDir, _ := os.MkdirTemp("", "blobcache-test-*")
 	defer os.RemoveAll(tmpDir)
 
-	// Unbuffered channel (capacity 0)
-	cache, err := New(tmpDir, WithMemTableCapacity(0))
+	cache, err := New(tmpDir)
 	require.NoError(t, err)
 
 	ctx := context.Background()

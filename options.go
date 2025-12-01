@@ -12,7 +12,8 @@ type config struct {
 	Shards                int
 	EvictionStrategy      EvictionStrategy
 	EvictionHysteresis    float64 // Percentage over MaxSize to evict (e.g., 0.1 = evict 10% extra)
-	MemTableCapacity      int     // Channel capacity (-1=disabled, 0=unbuffered, >0=buffered)
+	WriteBufferSize       int64   // Memtable batch size in bytes (like RocksDB write_buffer_size)
+	MaxInflightBatches    int     // Max batches queued (like RocksDB max_write_buffer_number)
 	BloomFPRate           float64
 	BloomEstimatedKeys    int
 	BloomRefreshInterval  time.Duration
@@ -65,17 +66,12 @@ func WithEvictionHysteresis(pct float64) Option {
 	})
 }
 
-// WithMemTableCapacity sets async write buffer size (default: -1 = disabled)
-// Emulates RocksDB memtable for async I/O:
-//
-//	-1: Disabled (synchronous writes)
-//	 0: Unbuffered channel (synchronous handoff to background writer)
-//	>0: Buffered channel (async up to N pending writes)
-//
-// Example: capacity=1000 allows 1000 Put() calls to queue before blocking
-func WithMemTableCapacity(capacity int) Option {
+// WithWriteBufferSize sets memtable batch threshold in bytes (default: 100MB, production ~1GB)
+// When accumulated entries exceed this size, batch is flushed to disk
+// Emulates RocksDB write_buffer_size parameter
+func WithWriteBufferSize(bytes int64) Option {
 	return funcOpt(func(c *config) {
-		c.MemTableCapacity = capacity
+		c.WriteBufferSize = bytes
 	})
 }
 
@@ -165,12 +161,13 @@ func defaultConfig(path string) config {
 		MaxSize:               0, // TODO: Auto-detect 80% of disk capacity
 		Shards:                256,
 		EvictionStrategy:      EvictByCTime,
-		EvictionHysteresis:    0.1,       // Evict 10% extra to prevent thrashing
-		MemTableCapacity:      -1,        // Disabled by default (synchronous writes)
-		BloomFPRate:           0.01,      // 1% FP rate
-		BloomEstimatedKeys:    1_000_000, // 1M keys → ~1.2 MB bloom
-		BloomRefreshInterval:  24 * time.Hour,
-		OrphanCleanupInterval: 24 * time.Hour, // Daily, 0 = disabled
+		EvictionHysteresis:    0.1,               // Evict 10% extra to prevent thrashing
+		WriteBufferSize:       100 * 1024 * 1024, // 100MB (production ~1GB)
+		MaxInflightBatches:    6,                 // Max batches queued
+		BloomFPRate:           0.01,              // 1% FP rate
+		BloomEstimatedKeys:    1_000_000,         // 1M keys → ~1.2 MB bloom
+		BloomRefreshInterval:  10 * time.Minute,
+		OrphanCleanupInterval: 1 * time.Hour,
 		Checksums:             true,
 		Fsync:                 false,
 		VerifyOnRead:          false,

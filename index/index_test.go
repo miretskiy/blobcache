@@ -58,8 +58,8 @@ func TestIndex_PutGet(t *testing.T) {
 		t.Errorf("CTime = %d, want %d", entry.CTime, now)
 	}
 
-	if entry.MTime != now {
-		t.Errorf("MTime = %d, want %d", entry.MTime, now)
+	if entry.ATime != now {
+		t.Errorf("ATime = %d, want %d", entry.ATime, now)
 	}
 }
 

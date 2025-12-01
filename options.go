@@ -12,6 +12,7 @@ type config struct {
 	Shards                int
 	EvictionStrategy      EvictionStrategy
 	EvictionHysteresis    float64 // Percentage over MaxSize to evict (e.g., 0.1 = evict 10% extra)
+	MemTableCapacity      int     // Channel capacity (-1=disabled, 0=unbuffered, >0=buffered)
 	BloomFPRate           float64
 	BloomEstimatedKeys    int
 	BloomRefreshInterval  time.Duration
@@ -61,6 +62,20 @@ func WithEvictionStrategy(strategy EvictionStrategy) Option {
 func WithEvictionHysteresis(pct float64) Option {
 	return funcOpt(func(c *config) {
 		c.EvictionHysteresis = pct
+	})
+}
+
+// WithMemTableCapacity sets async write buffer size (default: -1 = disabled)
+// Emulates RocksDB memtable for async I/O:
+//
+//	-1: Disabled (synchronous writes)
+//	 0: Unbuffered channel (synchronous handoff to background writer)
+//	>0: Buffered channel (async up to N pending writes)
+//
+// Example: capacity=1000 allows 1000 Put() calls to queue before blocking
+func WithMemTableCapacity(capacity int) Option {
+	return funcOpt(func(c *config) {
+		c.MemTableCapacity = capacity
 	})
 }
 
@@ -151,6 +166,7 @@ func defaultConfig(path string) config {
 		Shards:                256,
 		EvictionStrategy:      EvictByCTime,
 		EvictionHysteresis:    0.1,       // Evict 10% extra to prevent thrashing
+		MemTableCapacity:      -1,        // Disabled by default (synchronous writes)
 		BloomFPRate:           0.01,      // 1% FP rate
 		BloomEstimatedKeys:    1_000_000, // 1M keys → ~1.2 MB bloom
 		BloomRefreshInterval:  24 * time.Hour,

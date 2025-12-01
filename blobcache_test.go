@@ -466,3 +466,91 @@ func BenchmarkIndex_GetOldestEntries_1M(b *testing.B) {
 	}
 	_ = count // Prevent elision
 }
+
+//
+// Tests for memtable
+//
+
+func TestCache_MemTableDisabled(t *testing.T) {
+	tmpDir, _ := os.MkdirTemp("", "blobcache-test-*")
+	defer os.RemoveAll(tmpDir)
+
+	// Default: memtable disabled
+	cache, err := New(tmpDir)
+	require.NoError(t, err)
+	defer cache.Close()
+
+	require.Nil(t, cache.memTable, "Memtable should be nil when disabled")
+
+	// Verify Put still works (synchronous)
+	ctx := context.Background()
+	err = cache.Put(ctx, []byte("key"), []byte("value"))
+	require.NoError(t, err)
+
+	data, err := cache.Get(ctx, []byte("key"))
+	require.NoError(t, err)
+	require.Equal(t, []byte("value"), data)
+}
+
+func TestCache_MemTableBuffered(t *testing.T) {
+	tmpDir, _ := os.MkdirTemp("", "blobcache-test-*")
+	defer os.RemoveAll(tmpDir)
+
+	// Enable memtable with capacity 100
+	cache, err := New(tmpDir, WithMemTableCapacity(100))
+	require.NoError(t, err)
+
+	require.NotNil(t, cache.memTable, "Memtable should be created")
+
+	ctx := context.Background()
+
+	// Queue writes (should be async)
+	for i := 0; i < 10; i++ {
+		key := []byte(fmt.Sprintf("key-%d", i))
+		value := []byte(fmt.Sprintf("value-%d", i))
+		err := cache.Put(ctx, key, value)
+		require.NoError(t, err)
+	}
+
+	// Drain and close
+	cache.Drain()
+	cache.Close()
+
+	// Reopen and verify all writes persisted
+	cache2, err := New(tmpDir)
+	require.NoError(t, err)
+	defer cache2.Close()
+
+	for i := 0; i < 10; i++ {
+		key := []byte(fmt.Sprintf("key-%d", i))
+		data, err := cache2.Get(ctx, key)
+		require.NoError(t, err)
+		require.Equal(t, []byte(fmt.Sprintf("value-%d", i)), data)
+	}
+}
+
+func TestCache_MemTableUnbuffered(t *testing.T) {
+	tmpDir, _ := os.MkdirTemp("", "blobcache-test-*")
+	defer os.RemoveAll(tmpDir)
+
+	// Unbuffered channel (capacity 0)
+	cache, err := New(tmpDir, WithMemTableCapacity(0))
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	err = cache.Put(ctx, []byte("key"), []byte("value"))
+	require.NoError(t, err)
+
+	// Drain and close
+	cache.Drain()
+	cache.Close()
+
+	// Reopen and verify
+	cache2, err := New(tmpDir)
+	require.NoError(t, err)
+	defer cache2.Close()
+
+	data, err := cache2.Get(ctx, []byte("key"))
+	require.NoError(t, err)
+	require.Equal(t, []byte("value"), data)
+}

@@ -17,9 +17,10 @@ import (
 
 // Cache is a high-performance blob storage with bloom filter optimization
 type Cache struct {
-	cfg   config
-	index *index.Index
-	bloom atomic.Pointer[bloom.Filter]
+	cfg      config
+	index    *index.Index
+	bloom    atomic.Pointer[bloom.Filter]
+	memTable *MemTable // Optional async write buffer
 
 	// Background workers
 	stopCh chan struct{}
@@ -57,6 +58,9 @@ func New(path string, opts ...Option) (*Cache, error) {
 		return nil, fmt.Errorf("failed to load bloom: %w", err)
 	}
 
+	// Create memtable if enabled
+	c.memTable = c.newMemTable(cfg.MemTableCapacity)
+
 	return c, nil
 }
 
@@ -92,6 +96,11 @@ func (c *Cache) Close() error {
 		close(c.stopCh)
 	}
 
+	// Close memtable (does NOT drain - caller should call Drain() if needed)
+	if c.memTable != nil {
+		c.memTable.Close()
+	}
+
 	// Wait for all workers to finish
 	c.wg.Wait()
 
@@ -107,6 +116,14 @@ func (c *Cache) Close() error {
 	}
 
 	return nil
+}
+
+// Drain waits for all pending memtable writes to complete
+// No-op if memtable is disabled
+func (c *Cache) Drain() {
+	if c.memTable != nil {
+		c.memTable.Drain()
+	}
 }
 
 // checkOrInitialize ensures directory structure exists and validates configuration
@@ -379,7 +396,16 @@ func (c *Cache) orphanCleanupWorker() {
 }
 
 // Put stores a key-value pair
+// If memtable enabled, queues for async write; otherwise writes synchronously
 func (c *Cache) Put(ctx context.Context, key, value []byte) error {
+	if c.memTable != nil {
+		return c.memTable.Add(key, value)
+	}
+	return c.writeToDisk(ctx, key, value)
+}
+
+// writeToDisk writes key-value pair directly to index and blob file
+func (c *Cache) writeToDisk(ctx context.Context, key, value []byte) error {
 	k := base.NewKey(key, c.cfg.Shards)
 
 	// TODO: Add checksum if cfg.Checksums enabled

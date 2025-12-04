@@ -23,9 +23,7 @@ func TestNew_CreatesDirectories(t *testing.T) {
 
 	// Verify key directories created
 	require.DirExists(t, filepath.Join(tmpDir, "db"))
-	require.DirExists(t, filepath.Join(tmpDir, "blobs"))
-	require.DirExists(t, filepath.Join(tmpDir, "blobs", "shard-000"))
-	require.DirExists(t, filepath.Join(tmpDir, "blobs", "shard-255"))
+	require.DirExists(t, filepath.Join(tmpDir, "segments"))
 
 	// Verify marker
 	require.FileExists(t, filepath.Join(tmpDir, ".initialized"))
@@ -144,6 +142,9 @@ func TestCache_PutGet(t *testing.T) {
 	// Put
 	err = cache.Put(ctx, key, value)
 	require.NoError(t, err)
+
+	// Drain memtable to ensure write completes
+	cache.Drain()
 
 	// Get
 	retrieved, err := cache.Get(ctx, key)
@@ -298,6 +299,9 @@ func TestCache_Eviction(t *testing.T) {
 		time.Sleep(10 * time.Millisecond) // Ensure different mtimes
 	}
 
+	// Drain to ensure all writes complete
+	cache.Drain()
+
 	// Check size before eviction
 	totalSize, err := cache.index.TotalSizeOnDisk(ctx)
 	require.NoError(t, err)
@@ -313,9 +317,12 @@ func TestCache_Eviction(t *testing.T) {
 	// With 10% hysteresis, should evict to ~4.5MB (5MB - 10% of 5MB)
 	require.Less(t, totalSize, int64(4600000))
 
+	// Clear memtable so evicted keys are truly not found
+	cache.memTable.TestingClearMemtable()
+
 	// Verify oldest keys were evicted
 	_, err = cache.Get(ctx, []byte("key-0"))
-	require.ErrorIs(t, err, ErrNotFound)
+	require.ErrorIs(t, err, ErrNotFound, "key-0 should have been evicted")
 }
 
 func TestCache_BloomRefresh(t *testing.T) {
@@ -329,11 +336,14 @@ func TestCache_BloomRefresh(t *testing.T) {
 	ctx := context.Background()
 	value := []byte("test-value")
 
-	// Add some keys
+	// Put some keys
 	for i := 0; i < 100; i++ {
 		key := []byte(fmt.Sprintf("key-%d", i))
 		cache.Put(ctx, key, value)
 	}
+
+	// Drain memtable to ensure keys are flushed to index
+	cache.Drain()
 
 	// Clear bloom filter
 	emptyBloom := bloom.New(1000, 0.01)
@@ -471,22 +481,23 @@ func BenchmarkIndex_GetOldestEntries_1M(b *testing.B) {
 // Tests for memtable
 //
 
-func TestCache_MemTableDisabled(t *testing.T) {
+func TestCache_MemTableEnabled(t *testing.T) {
 	tmpDir, _ := os.MkdirTemp("", "blobcache-test-*")
 	defer os.RemoveAll(tmpDir)
 
-	// Default: memtable disabled
+	// Memtable is always enabled (required for apples-to-apples RocksDB comparison)
 	cache, err := New(tmpDir)
 	require.NoError(t, err)
 	defer cache.Close()
 
-	require.Nil(t, cache.memTable, "Memtable should be nil when disabled")
+	require.NotNil(t, cache.memTable, "Memtable should always be enabled")
 
-	// Verify Put still works (synchronous)
+	// Verify immediate read-after-write (from memtable, not disk)
 	ctx := context.Background()
 	err = cache.Put(ctx, []byte("key"), []byte("value"))
 	require.NoError(t, err)
 
+	// Should read from memtable immediately (before flush)
 	data, err := cache.Get(ctx, []byte("key"))
 	require.NoError(t, err)
 	require.Equal(t, []byte("value"), data)

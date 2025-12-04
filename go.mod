@@ -11,6 +11,11 @@ require (
 )
 
 require (
+	github.com/ncw/directio v1.0.5 // indirect
+	github.com/zhangyunhao116/fastrand v0.3.0 // indirect
+)
+
+require (
 	github.com/apache/arrow-go/v18 v18.1.0 // indirect
 	github.com/bits-and-blooms/bitset v1.24.2 // indirect
 	github.com/cockroachdb/errors v1.11.3 // indirect
@@ -33,6 +38,7 @@ require (
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/rogpeppe/go-internal v1.9.0 // indirect
 	github.com/zeebo/xxh3 v1.0.2 // indirect
+	github.com/zhangyunhao116/skipmap v0.10.1
 	golang.org/x/exp v0.0.0-20250128182459-e0ece0dbea4c // indirect
 	golang.org/x/mod v0.22.0 // indirect
 	golang.org/x/sync v0.10.0 // indirect

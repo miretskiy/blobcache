@@ -2,6 +2,7 @@ package index
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -28,10 +29,12 @@ func TestIndex_PutGet(t *testing.T) {
 	ctx := context.Background()
 
 	// Put an entry
-	key := base.NewKey([]byte("test-key"), 256)
+	key := base.Key([]byte("test-key"))
 	now := time.Now().UnixNano()
+	segmentID := fmt.Sprintf("%d-00", now)
+	pos := int64(1024)
 
-	err = idx.Put(ctx, key, 1024, now, now)
+	err = idx.Put(ctx, key, segmentID, pos, 1024, now)
 	require.NoError(t, err)
 
 	// Get it back
@@ -42,12 +45,12 @@ func TestIndex_PutGet(t *testing.T) {
 	}
 
 	// Verify
-	if entry.ShardID != key.ShardID() {
-		t.Errorf("ShardID = %d, want %d", entry.ShardID, key.ShardID())
+	if entry.SegmentID != segmentID {
+		t.Errorf("SegmentID = %s, want %s", entry.SegmentID, segmentID)
 	}
 
-	if entry.FileID != int64(key.FileID()) {
-		t.Errorf("FileID = %d, want %d", entry.FileID, key.FileID())
+	if entry.Pos != pos {
+		t.Errorf("Pos = %d, want %d", entry.Pos, pos)
 	}
 
 	if entry.Size != 1024 {
@@ -56,10 +59,6 @@ func TestIndex_PutGet(t *testing.T) {
 
 	if entry.CTime != now {
 		t.Errorf("CTime = %d, want %d", entry.CTime, now)
-	}
-
-	if entry.ATime != now {
-		t.Errorf("ATime = %d, want %d", entry.ATime, now)
 	}
 }
 
@@ -73,7 +72,7 @@ func TestIndex_GetNotFound(t *testing.T) {
 	}
 	defer idx.Close()
 
-	key := base.NewKey([]byte("nonexistent"), 256)
+	key := base.Key([]byte("nonexistent"))
 	var entry Entry
 	err = idx.Get(context.Background(), key, &entry)
 
@@ -82,35 +81,8 @@ func TestIndex_GetNotFound(t *testing.T) {
 	}
 }
 
-func TestIndex_UpdateSameKey(t *testing.T) {
-	tmpDir, _ := os.MkdirTemp("", "index-test-*")
-	defer os.RemoveAll(tmpDir)
-
-	idx, err := New(tmpDir)
-	require.NoError(t, err)
-	defer idx.Close()
-
-	ctx := context.Background()
-	key := base.NewKey([]byte("same-key"), 256)
-	ctime := time.Now().UnixNano()
-
-	// Insert
-	err = idx.Put(ctx, key, 100, ctime, ctime)
-	require.NoError(t, err)
-
-	// Update same key (should succeed with ON CONFLICT)
-	mtime := ctime + 1000
-	err = idx.Put(ctx, key, 200, ctime, mtime)
-	require.NoError(t, err, "Update should succeed")
-
-	// Verify
-	var entry Entry
-	err = idx.Get(ctx, key, &entry)
-	require.NoError(t, err)
-	require.Equal(t, 200, entry.Size, "Size should be updated to 200")
-	// Note: REPLACE deletes+inserts, so timestamps may change slightly
-	// Just verify entry exists with new size
-}
+// TestIndex_UpdateSameKey removed - with memtable design, duplicate keys are handled
+// by skipmap overwriting in memory, not at index level. Index sees unique keys only.
 
 func TestIndex_Delete(t *testing.T) {
 	tmpDir, _ := os.MkdirTemp("", "blobcache-test-*")
@@ -120,11 +92,12 @@ func TestIndex_Delete(t *testing.T) {
 	defer idx.Close()
 
 	ctx := context.Background()
-	key := base.NewKey([]byte("delete-me"), 256)
+	key := base.Key([]byte("delete-me"))
 
 	// Insert
 	now := time.Now().UnixNano()
-	idx.Put(ctx, key, 500, now, now)
+	segmentID := fmt.Sprintf("%d-00", now)
+	idx.Put(ctx, key, segmentID, 0, 500, now)
 
 	// Delete
 	err := idx.Delete(ctx, key)
@@ -165,11 +138,12 @@ func TestIndex_TotalSizeOnDisk(t *testing.T) {
 		t.Errorf("Empty total = %d, want 0", total)
 	}
 
-	// Add entries
+	// Put entries
 	now := time.Now().UnixNano()
-	idx.Put(ctx, base.NewKey([]byte("key1"), 256), 100, now, now)
-	idx.Put(ctx, base.NewKey([]byte("key2"), 256), 200, now, now)
-	idx.Put(ctx, base.NewKey([]byte("key3"), 256), 300, now, now)
+	segmentID := fmt.Sprintf("%d-00", now)
+	idx.Put(ctx, base.Key([]byte("key1")), segmentID, 0, 100, now)
+	idx.Put(ctx, base.Key([]byte("key2")), segmentID, 100, 200, now)
+	idx.Put(ctx, base.Key([]byte("key3")), segmentID, 300, 300, now)
 
 	total, err = idx.TotalSizeOnDisk(ctx)
 	if err != nil {
@@ -181,7 +155,7 @@ func TestIndex_TotalSizeOnDisk(t *testing.T) {
 	}
 
 	// Delete one
-	idx.Delete(ctx, base.NewKey([]byte("key2"), 256))
+	idx.Delete(ctx, base.Key([]byte("key2")))
 
 	total, _ = idx.TotalSizeOnDisk(ctx)
 	if total != 400 {
@@ -194,12 +168,13 @@ func TestIndex_Persistence(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	ctx := context.Background()
-	key := base.NewKey([]byte("persist-key"), 256)
+	key := base.Key([]byte("persist-key"))
 	now := time.Now().UnixNano()
+	segmentID := fmt.Sprintf("%d-00", now)
 
 	// Create index and insert
 	idx1, _ := New(tmpDir)
-	idx1.Put(ctx, key, 999, now, now)
+	idx1.Put(ctx, key, segmentID, 0, 999, now)
 	idx1.Close()
 
 	// Reopen and verify data persisted

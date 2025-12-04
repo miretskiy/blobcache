@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	
+
 	"github.com/marcboeker/go-duckdb"
 	"github.com/miretskiy/blobcache/base"
 )
@@ -23,12 +23,11 @@ type Index struct {
 
 // Entry represents a cached blob's metadata
 type Entry struct {
-	Key     []byte // Raw key (for eviction/iteration)
-	ShardID int
-	FileID  int64 // Signed to avoid DuckDB uint64 high-bit issues
-	Size    int
-	CTime   int64
-	ATime   int64
+	Key       []byte // Raw key (for eviction/iteration)
+	SegmentID string // Format: "{unix_nanos}-{worker_id}"
+	Pos       int64  // Byte position within segment
+	Size      int
+	CTime     int64 // Creation time
 }
 
 // KeyValue holds a key with metadata for bulk insert
@@ -43,91 +42,89 @@ func New(basePath string) (*Index, error) {
 	if err := os.MkdirAll(dbDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create db directory: %w", err)
 	}
-	
+
 	dbPath := filepath.Join(dbDir, "index.duckdb")
 	db, err := sql.Open("duckdb", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open duckdb: %w", err)
 	}
-	
+
 	idx := &Index{db: db}
-	
+
 	if err := idx.initSchema(); err != nil {
 		db.Close()
 		return nil, err
 	}
-	
+
 	if err := idx.prepareStatements(); err != nil {
 		db.Close()
 		return nil, err
 	}
-	
+
 	return idx, nil
 }
 
 func (idx *Index) initSchema() error {
 	schema := `
 		CREATE TABLE IF NOT EXISTS entries (
-			key BLOB PRIMARY KEY,
-			shard_id INTEGER NOT NULL,
-			file_id BIGINT NOT NULL,
+			key BLOB NOT NULL,
+			segment_id TEXT NOT NULL,
+			pos BIGINT NOT NULL,
 			size INTEGER NOT NULL,
-			ctime BIGINT NOT NULL,
-			mtime BIGINT NOT NULL
+			ctime BIGINT NOT NULL
 		);
 
+		CREATE INDEX IF NOT EXISTS idx_key ON entries(key);
+		CREATE INDEX IF NOT EXISTS idx_segment_ctime ON entries(segment_id, ctime);
 		CREATE INDEX IF NOT EXISTS idx_ctime ON entries(ctime);
-		CREATE INDEX IF NOT EXISTS idx_mtime ON entries(mtime);
-		CREATE INDEX IF NOT EXISTS idx_shard_file ON entries(shard_id, file_id);
 	`
-	
+
 	_, err := idx.db.Exec(schema)
 	return err
 }
 
 func (idx *Index) prepareStatements() error {
 	var err error
-	
-	// Note: Can't use ON CONFLICT DO UPDATE with DuckDB when columns are in indexes
-	// Use REPLACE instead (delete + insert)
+
+	// No PRIMARY KEY constraint - allows duplicates, latest wins via ORDER BY ctime
 	idx.stmtPut, err = idx.db.Prepare(`
-		INSERT OR REPLACE INTO entries (key, shard_id, file_id, size, ctime, mtime)
-		VALUES (?, ?, ?, ?, ?, ?)
+		INSERT INTO entries (key, segment_id, pos, size, ctime)
+		VALUES (?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return fmt.Errorf("failed to prepare put: %w", err)
 	}
-	
+
 	idx.stmtGet, err = idx.db.Prepare(
-		"SELECT shard_id, file_id, size, ctime, mtime FROM entries WHERE key = ?")
+		`SELECT segment_id, pos, size, ctime FROM entries WHERE key = ? ORDER BY ctime DESC LIMIT 1`)
 	if err != nil {
 		return fmt.Errorf("failed to prepare get: %w", err)
 	}
-	
+
 	idx.stmtDelete, err = idx.db.Prepare("DELETE FROM entries WHERE key = ?")
 	if err != nil {
 		return fmt.Errorf("failed to prepare delete: %w", err)
 	}
-	
+
 	return nil
 }
 
 // Put inserts or updates an entry
-func (idx *Index) Put(ctx context.Context, key base.Key, size int, ctime, mtime int64) error {
+func (idx *Index) Put(ctx context.Context, key base.Key, segmentID string, pos int64, size int, ctime int64) error {
 	_, err := idx.stmtPut.ExecContext(ctx,
-		key.Raw(), key.ShardID(), int64(key.FileID()), size, ctime, mtime)
+		key.Raw(), segmentID, pos, size, ctime)
 	return err
 }
 
 // Get retrieves an entry (caller provides Entry to avoid allocation)
 func (idx *Index) Get(ctx context.Context, key base.Key, entry *Entry) error {
 	err := idx.stmtGet.QueryRowContext(ctx, key.Raw()).Scan(
-		&entry.ShardID, &entry.FileID, &entry.Size, &entry.CTime, &entry.ATime)
-	
+		&entry.SegmentID, &entry.Pos, &entry.Size, &entry.CTime)
+
 	if err == sql.ErrNoRows {
 		return ErrNotFound
 	}
-	
+
 	return err
 }
 
@@ -137,12 +134,12 @@ func (idx *Index) Delete(ctx context.Context, key base.Key) error {
 	if err != nil {
 		return err
 	}
-	
+
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
 		return ErrNotFound
 	}
-	
+
 	return nil
 }
 
@@ -154,18 +151,18 @@ var (
 // TotalSizeOnDisk returns sum of all blob sizes
 func (idx *Index) TotalSizeOnDisk(ctx context.Context) (int64, error) {
 	var total sql.NullInt64
-	
+
 	err := idx.db.QueryRowContext(ctx,
 		"SELECT SUM(size) FROM entries").Scan(&total)
-	
+
 	if err != nil {
 		return 0, err
 	}
-	
+
 	if !total.Valid {
 		return 0, nil
 	}
-	
+
 	return total.Int64, nil
 }
 
@@ -186,7 +183,7 @@ func (it *EntryIterator) Next() bool {
 // Entry returns the current entry
 func (it *EntryIterator) Entry() (Entry, error) {
 	var entry Entry
-	err := it.rows.Scan(&entry.Key, &entry.ShardID, &entry.FileID, &entry.Size, &entry.CTime, &entry.ATime)
+	err := it.rows.Scan(&entry.Key, &entry.SegmentID, &entry.Pos, &entry.Size, &entry.CTime)
 	return entry, err
 }
 
@@ -206,10 +203,10 @@ func (it *EntryIterator) Close() error {
 	return nil
 }
 
-// GetOldestEntries returns iterator over N oldest entries by mtime for eviction
+// GetOldestEntries returns iterator over N oldest entries by ctime for eviction
 func (idx *Index) GetOldestEntries(ctx context.Context, limit int) *EntryIterator {
 	rows, err := idx.db.QueryContext(ctx,
-		"SELECT key, shard_id, file_id, size, ctime, mtime FROM entries ORDER BY mtime ASC LIMIT ?",
+		`SELECT key, segment_id, pos, size, ctime FROM entries ORDER BY ctime ASC LIMIT ?`,
 		limit)
 	return &EntryIterator{rows: rows, err: err}
 }
@@ -221,7 +218,7 @@ func (idx *Index) GetAllKeys(ctx context.Context) ([][]byte, error) {
 		return nil, err
 	}
 	defer rows.Close()
-	
+
 	var keys [][]byte
 	for rows.Next() {
 		var key []byte
@@ -230,7 +227,7 @@ func (idx *Index) GetAllKeys(ctx context.Context) ([][]byte, error) {
 		}
 		keys = append(keys, key)
 	}
-	
+
 	return keys, rows.Err()
 }
 
@@ -240,7 +237,7 @@ func (idx *Index) NewAppender(ctx context.Context) (*duckdb.Appender, func(), er
 	if err != nil {
 		return nil, nil, err
 	}
-	
+
 	var appender *duckdb.Appender
 	err = conn.Raw(func(dc any) error {
 		driverConn := dc.(driver.Conn)
@@ -248,18 +245,18 @@ func (idx *Index) NewAppender(ctx context.Context) (*duckdb.Appender, func(), er
 		appender, err = duckdb.NewAppenderFromConn(driverConn, "", "entries")
 		return err
 	})
-	
+
 	if err != nil {
 		conn.Close()
 		return nil, nil, err
 	}
-	
+
 	// Return appender and cleanup function
 	cleanup := func() {
 		appender.Close()
 		conn.Close()
 	}
-	
+
 	return appender, cleanup, nil
 }
 

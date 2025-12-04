@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -123,14 +122,13 @@ func (c *Cache) Drain() {
 
 // checkOrInitialize ensures directory structure exists and validates configuration
 // Uses empty .initialized marker file for fast idempotency check
-// Verifies shard count by counting shard directories
 func checkOrInitialize(cfg config) error {
 	markerPath := filepath.Join(cfg.Path, ".initialized")
 
 	// Check if already initialized
 	if _, err := os.Stat(markerPath); err == nil {
-		// Initialized - verify shard count matches
-		return verifyShards(cfg)
+		// Already initialized
+		return nil
 	}
 
 	// Not initialized - create directory structure
@@ -138,7 +136,7 @@ func checkOrInitialize(cfg config) error {
 	// Create base directories
 	dirs := []string{
 		filepath.Join(cfg.Path, "db"),
-		filepath.Join(cfg.Path, "blobs"),
+		filepath.Join(cfg.Path, "segments"), // Flat directory for segment files
 	}
 
 	for _, dir := range dirs {
@@ -147,54 +145,9 @@ func checkOrInitialize(cfg config) error {
 		}
 	}
 
-	// Create shard directories
-	for i := 0; i < cfg.Shards; i++ {
-		shardDir := filepath.Join(cfg.Path, "blobs", fmt.Sprintf("shard-%03d", i))
-		if err := os.MkdirAll(shardDir, 0755); err != nil {
-			return fmt.Errorf("failed to create shard-%03d: %w", i, err)
-		}
-	}
-
 	// Touch empty marker file
 	if err := os.WriteFile(markerPath, []byte{}, 0644); err != nil {
 		return fmt.Errorf("failed to write marker: %w", err)
-	}
-
-	return nil
-}
-
-// verifyShards checks that expected shard directories exist
-// Warns on mismatch but doesn't fail (cache can still function, just inefficiently)
-func verifyShards(cfg config) error {
-	blobsDir := filepath.Join(cfg.Path, "blobs")
-
-	// Check each expected shard directory exists
-	missing := 0
-	for i := 0; i < cfg.Shards; i++ {
-		shardDir := filepath.Join(blobsDir, fmt.Sprintf("shard-%03d", i))
-		if _, err := os.Stat(shardDir); os.IsNotExist(err) {
-			missing++
-		}
-	}
-
-	if missing > 0 {
-		fmt.Printf("WARNING: %d shard directories missing (config wants %d). Cache may be inefficient.\n",
-			missing, cfg.Shards)
-		// Don't fail - cache can still operate
-	}
-
-	// Check for extra shards (wrong config)
-	entries, _ := os.ReadDir(blobsDir)
-	extra := 0
-	for _, entry := range entries {
-		if entry.IsDir() && strings.HasPrefix(entry.Name(), "shard-") {
-			extra++
-		}
-	}
-
-	if extra > cfg.Shards {
-		fmt.Printf("WARNING: Found %d shard directories, config expects %d. Extra shards will not be used.\n",
-			extra, cfg.Shards)
 	}
 
 	return nil
@@ -236,7 +189,7 @@ func (c *Cache) rebuildBloom(ctx context.Context) error {
 
 	filter := bloom.New(uint(estimatedKeys), c.cfg.BloomFPRate)
 
-	// Add all keys
+	// Put all keys
 	for _, key := range keys {
 		filter.Add(key)
 	}
@@ -321,14 +274,12 @@ func (c *Cache) runEviction(ctx context.Context) error {
 				return fmt.Errorf("failed to get entry: %w", err)
 			}
 
-			// Delete blob file
-			blobPath := filepath.Join(c.cfg.Path, "blobs",
-				fmt.Sprintf("shard-%03d", entry.ShardID),
-				fmt.Sprintf("%d.blob", entry.FileID))
-			os.Remove(blobPath) // Best effort - ignore errors
+			// TODO: Delete segment blob data (for now, skip file deletion)
+			// Segment files will be cleaned up when entire segment is evicted
+			// or by orphan cleanup worker
 
 			// Delete from index
-			k := base.NewKey(entry.Key, c.cfg.Shards)
+			k := base.Key(entry.Key)
 			if err := c.index.Delete(ctx, k); err != nil {
 				// Log warning but continue
 				fmt.Printf("Warning: failed to delete key from index: %v\n", err)
@@ -390,61 +341,62 @@ func (c *Cache) orphanCleanupWorker() {
 	}
 }
 
-// Put stores a key-value pair
-// If memtable enabled, queues for async write; otherwise writes synchronously
+// Put stores a key-value pair (makes copies for safety)
 func (c *Cache) Put(ctx context.Context, key, value []byte) error {
-	return c.memTable.UnsafeAdd(key, value)
+	keyCopy := make([]byte, len(key))
+	copy(keyCopy, key)
+	valueCopy := make([]byte, len(value))
+	copy(valueCopy, value)
+	return c.memTable.Put(keyCopy, valueCopy)
 }
 
-// writeToDisk writes key-value pair directly to index and blob file
-func (c *Cache) writeToDisk(ctx context.Context, key, value []byte) error {
-	k := base.NewKey(key, c.cfg.Shards)
-
-	// TODO: Add checksum if cfg.Checksums enabled
-
-	// 1. Update index first (if this fails, nothing written)
-	now := time.Now().UnixNano()
-	if err := c.index.Put(ctx, k, len(value), now, now); err != nil {
-		return fmt.Errorf("index put failed: %w", err)
-	}
-
-	// 2. Update bloom filter (fast, lock-free)
-	bloom := c.bloom.Load()
-	bloom.Add(key)
-
-	// 3. Write blob file (if this fails, orphan in index gets cleaned up eventually)
-	blobPath := filepath.Join(c.cfg.Path, "blobs",
-		fmt.Sprintf("shard-%03d", k.ShardID()),
-		fmt.Sprintf("%d.blob", k.FileID()))
-
-	if err := os.WriteFile(blobPath, value, 0644); err != nil {
-		// File write failed but index updated - acceptable for cache
-		return fmt.Errorf("blob write failed: %w", err)
-	}
-
-	return nil
+// UnsafePut stores key-value without copying
+// Caller must ensure key and value are not modified after this call
+func (c *Cache) UnsafePut(ctx context.Context, key, value []byte) error {
+	return c.memTable.Put(key, value)
 }
 
 // Get retrieves a value by key
 func (c *Cache) Get(ctx context.Context, key []byte) ([]byte, error) {
-	// 1. Check bloom filter (lock-free, <1 ns)
 	bloom := c.bloom.Load()
 	if !bloom.Test(key) {
 		return nil, ErrNotFound
 	}
 
-	// 2. Read blob file directly (no index lookup needed!)
-	k := base.NewKey(key, c.cfg.Shards)
-	blobPath := filepath.Join(c.cfg.Path, "blobs",
-		fmt.Sprintf("shard-%03d", k.ShardID()),
-		fmt.Sprintf("%d.blob", k.FileID()))
+	if c.memTable != nil {
+		if value, found := c.memTable.Get(key); found {
+			return value, nil
+		}
+	}
 
-	data, err := os.ReadFile(blobPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, ErrNotFound // Bloom FP or file evicted
+	k := base.Key(key)
+	var entry index.Entry
+	if err := c.index.Get(ctx, k, &entry); err != nil {
+		if err == index.ErrNotFound {
+			return nil, ErrNotFound
 		}
 		return nil, err
+	}
+
+	segmentPath := filepath.Join(c.cfg.Path, "segments", entry.SegmentID+".seg")
+
+	file, err := os.Open(segmentPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, ErrNotFound // Segment evicted
+		}
+		return nil, fmt.Errorf("failed to open segment: %w", err)
+	}
+	defer file.Close()
+
+	// Read blob data at position
+	data := make([]byte, entry.Size)
+	n, err := file.ReadAt(data, entry.Pos)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read from segment: %w", err)
+	}
+	if n != entry.Size {
+		return nil, fmt.Errorf("partial read: got %d bytes, want %d", n, entry.Size)
 	}
 
 	// TODO: Verify checksum if cfg.VerifyOnRead enabled

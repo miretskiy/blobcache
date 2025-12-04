@@ -9,7 +9,7 @@ import (
 func TestBloom_AddTest(t *testing.T) {
 	filter := New(1000, 0.01)
 
-	// Add a key
+	// Put a key
 	key := []byte("test-key")
 	filter.Add(key)
 
@@ -31,7 +31,7 @@ func TestBloom_FalsePositiveRate(t *testing.T) {
 
 	filter := New(n, fpRate)
 
-	// Add n keys
+	// Put n keys
 	for i := uint(0); i < n; i++ {
 		key := []byte(fmt.Sprintf("key-%d", i))
 		filter.Add(key)
@@ -61,21 +61,21 @@ func TestBloom_Deterministic(t *testing.T) {
 
 	key := []byte("deterministic-key")
 
-	// Add multiple times
+	// Put multiple times
 	filter.Add(key)
 	filter.Add(key)
 	filter.Add(key)
 
 	// Should still work
 	if !filter.Test(key) {
-		t.Error("Test failed after multiple Add calls")
+		t.Error("Test failed after multiple Put calls")
 	}
 }
 
 func TestBloom_Serialize(t *testing.T) {
 	filter1 := New(1000, 0.01)
 
-	// Add keys
+	// Put keys
 	keys := []string{"key1", "key2", "key3"}
 	for _, k := range keys {
 		filter1.Add([]byte(k))
@@ -140,7 +140,7 @@ func TestBloom_ConcurrentAdd(t *testing.T) {
 	}
 
 	if missing > 0 {
-		t.Errorf("%d keys missing after concurrent Add", missing)
+		t.Errorf("%d keys missing after concurrent Put", missing)
 	}
 }
 

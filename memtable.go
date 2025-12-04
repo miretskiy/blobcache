@@ -2,212 +2,370 @@ package blobcache
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
+	"unsafe"
 
-	"github.com/HdrHistogram/hdrhistogram-go"
 	"github.com/miretskiy/blobcache/base"
+	"github.com/ncw/directio"
+	"github.com/zhangyunhao116/skipmap"
 )
 
-// MemTable provides async write buffering with batching
+// Metrics counters (TODO: replace with proper metrics system)
+var (
+	metricsAlignedWrites   atomic.Int64
+	metricsUnalignedWrites atomic.Int64
+)
+
+// isAligned checks if slice is aligned to BlockSize
+func isAligned(b []byte) bool {
+	if len(b) == 0 {
+		return true
+	}
+	return uintptr(unsafe.Pointer(&b[0]))%uintptr(directio.BlockSize) == 0
+}
+
+// writeAlignedBlocks writes aligned blocks to file, returns unaligned remainder
+func writeAlignedBlocks(f *os.File, buf []byte) ([]byte, error) {
+	alignedLen := (len(buf) / directio.BlockSize) * directio.BlockSize
+	if alignedLen > 0 {
+		if _, err := f.Write(buf[:alignedLen]); err != nil {
+			return nil, err
+		}
+	}
+	return buf[alignedLen:], nil
+}
+
+// memFile represents a single memtable with skipmap and size tracking
+type memFile struct {
+	data *skipmap.StringMap[[]byte]
+	size atomic.Int64
+}
+
+// MemTable provides async write buffering with in-memory read support
+// Uses atomic memFile pointer for lock-free writes
 type MemTable struct {
-	entries         chan memTableEntry
-	batches         chan []memTableEntry // Batches ready for I/O workers
-	stopCh          chan struct{}
-	wg              sync.WaitGroup
+	// Active memfile - currently accepting writes (lock-free)
+	active atomic.Pointer[memFile]
+
+	// Frozen coordination
+	frozen struct {
+		sync.RWMutex
+		inflight []*memFile
+		cond     *sync.Cond
+	}
+
+	// Background flush workers
+	flushCh chan *memFile
+	stopCh  chan struct{}
+	wg      sync.WaitGroup
+
 	cache           *Cache
 	writeBufferSize int64
-	batchPool       sync.Pool
 }
 
-type memTableEntry struct {
-	key   []byte
-	value []byte
-}
-
-// newMemTable creates a memtable
+// newMemTable creates a memtable with skipmap-based storage
 func (c *Cache) newMemTable() *MemTable {
-	const entryQueueSize = 256 // Small fixed queue to smooth producer spikes
-
 	mt := &MemTable{
-		entries:         make(chan memTableEntry, entryQueueSize),
-		batches:         make(chan []memTableEntry, c.cfg.MaxInflightBatches),
+		flushCh:         make(chan *memFile, c.cfg.MaxInflightBatches),
 		stopCh:          make(chan struct{}),
 		cache:           c,
 		writeBufferSize: c.cfg.WriteBufferSize,
-		batchPool: sync.Pool{
-			New: func() any {
-				return make([]memTableEntry, 0, 1000)
-			},
-		},
 	}
+	mt.frozen.inflight = make([]*memFile, 0)
+	mt.frozen.cond = sync.NewCond(&mt.frozen)
 
-	// Single batcher: accumulates entries
-	mt.wg.Add(1)
-	go mt.batcher()
+	// Initialize active memfile
+	mf := &memFile{
+		data: skipmap.NewString[[]byte](),
+	}
+	mt.active.Store(mf)
 
-	// as many workers as the number of inflight batches.
+	// Start I/O workers for flushing memfiles
 	for i := 0; i < c.cfg.MaxInflightBatches; i++ {
 		mt.wg.Add(1)
-		go mt.ioWorker()
+		workerID := i
+		go mt.flushWorker(workerID)
 	}
 
 	return mt
 }
 
-// batcher accumulates entries into size-based batches
-func (mt *MemTable) batcher() {
-	defer mt.wg.Done()
+// Put stores key-value in memtable
+// Caller must ensure key and value are not modified after this call
+func (mt *MemTable) Put(key, value []byte) error {
+retry:
+	mf := mt.active.Load()
 
-	batch := mt.getBatch()
-	batchSize := int64(0)
+	keyStr := unsafe.String(unsafe.SliceData(key), len(key))
+	mf.data.Store(keyStr, value)
+
+	bloom := mt.cache.bloom.Load()
+	bloom.Add(key)
+
+	newSize := mf.size.Add(int64(len(value)))
+	if newSize >= mt.writeBufferSize {
+		mt.frozen.Lock()
+
+		if mt.active.Load() != mf {
+			mt.frozen.Unlock()
+			goto retry
+		}
+
+		mt.doRotateUnderLock(mf)
+		mt.frozen.Unlock()
+	}
+
+	return nil
+}
+
+// doRotateUnderLock rotates the given memfile out
+// CALLER MUST HOLD mt.frozen.Lock()
+func (mt *MemTable) doRotateUnderLock(mf *memFile) {
+	for len(mt.frozen.inflight) >= mt.cache.cfg.MaxInflightBatches {
+		mt.frozen.cond.Wait()
+	}
+
+	// Add to frozen list before swapping active (maintains visibility)
+	mt.frozen.inflight = append(mt.frozen.inflight, mf)
+
+	newMf := &memFile{
+		data: skipmap.NewString[[]byte](),
+	}
+	mt.active.Store(newMf)
+
+	select {
+	case mt.flushCh <- mf:
+	default:
+		panic("doRotateUnderLock: flushCh full despite backpressure")
+	}
+}
+
+// Get retrieves value from active or frozen memfiles
+func (mt *MemTable) Get(key []byte) ([]byte, bool) {
+	keyStr := unsafe.String(unsafe.SliceData(key), len(key))
+
+	mf := mt.active.Load()
+	if value, ok := mf.data.Load(keyStr); ok {
+		return value, true
+	}
+
+	mt.frozen.RLock()
+	defer mt.frozen.RUnlock()
+
+	for i := len(mt.frozen.inflight) - 1; i >= 0; i-- {
+		if value, ok := mt.frozen.inflight[i].data.Load(keyStr); ok {
+			return value, true
+		}
+	}
+
+	return nil, false
+}
+
+// flushWorker processes frozen memfiles
+func (mt *MemTable) flushWorker(workerID int) {
+	defer mt.wg.Done()
+	ctx := context.Background()
 
 	for {
 		select {
-		case entry := <-mt.entries:
-			batch = append(batch, entry)
-			batchSize += int64(len(entry.key) + len(entry.value))
-
-			if batchSize >= mt.writeBufferSize {
-				mt.batches <- batch
-				batch = mt.getBatch()
-				batchSize = 0
-			}
+		case mf := <-mt.flushCh:
+			mt.flushMemFile(ctx, workerID, mf)
+			mt.removeFrozen(mf)
 
 		case <-mt.stopCh:
-			if len(batch) > 0 {
-				mt.batches <- batch
+			for {
+				select {
+				case mf := <-mt.flushCh:
+					mt.flushMemFile(ctx, workerID, mf)
+					mt.removeFrozen(mf)
+				default:
+					return
+				}
 			}
-			close(mt.batches)
+		}
+	}
+}
+
+// removeFrozen removes memfile from frozen list after flush
+func (mt *MemTable) removeFrozen(target *memFile) {
+	mt.frozen.Lock()
+	defer mt.frozen.Unlock()
+
+	for i, mf := range mt.frozen.inflight {
+		if mf == target {
+			mt.frozen.inflight = append(mt.frozen.inflight[:i], mt.frozen.inflight[i+1:]...)
+			mt.frozen.cond.Broadcast()
 			return
 		}
 	}
 }
 
-// ioWorker processes batches in parallel
-func (mt *MemTable) ioWorker() {
-	defer mt.wg.Done()
-	ctx := context.Background()
+// flushMemFile writes memfile to segment and updates index
+func (mt *MemTable) flushMemFile(ctx context.Context, workerID int, mf *memFile) {
+	now := time.Now().UnixNano()
+	segmentID := fmt.Sprintf("%d-%02d", now, workerID)
 
-	for batch := range mt.batches {
-		mt.flush(ctx, batch)
+	blobMetas, err := mt.writeMemFileData(segmentID, mf)
+	if err != nil {
+		return
 	}
+
+	mt.writeMemFileIndex(ctx, segmentID, now, blobMetas)
 }
 
-// flush writes a batch using Appender, falls back to individual Puts on error
-func (mt *MemTable) flush(ctx context.Context, batch []memTableEntry) {
-	defer mt.putBatch(batch)
+// writeMemFileData writes memfile data to segment file, returns blob metadata
+func (mt *MemTable) writeMemFileData(segmentID string, mf *memFile) ([]blobMeta, error) {
+	segmentPath := filepath.Join(mt.cache.cfg.Path, "segments", segmentID+".seg")
 
-	// Try bulk insert with Appender
+	// Create segment file with DirectIO
+	segmentFile, err := directio.OpenFile(segmentPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
+	if err != nil {
+		// TODO: CRITICAL - add monitoring/alerting for segment file creation failures
+		fmt.Printf("CRITICAL: failed to create segment %s: %v\n", segmentID, err)
+		return nil, err
+	}
+	defer segmentFile.Close()
+
+	var blobMetas []blobMeta
+	var leftover []byte
+	var scratchBuf []byte
+	filePos := int64(0)
+
+	mf.data.Range(func(keyStr string, value []byte) bool {
+		key := unsafe.Slice(unsafe.StringData(keyStr), len(keyStr))
+
+		// Prepare buffer to write (use value directly if aligned, else scratch buffer)
+		var toWrite []byte
+		blobPosInFile := filePos
+
+		// Use value directly if aligned, else copy to scratch buffer
+		if !(len(leftover) == 0 && isAligned(value) && len(value)%directio.BlockSize == 0) {
+			// Need scratch buffer
+			metricsUnalignedWrites.Add(1)
+			needed := len(leftover) + len(value)
+			if cap(scratchBuf) < needed+directio.BlockSize {
+				scratchBuf = directio.AlignedBlock(needed + directio.BlockSize)
+			}
+			scratchBuf = scratchBuf[:0]
+			scratchBuf = append(scratchBuf, leftover...)
+			blobPosInFile += int64(len(leftover))
+			scratchBuf = append(scratchBuf, value...)
+			toWrite = scratchBuf
+		} else {
+			metricsAlignedWrites.Add(1)
+			toWrite = value
+		}
+
+		blobMetas = append(blobMetas, blobMeta{key: key, pos: blobPosInFile, size: len(value)})
+
+		// Write aligned blocks, keep remainder as leftover
+		var writeErr error
+		leftover, writeErr = writeAlignedBlocks(segmentFile, toWrite)
+		if writeErr != nil {
+			fmt.Printf("CRITICAL: segment write failed: %v\n", writeErr)
+			_ = os.Remove(segmentPath)
+			return false
+		}
+		filePos += int64(len(toWrite) - len(leftover))
+
+		return true
+	})
+
+	// Write final leftover with padding
+	if len(leftover) > 0 {
+		paddedSize := ((len(leftover) + directio.BlockSize - 1) / directio.BlockSize) * directio.BlockSize
+		if cap(scratchBuf) < paddedSize {
+			scratchBuf = directio.AlignedBlock(paddedSize)
+		}
+		scratchBuf = scratchBuf[:paddedSize]
+		copy(scratchBuf, leftover)
+		if _, err = segmentFile.Write(scratchBuf); err != nil {
+			fmt.Printf("CRITICAL: segment write failed: %v\n", err)
+			_ = os.Remove(segmentPath)
+			return nil, err
+		}
+	}
+
+	return blobMetas, nil
+}
+
+// writeMemFileIndex updates index with blob metadata
+func (mt *MemTable) writeMemFileIndex(ctx context.Context, segmentID string, timestamp int64, blobMetas []blobMeta) {
+	// Bulk insert into index using Appender
 	appender, cleanup, err := mt.cache.index.NewAppender(ctx)
 	if err != nil {
-		// Fallback to individual writes
-		fmt.Printf("Warning: fallback appender: %v\n", err)
-		mt.flushFallback(ctx, batch)
+		fmt.Printf("Warning: failed to create appender: %v\n", err)
+		mt.flushSkipmapFallback(ctx, segmentID, timestamp, blobMetas)
 		return
 	}
 	defer cleanup()
 
-	now := time.Now().UnixNano()
-	bloom := mt.cache.bloom.Load()
-
-	// Append all rows
-	for _, e := range batch {
-		k := base.NewKey(e.key, mt.cache.cfg.Shards)
+	for _, meta := range blobMetas {
+		k := base.Key(meta.key)
 		if err := appender.AppendRow(
 			k.Raw(),
-			k.ShardID(),
-			int64(k.FileID()),
-			len(e.value),
-			now, now,
+			segmentID,
+			meta.pos,
+			meta.size,
+			timestamp,
 		); err != nil {
-			// Appender failed (likely duplicate key), fallback
 			cleanup()
-			fmt.Printf("Warning: fallback append row: %v\n", err)
-
-			mt.flushFallback(ctx, batch)
+			fmt.Printf("Warning: appender failed: %v\n", err)
+			mt.flushSkipmapFallback(ctx, segmentID, timestamp, blobMetas)
 			return
 		}
-		bloom.Add(e.key)
 	}
 
-	// Commit batch
 	if err := appender.Flush(); err != nil {
-		// Flush failed, fallback
-		fmt.Printf("Warning: fallback appender flush: %v\n", err)
-
-		mt.flushFallback(ctx, batch)
+		fmt.Printf("Warning: appender flush failed: %v\n", err)
+		mt.flushSkipmapFallback(ctx, segmentID, timestamp, blobMetas)
 		return
 	}
+}
 
-	// Write blob files
-	for _, e := range batch {
-		k := base.NewKey(e.key, mt.cache.cfg.Shards)
-		blobPath := filepath.Join(mt.cache.cfg.Path, "blobs",
-			fmt.Sprintf("shard-%03d", k.ShardID()),
-			fmt.Sprintf("%d.blob", k.FileID()))
+// blobMeta tracks metadata for each blob in segment
+type blobMeta struct {
+	key  []byte
+	pos  int64
+	size int
+}
 
-		if err := os.WriteFile(blobPath, e.value, 0644); err != nil {
-			fmt.Printf("Warning: blob write failed for key %s: %v\n", e.key, err)
+// flushSkipmapFallback retries index inserts one at a time
+// The segment file has already been written successfully - only retry index inserts
+func (mt *MemTable) flushSkipmapFallback(
+	ctx context.Context, segmentID string, timestamp int64, blobMetas []blobMeta,
+) {
+	// Retry each index insert individually
+	// Segment file write succeeded - only need to update index
+	for _, meta := range blobMetas {
+		k := base.Key(meta.key)
+		if err := mt.cache.index.Put(ctx, k.Raw(), segmentID, meta.pos, meta.size, timestamp); err != nil {
+			// Log but continue - some keys may already exist (updates/duplicates)
+			fmt.Printf("Warning: individual index insert failed for key %x: %v\n", meta.key, err)
 		}
 	}
 }
 
-// flushFallback writes batch using individual Put() calls (handles duplicates)
-func (mt *MemTable) flushFallback(ctx context.Context, batch []memTableEntry) {
-	for _, e := range batch {
-		if err := mt.cache.writeToDisk(ctx, e.key, e.value); err != nil {
-			fmt.Printf("Warning: fallback write failed: %v\n", err)
-		}
+// Drain waits for all memfiles to be flushed
+func (mt *MemTable) Drain() {
+	mt.frozen.Lock()
+	mf := mt.active.Load()
+	if mf.size.Load() > 0 {
+		mt.doRotateUnderLock(mf)
 	}
-}
 
-// getBatch gets a batch from pool
-func (mt *MemTable) getBatch() []memTableEntry {
-	batch := mt.batchPool.Get().([]memTableEntry)
-	return batch[:0]
-}
-
-// putBatch clears and returns batch to pool
-func (mt *MemTable) putBatch(batch []memTableEntry) {
-	for i := range batch {
-		batch[i] = memTableEntry{}
+	for len(mt.frozen.inflight) > 0 {
+		mt.frozen.cond.Wait()
 	}
-	mt.batchPool.Put(batch[:0])
+	mt.frozen.Unlock()
 }
 
-// Add copies key and value, then enqueues for background write
-func (mt *MemTable) Add(key, value []byte) error {
-	keyCopy := make([]byte, len(key))
-	copy(keyCopy, key)
-	valueCopy := make([]byte, len(value))
-	copy(valueCopy, value)
-	return mt.UnsafeAdd(keyCopy, valueCopy)
-}
-
-var hist = hdrhistogram.New(1, int64(60*time.Second), 3)
-
-// UnsafeAdd enqueues without copying
-func (mt *MemTable) UnsafeAdd(key, value []byte) error {
-	now := time.Now()
-	defer func() {
-		hist.RecordValue(time.Since(now).Nanoseconds())
-	}()
-
-	entry := memTableEntry{key: key, value: value}
-	select {
-	case mt.entries <- entry:
-		return nil
-	case <-mt.stopCh:
-		return ErrClosed
-	}
-}
-
-// Close shuts down worker
+// Close shuts down workers and waits for completion
 func (mt *MemTable) Close() error {
 	select {
 	case <-mt.stopCh:
@@ -219,13 +377,22 @@ func (mt *MemTable) Close() error {
 	return nil
 }
 
-// Drain waits for all pending writes
-func (mt *MemTable) Drain() {
-	for len(mt.entries) > 0 {
-		time.Sleep(10 * time.Millisecond)
+// TestingClearMemtable clears active memfile
+// ONLY for use in tests - this breaks the normal memtable contract
+func (mt *MemTable) TestingClearMemtable() {
+	// Create new empty memfile
+	newMf := &memFile{
+		data: skipmap.NewString[[]byte](),
+	}
+	mt.active.Store(newMf)
+
+	// Drain flush channel
+	for {
+		select {
+		case <-mt.flushCh:
+			// Drop any pending flushes
+		default:
+			return
+		}
 	}
 }
-
-var (
-	ErrClosed = errors.New("memtable closed")
-)

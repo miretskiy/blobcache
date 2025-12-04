@@ -9,3 +9,5 @@
 
 # Temporary directories
 /tmp/
+.claude/
+.idea/

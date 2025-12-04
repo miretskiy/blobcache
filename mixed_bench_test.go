@@ -24,8 +24,9 @@ func Benchmark_Mixed(b *testing.B) {
 	defer os.RemoveAll(tmpDir)
 
 	cache, err := New(tmpDir,
-		WithMaxSize(256*1024*1024*1024),     // 256GB for Mac (production ~1TB)
-		WithWriteBufferSize(1024*1024*1024)) // 1GB like production
+		WithMaxSize(256*1024*1024*1024), // 256GB for Mac (production ~1TB)
+		WithWriteBufferSize(1<<30),
+		WithSegmentSize(2<<30)) // 4GB
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -110,8 +111,8 @@ func Benchmark_Mixed(b *testing.B) {
 	b.ReportMetric(writeThroughput, "write-GB/s")
 	b.ReportMetric(hitRate, "hit-%")
 	b.ReportMetric(bloomFPRate, "bloom-FP-%")
-	b.ReportMetric(float64(metricsAlignedWrites.Load()), "aligned-writes")
-	b.ReportMetric(float64(metricsUnalignedWrites.Load()), "unaligned-writes")
+	// b.ReportMetric(float64(metricsAlignedWrites.Load()), "aligned-writes")
+	// b.ReportMetric(float64(metricsUnalignedWrites.Load()), "unaligned-writes")
 
 	b.Logf("Operations: %d writes, %d reads (%d hits, %d misses, %d bloom-FP) in %v",
 		writes, totalReads, hits, misses, bloomFP, duration)

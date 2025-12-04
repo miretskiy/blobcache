@@ -1,6 +1,7 @@
 package blobcache
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -166,22 +167,98 @@ func (mt *MemTable) Get(key []byte) ([]byte, bool) {
 	return nil, false
 }
 
+// segmentFile tracks an open segment file and its metadata
+type segmentFile struct {
+	file *os.File
+	id   string
+	size int64
+}
+
+// Close closes the underlying file if open
+func (sf *segmentFile) Close() {
+	if sf != nil && sf.file != nil {
+		_ = sf.file.Close()
+		sf.file = nil
+	}
+}
+
+func newSegmentFile(basePath string, workerID int) (*segmentFile, error) {
+	// Generate new segment ID and path
+	now := time.Now().UnixNano()
+	segmentID := fmt.Sprintf("%d-%02d", now, workerID)
+	segmentPath := filepath.Join(basePath, "segments", segmentID+".seg")
+
+	// Create new segment file with DirectIO (O_APPEND for sequential writes)
+	file, err := directio.OpenFile(segmentPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	st, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	return &segmentFile{
+		file: file,
+		id:   segmentID,
+		size: st.Size(),
+	}, nil
+}
+
 // flushWorker processes frozen memfiles
+// Manages segment file lifecycle - keeps file open across multiple memfile flushes
+// until segment reaches SegmentSize threshold
 func (mt *MemTable) flushWorker(workerID int) {
 	defer mt.wg.Done()
 	ctx := context.Background()
 
+	var segment *segmentFile
+	defer segment.Close()
+
+	// openSegment returns current segment, opening new one if needed or if size exceeded
+	openSegment := func() (*segmentFile, error) {
+		// Rotate if no file or size exceeded
+		if segment == nil || segment.size >= mt.cache.cfg.SegmentSize {
+			segment.Close() // safe to close nil segment
+			seg, err := newSegmentFile(mt.cache.cfg.Path, workerID)
+			if err != nil {
+				return nil, err
+			}
+			segment = seg
+		}
+		return segment, nil
+	}
+
+	// recordWrite handles flush result - updates segment size or closes failed segment
+	flushMemFile := func(mf *memFile) error {
+		seg, err := openSegment()
+		if err != nil {
+			return err
+		}
+		numWritten, err := mt.flushMemFileDataLargeWrites(ctx, seg, mf)
+		if err != nil {
+			return err
+		}
+		seg.size += numWritten
+		return nil
+	}
+
 	for {
 		select {
 		case mf := <-mt.flushCh:
-			mt.flushMemFile(ctx, workerID, mf)
+			if err := flushMemFile(mf); err != nil {
+				fmt.Printf("Error: error flushing memfile: %v\n", err)
+				segment.Close()
+			}
 			mt.removeFrozen(mf)
-
 		case <-mt.stopCh:
+			// Drain remaining memfiles
 			for {
 				select {
 				case mf := <-mt.flushCh:
-					mt.flushMemFile(ctx, workerID, mf)
+					if err := flushMemFile(mf); err != nil {
+						fmt.Printf("Error: error flushing memfile: %v\n", err)
+						segment.Close()
+					}
 					mt.removeFrozen(mf)
 				default:
 					return
@@ -205,38 +282,92 @@ func (mt *MemTable) removeFrozen(target *memFile) {
 	}
 }
 
-// flushMemFile writes memfile to segment and updates index
-func (mt *MemTable) flushMemFile(ctx context.Context, workerID int, mf *memFile) {
-	now := time.Now().UnixNano()
-	segmentID := fmt.Sprintf("%d-%02d", now, workerID)
+const dioWriteSize = 64 << 20
 
-	blobMetas, err := mt.writeMemFileData(segmentID, mf)
-	if err != nil {
-		return
-	}
-
-	mt.writeMemFileIndex(ctx, segmentID, now, blobMetas)
+var alignedBufferPool = sync.Pool{
+	New: func() any { return directio.AlignedBlock(dioWriteSize) },
 }
 
-// writeMemFileData writes memfile data to segment file, returns blob metadata
-func (mt *MemTable) writeMemFileData(segmentID string, mf *memFile) ([]blobMeta, error) {
-	segmentPath := filepath.Join(mt.cache.cfg.Path, "segments", segmentID+".seg")
-
-	// Create segment file with DirectIO
-	segmentFile, err := directio.OpenFile(segmentPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
-	if err != nil {
-		// TODO: CRITICAL - add monitoring/alerting for segment file creation failures
-		fmt.Printf("CRITICAL: failed to create segment %s: %v\n", segmentID, err)
-		return nil, err
+func (mt *MemTable) flushMemFileDataLargeWrites(
+	ctx context.Context, segment *segmentFile, mf *memFile,
+) (int64, error) {
+	if segment == nil || segment.file == nil {
+		return 0, fmt.Errorf("segment is nil")
 	}
-	defer segmentFile.Close()
 
+	filePos := segment.size
+	var blobMetas []blobMeta
+	alignedBuffer := bytes.NewBuffer((alignedBufferPool.Get().([]byte))[:0])
+	defer alignedBufferPool.Put(alignedBuffer.Bytes())
+
+	putBuf := func(b []byte) error {
+		for len(b) > 0 {
+			l := min(len(b), alignedBuffer.Available())
+			alignedBuffer.Write(b[:l])
+			b = b[l:]
+			if alignedBuffer.Available() == 0 {
+				if _, err := segment.file.Write(alignedBuffer.Bytes()); err != nil {
+					return err
+				}
+				alignedBuffer.Reset()
+			}
+		}
+		return nil
+	}
+
+	mf.data.Range(func(keyStr string, value []byte) bool {
+		if len(value) == 0 {
+			return true
+		}
+		if err := putBuf(value); err != nil {
+			fmt.Printf("Error: error putting value to buffer: %v\n", err)
+			return false
+		}
+		key := unsafe.Slice(unsafe.StringData(keyStr), len(keyStr))
+		blobMetas = append(blobMetas, blobMeta{key: key, pos: filePos, size: len(value)})
+		filePos += int64(len(value))
+		return true
+	})
+
+	// Write final leftover with padding
+	if alignedBuffer.Len() > 0 {
+		// Round up to block size using bit twiddling (buffer is already large enough)
+		currentLen := alignedBuffer.Len()
+		const mask = directio.BlockSize - 1
+		paddedSize := (currentLen + mask) &^ mask
+		if _, err := segment.file.Write(alignedBuffer.Bytes()[:paddedSize]); err != nil {
+			return 0, err
+		}
+		filePos += int64(paddedSize - currentLen) // Account for padding bytes
+	}
+
+	// Calculate total bytes written
+	bytesWritten := filePos - segment.size
+
+	// Update index with blob metadata
+	now := time.Now().UnixNano()
+	mt.writeMemFileIndex(ctx, segment.id, now, blobMetas)
+	return bytesWritten, nil
+}
+
+// flushMemFileData writes memfile data to an existing segment file and updates index
+// Returns number of bytes written (for segment size tracking) and error
+func (mt *MemTable) flushMemFileData(
+	ctx context.Context, segment *segmentFile, mf *memFile,
+) (int64, error) {
+	if segment == nil || segment.file == nil {
+		return 0, fmt.Errorf("segment is nil")
+	}
+
+	filePos := segment.size
 	var blobMetas []blobMeta
 	var leftover []byte
 	var scratchBuf []byte
-	filePos := int64(0)
 
 	mf.data.Range(func(keyStr string, value []byte) bool {
+		if len(value) == 0 {
+			return true
+		}
 		key := unsafe.Slice(unsafe.StringData(keyStr), len(keyStr))
 
 		// Prepare buffer to write (use value directly if aligned, else scratch buffer)
@@ -244,7 +375,10 @@ func (mt *MemTable) writeMemFileData(segmentID string, mf *memFile) ([]blobMeta,
 		blobPosInFile := filePos
 
 		// Use value directly if aligned, else copy to scratch buffer
-		if !(len(leftover) == 0 && isAligned(value) && len(value)%directio.BlockSize == 0) {
+		if len(leftover) == 0 && isAligned(value) && len(value)%directio.BlockSize == 0 {
+			metricsAlignedWrites.Add(1)
+			toWrite = value
+		} else {
 			// Need scratch buffer
 			metricsUnalignedWrites.Add(1)
 			needed := len(leftover) + len(value)
@@ -256,19 +390,15 @@ func (mt *MemTable) writeMemFileData(segmentID string, mf *memFile) ([]blobMeta,
 			blobPosInFile += int64(len(leftover))
 			scratchBuf = append(scratchBuf, value...)
 			toWrite = scratchBuf
-		} else {
-			metricsAlignedWrites.Add(1)
-			toWrite = value
 		}
 
 		blobMetas = append(blobMetas, blobMeta{key: key, pos: blobPosInFile, size: len(value)})
 
 		// Write aligned blocks, keep remainder as leftover
 		var writeErr error
-		leftover, writeErr = writeAlignedBlocks(segmentFile, toWrite)
+		leftover, writeErr = writeAlignedBlocks(segment.file, toWrite)
 		if writeErr != nil {
 			fmt.Printf("CRITICAL: segment write failed: %v\n", writeErr)
-			_ = os.Remove(segmentPath)
 			return false
 		}
 		filePos += int64(len(toWrite) - len(leftover))
@@ -284,18 +414,27 @@ func (mt *MemTable) writeMemFileData(segmentID string, mf *memFile) ([]blobMeta,
 		}
 		scratchBuf = scratchBuf[:paddedSize]
 		copy(scratchBuf, leftover)
-		if _, err = segmentFile.Write(scratchBuf); err != nil {
+		if _, err := segment.file.Write(scratchBuf); err != nil {
 			fmt.Printf("CRITICAL: segment write failed: %v\n", err)
-			_ = os.Remove(segmentPath)
-			return nil, err
+			return 0, err
 		}
+		filePos += int64(paddedSize)
 	}
 
-	return blobMetas, nil
+	// Calculate total bytes written
+	bytesWritten := filePos - segment.size
+
+	// Update index with blob metadata
+	now := time.Now().UnixNano()
+	mt.writeMemFileIndex(ctx, segment.id, now, blobMetas)
+
+	return bytesWritten, nil
 }
 
 // writeMemFileIndex updates index with blob metadata
-func (mt *MemTable) writeMemFileIndex(ctx context.Context, segmentID string, timestamp int64, blobMetas []blobMeta) {
+func (mt *MemTable) writeMemFileIndex(
+	ctx context.Context, segmentID string, timestamp int64, blobMetas []blobMeta,
+) {
 	// Bulk insert into index using Appender
 	appender, cleanup, err := mt.cache.index.NewAppender(ctx)
 	if err != nil {

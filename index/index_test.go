@@ -2,7 +2,6 @@ package index
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -29,12 +28,11 @@ func TestIndex_PutGet(t *testing.T) {
 	ctx := context.Background()
 
 	// Put an entry
-	key := base.Key([]byte("test-key"))
+	const numShards = 256
+	key := base.NewKey([]byte("test-key"), numShards)
 	now := time.Now().UnixNano()
-	segmentID := fmt.Sprintf("%d-00", now)
-	pos := int64(1024)
 
-	err = idx.Put(ctx, key, segmentID, pos, 1024, now)
+	err = idx.Put(ctx, key, 1024, now)
 	require.NoError(t, err)
 
 	// Get it back
@@ -44,15 +42,7 @@ func TestIndex_PutGet(t *testing.T) {
 		t.Fatalf("Get failed: %v", err)
 	}
 
-	// Verify
-	if entry.SegmentID != segmentID {
-		t.Errorf("SegmentID = %s, want %s", entry.SegmentID, segmentID)
-	}
-
-	if entry.Pos != pos {
-		t.Errorf("Pos = %d, want %d", entry.Pos, pos)
-	}
-
+	// Verify (only size and ctime are stored; shard/file IDs computed from key)
 	if entry.Size != 1024 {
 		t.Errorf("Size = %d, want 1024", entry.Size)
 	}
@@ -72,7 +62,8 @@ func TestIndex_GetNotFound(t *testing.T) {
 	}
 	defer idx.Close()
 
-	key := base.Key([]byte("nonexistent"))
+	const numShards = 256
+	key := base.NewKey([]byte("nonexistent"), numShards)
 	var entry Entry
 	err = idx.Get(context.Background(), key, &entry)
 
@@ -92,12 +83,12 @@ func TestIndex_Delete(t *testing.T) {
 	defer idx.Close()
 
 	ctx := context.Background()
-	key := base.Key([]byte("delete-me"))
+	const numShards = 256
+	key := base.NewKey([]byte("delete-me"), numShards)
 
 	// Insert
 	now := time.Now().UnixNano()
-	segmentID := fmt.Sprintf("%d-00", now)
-	idx.Put(ctx, key, segmentID, 0, 500, now)
+	idx.Put(ctx, key, 500, now)
 
 	// Delete
 	err := idx.Delete(ctx, key)
@@ -139,11 +130,11 @@ func TestIndex_TotalSizeOnDisk(t *testing.T) {
 	}
 
 	// Put entries
+	const numShards = 256
 	now := time.Now().UnixNano()
-	segmentID := fmt.Sprintf("%d-00", now)
-	idx.Put(ctx, base.Key([]byte("key1")), segmentID, 0, 100, now)
-	idx.Put(ctx, base.Key([]byte("key2")), segmentID, 100, 200, now)
-	idx.Put(ctx, base.Key([]byte("key3")), segmentID, 300, 300, now)
+	idx.Put(ctx, base.NewKey([]byte("key1"), numShards), 100, now)
+	idx.Put(ctx, base.NewKey([]byte("key2"), numShards), 200, now)
+	idx.Put(ctx, base.NewKey([]byte("key3"), numShards), 300, now)
 
 	total, err = idx.TotalSizeOnDisk(ctx)
 	if err != nil {
@@ -155,7 +146,7 @@ func TestIndex_TotalSizeOnDisk(t *testing.T) {
 	}
 
 	// Delete one
-	idx.Delete(ctx, base.Key([]byte("key2")))
+	idx.Delete(ctx, base.NewKey([]byte("key2"), numShards))
 
 	total, _ = idx.TotalSizeOnDisk(ctx)
 	if total != 400 {
@@ -168,13 +159,13 @@ func TestIndex_Persistence(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	ctx := context.Background()
-	key := base.Key([]byte("persist-key"))
+	const numShards = 256
+	key := base.NewKey([]byte("persist-key"), numShards)
 	now := time.Now().UnixNano()
-	segmentID := fmt.Sprintf("%d-00", now)
 
 	// Create index and insert
 	idx1, _ := New(tmpDir)
-	idx1.Put(ctx, key, segmentID, 0, 999, now)
+	idx1.Put(ctx, key, 999, now)
 	idx1.Close()
 
 	// Reopen and verify data persisted

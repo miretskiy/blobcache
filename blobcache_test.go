@@ -23,7 +23,6 @@ func TestNew_CreatesDirectories(t *testing.T) {
 
 	// Verify key directories created
 	require.DirExists(t, filepath.Join(tmpDir, "db"))
-	require.DirExists(t, filepath.Join(tmpDir, "segments"))
 
 	// Verify marker
 	require.FileExists(t, filepath.Join(tmpDir, ".initialized"))
@@ -135,20 +134,18 @@ func TestCache_PutGet(t *testing.T) {
 	require.NoError(t, err)
 	defer cache.Close()
 
-	ctx := context.Background()
 	key := []byte("test-key")
 	value := []byte("test-value")
 
 	// Put
-	err = cache.Put(ctx, key, value)
-	require.NoError(t, err)
+	cache.Put(key, value)
 
 	// Drain memtable to ensure write completes
 	cache.Drain()
 
 	// Get
-	retrieved, err := cache.Get(ctx, key)
-	require.NoError(t, err)
+	retrieved, found := cache.Get(key)
+	require.True(t, found)
 	require.Equal(t, value, retrieved)
 }
 
@@ -160,11 +157,9 @@ func TestCache_GetNotFound(t *testing.T) {
 	require.NoError(t, err)
 	defer cache.Close()
 
-	ctx := context.Background()
-
 	// Get non-existent key
-	_, err = cache.Get(ctx, []byte("nonexistent"))
-	require.ErrorIs(t, err, ErrNotFound)
+	_, found := cache.Get([]byte("nonexistent"))
+	require.False(t, found)
 }
 
 // Benchmarks
@@ -176,14 +171,13 @@ func BenchmarkCache_Put(b *testing.B) {
 	cache, _ := New(tmpDir)
 	defer cache.Close()
 
-	ctx := context.Background()
 	value := make([]byte, 1024*1024) // 1MB
 
 	b.ResetTimer()
 	b.SetBytes(int64(len(value)))
 	for i := 0; i < b.N; i++ {
 		key := []byte(fmt.Sprintf("key-%d", i))
-		cache.Put(ctx, key, value)
+		cache.Put(key, value)
 	}
 }
 
@@ -193,21 +187,19 @@ func BenchmarkCache_GetHit(b *testing.B) {
 
 	cache, _ := New(tmpDir)
 	defer cache.Close()
-
-	ctx := context.Background()
 	value := make([]byte, 1024*1024) // 1MB
 
 	// Pre-populate
 	for i := 0; i < 1000; i++ {
 		key := []byte(fmt.Sprintf("key-%d", i))
-		cache.Put(ctx, key, value)
+		cache.Put(key, value)
 	}
 
 	b.ResetTimer()
 	b.SetBytes(int64(len(value)))
 	for i := 0; i < b.N; i++ {
 		key := []byte(fmt.Sprintf("key-%d", i%1000))
-		cache.Get(ctx, key)
+		cache.Get(key)
 	}
 }
 
@@ -217,21 +209,19 @@ func BenchmarkCache_GetMiss(b *testing.B) {
 
 	cache, _ := New(tmpDir)
 	defer cache.Close()
-
-	ctx := context.Background()
 	value := make([]byte, 1024*1024) // 1MB
 
 	// Pre-populate with different keys
 	for i := 0; i < 1000; i++ {
 		key := []byte(fmt.Sprintf("existing-%d", i))
-		cache.Put(ctx, key, value)
+		cache.Put(key, value)
 	}
 
 	b.ResetTimer()
 	b.SetBytes(int64(len(value)))
 	for i := 0; i < b.N; i++ {
 		key := []byte(fmt.Sprintf("missing-%d", i))
-		cache.Get(ctx, key)
+		cache.Get(key)
 	}
 }
 
@@ -241,14 +231,12 @@ func BenchmarkCache_Mixed(b *testing.B) {
 
 	cache, _ := New(tmpDir)
 	defer cache.Close()
-
-	ctx := context.Background()
 	value := make([]byte, 1024*1024) // 1MB
 
 	// Pre-populate 1000 keys
 	for i := 0; i < 1000; i++ {
 		key := []byte(fmt.Sprintf("key-%d", i))
-		cache.Put(ctx, key, value)
+		cache.Put(key, value)
 	}
 
 	b.ResetTimer()
@@ -259,15 +247,15 @@ func BenchmarkCache_Mixed(b *testing.B) {
 		if op < 10 {
 			// 10% writes
 			key := []byte(fmt.Sprintf("key-%d", 1000+i))
-			cache.Put(ctx, key, value)
+			cache.Put(key, value)
 		} else if op < 55 {
 			// 45% read hits
 			key := []byte(fmt.Sprintf("key-%d", i%1000))
-			cache.Get(ctx, key)
+			cache.Get(key)
 		} else {
 			// 45% read misses
 			key := []byte(fmt.Sprintf("missing-%d", i))
-			cache.Get(ctx, key)
+			cache.Get(key)
 		}
 	}
 }
@@ -294,8 +282,7 @@ func TestCache_Eviction(t *testing.T) {
 	// Fill cache with 6 entries (6MB > 5MB limit)
 	for i := 0; i < 6; i++ {
 		key := []byte(fmt.Sprintf("key-%d", i))
-		err = cache.Put(ctx, key, value)
-		require.NoError(t, err)
+		cache.Put(key, value)
 		time.Sleep(10 * time.Millisecond) // Ensure different mtimes
 	}
 
@@ -321,8 +308,8 @@ func TestCache_Eviction(t *testing.T) {
 	cache.memTable.TestingClearMemtable()
 
 	// Verify oldest keys were evicted
-	_, err = cache.Get(ctx, []byte("key-0"))
-	require.ErrorIs(t, err, ErrNotFound, "key-0 should have been evicted")
+	_, found := cache.Get([]byte("key-0"))
+	require.False(t, found, "key-0 should have been evicted")
 }
 
 func TestCache_BloomRefresh(t *testing.T) {
@@ -339,7 +326,7 @@ func TestCache_BloomRefresh(t *testing.T) {
 	// Put some keys
 	for i := 0; i < 100; i++ {
 		key := []byte(fmt.Sprintf("key-%d", i))
-		cache.Put(ctx, key, value)
+		cache.Put(key, value)
 	}
 
 	// Drain memtable to ensure keys are flushed to index
@@ -493,13 +480,11 @@ func TestCache_MemTableEnabled(t *testing.T) {
 	require.NotNil(t, cache.memTable, "Memtable should always be enabled")
 
 	// Verify immediate read-after-write (from memtable, not disk)
-	ctx := context.Background()
-	err = cache.Put(ctx, []byte("key"), []byte("value"))
-	require.NoError(t, err)
+	cache.Put([]byte("key"), []byte("value"))
 
 	// Should read from memtable immediately (before flush)
-	data, err := cache.Get(ctx, []byte("key"))
-	require.NoError(t, err)
+	data, found := cache.Get([]byte("key"))
+	require.True(t, found)
 	require.Equal(t, []byte("value"), data)
 }
 
@@ -512,14 +497,11 @@ func TestCache_MemTableBuffered(t *testing.T) {
 
 	require.NotNil(t, cache.memTable, "Memtable should be created")
 
-	ctx := context.Background()
-
 	// Queue writes (should be async)
 	for i := 0; i < 10; i++ {
 		key := []byte(fmt.Sprintf("key-%d", i))
 		value := []byte(fmt.Sprintf("value-%d", i))
-		err := cache.Put(ctx, key, value)
-		require.NoError(t, err)
+		cache.Put(key, value)
 	}
 
 	// Drain and close
@@ -533,8 +515,8 @@ func TestCache_MemTableBuffered(t *testing.T) {
 
 	for i := 0; i < 10; i++ {
 		key := []byte(fmt.Sprintf("key-%d", i))
-		data, err := cache2.Get(ctx, key)
-		require.NoError(t, err)
+		data, found := cache2.Get(key)
+		require.True(t, found)
 		require.Equal(t, []byte(fmt.Sprintf("value-%d", i)), data)
 	}
 }
@@ -546,9 +528,7 @@ func TestCache_MemTableUnbuffered(t *testing.T) {
 	cache, err := New(tmpDir)
 	require.NoError(t, err)
 
-	ctx := context.Background()
-	err = cache.Put(ctx, []byte("key"), []byte("value"))
-	require.NoError(t, err)
+	cache.Put([]byte("key"), []byte("value"))
 
 	// Drain and close
 	cache.Drain()
@@ -559,7 +539,7 @@ func TestCache_MemTableUnbuffered(t *testing.T) {
 	require.NoError(t, err)
 	defer cache2.Close()
 
-	data, err := cache2.Get(ctx, []byte("key"))
-	require.NoError(t, err)
+	data, found := cache2.Get([]byte("key"))
+	require.True(t, found)
 	require.Equal(t, []byte("value"), data)
 }

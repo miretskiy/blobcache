@@ -21,13 +21,11 @@ type Index struct {
 	stmtDelete *sql.Stmt
 }
 
-// Entry represents a cached blob's metadata
+// Entry represents a cached blob's metadata (for eviction only)
 type Entry struct {
-	Key       []byte // Raw key (for eviction/iteration)
-	SegmentID string // Format: "{unix_nanos}-{worker_id}"
-	Pos       int64  // Byte position within segment
-	Size      int
-	CTime     int64 // Creation time
+	Key   []byte // Raw key
+	Size  int
+	CTime int64 // Creation time
 }
 
 // KeyValue holds a key with metadata for bulk insert
@@ -68,14 +66,11 @@ func (idx *Index) initSchema() error {
 	schema := `
 		CREATE TABLE IF NOT EXISTS entries (
 			key BLOB NOT NULL,
-			segment_id TEXT NOT NULL,
-			pos BIGINT NOT NULL,
 			size INTEGER NOT NULL,
 			ctime BIGINT NOT NULL
 		);
 
 		CREATE INDEX IF NOT EXISTS idx_key ON entries(key);
-		CREATE INDEX IF NOT EXISTS idx_segment_ctime ON entries(segment_id, ctime);
 		CREATE INDEX IF NOT EXISTS idx_ctime ON entries(ctime);
 	`
 
@@ -88,15 +83,15 @@ func (idx *Index) prepareStatements() error {
 
 	// No PRIMARY KEY constraint - allows duplicates, latest wins via ORDER BY ctime
 	idx.stmtPut, err = idx.db.Prepare(`
-		INSERT INTO entries (key, segment_id, pos, size, ctime)
-		VALUES (?, ?, ?, ?, ?)
+		INSERT INTO entries (key, size, ctime)
+		VALUES (?, ?, ?)
 	`)
 	if err != nil {
 		return fmt.Errorf("failed to prepare put: %w", err)
 	}
 
 	idx.stmtGet, err = idx.db.Prepare(
-		`SELECT segment_id, pos, size, ctime FROM entries WHERE key = ? ORDER BY ctime DESC LIMIT 1`)
+		`SELECT size, ctime FROM entries WHERE key = ? ORDER BY ctime DESC LIMIT 1`)
 	if err != nil {
 		return fmt.Errorf("failed to prepare get: %w", err)
 	}
@@ -110,16 +105,15 @@ func (idx *Index) prepareStatements() error {
 }
 
 // Put inserts or updates an entry
-func (idx *Index) Put(ctx context.Context, key base.Key, segmentID string, pos int64, size int, ctime int64) error {
-	_, err := idx.stmtPut.ExecContext(ctx,
-		key.Raw(), segmentID, pos, size, ctime)
+func (idx *Index) Put(ctx context.Context, key base.Key, size int, ctime int64) error {
+	_, err := idx.stmtPut.ExecContext(ctx, key.Raw(), size, ctime)
 	return err
 }
 
 // Get retrieves an entry (caller provides Entry to avoid allocation)
 func (idx *Index) Get(ctx context.Context, key base.Key, entry *Entry) error {
 	err := idx.stmtGet.QueryRowContext(ctx, key.Raw()).Scan(
-		&entry.SegmentID, &entry.Pos, &entry.Size, &entry.CTime)
+		&entry.Size, &entry.CTime)
 
 	if err == sql.ErrNoRows {
 		return ErrNotFound
@@ -183,7 +177,7 @@ func (it *EntryIterator) Next() bool {
 // Entry returns the current entry
 func (it *EntryIterator) Entry() (Entry, error) {
 	var entry Entry
-	err := it.rows.Scan(&entry.Key, &entry.SegmentID, &entry.Pos, &entry.Size, &entry.CTime)
+	err := it.rows.Scan(&entry.Key, &entry.Size, &entry.CTime)
 	return entry, err
 }
 
@@ -206,7 +200,7 @@ func (it *EntryIterator) Close() error {
 // GetOldestEntries returns iterator over N oldest entries by ctime for eviction
 func (idx *Index) GetOldestEntries(ctx context.Context, limit int) *EntryIterator {
 	rows, err := idx.db.QueryContext(ctx,
-		`SELECT key, segment_id, pos, size, ctime FROM entries ORDER BY ctime ASC LIMIT ?`,
+		`SELECT key, size, ctime FROM entries ORDER BY ctime ASC LIMIT ?`,
 		limit)
 	return &EntryIterator{rows: rows, err: err}
 }

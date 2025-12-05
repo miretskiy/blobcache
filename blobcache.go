@@ -19,7 +19,7 @@ type Cache struct {
 	cfg      config
 	index    *index.Index
 	bloom    atomic.Pointer[bloom.Filter]
-	memTable *MemTable // Optional async write buffer
+	memTable *MemTable
 
 	// Background workers
 	stopCh chan struct{}
@@ -136,17 +136,25 @@ func checkOrInitialize(cfg config) error {
 	// Create base directories
 	dirs := []string{
 		filepath.Join(cfg.Path, "db"),
-		filepath.Join(cfg.Path, "segments"), // Flat directory for segment files
+		filepath.Join(cfg.Path, "blobs"),
 	}
 
 	for _, dir := range dirs {
-		if err := os.MkdirAll(dir, 0755); err != nil {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return fmt.Errorf("failed to create directory %s: %w", dir, err)
 		}
 	}
 
+	// Create shard directories
+	for i := 0; i < cfg.Shards; i++ {
+		shardDir := filepath.Join(cfg.Path, "blobs", fmt.Sprintf("shard-%03d", i))
+		if err := os.MkdirAll(shardDir, 0o755); err != nil {
+			return fmt.Errorf("failed to create shard-%03d: %w", i, err)
+		}
+	}
+
 	// Touch empty marker file
-	if err := os.WriteFile(markerPath, []byte{}, 0644); err != nil {
+	if err := os.WriteFile(markerPath, []byte{}, 0o644); err != nil {
 		return fmt.Errorf("failed to write marker: %w", err)
 	}
 
@@ -211,7 +219,7 @@ func (c *Cache) saveBloom() error {
 	}
 
 	bloomPath := filepath.Join(c.cfg.Path, "bloom.dat")
-	return os.WriteFile(bloomPath, data, 0644)
+	return os.WriteFile(bloomPath, data, 0o644)
 }
 
 // Background workers
@@ -274,12 +282,18 @@ func (c *Cache) runEviction(ctx context.Context) error {
 				return fmt.Errorf("failed to get entry: %w", err)
 			}
 
-			// TODO: Delete segment blob data (for now, skip file deletion)
-			// Segment files will be cleaned up when entire segment is evicted
-			// or by orphan cleanup worker
+			// Compute file path from key
+			k := base.NewKey(entry.Key, c.cfg.Shards)
+			shardDir := fmt.Sprintf("shard-%03d", k.ShardID())
+			blobFile := fmt.Sprintf("%d.blob", k.FileID())
+			blobPath := filepath.Join(c.cfg.Path, "blobs", shardDir, blobFile)
+
+			// Delete blob file
+			if err := os.Remove(blobPath); err != nil && !os.IsNotExist(err) {
+				fmt.Printf("Warning: failed to delete blob %s: %v\n", blobPath, err)
+			}
 
 			// Delete from index
-			k := base.Key(entry.Key)
 			if err := c.index.Delete(ctx, k); err != nil {
 				// Log warning but continue
 				fmt.Printf("Warning: failed to delete key from index: %v\n", err)
@@ -342,64 +356,44 @@ func (c *Cache) orphanCleanupWorker() {
 }
 
 // Put stores a key-value pair (makes copies for safety)
-func (c *Cache) Put(ctx context.Context, key, value []byte) error {
+func (c *Cache) Put(key, value []byte) {
 	keyCopy := make([]byte, len(key))
 	copy(keyCopy, key)
 	valueCopy := make([]byte, len(value))
 	copy(valueCopy, value)
-	return c.memTable.Put(keyCopy, valueCopy)
+	c.memTable.Put(keyCopy, valueCopy)
 }
 
 // UnsafePut stores key-value without copying
 // Caller must ensure key and value are not modified after this call
-func (c *Cache) UnsafePut(ctx context.Context, key, value []byte) error {
-	return c.memTable.Put(key, value)
+func (c *Cache) UnsafePut(key, value []byte) {
+	c.memTable.Put(key, value)
 }
 
 // Get retrieves a value by key
-func (c *Cache) Get(ctx context.Context, key []byte) ([]byte, error) {
+// Returns (value, true) if found, (nil, false) if not found
+func (c *Cache) Get(key []byte) ([]byte, bool) {
+	// 1. Check bloom filter (lock-free, <1 ns)
 	bloom := c.bloom.Load()
 	if !bloom.Test(key) {
-		return nil, ErrNotFound
+		return nil, false
 	}
 
-	if c.memTable != nil {
-		if value, found := c.memTable.Get(key); found {
-			return value, nil
-		}
+	// 2. Check memtable (recent writes)
+	if value, found := c.memTable.Get(key); found {
+		return value, true
 	}
 
-	k := base.Key(key)
-	var entry index.Entry
-	if err := c.index.Get(ctx, k, &entry); err != nil {
-		if err == index.ErrNotFound {
-			return nil, ErrNotFound
-		}
-		return nil, err
-	}
+	// 3. Read blob file directly using deterministic path (no index lookup!)
+	k := base.NewKey(key, c.cfg.Shards)
+	shardDir := fmt.Sprintf("shard-%03d", k.ShardID())
+	blobFile := fmt.Sprintf("%d.blob", k.FileID())
+	blobPath := filepath.Join(c.cfg.Path, "blobs", shardDir, blobFile)
 
-	segmentPath := filepath.Join(c.cfg.Path, "segments", entry.SegmentID+".seg")
-
-	file, err := os.Open(segmentPath)
+	data, err := os.ReadFile(blobPath)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, ErrNotFound // Segment evicted
-		}
-		return nil, fmt.Errorf("failed to open segment: %w", err)
-	}
-	defer file.Close()
-
-	// Read blob data at position
-	data := make([]byte, entry.Size)
-	n, err := file.ReadAt(data, entry.Pos)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read from segment: %w", err)
-	}
-	if n != entry.Size {
-		return nil, fmt.Errorf("partial read: got %d bytes, want %d", n, entry.Size)
+		return nil, false
 	}
 
-	// TODO: Verify checksum if cfg.VerifyOnRead enabled
-
-	return data, nil
+	return data, true
 }

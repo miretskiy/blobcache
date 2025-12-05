@@ -9,11 +9,10 @@ import (
 type config struct {
 	Path                  string
 	MaxSize               int64
-	Shards                int
+	Shards                int // Number of shard directories (default: 256)
 	EvictionStrategy      EvictionStrategy
 	EvictionHysteresis    float64 // Percentage over MaxSize to evict (e.g., 0.1 = evict 10% extra)
 	WriteBufferSize       int64   // Memtable batch size in bytes (like RocksDB write_buffer_size)
-	SegmentSize           int64   // Target segment file size in bytes (independent of WriteBufferSize)
 	MaxInflightBatches    int     // Max batches queued (like RocksDB max_write_buffer_number)
 	BloomFPRate           float64
 	BloomEstimatedKeys    int
@@ -73,15 +72,6 @@ func WithEvictionHysteresis(pct float64) Option {
 func WithWriteBufferSize(bytes int64) Option {
 	return funcOpt(func(c *config) {
 		c.WriteBufferSize = bytes
-	})
-}
-
-// WithSegmentSize sets target segment file size in bytes (default: 1GB)
-// Segment files can span multiple memfile flushes, allowing independent control
-// of in-memory buffering (WriteBufferSize) and on-disk file granularity (SegmentSize)
-func WithSegmentSize(bytes int64) Option {
-	return funcOpt(func(c *config) {
-		c.SegmentSize = bytes
 	})
 }
 
@@ -171,12 +161,11 @@ func defaultConfig(path string) config {
 		MaxSize:               0, // TODO: Auto-detect 80% of disk capacity
 		Shards:                256,
 		EvictionStrategy:      EvictByCTime,
-		EvictionHysteresis:    0.1,                // Evict 10% extra to prevent thrashing
-		WriteBufferSize:       100 * 1024 * 1024,  // 100MB (production ~1GB)
-		SegmentSize:           1024 * 1024 * 1024, // 1GB segment files
-		MaxInflightBatches:    6,                  // Max batches queued
-		BloomFPRate:           0.01,               // 1% FP rate
-		BloomEstimatedKeys:    1_000_000,          // 1M keys → ~1.2 MB bloom
+		EvictionHysteresis:    0.1,               // Evict 10% extra to prevent thrashing
+		WriteBufferSize:       100 * 1024 * 1024, // 100MB (production ~1GB)
+		MaxInflightBatches:    6,                 // Max batches queued
+		BloomFPRate:           0.01,              // 1% FP rate
+		BloomEstimatedKeys:    1_000_000,         // 1M keys → ~1.2 MB bloom
 		BloomRefreshInterval:  10 * time.Minute,
 		OrphanCleanupInterval: 1 * time.Hour,
 		Checksums:             true,

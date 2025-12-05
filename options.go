@@ -21,6 +21,7 @@ type config struct {
 	Checksums             bool
 	Fsync                 bool
 	VerifyOnRead          bool
+	DirectIOWrites        bool // Use DirectIO for writes
 }
 
 // Option configures BlobCache
@@ -122,6 +123,15 @@ func WithVerifyOnRead(enabled bool) Option {
 	})
 }
 
+// WithDirectIOWrites enables DirectIO for writes (default: false)
+// DirectIO uses aligned writes with padding, then truncates to actual size
+// Provides better sustained throughput for large workloads by bypassing OS cache
+func WithDirectIOWrites() Option {
+	return funcOpt(func(c *config) {
+		c.DirectIOWrites = true
+	})
+}
+
 // WithOrphanCleanupInterval sets how often orphaned files are cleaned (default: 24h, 0 = disabled)
 func WithOrphanCleanupInterval(d time.Duration) Option {
 	return funcOpt(func(c *config) {
@@ -171,5 +181,6 @@ func defaultConfig(path string) config {
 		Checksums:             true,
 		Fsync:                 false,
 		VerifyOnRead:          false,
+		DirectIOWrites:        false,
 	}
 }

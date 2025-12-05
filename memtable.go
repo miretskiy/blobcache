@@ -3,8 +3,6 @@ package blobcache
 import (
 	"context"
 	"fmt"
-	"os"
-	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -39,15 +37,25 @@ type MemTable struct {
 	wg      sync.WaitGroup
 
 	cache           *Cache
+	blobWriter      BlobWriter
 	writeBufferSize int64
 }
 
 // newMemTable creates a memtable with skipmap-based storage
 func (c *Cache) newMemTable() *MemTable {
+	// Choose blob writer based on config
+	var writer BlobWriter
+	if c.cfg.DirectIOWrites {
+		writer = NewDirectIOWriter(c.cfg.Path, c.cfg.Shards)
+	} else {
+		writer = NewBufferedWriter(c.cfg.Path, c.cfg.Shards)
+	}
+
 	mt := &MemTable{
 		flushCh:         make(chan *memFile, c.cfg.MaxInflightBatches),
 		stopCh:          make(chan struct{}),
 		cache:           c,
+		blobWriter:      writer,
 		writeBufferSize: c.cfg.WriteBufferSize,
 	}
 	mt.frozen.inflight = make([]*memFile, 0)
@@ -187,14 +195,9 @@ func (mt *MemTable) flushMemFile(mf *memFile) {
 		key := unsafe.Slice(unsafe.StringData(keyStr), len(keyStr))
 		k := base.NewKey(key, mt.cache.cfg.Shards)
 
-		// Build file path: blobs/shard-XXX/fileID.blob
-		shardDir := fmt.Sprintf("shard-%03d", k.ShardID())
-		blobFile := fmt.Sprintf("%d.blob", k.FileID())
-		blobPath := filepath.Join(mt.cache.cfg.Path, "blobs", shardDir, blobFile)
-
-		// Write blob file
-		if err := os.WriteFile(blobPath, value, 0o644); err != nil {
-			fmt.Printf("Warning: failed to write blob %s: %v\n", blobPath, err)
+		// Write blob via writer interface
+		if err := mt.blobWriter.Write(k, value); err != nil {
+			fmt.Printf("Warning: blob write failed for key %x: %v\n", key, err)
 			return true // Continue with other entries
 		}
 

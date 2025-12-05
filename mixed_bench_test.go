@@ -25,15 +25,13 @@ func Benchmark_Mixed(b *testing.B) {
 	defer os.RemoveAll(tmpDir)
 
 	cache, err := New(tmpDir,
-		WithMaxSize(256<<30),       // 256GB for Mac (production ~1TB)
-		WithWriteBufferSize(1<<22)) // 4MB
+		WithMaxSize(256<<30), // 256GB for Mac (production ~1TB)
+		WithWriteBufferSize(1<<30),
+		WithDirectIOWrites(),
+	)
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer func() {
-		cache.Drain()
-		cache.Close()
-	}()
 
 	var numReads, numFound atomic.Int64
 	var numWrites, completedWrites atomic.Int64 // Pre-allocates key IDs
@@ -86,60 +84,10 @@ func Benchmark_Mixed(b *testing.B) {
 		}
 	})
 
+	cache.Drain() // include drain time to flush the rest of the data.
 	duration := time.Since(start)
 	b.StopTimer()
 
-	//// Verify all completed writes exist BEFORE drain (should be in memtable or disk)
-	//totalCompleted := completedWrites.Load()
-	//var preDrainMissing int64
-	//for i := int64(0); i < totalCompleted; i++ {
-	//	key := []byte(fmt.Sprintf("key-%d", i))
-	//	if _, err := cache.MustGet(key); err != nil {
-	//		preDrainMissing++
-	//		if preDrainMissing <= 10 {
-	//			fmt.Printf("PRE-DRAIN MISSING: key-%d\n", i)
-	//		}
-	//	}
-	//}
-	//if preDrainMissing > 0 {
-	//	b.Logf("WARNING PRE-DRAIN: %d/%d keys missing BEFORE drain!", preDrainMissing, totalCompleted)
-	//}
-
-	cache.Drain()
-
-	//// Verify again after drain
-	//var postDrainMissing int64
-	//for i := int64(0); i < totalCompleted; i++ {
-	//	key := []byte(fmt.Sprintf("key-%d", i))
-	//	if _, err := cache.MustGet(key); err != nil {
-	//		postDrainMissing++
-	//		if postDrainMissing <= 10 {
-	//			fmt.Printf("POST-DRAIN MISSING: key-%d\n", i)
-	//		}
-	//	}
-	//}
-	//if postDrainMissing > 0 {
-	//	b.Logf("WARNING POST-DRAIN: %d/%d keys missing AFTER drain!", postDrainMissing, totalCompleted)
-	//}
-
-	// Calculate metrics
 	writeThroughput := float64(numWrites.Load()) / duration.Seconds() / 1024 // GB/s
-	hitRate := float64(numFound.Load()) / float64(numReads.Load()) * 100     // %
-
-	// Report metrics
-	b.ReportMetric(float64(numWrites.Load()), "writes")
-	b.ReportMetric(float64(numReads.Load()), "reads")
-	b.ReportMetric(float64(numFound.Load()), "found")
 	b.ReportMetric(writeThroughput, "write-GB/s")
-	b.ReportMetric(hitRate, "hit-%")
-
-	b.Logf("Operations: %d writes, %d reads %d found in %v",
-		numWrites.Load(), numReads.Load(), numFound.Load(), duration)
-	b.Logf("Write: %.2f GB/s, Hit rate: %.1f%%", writeThroughput, hitRate)
-	// TODO: Re-add histogram tracking for latency measurements
-	// var buf bytes.Buffer
-	// hist.PercentilesPrint(&buf, 1, 1)
-	// b.Log(buf.String())
-	// b.Logf("hist: min=%d mean=%f 95=%d 99=%d max=%d",
-	// 	hist.Min(), hist.Mean(), hist.ValueAtPercentile(95), hist.ValueAtPercentile(99), hist.Max())
 }

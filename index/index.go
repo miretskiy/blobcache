@@ -28,14 +28,34 @@ type Entry struct {
 	CTime int64 // Creation time
 }
 
+// Record holds metadata for a single index entry
+type Record struct {
+	Key   base.Key
+	Size  int
+	CTime int64
+}
+
+// Indexer defines the index operations
+type Indexer interface {
+	Put(context.Context, base.Key, int, int64) error
+	Get(context.Context, base.Key, *Entry) error
+	Delete(context.Context, base.Key) error
+	Close() error
+	TotalSizeOnDisk(context.Context) (int64, error)
+	GetOldestEntries(context.Context, int) EntryIteratorInterface
+	GetAllKeys(context.Context) ([][]byte, error)
+	// PutBatch inserts multiple records atomically
+	PutBatch(context.Context, []Record) error
+}
+
 // KeyValue holds a key with metadata for bulk insert
 type KeyValue struct {
 	Key  base.Key
 	Size int
 }
 
-// New creates or opens a DuckDB index
-func New(basePath string) (*Index, error) {
+// NewDuckDBIndex creates or opens a DuckDB index
+func NewDuckDBIndex(basePath string) (*Index, error) {
 	dbDir := filepath.Join(basePath, "db")
 	if err := os.MkdirAll(dbDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create db directory: %w", err)
@@ -160,7 +180,15 @@ func (idx *Index) TotalSizeOnDisk(ctx context.Context) (int64, error) {
 	return total.Int64, nil
 }
 
-// EntryIterator provides iteration over entries
+// EntryIteratorInterface provides iteration over entries
+type EntryIteratorInterface interface {
+	Next() bool
+	Entry() (Entry, error)
+	Err() error
+	Close() error
+}
+
+// EntryIterator provides iteration over entries (DuckDB implementation)
 type EntryIterator struct {
 	rows *sql.Rows
 	err  error
@@ -198,7 +226,7 @@ func (it *EntryIterator) Close() error {
 }
 
 // GetOldestEntries returns iterator over N oldest entries by ctime for eviction
-func (idx *Index) GetOldestEntries(ctx context.Context, limit int) *EntryIterator {
+func (idx *Index) GetOldestEntries(ctx context.Context, limit int) EntryIteratorInterface {
 	rows, err := idx.db.QueryContext(ctx,
 		`SELECT key, size, ctime FROM entries ORDER BY ctime ASC LIMIT ?`,
 		limit)
@@ -225,12 +253,13 @@ func (idx *Index) GetAllKeys(ctx context.Context) ([][]byte, error) {
 	return keys, rows.Err()
 }
 
-// NewAppender creates a DuckDB Appender for bulk inserts
-func (idx *Index) NewAppender(ctx context.Context) (*duckdb.Appender, func(), error) {
+// PutBatch inserts multiple records using DuckDB Appender
+func (idx *Index) PutBatch(ctx context.Context, records []Record) error {
 	conn, err := idx.db.Conn(ctx)
 	if err != nil {
-		return nil, nil, err
+		return err
 	}
+	defer conn.Close()
 
 	var appender *duckdb.Appender
 	err = conn.Raw(func(dc any) error {
@@ -239,19 +268,19 @@ func (idx *Index) NewAppender(ctx context.Context) (*duckdb.Appender, func(), er
 		appender, err = duckdb.NewAppenderFromConn(driverConn, "", "entries")
 		return err
 	})
-
 	if err != nil {
-		conn.Close()
-		return nil, nil, err
+		return err
+	}
+	defer appender.Close()
+
+	// Append all records
+	for _, rec := range records {
+		if err := appender.AppendRow(rec.Key.Raw(), rec.Size, rec.CTime); err != nil {
+			return err
+		}
 	}
 
-	// Return appender and cleanup function
-	cleanup := func() {
-		appender.Close()
-		conn.Close()
-	}
-
-	return appender, cleanup, nil
+	return appender.Flush()
 }
 
 // TestingGetDB returns the underlying database for testing/benchmarking only

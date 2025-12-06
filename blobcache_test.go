@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/miretskiy/blobcache/bloom"
+	"github.com/miretskiy/blobcache/index"
 	"github.com/stretchr/testify/require"
 )
 
@@ -358,7 +359,12 @@ func TestCache_BloomRefresh(t *testing.T) {
 // ONLY for testing/benchmarking - bypasses normal Put() path
 func bulkPopulateIndex(cache *Cache, count int) error {
 	ctx := context.Background()
-	db := cache.index.TestingGetDB()
+	// Type assert to DuckDB index (this helper only works with DuckDB)
+	duckdbIndex, ok := cache.index.(*index.Index)
+	if !ok {
+		return fmt.Errorf("bulkPopulateIndex only works with DuckDB index")
+	}
+	db := duckdbIndex.TestingGetDB()
 
 	query := fmt.Sprintf(`
 		INSERT INTO entries (key, shard_id, file_id, size, ctime, mtime)

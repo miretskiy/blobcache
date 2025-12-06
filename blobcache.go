@@ -17,7 +17,7 @@ import (
 // Cache is a high-performance blob storage with bloom filter optimization
 type Cache struct {
 	cfg      config
-	index    *index.Index
+	index    index.Indexer
 	bloom    atomic.Pointer[bloom.Filter]
 	memTable *MemTable
 
@@ -39,8 +39,13 @@ func New(path string, opts ...Option) (*Cache, error) {
 		return nil, fmt.Errorf("initialization failed: %w", err)
 	}
 
-	// Open DuckDB index
-	idx, err := index.New(path)
+	// Open index (DuckDB or Bitcask based on config)
+	idx, err := func() (index.Indexer, error) {
+		if cfg.UseBitcaskIndex {
+			return index.NewBitcaskIndex(path)
+		}
+		return index.NewDuckDBIndex(path)
+	}()
 	if err != nil {
 		return nil, fmt.Errorf("failed to open index: %w", err)
 	}

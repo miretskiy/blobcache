@@ -19,7 +19,7 @@ func TestIndex_PutGet(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	// Open index
-	idx, err := New(tmpDir)
+	idx, err := NewDuckDBIndex(tmpDir)
 	if err != nil {
 		t.Fatalf("Failed to create index: %v", err)
 	}
@@ -56,7 +56,7 @@ func TestIndex_GetNotFound(t *testing.T) {
 	tmpDir, _ := os.MkdirTemp("", "blobcache-test-*")
 	defer os.RemoveAll(tmpDir)
 
-	idx, err := New(tmpDir)
+	idx, err := NewDuckDBIndex(tmpDir)
 	if err != nil {
 		t.Fatalf("Failed to create index: %v", err)
 	}
@@ -79,7 +79,7 @@ func TestIndex_Delete(t *testing.T) {
 	tmpDir, _ := os.MkdirTemp("", "blobcache-test-*")
 	defer os.RemoveAll(tmpDir)
 
-	idx, _ := New(tmpDir)
+	idx, _ := NewDuckDBIndex(tmpDir)
 	defer idx.Close()
 
 	ctx := context.Background()
@@ -114,7 +114,7 @@ func TestIndex_TotalSizeOnDisk(t *testing.T) {
 	tmpDir, _ := os.MkdirTemp("", "blobcache-test-*")
 	defer os.RemoveAll(tmpDir)
 
-	idx, _ := New(tmpDir)
+	idx, _ := NewDuckDBIndex(tmpDir)
 	defer idx.Close()
 
 	ctx := context.Background()
@@ -164,12 +164,12 @@ func TestIndex_Persistence(t *testing.T) {
 	now := time.Now().UnixNano()
 
 	// Create index and insert
-	idx1, _ := New(tmpDir)
+	idx1, _ := NewDuckDBIndex(tmpDir)
 	idx1.Put(ctx, key, 999, now)
 	idx1.Close()
 
 	// Reopen and verify data persisted
-	idx2, err := New(tmpDir)
+	idx2, err := NewDuckDBIndex(tmpDir)
 	if err != nil {
 		t.Fatalf("Failed to reopen index: %v", err)
 	}

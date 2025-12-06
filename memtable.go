@@ -9,6 +9,7 @@ import (
 	"unsafe"
 
 	"github.com/miretskiy/blobcache/base"
+	"github.com/miretskiy/blobcache/index"
 	"github.com/zhangyunhao116/skipmap"
 )
 
@@ -180,12 +181,8 @@ func (mt *MemTable) flushMemFile(mf *memFile) {
 	ctx := context.Background()
 	now := time.Now().UnixNano()
 
-	// Phase 1: Write all blob files and collect metadata
-	type keyMeta struct {
-		key  base.Key
-		size int
-	}
-	var metas []keyMeta
+	// Phase 1: Write all blob files and collect records for index
+	var records []index.Record
 
 	mf.data.Range(func(keyStr string, value []byte) bool {
 		if len(value) == 0 {
@@ -201,35 +198,21 @@ func (mt *MemTable) flushMemFile(mf *memFile) {
 			return true // Continue with other entries
 		}
 
-		metas = append(metas, keyMeta{key: k, size: len(value)})
+		records = append(records, index.Record{
+			Key:   k,
+			Size:  len(value),
+			CTime: now,
+		})
 		return true
 	})
 
-	// Phase 2: Batch update index using Appender API
-	if len(metas) == 0 {
+	// Phase 2: Batch update index
+	if len(records) == 0 {
 		return
 	}
 
-	appender, cleanup, err := mt.cache.index.NewAppender(ctx)
-	if err != nil {
-		fmt.Printf("Warning: failed to create appender: %v\n", err)
-		return
-	}
-	defer cleanup()
-
-	for _, meta := range metas {
-		if err := appender.AppendRow(
-			meta.key.Raw(),
-			meta.size,
-			now,
-		); err != nil {
-			fmt.Printf("Warning: appender.AppendRow failed: %v\n", err)
-			return
-		}
-	}
-
-	if err := appender.Flush(); err != nil {
-		fmt.Printf("Warning: appender.Flush failed: %v\n", err)
+	if err := mt.cache.index.PutBatch(ctx, records); err != nil {
+		fmt.Printf("Warning: index batch insert failed: %v\n", err)
 	}
 }
 

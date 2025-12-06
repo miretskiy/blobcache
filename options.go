@@ -22,6 +22,7 @@ type config struct {
 	Fsync                 bool
 	VerifyOnRead          bool
 	DirectIOWrites        bool // Use DirectIO for writes
+	UseBitcaskIndex       bool // Use Bitcask instead of DuckDB for index
 }
 
 // Option configures BlobCache
@@ -132,6 +133,15 @@ func WithDirectIOWrites() Option {
 	})
 }
 
+// WithBitcaskIndex uses Bitcask instead of DuckDB for index (default: false)
+// Bitcask provides simpler embedded storage with in-memory hash table
+// Note: GetOldestEntries requires full scan and sort in memory
+func WithBitcaskIndex() Option {
+	return funcOpt(func(c *config) {
+		c.UseBitcaskIndex = true
+	})
+}
+
 // WithOrphanCleanupInterval sets how often orphaned files are cleaned (default: 24h, 0 = disabled)
 func WithOrphanCleanupInterval(d time.Duration) Option {
 	return funcOpt(func(c *config) {
@@ -182,5 +192,6 @@ func defaultConfig(path string) config {
 		Fsync:                 false,
 		VerifyOnRead:          false,
 		DirectIOWrites:        false,
+		UseBitcaskIndex:       false,
 	}
 }

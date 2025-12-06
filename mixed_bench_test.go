@@ -26,8 +26,9 @@ func Benchmark_Mixed(b *testing.B) {
 
 	cache, err := New(tmpDir,
 		WithMaxSize(256<<30), // 256GB for Mac (production ~1TB)
-		WithWriteBufferSize(1<<30),
-		WithDirectIOWrites(),
+		WithWriteBufferSize(1<<27),
+		WithBitcaskIndex(),
+		// WithDirectIOWrites(),
 	)
 	if err != nil {
 		b.Fatal(err)

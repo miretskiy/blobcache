@@ -19,6 +19,20 @@ type memFile struct {
 	size atomic.Int64
 }
 
+// createBlobWriter creates appropriate writer based on config
+func createBlobWriter(cfg config, workerID int) BlobWriter {
+	// Use segments if SegmentSize > 0
+	if cfg.SegmentSize > 0 {
+		return NewSegmentWriter(cfg.Path, cfg.SegmentSize, cfg.DirectIOWrites, workerID)
+	}
+
+	// Per-blob mode
+	if cfg.DirectIOWrites {
+		return NewDirectIOWriter(cfg.Path, cfg.Shards)
+	}
+	return NewBufferedWriter(cfg.Path, cfg.Shards)
+}
+
 // MemTable provides async write buffering with in-memory read support
 // Uses atomic memFile pointer for lock-free writes
 type MemTable struct {
@@ -38,25 +52,15 @@ type MemTable struct {
 	wg      sync.WaitGroup
 
 	cache           *Cache
-	blobWriter      BlobWriter
 	writeBufferSize int64
 }
 
 // newMemTable creates a memtable with skipmap-based storage
 func (c *Cache) newMemTable() *MemTable {
-	// Choose blob writer based on config
-	var writer BlobWriter
-	if c.cfg.DirectIOWrites {
-		writer = NewDirectIOWriter(c.cfg.Path, c.cfg.Shards)
-	} else {
-		writer = NewBufferedWriter(c.cfg.Path, c.cfg.Shards)
-	}
-
 	mt := &MemTable{
 		flushCh:         make(chan *memFile, c.cfg.MaxInflightBatches),
 		stopCh:          make(chan struct{}),
 		cache:           c,
-		blobWriter:      writer,
 		writeBufferSize: c.cfg.WriteBufferSize,
 	}
 	mt.frozen.inflight = make([]*memFile, 0)
@@ -152,21 +156,25 @@ func (mt *MemTable) Get(key []byte) ([]byte, bool) {
 	return nil, false
 }
 
-// flushWorker processes frozen memfiles - writes one file per blob
+// flushWorker processes frozen memfiles
 func (mt *MemTable) flushWorker(workerID int) {
 	defer mt.wg.Done()
+
+	// Create per-worker blob writer
+	writer := createBlobWriter(mt.cache.cfg, workerID)
+	defer writer.Close()
 
 	for {
 		select {
 		case mf := <-mt.flushCh:
-			mt.flushMemFile(mf)
+			mt.flushMemFile(mf, writer)
 			mt.removeFrozen(mf)
 		case <-mt.stopCh:
 			// Drain remaining memfiles
 			for {
 				select {
 				case mf := <-mt.flushCh:
-					mt.flushMemFile(mf)
+					mt.flushMemFile(mf, writer)
 					mt.removeFrozen(mf)
 				default:
 					return
@@ -176,7 +184,7 @@ func (mt *MemTable) flushWorker(workerID int) {
 	}
 }
 
-func (mt *MemTable) flushMemFile(mf *memFile) {
+func (mt *MemTable) flushMemFile(mf *memFile, writer BlobWriter) {
 	ctx := context.Background()
 	now := time.Now().UnixNano()
 
@@ -192,13 +200,13 @@ func (mt *MemTable) flushMemFile(mf *memFile) {
 		k := base.NewKey(key, mt.cache.cfg.Shards)
 
 		// Write blob via writer interface
-		if err := mt.blobWriter.Write(k, value); err != nil {
+		if err := writer.Write(k, value); err != nil {
 			fmt.Printf("Warning: blob write failed for key %x: %v\n", key, err)
 			return true // Continue with other entries
 		}
 
 		// Get position for index (segment mode returns segmentID+pos, per-blob returns zeros)
-		pos := mt.blobWriter.Pos()
+		pos := writer.Pos()
 
 		records = append(records, index.Record{
 			Key:       k,

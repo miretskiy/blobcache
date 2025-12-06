@@ -31,21 +31,21 @@ func NewBitcaskIndex(basePath string) (*BitcaskIndex, error) {
 }
 
 // encodeValue encodes segment_id, pos, size, and ctime into bytes
-func encodeValue(segmentID int, pos int64, size int, ctime int64) []byte {
-	buf := make([]byte, 24) // 4+8+4+8 bytes
-	binary.LittleEndian.PutUint32(buf[0:4], uint32(segmentID))
-	binary.LittleEndian.PutUint64(buf[4:12], uint64(pos))
-	binary.LittleEndian.PutUint32(buf[12:16], uint32(size))
-	binary.LittleEndian.PutUint64(buf[16:24], uint64(ctime))
+func encodeValue(segmentID int64, pos int64, size int, ctime int64) []byte {
+	buf := make([]byte, 28) // 8+8+4+8 bytes
+	binary.LittleEndian.PutUint64(buf[0:8], uint64(segmentID))
+	binary.LittleEndian.PutUint64(buf[8:16], uint64(pos))
+	binary.LittleEndian.PutUint32(buf[16:20], uint32(size))
+	binary.LittleEndian.PutUint64(buf[20:28], uint64(ctime))
 	return buf
 }
 
 // decodeValue decodes segment_id, pos, size, and ctime from bytes into entry
 func decodeValue(buf []byte, entry *Entry) {
-	entry.SegmentID = int(binary.LittleEndian.Uint32(buf[0:4]))
-	entry.Pos = int64(binary.LittleEndian.Uint64(buf[4:12]))
-	entry.Size = int(binary.LittleEndian.Uint32(buf[12:16]))
-	entry.CTime = int64(binary.LittleEndian.Uint64(buf[16:24]))
+	entry.SegmentID = int64(binary.LittleEndian.Uint64(buf[0:8]))
+	entry.Pos = int64(binary.LittleEndian.Uint64(buf[8:16]))
+	entry.Size = int(binary.LittleEndian.Uint32(buf[16:20]))
+	entry.CTime = int64(binary.LittleEndian.Uint64(buf[20:28]))
 }
 
 // Put inserts or updates an entry (for compatibility, uses segment_id=0, pos=0)

@@ -19,7 +19,7 @@ type SegmentWriter struct {
 
 	// Current segment state
 	currentFile  *os.File
-	currentID    int
+	currentID    int64
 	currentPos   int64
 	lastWritePos int64  // Position of last Write() for Pos()
 	leftover     []byte // For DirectIO alignment
@@ -45,8 +45,7 @@ func (w *SegmentWriter) openNewSegment() error {
 	}
 
 	// Generate segment ID: timestamp
-	now := time.Now().UnixNano()
-	w.currentID = int(now)
+	w.currentID = time.Now().UnixNano()
 
 	segmentPath := filepath.Join(w.basePath, "segments", fmt.Sprintf("%d.seg", w.currentID))
 
@@ -72,58 +71,52 @@ func (w *SegmentWriter) closeCurrentSegment() error {
 		return nil
 	}
 
-	// Flush leftover if DirectIO
-	if w.useDirectIO && len(w.leftover) > 0 {
-		const mask = directio.BlockSize - 1
-		paddedSize := (len(w.leftover) + mask) &^ mask
-		buf := directio.AlignedBlock(paddedSize)
-		copy(buf, w.leftover)
-		if _, err := w.currentFile.Write(buf); err != nil {
-			return err
-		}
-
-		// Track actual size before padding
-		actualSize := w.currentPos + int64(len(w.leftover))
-
-		// Close file
-		if err := w.currentFile.Close(); err != nil {
-			return err
-		}
-		w.currentFile = nil
-
-		// Truncate to remove padding
-		segmentPath := filepath.Join(w.basePath, "segments", fmt.Sprintf("%d.seg", w.currentID))
-		if err := os.Truncate(segmentPath, actualSize); err != nil {
-			return err
-		}
-	} else {
-		// Just close for buffered I/O
-		if err := w.currentFile.Close(); err != nil {
-			return err
-		}
-		w.currentFile = nil
+	// Just close - no leftover handling needed with per-blob padding
+	if err := w.currentFile.Close(); err != nil {
+		return err
 	}
-
+	w.currentFile = nil
 	return nil
 }
 
 // Write writes a blob to current segment
 func (w *SegmentWriter) Write(key base.Key, value []byte) error {
-	// Open new segment if needed
-	if w.currentFile == nil || w.currentPos >= w.segmentSize {
+	// Open new segment if needed or if this write would exceed segment size
+	if w.currentFile == nil || w.currentPos+int64(len(value)) > w.segmentSize {
 		if err := w.openNewSegment(); err != nil {
 			return err
 		}
 	}
 
-	// Record position before write
-	w.lastWritePos = w.currentPos
-
 	if w.useDirectIO {
-		// Handle DirectIO with alignment and leftover
-		// TODO: Implement DirectIO write with leftover handling
-		return fmt.Errorf("DirectIO segment write not implemented yet")
+		// Each blob is padded individually (no cross-blob leftover)
+		// This wastes space but keeps blob addressing simple
+		w.lastWritePos = w.currentPos
+
+		// Pad value to block size
+		const mask = directio.BlockSize - 1
+		paddedSize := (len(value) + mask) &^ mask
+
+		var buf []byte
+		if len(value) == paddedSize && isAligned(value) {
+			// Already padded and aligned
+			buf = value
+		} else {
+			// Allocate aligned+padded buffer
+			buf = directio.AlignedBlock(paddedSize)
+			copy(buf, value)
+		}
+
+		n, err := w.currentFile.Write(buf)
+		if err != nil {
+			return err
+		}
+		w.currentPos += int64(n)
+		// No leftover with this approach
 	} else {
+		// Buffered write
+		w.lastWritePos = w.currentPos
+
 		// Simple buffered write
 		n, err := w.currentFile.Write(value)
 		if err != nil {

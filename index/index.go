@@ -24,7 +24,7 @@ type Index struct {
 // Entry represents a cached blob's metadata
 type Entry struct {
 	Key       []byte // Raw key
-	SegmentID int    // Segment ID (0 for per-blob mode)
+	SegmentID int64  // Segment ID (0 for per-blob mode)
 	Pos       int64  // Position within segment (0 for per-blob mode)
 	Size      int
 	CTime     int64 // Creation time
@@ -33,7 +33,7 @@ type Entry struct {
 // Record holds metadata for a single index entry
 type Record struct {
 	Key       base.Key
-	SegmentID int   // Segment ID (0 for per-blob mode)
+	SegmentID int64 // Segment ID (0 for per-blob mode)
 	Pos       int64 // Position within segment (0 for per-blob mode)
 	Size      int
 	CTime     int64

@@ -89,3 +89,8 @@ func (w *DirectIOWriter) Write(key base.Key, value []byte) error {
 func (w *DirectIOWriter) Pos() WritePosition {
 	return WritePosition{}
 }
+
+// Close is a no-op for DirectIOWriter (no persistent state)
+func (w *DirectIOWriter) Close() error {
+	return nil
+}

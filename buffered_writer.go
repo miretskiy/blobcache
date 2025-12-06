@@ -49,3 +49,8 @@ func (w *BufferedWriter) Write(key base.Key, value []byte) error {
 func (w *BufferedWriter) Pos() WritePosition {
 	return WritePosition{}
 }
+
+// Close is a no-op for BufferedWriter (no persistent state)
+func (w *BufferedWriter) Close() error {
+	return nil
+}

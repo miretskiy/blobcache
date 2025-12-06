@@ -44,6 +44,10 @@ func New(path string, opts ...Option) (*Cache, error) {
 		if cfg.UseBitcaskIndex {
 			return index.NewBitcaskIndex(path)
 		}
+		// DuckDB index doesn't support segments yet
+		if cfg.SegmentSize > 0 {
+			panic("Segment mode requires Bitcask index (use WithBitcaskIndex())")
+		}
 		return index.NewDuckDBIndex(path)
 	}()
 	if err != nil {
@@ -138,10 +142,11 @@ func checkOrInitialize(cfg config) error {
 
 	// Not initialized - create directory structure
 
-	// Create base directories
+	// Create base directories (both blobs and segments, use based on config)
 	dirs := []string{
 		filepath.Join(cfg.Path, "db"),
 		filepath.Join(cfg.Path, "blobs"),
+		filepath.Join(cfg.Path, "segments"),
 	}
 
 	for _, dir := range dirs {
@@ -389,16 +394,40 @@ func (c *Cache) Get(key []byte) ([]byte, bool) {
 		return value, true
 	}
 
-	// 3. Read blob file directly using deterministic path (no index lookup!)
+	// 3. Read from disk (per-blob or segment based on config)
 	k := base.NewKey(key, c.cfg.Shards)
-	shardDir := fmt.Sprintf("shard-%03d", k.ShardID())
-	blobFile := fmt.Sprintf("%d.blob", k.FileID())
-	blobPath := filepath.Join(c.cfg.Path, "blobs", shardDir, blobFile)
 
-	data, err := os.ReadFile(blobPath)
-	if err != nil {
-		return nil, false
+	if c.cfg.SegmentSize > 0 {
+		// Segment mode: lookup in index to get (segmentID, pos, size)
+		var entry index.Entry
+		if err := c.index.Get(context.Background(), k, &entry); err != nil {
+			return nil, false
+		}
+
+		// Read from segment file at position
+		segmentPath := filepath.Join(c.cfg.Path, "segments", fmt.Sprintf("%d.seg", entry.SegmentID))
+		file, err := os.Open(segmentPath)
+		if err != nil {
+			return nil, false
+		}
+		defer file.Close()
+
+		data := make([]byte, entry.Size)
+		n, err := file.ReadAt(data, entry.Pos)
+		if err != nil || n != entry.Size {
+			return nil, false
+		}
+		return data, true
+	} else {
+		// Per-blob mode: deterministic path from key
+		shardDir := fmt.Sprintf("shard-%03d", k.ShardID())
+		blobFile := fmt.Sprintf("%d.blob", k.FileID())
+		blobPath := filepath.Join(c.cfg.Path, "blobs", shardDir, blobFile)
+
+		data, err := os.ReadFile(blobPath)
+		if err != nil {
+			return nil, false
+		}
+		return data, true
 	}
-
-	return data, true
 }

@@ -8,8 +8,9 @@ import (
 	"path/filepath"
 	"sort"
 
-	"github.com/miretskiy/blobcache/base"
 	"go.mills.io/bitcask/v2"
+
+	"github.com/miretskiy/blobcache/base"
 )
 
 // BitcaskIndex implements Index using Bitcask for metadata storage
@@ -29,24 +30,27 @@ func NewBitcaskIndex(basePath string) (*BitcaskIndex, error) {
 	return &BitcaskIndex{db: db}, nil
 }
 
-// encodeValue encodes size and ctime into bytes
-func encodeValue(size int, ctime int64) []byte {
-	buf := make([]byte, 12) // 4 bytes for size + 8 bytes for ctime
-	binary.LittleEndian.PutUint32(buf[0:4], uint32(size))
-	binary.LittleEndian.PutUint64(buf[4:12], uint64(ctime))
+// encodeValue encodes segment_id, pos, size, and ctime into bytes
+func encodeValue(segmentID int, pos int64, size int, ctime int64) []byte {
+	buf := make([]byte, 24) // 4+8+4+8 bytes
+	binary.LittleEndian.PutUint32(buf[0:4], uint32(segmentID))
+	binary.LittleEndian.PutUint64(buf[4:12], uint64(pos))
+	binary.LittleEndian.PutUint32(buf[12:16], uint32(size))
+	binary.LittleEndian.PutUint64(buf[16:24], uint64(ctime))
 	return buf
 }
 
-// decodeValue decodes size and ctime from bytes
-func decodeValue(buf []byte) (size int, ctime int64) {
-	size = int(binary.LittleEndian.Uint32(buf[0:4]))
-	ctime = int64(binary.LittleEndian.Uint64(buf[4:12]))
-	return
+// decodeValue decodes segment_id, pos, size, and ctime from bytes into entry
+func decodeValue(buf []byte, entry *Entry) {
+	entry.SegmentID = int(binary.LittleEndian.Uint32(buf[0:4]))
+	entry.Pos = int64(binary.LittleEndian.Uint64(buf[4:12]))
+	entry.Size = int(binary.LittleEndian.Uint32(buf[12:16]))
+	entry.CTime = int64(binary.LittleEndian.Uint64(buf[16:24]))
 }
 
-// Put inserts or updates an entry
+// Put inserts or updates an entry (for compatibility, uses segment_id=0, pos=0)
 func (idx *BitcaskIndex) Put(ctx context.Context, key base.Key, size int, ctime int64) error {
-	value := encodeValue(size, ctime)
+	value := encodeValue(0, 0, size, ctime)
 	return idx.db.Put(key.Raw(), value)
 }
 
@@ -61,7 +65,7 @@ func (idx *BitcaskIndex) Get(ctx context.Context, key base.Key, entry *Entry) er
 	}
 
 	entry.Key = key.Raw()
-	entry.Size, entry.CTime = decodeValue(value)
+	decodeValue(value, entry)
 	return nil
 }
 
@@ -83,8 +87,9 @@ func (idx *BitcaskIndex) TotalSizeOnDisk(ctx context.Context) (int64, error) {
 		if err != nil {
 			return err
 		}
-		size, _ := decodeValue(value)
-		total += int64(size)
+		var entry Entry
+		decodeValue(value, &entry)
+		total += int64(entry.Size)
 		return nil
 	})
 	return total, err
@@ -119,10 +124,11 @@ func (idx *BitcaskIndex) GetOldestEntries(ctx context.Context, limit int) EntryI
 		if err != nil {
 			return err
 		}
-		size, ctime := decodeValue(value)
+		var entry Entry
+		decodeValue(value, &entry)
 		keyCopy := make([]byte, len(key))
 		copy(keyCopy, key)
-		entries = append(entries, entryWithTime{key: keyCopy, size: size, ctime: ctime})
+		entries = append(entries, entryWithTime{key: keyCopy, size: entry.Size, ctime: entry.CTime})
 		return nil
 	})
 	if err != nil {
@@ -178,7 +184,7 @@ func (it *BitcaskEntryIterator) Close() error {
 // PutBatch inserts multiple records
 func (idx *BitcaskIndex) PutBatch(ctx context.Context, records []Record) error {
 	for _, rec := range records {
-		value := encodeValue(rec.Size, rec.CTime)
+		value := encodeValue(rec.SegmentID, rec.Pos, rec.Size, rec.CTime)
 		if err := idx.db.Put(rec.Key.Raw(), value); err != nil {
 			return err
 		}

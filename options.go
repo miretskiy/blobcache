@@ -13,6 +13,7 @@ type config struct {
 	EvictionStrategy      EvictionStrategy
 	EvictionHysteresis    float64 // Percentage over MaxSize to evict (e.g., 0.1 = evict 10% extra)
 	WriteBufferSize       int64   // Memtable batch size in bytes (like RocksDB write_buffer_size)
+	SegmentSize           int64   // Target segment file size (0 = one blob per file)
 	MaxInflightBatches    int     // Max batches queued (like RocksDB max_write_buffer_number)
 	BloomFPRate           float64
 	BloomEstimatedKeys    int
@@ -124,6 +125,15 @@ func WithVerifyOnRead(enabled bool) Option {
 	})
 }
 
+// WithSegmentSize sets target segment file size (default: 0 = one blob per file)
+// When > 0, multiple blobs are written to large segment files
+// Reduces file count and syscall overhead for high-throughput workloads
+func WithSegmentSize(size int64) Option {
+	return funcOpt(func(c *config) {
+		c.SegmentSize = size
+	})
+}
+
 // WithDirectIOWrites enables DirectIO for writes (default: false)
 // DirectIO uses aligned writes with padding, then truncates to actual size
 // Provides better sustained throughput for large workloads by bypassing OS cache
@@ -183,6 +193,7 @@ func defaultConfig(path string) config {
 		EvictionStrategy:      EvictByCTime,
 		EvictionHysteresis:    0.1,               // Evict 10% extra to prevent thrashing
 		WriteBufferSize:       100 * 1024 * 1024, // 100MB (production ~1GB)
+		SegmentSize:           0,                 // 0 = one blob per file
 		MaxInflightBatches:    6,                 // Max batches queued
 		BloomFPRate:           0.01,              // 1% FP rate
 		BloomEstimatedKeys:    1_000_000,         // 1M keys → ~1.2 MB bloom

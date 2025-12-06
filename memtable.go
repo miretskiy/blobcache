@@ -106,18 +106,10 @@ retry:
 // doRotateUnderLock rotates the given memfile out
 // CALLER MUST HOLD mt.frozen.Lock()
 func (mt *MemTable) doRotateUnderLock(mf *memFile) {
-	for len(mt.frozen.inflight) >= mt.cache.cfg.MaxInflightBatches {
-		mt.frozen.cond.Wait()
-		// cond.Wait() released and re-acquired lock - active may have changed
-		// If mf is no longer active, another thread already rotated it
-		if mt.active.Load() != mf {
-			return
-		}
-	}
-
 	// Add to frozen list before swapping active (maintains visibility)
 	mt.frozen.inflight = append(mt.frozen.inflight, mf)
 
+	// Swap to new active immediately - new writes go to new memfile
 	newMf := &memFile{
 		data: skipmap.NewString[[]byte](),
 	}
@@ -125,6 +117,13 @@ func (mt *MemTable) doRotateUnderLock(mf *memFile) {
 		panic(fmt.Errorf("active map changed under lock: expected %p found %p", mf, old))
 	}
 
+	// Wait for space in flush queue (after swap, so new writes don't block)
+	// After swap, mf can never be active again, so no need to check after Wait()
+	for len(mt.frozen.inflight) > mt.cache.cfg.MaxInflightBatches {
+		mt.frozen.cond.Wait()
+	}
+
+	// Send to flush workers
 	select {
 	case mt.flushCh <- mf:
 	default:
@@ -198,10 +197,15 @@ func (mt *MemTable) flushMemFile(mf *memFile) {
 			return true // Continue with other entries
 		}
 
+		// Get position for index (segment mode returns segmentID+pos, per-blob returns zeros)
+		pos := mt.blobWriter.Pos()
+
 		records = append(records, index.Record{
-			Key:   k,
-			Size:  len(value),
-			CTime: now,
+			Key:       k,
+			SegmentID: pos.SegmentID,
+			Pos:       pos.Pos,
+			Size:      len(value),
+			CTime:     now,
 		})
 		return true
 	})

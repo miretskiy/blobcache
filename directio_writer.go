@@ -84,3 +84,8 @@ func (w *DirectIOWriter) Write(key base.Key, value []byte) error {
 
 	return nil
 }
+
+// Pos returns empty position (per-blob mode doesn't use segments)
+func (w *DirectIOWriter) Pos() WritePosition {
+	return WritePosition{}
+}

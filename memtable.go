@@ -110,21 +110,24 @@ retry:
 // doRotateUnderLock rotates the given memfile out
 // CALLER MUST HOLD mt.frozen.Lock()
 func (mt *MemTable) doRotateUnderLock(mf *memFile) {
+	// Wait for space FIRST, before modifying any state
+	for len(mt.frozen.inflight) >= mt.cache.cfg.MaxInflightBatches {
+		mt.frozen.cond.Wait()
+		// After Wait(), check if another thread already rotated this mf
+		if mt.active.Load() != mf {
+			return // Already rotated by another thread
+		}
+	}
+
 	// Add to frozen list before swapping active (maintains visibility)
 	mt.frozen.inflight = append(mt.frozen.inflight, mf)
 
-	// Swap to new active immediately - new writes go to new memfile
+	// Swap to new active
 	newMf := &memFile{
 		data: skipmap.NewString[[]byte](),
 	}
 	if old := mt.active.Swap(newMf); old != mf {
 		panic(fmt.Errorf("active map changed under lock: expected %p found %p", mf, old))
-	}
-
-	// Wait for space in flush queue (after swap, so new writes don't block)
-	// After swap, mf can never be active again, so no need to check after Wait()
-	for len(mt.frozen.inflight) > mt.cache.cfg.MaxInflightBatches {
-		mt.frozen.cond.Wait()
 	}
 
 	// Send to flush workers
@@ -245,15 +248,31 @@ func (mt *MemTable) removeFrozen(target *memFile) {
 // Drain waits for all memfiles to be flushed
 func (mt *MemTable) Drain() {
 	mt.frozen.Lock()
+	defer mt.frozen.Unlock()
+
+	// Send active directly if it has data (no need to rotate/create new active)
 	mf := mt.active.Load()
 	if mf.size.Load() > 0 {
-		mt.doRotateUnderLock(mf)
+		// Wait for space in inflight
+		for len(mt.frozen.inflight) >= mt.cache.cfg.MaxInflightBatches {
+			mt.frozen.cond.Wait()
+		}
+
+		// Add to frozen
+		mt.frozen.inflight = append(mt.frozen.inflight, mf)
+
+		// Create empty active (drain context, no more writes expected)
+		emptyMf := &memFile{data: skipmap.NewString[[]byte]()}
+		mt.active.Store(emptyMf)
+
+		// Send to flush
+		mt.flushCh <- mf
 	}
 
+	// Wait for all inflight to be processed
 	for len(mt.frozen.inflight) > 0 {
 		mt.frozen.cond.Wait()
 	}
-	mt.frozen.Unlock()
 }
 
 // Close shuts down workers and waits for completion

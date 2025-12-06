@@ -25,7 +25,7 @@ func TestCache_DirectIOWrites(t *testing.T) {
 	cache.Drain()
 
 	// Read it back
-	retrieved, found := cache.Get(key)
+	retrieved, found := readAll(t, cache, key)
 	require.True(t, found)
 	require.Equal(t, value, retrieved)
 }
@@ -50,7 +50,7 @@ func TestCache_DirectIOWithLargeValue(t *testing.T) {
 	cache.Drain()
 
 	// Read it back and verify
-	retrieved, found := cache.Get(key)
+	retrieved, found := readAll(t, cache, key)
 	require.True(t, found)
 	require.Equal(t, value, retrieved)
 }
@@ -75,7 +75,7 @@ func TestCache_DirectIOWithUnalignedValue(t *testing.T) {
 	cache.Drain()
 
 	// Read it back and verify size and content
-	retrieved, found := cache.Get(key)
+	retrieved, found := readAll(t, cache, key)
 	require.True(t, found)
 	require.Equal(t, 5000, len(retrieved), "Size should be exact, not padded")
 	require.Equal(t, value, retrieved)

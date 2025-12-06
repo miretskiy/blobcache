@@ -1,13 +1,10 @@
 package blobcache
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"testing"
 
-	"github.com/miretskiy/blobcache/base"
-	"github.com/miretskiy/blobcache/index"
 	"github.com/stretchr/testify/require"
 )
 
@@ -38,18 +35,7 @@ func TestCache_SegmentMode(t *testing.T) {
 	// Read them back and verify
 	for i := 0; i < 10; i++ {
 		key := []byte(fmt.Sprintf("key-%d", i))
-		value, found := cache.Get(key)
-		if !found {
-			t.Logf("DEBUG: key-%d not found, checking why...", i)
-			// Try to see if it's in index
-			k := base.NewKey(key, cache.cfg.Shards)
-			var entry index.Entry
-			if err := cache.index.Get(context.Background(), k, &entry); err != nil {
-				t.Logf("  Index lookup failed: %v", err)
-			} else {
-				t.Logf("  Found in index: segmentID=%d, pos=%d, size=%d", entry.SegmentID, entry.Pos, entry.Size)
-			}
-		}
+		value, found := readAll(t, cache, key)
 		require.True(t, found, "key-%d should be found", i)
 		require.Equal(t, 1024*1024, len(value), "key-%d size mismatch", i)
 
@@ -90,7 +76,7 @@ func TestCache_SegmentModeWithDirectIO(t *testing.T) {
 	// Verify all keys
 	for i, size := range sizes {
 		key := []byte(fmt.Sprintf("key-%d", i))
-		value, found := cache.Get(key)
+		value, found := readAll(t, cache, key)
 		require.True(t, found, "key-%d should be found", i)
 		require.Equal(t, size, len(value), "key-%d size mismatch", i)
 

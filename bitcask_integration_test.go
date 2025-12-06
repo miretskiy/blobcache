@@ -27,7 +27,7 @@ func TestCache_WithBitcaskIndex(t *testing.T) {
 	cache.Drain()
 
 	// Read it back
-	retrieved, found := cache.Get(key)
+	retrieved, found := readAll(t, cache, key)
 	require.True(t, found)
 	require.Equal(t, value, retrieved)
 }

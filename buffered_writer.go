@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/miretskiy/blobcache/base"
 )
@@ -28,7 +29,8 @@ func (w *BufferedWriter) Write(key base.Key, value []byte) error {
 	shardDir := fmt.Sprintf("shard-%03d", key.ShardID())
 	blobFile := fmt.Sprintf("%d.blob", key.FileID())
 	shardPath := filepath.Join(w.basePath, "blobs", shardDir)
-	tempPath := filepath.Join(shardPath, fmt.Sprintf(".tmp-%d.blob", key.FileID()))
+	// Include timestamp to avoid collisions on retry
+	tempPath := filepath.Join(shardPath, fmt.Sprintf(".tmp-%d-%d.blob", key.FileID(), time.Now().UnixNano()))
 	finalPath := filepath.Join(shardPath, blobFile)
 
 	// Write to temp file

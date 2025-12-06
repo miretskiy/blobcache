@@ -2,6 +2,7 @@ package blobcache
 
 import (
 	"fmt"
+	"io"
 	"math/rand"
 	"os"
 	"sync/atomic"
@@ -66,9 +67,15 @@ func Benchmark_Mixed(b *testing.B) {
 					idx := rng.Intn(len(myKeys))
 					keyID := myKeys[idx]
 					key := []byte(fmt.Sprintf("w-%d-key-%d", workerID, keyID))
-					_, found := cache.Get(key)
+					reader, found := cache.Get(key)
 					numReads.Add(1)
 					if found {
+						// Consume the reader to simulate real usage
+						io.Copy(io.Discard, reader)
+						// Close to avoid FD exhaustion with many reads
+						if closer, ok := reader.(io.Closer); ok {
+							closer.Close()
+						}
 						numFound.Add(1)
 					} else {
 						k := base.NewKey(key, cache.cfg.Shards)
@@ -85,10 +92,12 @@ func Benchmark_Mixed(b *testing.B) {
 		}
 	})
 
+	b.Logf("done with loop; drain")
 	cache.Drain() // include drain time to flush the rest of the data.
 	duration := time.Since(start)
 	b.StopTimer()
 
 	writeThroughput := float64(numWrites.Load()) / duration.Seconds() / 1024 // GB/s
 	b.ReportMetric(writeThroughput, "write-GB/s")
+	b.Logf("done with benchmark")
 }

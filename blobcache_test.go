@@ -3,6 +3,7 @@ package blobcache
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -12,6 +13,24 @@ import (
 	"github.com/miretskiy/blobcache/index"
 	"github.com/stretchr/testify/require"
 )
+
+// Helper to read all bytes from Get()
+func readAll(t *testing.T, cache *Cache, key []byte) ([]byte, bool) {
+	reader, found := cache.Get(key)
+	if !found {
+		return nil, false
+	}
+
+	data, err := io.ReadAll(reader)
+	require.NoError(t, err)
+
+	// Close if it's a Closer
+	if closer, ok := reader.(io.Closer); ok {
+		closer.Close()
+	}
+
+	return data, true
+}
 
 func TestNew_CreatesDirectories(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "blobcache-test-*")
@@ -145,7 +164,7 @@ func TestCache_PutGet(t *testing.T) {
 	cache.Drain()
 
 	// Get
-	retrieved, found := cache.Get(key)
+	retrieved, found := readAll(t, cache, key)
 	require.True(t, found)
 	require.Equal(t, value, retrieved)
 }
@@ -489,7 +508,7 @@ func TestCache_MemTableEnabled(t *testing.T) {
 	cache.Put([]byte("key"), []byte("value"))
 
 	// Should read from memtable immediately (before flush)
-	data, found := cache.Get([]byte("key"))
+	data, found := readAll(t, cache, []byte("key"))
 	require.True(t, found)
 	require.Equal(t, []byte("value"), data)
 }
@@ -521,7 +540,7 @@ func TestCache_MemTableBuffered(t *testing.T) {
 
 	for i := 0; i < 10; i++ {
 		key := []byte(fmt.Sprintf("key-%d", i))
-		data, found := cache2.Get(key)
+		data, found := readAll(t, cache2, key)
 		require.True(t, found)
 		require.Equal(t, []byte(fmt.Sprintf("value-%d", i)), data)
 	}
@@ -545,7 +564,7 @@ func TestCache_MemTableUnbuffered(t *testing.T) {
 	require.NoError(t, err)
 	defer cache2.Close()
 
-	data, found := cache2.Get([]byte("key"))
+	data, found := readAll(t, cache2, []byte("key"))
 	require.True(t, found)
 	require.Equal(t, []byte("value"), data)
 }

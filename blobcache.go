@@ -1,8 +1,10 @@
 package blobcache
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -16,10 +18,11 @@ import (
 
 // Cache is a high-performance blob storage with bloom filter optimization
 type Cache struct {
-	cfg      config
-	index    index.Indexer
-	bloom    atomic.Pointer[bloom.Filter]
-	memTable *MemTable
+	cfg        config
+	index      index.Indexer
+	blobReader BlobReader
+	bloom      atomic.Pointer[bloom.Filter]
+	memTable   *MemTable
 
 	// Background workers
 	stopCh chan struct{}
@@ -54,10 +57,19 @@ func New(path string, opts ...Option) (*Cache, error) {
 		return nil, fmt.Errorf("failed to open index: %w", err)
 	}
 
+	// Create blob reader based on config
+	var blobReader BlobReader
+	if cfg.SegmentSize > 0 {
+		blobReader = NewSegmentReader(path)
+	} else {
+		blobReader = NewBufferedReader(path, cfg.Shards)
+	}
+
 	c := &Cache{
-		cfg:    cfg,
-		index:  idx,
-		stopCh: make(chan struct{}),
+		cfg:        cfg,
+		index:      idx,
+		blobReader: blobReader,
+		stopCh:     make(chan struct{}),
 	}
 
 	// Load or rebuild bloom filter
@@ -115,7 +127,12 @@ func (c *Cache) Close() error {
 		fmt.Printf("Warning: failed to save bloom filter: %v\n", err)
 	}
 
-	// Close index (DuckDB)
+	// Close blob reader (releases cached file handles)
+	if c.blobReader != nil {
+		c.blobReader.Close()
+	}
+
+	// Close index
 	if c.index != nil {
 		return c.index.Close()
 	}
@@ -380,9 +397,10 @@ func (c *Cache) UnsafePut(key, value []byte) {
 	c.memTable.Put(key, value)
 }
 
-// Get retrieves a value by key
-// Returns (value, true) if found, (nil, false) if not found
-func (c *Cache) Get(key []byte) ([]byte, bool) {
+// Get retrieves a value by key as a Reader
+// Returns (reader, true) if found, (nil, false) if not found
+// For file-backed readers, caller should close when done
+func (c *Cache) Get(key []byte) (io.Reader, bool) {
 	// 1. Check bloom filter (lock-free, <1 ns)
 	bloom := c.bloom.Load()
 	if !bloom.Test(key) {
@@ -391,43 +409,19 @@ func (c *Cache) Get(key []byte) ([]byte, bool) {
 
 	// 2. Check memtable (recent writes)
 	if value, found := c.memTable.Get(key); found {
-		return value, true
+		return bytes.NewReader(value), true
 	}
 
-	// 3. Read from disk (per-blob or segment based on config)
+	// 3. Read from disk using BlobReader
 	k := base.NewKey(key, c.cfg.Shards)
 
+	// For segment mode, need index lookup
+	var entry index.Entry
 	if c.cfg.SegmentSize > 0 {
-		// Segment mode: lookup in index to get (segmentID, pos, size)
-		var entry index.Entry
 		if err := c.index.Get(context.Background(), k, &entry); err != nil {
 			return nil, false
 		}
-
-		// Read from segment file at position
-		segmentPath := filepath.Join(c.cfg.Path, "segments", fmt.Sprintf("%d.seg", entry.SegmentID))
-		file, err := os.Open(segmentPath)
-		if err != nil {
-			return nil, false
-		}
-		defer file.Close()
-
-		data := make([]byte, entry.Size)
-		n, err := file.ReadAt(data, entry.Pos)
-		if err != nil || n != entry.Size {
-			return nil, false
-		}
-		return data, true
-	} else {
-		// Per-blob mode: deterministic path from key
-		shardDir := fmt.Sprintf("shard-%03d", k.ShardID())
-		blobFile := fmt.Sprintf("%d.blob", k.FileID())
-		blobPath := filepath.Join(c.cfg.Path, "blobs", shardDir, blobFile)
-
-		data, err := os.ReadFile(blobPath)
-		if err != nil {
-			return nil, false
-		}
-		return data, true
 	}
+
+	return c.blobReader.Get(k, &entry)
 }

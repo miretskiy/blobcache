@@ -14,16 +14,13 @@ import (
 // SegmentReader reads blobs from segment files with file handle caching
 type SegmentReader struct {
 	basePath string
-
-	mu    sync.RWMutex
-	cache map[int64]*os.File // segmentID -> open file handle
+	cache    sync.Map // segmentID (int64) -> *os.File
 }
 
 // NewSegmentReader creates a segment reader
 func NewSegmentReader(basePath string) *SegmentReader {
 	return &SegmentReader{
 		basePath: basePath,
-		cache:    make(map[int64]*os.File),
 	}
 }
 
@@ -42,42 +39,52 @@ func (r *SegmentReader) Get(key base.Key, entry *index.Entry) (io.Reader, bool) 
 
 // getSegmentFile returns cached file or opens it
 func (r *SegmentReader) getSegmentFile(segmentID int64) (*os.File, error) {
-	// Check cache with read lock
-	r.mu.RLock()
-	if file, ok := r.cache[segmentID]; ok {
-		r.mu.RUnlock()
-		return file, nil
-	}
-	r.mu.RUnlock()
-
-	// Open file with write lock
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	// Double-check after acquiring write lock
-	if file, ok := r.cache[segmentID]; ok {
-		return file, nil
+	// Check cache
+	if cached, ok := r.cache.Load(segmentID); ok {
+		return cached.(*os.File), nil
 	}
 
-	// Open segment file
-	segmentPath := filepath.Join(r.basePath, "segments", fmt.Sprintf("%d.seg", segmentID))
+	// Find segment file with workerID suffix
+	pattern := filepath.Join(r.basePath, "segments", fmt.Sprintf("%d-*.seg", segmentID))
+	matches, err := filepath.Glob(pattern)
+	if err != nil || len(matches) == 0 {
+		return nil, fmt.Errorf("segment file not found for ID %d", segmentID)
+	}
+
+	segmentPath := matches[0] // Take first match
 	file, err := os.Open(segmentPath)
 	if err != nil {
 		return nil, err
 	}
 
-	r.cache[segmentID] = file
+	// Store in cache (LoadOrStore handles race)
+	actual, _ := r.cache.LoadOrStore(segmentID, file)
+	if actual != file {
+		// Another goroutine opened it first, close ours and use theirs
+		file.Close()
+		return actual.(*os.File), nil
+	}
+
 	return file, nil
 }
 
 // Close closes all cached file handles
 func (r *SegmentReader) Close() error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	for _, file := range r.cache {
-		file.Close()
-	}
-	r.cache = make(map[int64]*os.File)
+	r.cache.Range(func(key, value any) bool {
+		if file, ok := value.(*os.File); ok {
+			file.Close()
+		}
+		r.cache.Delete(key)
+		return true
+	})
 	return nil
+}
+
+// RemoveSegment closes and removes a segment from cache (called when segment is deleted)
+func (r *SegmentReader) RemoveSegment(segmentID int64) {
+	if cached, ok := r.cache.LoadAndDelete(segmentID); ok {
+		if file, ok := cached.(*os.File); ok {
+			file.Close()
+		}
+	}
 }

@@ -44,10 +44,11 @@ func (w *SegmentWriter) openNewSegment() error {
 		}
 	}
 
-	// Generate segment ID: timestamp
+	// Generate segment ID: timestamp-workerID for uniqueness
 	w.currentID = time.Now().UnixNano()
 
-	segmentPath := filepath.Join(w.basePath, "segments", fmt.Sprintf("%d.seg", w.currentID))
+	// Flat directory structure for segments
+	segmentPath := filepath.Join(w.basePath, "segments", fmt.Sprintf("%d-%02d.seg", w.currentID, w.workerID))
 
 	var err error
 	if w.useDirectIO {
@@ -99,7 +100,7 @@ func (w *SegmentWriter) Write(key base.Key, value []byte) error {
 
 		var buf []byte
 		if len(value) == paddedSize && isAligned(value) {
-			// Already padded and aligned
+			// Already padded and aligned (fast path)
 			buf = value
 		} else {
 			// Allocate aligned+padded buffer

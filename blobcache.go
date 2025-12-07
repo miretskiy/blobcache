@@ -172,7 +172,7 @@ func checkOrInitialize(cfg config) error {
 		}
 	}
 
-	// Create shard directories
+	// Create shard directories for blobs
 	for i := 0; i < cfg.Shards; i++ {
 		shardDir := filepath.Join(cfg.Path, "blobs", fmt.Sprintf("shard-%03d", i))
 		if err := os.MkdirAll(shardDir, 0o755); err != nil {

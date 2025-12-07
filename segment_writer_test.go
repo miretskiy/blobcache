@@ -2,6 +2,7 @@ package blobcache
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/miretskiy/blobcache/base"
@@ -14,7 +15,7 @@ func TestSegmentWriter_Buffered(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	// Create segments directory
-	segDir := tmpDir + "/segments"
+	segDir := filepath.Join(tmpDir, "segments")
 	require.NoError(t, os.MkdirAll(segDir, 0755))
 
 	// Create segment writer with 10KB segments
@@ -53,7 +54,8 @@ func TestSegmentWriter_DirectIO(t *testing.T) {
 	require.NoError(t, err)
 	defer os.RemoveAll(tmpDir)
 
-	segDir := tmpDir + "/segments"
+	// Create segments directory
+	segDir := filepath.Join(tmpDir, "segments")
 	require.NoError(t, os.MkdirAll(segDir, 0755))
 
 	// Create segment writer with DirectIO
@@ -85,7 +87,8 @@ func TestSegmentWriter_MultipleSegments(t *testing.T) {
 	require.NoError(t, err)
 	defer os.RemoveAll(tmpDir)
 
-	segDir := tmpDir + "/segments"
+	// Create segments directory
+	segDir := filepath.Join(tmpDir, "segments")
 	require.NoError(t, os.MkdirAll(segDir, 0755))
 
 	// Small segment size to trigger multiple segments

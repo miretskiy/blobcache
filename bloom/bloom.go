@@ -4,15 +4,15 @@ import (
 	"encoding/binary"
 	"errors"
 	"math"
-	"sync"
+	"sync/atomic"
 
 	"github.com/cespare/xxhash/v2"
 )
 
-// Filter is a bloom filter with mutex protection for correctness
+// Filter is a lock-free bloom filter using atomic operations
+// Combines fastbloom's atomic CAS approach with RocksDB's FastLocalBloom algorithm
 type Filter struct {
-	mu   sync.RWMutex
-	data []uint32 // Bit vector
+	data []uint32 // Bit vector (accessed atomically)
 	m    uint     // Filter size in bits
 	k    uint     // Number of hash functions (probes)
 }
@@ -29,27 +29,37 @@ func New(estimatedKeys uint, fpRate float64) *Filter {
 	}
 }
 
-// Add inserts a key into the bloom filter
+// Add inserts a key into the bloom filter (lock-free, concurrent-safe)
 func (f *Filter) Add(key []byte) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
 	h := xxhash.Sum64(key)
 
 	for i := uint(0); i < f.k; i++ {
+		// RocksDB FastLocalBloom: use high bits for bit position
 		bit := uint(h>>23) % f.m
+
+		// Atomic bit set (fastbloom approach)
 		index := bit / 32
 		mask := uint32(1 << (bit % 32))
-		f.data[index] |= mask
+
+		// CAS loop to set bit atomically
+		for {
+			orig := atomic.LoadUint32(&f.data[index])
+			if orig&mask != 0 {
+				break // Bit already set
+			}
+			if atomic.CompareAndSwapUint32(&f.data[index], orig, orig|mask) {
+				break
+			}
+			// CAS failed (another writer won), retry
+		}
+
+		// RocksDB golden ratio multiply for next probe
 		h = h * 0x9e3779b9
 	}
 }
 
-// Test checks if a key might be in the set
+// Test checks if a key might be in the set (lock-free)
 func (f *Filter) Test(key []byte) bool {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-
 	h := xxhash.Sum64(key)
 
 	for i := uint(0); i < f.k; i++ {
@@ -57,7 +67,9 @@ func (f *Filter) Test(key []byte) bool {
 		index := bit / 32
 		mask := uint32(1 << (bit % 32))
 
-		if f.data[index]&mask == 0 {
+		// Atomic load (lock-free read!)
+		word := atomic.LoadUint32(&f.data[index])
+		if word&mask == 0 {
 			return false
 		}
 
@@ -67,16 +79,20 @@ func (f *Filter) Test(key []byte) bool {
 	return true
 }
 
-// Serialize returns the bloom filter as bytes
+// Serialize returns the bloom filter as bytes (caller controls storage)
 func (f *Filter) Serialize() ([]byte, error) {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
+	// Snapshot data atomically
+	snapshot := make([]uint32, len(f.data))
+	for i := range f.data {
+		snapshot[i] = atomic.LoadUint32(&f.data[i])
+	}
 
-	buf := make([]byte, 12+len(f.data)*4)
+	// Encode: [m:8][k:4][data...]
+	buf := make([]byte, 12+len(snapshot)*4)
 	binary.LittleEndian.PutUint64(buf[0:8], uint64(f.m))
 	binary.LittleEndian.PutUint32(buf[8:12], uint32(f.k))
 
-	for i, word := range f.data {
+	for i, word := range snapshot {
 		binary.LittleEndian.PutUint32(buf[12+i*4:], word)
 	}
 

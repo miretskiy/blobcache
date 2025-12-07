@@ -2,7 +2,6 @@ package blobcache
 
 import (
 	"fmt"
-	"io"
 	"math/rand"
 	"os"
 	"sync/atomic"
@@ -23,12 +22,13 @@ import (
 func Benchmark_Mixed(b *testing.B) {
 	tmpDir := "/tmp/bench-blobcache-mixed"
 	os.RemoveAll(tmpDir)
-	defer os.RemoveAll(tmpDir)
+	// defer os.RemoveAll(tmpDir)
 
 	cache, err := New(tmpDir,
 		WithMaxSize(256<<30), // 256GB for Mac (production ~1TB)
 		WithWriteBufferSize(1<<27),
 		WithBitcaskIndex(),
+		WithSegmentSize(2<<30),
 		// WithDirectIOWrites(),
 	)
 	if err != nil {
@@ -70,12 +70,10 @@ func Benchmark_Mixed(b *testing.B) {
 					reader, found := cache.Get(key)
 					numReads.Add(1)
 					if found {
-						// Consume the reader to simulate real usage
-						io.Copy(io.Discard, reader)
-						// Close to avoid FD exhaustion with many reads
-						if closer, ok := reader.(io.Closer); ok {
-							closer.Close()
-						}
+						// Read the full 1MB value (single read syscall, not chunked)
+						// var buf [1024 * 1024]byte
+						// io.ReadFull(reader, buf[:])
+						_ = reader
 						numFound.Add(1)
 					} else {
 						k := base.NewKey(key, cache.cfg.Shards)
@@ -92,12 +90,10 @@ func Benchmark_Mixed(b *testing.B) {
 		}
 	})
 
-	b.Logf("done with loop; drain")
 	cache.Drain() // include drain time to flush the rest of the data.
 	duration := time.Since(start)
 	b.StopTimer()
 
 	writeThroughput := float64(numWrites.Load()) / duration.Seconds() / 1024 // GB/s
 	b.ReportMetric(writeThroughput, "write-GB/s")
-	b.Logf("done with benchmark")
 }

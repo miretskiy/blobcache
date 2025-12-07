@@ -42,14 +42,22 @@ func New(path string, opts ...Option) (*Cache, error) {
 		return nil, fmt.Errorf("initialization failed: %w", err)
 	}
 
-	// Open index (DuckDB or Bitcask based on config)
+	// Open index (DuckDB, Bitcask, or Skipmap based on config)
 	idx, err := func() (index.Indexer, error) {
+		if cfg.UseSkipmapIndex {
+			// Durable skipmap backed by Bitcask for segments
+			if cfg.SegmentSize > 0 {
+				return index.NewDurableSkipmapIndex(path)
+			}
+			// Pure in-memory for per-blob mode
+			return index.NewSkipmapIndex(), nil
+		}
 		if cfg.UseBitcaskIndex {
 			return index.NewBitcaskIndex(path)
 		}
 		// DuckDB index doesn't support segments yet
 		if cfg.SegmentSize > 0 {
-			panic("Segment mode requires Bitcask index (use WithBitcaskIndex())")
+			panic("Segment mode requires Bitcask or Skipmap index")
 		}
 		return index.NewDuckDBIndex(path)
 	}()

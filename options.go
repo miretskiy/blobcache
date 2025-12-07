@@ -24,6 +24,7 @@ type config struct {
 	VerifyOnRead          bool
 	DirectIOWrites        bool // Use DirectIO for writes
 	UseBitcaskIndex       bool // Use Bitcask instead of DuckDB for index
+	UseSkipmapIndex       bool // Use in-memory skipmap index (fastest, no persistence)
 }
 
 // Option configures BlobCache
@@ -152,6 +153,15 @@ func WithBitcaskIndex() Option {
 	})
 }
 
+// WithSkipmapIndex uses pure in-memory skipmap for index (default: false)
+// Fastest index option but no persistence - requires segment mode
+// Index rebuilt from segments on restart
+func WithSkipmapIndex() Option {
+	return funcOpt(func(c *config) {
+		c.UseSkipmapIndex = true
+	})
+}
+
 // WithOrphanCleanupInterval sets how often orphaned files are cleaned (default: 24h, 0 = disabled)
 func WithOrphanCleanupInterval(d time.Duration) Option {
 	return funcOpt(func(c *config) {
@@ -204,5 +214,6 @@ func defaultConfig(path string) config {
 		VerifyOnRead:          false,
 		DirectIOWrites:        false,
 		UseBitcaskIndex:       false,
+		UseSkipmapIndex:       false,
 	}
 }

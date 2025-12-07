@@ -27,7 +27,8 @@ func Benchmark_Mixed(b *testing.B) {
 	cache, err := New(tmpDir,
 		WithMaxSize(256<<30), // 256GB for Mac (production ~1TB)
 		WithWriteBufferSize(1<<27),
-		WithBitcaskIndex(),
+		// WithBitcaskIndex(),
+		WithSkipmapIndex(),
 		WithSegmentSize(2<<30),
 		// WithDirectIOWrites(),
 	)

@@ -3,8 +3,6 @@ package blobcache
 import (
 	"fmt"
 	"os"
-	"path/filepath"
-	"time"
 
 	"github.com/miretskiy/blobcache/base"
 	"github.com/ncw/directio"
@@ -12,17 +10,15 @@ import (
 
 // DirectIOWriter writes blobs using DirectIO with aligned writes, truncate, and atomic rename
 type DirectIOWriter struct {
-	basePath string
-	shards   int
-	fsync    bool
+	paths BlobPaths
+	fsync bool
 }
 
 // NewDirectIOWriter creates a DirectIO blob writer
 func NewDirectIOWriter(basePath string, shards int, fsync bool) *DirectIOWriter {
 	return &DirectIOWriter{
-		basePath: basePath,
-		shards:   shards,
-		fsync:    fsync,
+		paths: BlobPaths(basePath),
+		fsync: fsync,
 	}
 }
 
@@ -30,13 +26,8 @@ func NewDirectIOWriter(basePath string, shards int, fsync bool) *DirectIOWriter 
 
 // Write writes a blob atomically using DirectIO with temp file + truncate + rename
 func (w *DirectIOWriter) Write(key base.Key, value []byte) error {
-	// Build file paths
-	shardDir := fmt.Sprintf("shard-%03d", key.ShardID())
-	blobFile := fmt.Sprintf("%d.blob", key.FileID())
-	shardPath := filepath.Join(w.basePath, "blobs", shardDir)
-	// Include timestamp to avoid collisions on retry
-	tempPath := filepath.Join(shardPath, fmt.Sprintf(".tmp-%d-%d.blob", key.FileID(), time.Now().UnixNano()))
-	finalPath := filepath.Join(shardPath, blobFile)
+	tempPath := w.paths.TempBlobPath(key)
+	finalPath := w.paths.BlobPath(key)
 
 	// Open temp file with DirectIO
 	f, err := directio.OpenFile(tempPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)

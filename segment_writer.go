@@ -3,7 +3,6 @@ package blobcache
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/miretskiy/blobcache/base"
@@ -12,7 +11,7 @@ import (
 
 // SegmentWriter writes multiple blobs into large segment files
 type SegmentWriter struct {
-	basePath    string
+	paths       SegmentPaths
 	segmentSize int64
 	useDirectIO bool
 	fsync       bool
@@ -31,7 +30,7 @@ func NewSegmentWriter(
 	basePath string, segmentSize int64, useDirectIO bool, fsync bool, workerID int,
 ) *SegmentWriter {
 	return &SegmentWriter{
-		basePath:    basePath,
+		paths:       SegmentPaths(basePath),
 		segmentSize: segmentSize,
 		useDirectIO: useDirectIO,
 		fsync:       fsync,
@@ -48,11 +47,11 @@ func (w *SegmentWriter) openNewSegment() error {
 		}
 	}
 
-	// Generate segment ID: timestamp-workerID for uniqueness
+	// Generate segment ID: timestamp for uniqueness
 	w.currentID = time.Now().UnixNano()
 
-	// Flat directory structure for segments
-	segmentPath := filepath.Join(w.basePath, "segments", fmt.Sprintf("%d-%02d.seg", w.currentID, w.workerID))
+	// Get segment path from path manager
+	segmentPath := w.paths.SegmentPath(w.currentID, w.workerID)
 
 	var err error
 	if w.useDirectIO {

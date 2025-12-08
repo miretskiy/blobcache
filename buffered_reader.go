@@ -3,11 +3,9 @@ package blobcache
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"hash"
 	"io"
 	"os"
-	"path/filepath"
 
 	"github.com/miretskiy/blobcache/base"
 	"github.com/miretskiy/blobcache/index"
@@ -15,8 +13,7 @@ import (
 
 // BufferedReader reads blobs from individual shard files
 type BufferedReader struct {
-	basePath     string
-	shards       int
+	paths        BlobPaths
 	index        index.Indexer
 	checksumHash func() hash.Hash32
 	verifyOnRead bool
@@ -25,8 +22,7 @@ type BufferedReader struct {
 // NewBufferedReader creates a buffered blob reader
 func NewBufferedReader(basePath string, shards int, idx index.Indexer, checksumHash func() hash.Hash32, verifyOnRead bool) *BufferedReader {
 	return &BufferedReader{
-		basePath:     basePath,
-		shards:       shards,
+		paths:        BlobPaths(basePath),
 		index:        idx,
 		checksumHash: checksumHash,
 		verifyOnRead: verifyOnRead,
@@ -35,13 +31,8 @@ func NewBufferedReader(basePath string, shards int, idx index.Indexer, checksumH
 
 // Get reads a blob from its deterministic shard/file path
 func (r *BufferedReader) Get(key base.Key) (io.Reader, bool) {
-	// Build path from key
-	shardDir := fmt.Sprintf("shard-%03d", key.ShardID())
-	blobFile := fmt.Sprintf("%d.blob", key.FileID())
-	blobPath := filepath.Join(r.basePath, "blobs", shardDir, blobFile)
-
 	// Read file data
-	data, err := os.ReadFile(blobPath)
+	data, err := os.ReadFile(r.paths.BlobPath(key))
 	if err != nil {
 		return nil, false
 	}

@@ -100,32 +100,34 @@ func TestSkipmapIndex_PutBatch(t *testing.T) {
 	require.Equal(t, int64(100), entry.Pos)
 }
 
-func TestSkipmapIndex_GetOldestRecords(t *testing.T) {
+func TestSkipmapIndex_Scan(t *testing.T) {
 	idx := NewSkipmapIndex()
 	defer idx.Close()
 
 	ctx := context.Background()
 	const numShards = 256
 
-	// Put records with different ctimes
+	// Put records
 	now := time.Now().UnixNano()
 	idx.Put(ctx, base.NewKey([]byte("key1"), numShards), &Record{Size: 100, CTime: now})
 	idx.Put(ctx, base.NewKey([]byte("key2"), numShards), &Record{Size: 200, CTime: now + 1000})
 	idx.Put(ctx, base.NewKey([]byte("key3"), numShards), &Record{Size: 300, CTime: now + 2000})
 
-	// Get oldest 2
-	it := idx.GetOldestRecords(ctx, 2)
-	defer it.Close()
-
-	require.True(t, it.Next())
-	rec1, err := it.Record()
+	// Scan all records
+	var scanned []Record
+	err := idx.Scan(ctx, func(rec Record) error {
+		scanned = append(scanned, rec)
+		return nil
+	})
 	require.NoError(t, err)
-	require.Equal(t, 100, rec1.Size)
+	require.Equal(t, 3, len(scanned))
 
-	require.True(t, it.Next())
-	rec2, err := it.Record()
-	require.NoError(t, err)
-	require.Equal(t, 200, rec2.Size)
-
-	require.False(t, it.Next())
+	// Verify all records present
+	sizes := make(map[int]bool)
+	for _, rec := range scanned {
+		sizes[rec.Size] = true
+	}
+	require.True(t, sizes[100])
+	require.True(t, sizes[200])
+	require.True(t, sizes[300])
 }

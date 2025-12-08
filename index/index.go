@@ -25,10 +25,8 @@ type Indexer interface {
 	Get(ctx context.Context, key base.Key, record *Record) error
 	Delete(ctx context.Context, key base.Key) error
 	Close() error
-	TotalSizeOnDisk(ctx context.Context) (int64, error)
-	GetOldestRecords(ctx context.Context, limit int) RecordIterator
-	GetAllKeys(ctx context.Context) ([][]byte, error)
 	PutBatch(ctx context.Context, records []Record) error
+	Scan(ctx context.Context, fn func(Record) error) error
 }
 
 // KeyValue holds a key with metadata for bulk insert

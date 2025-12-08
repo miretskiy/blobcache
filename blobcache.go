@@ -18,11 +18,12 @@ import (
 
 // Cache is a high-performance blob storage with bloom filter optimization
 type Cache struct {
-	cfg        config
-	index      index.Indexer
-	blobReader BlobReader
-	bloom      atomic.Pointer[bloom.Filter]
-	memTable   *MemTable
+	cfg             config
+	index           index.Indexer
+	blobReader      BlobReader
+	bloom           atomic.Pointer[bloom.Filter]
+	memTable        *MemTable
+	storageStrategy StorageStrategy
 
 	// Size tracking for reactive eviction
 	approxSize      atomic.Int64 // Approximate total size (updated during flush/eviction)
@@ -71,11 +72,20 @@ func New(path string, opts ...Option) (*Cache, error) {
 		blobReader = NewBufferedReader(path, cfg.Shards, idx, cfg.ChecksumHash, cfg.VerifyOnRead)
 	}
 
+	// Create storage strategy for eviction
+	var strategy StorageStrategy
+	if cfg.SegmentSize > 0 {
+		strategy = NewSegmentStorage(path, idx)
+	} else {
+		strategy = NewBlobStorage(path, cfg.Shards, idx)
+	}
+
 	c := &Cache{
-		cfg:        cfg,
-		index:      idx,
-		blobReader: blobReader,
-		stopCh:     make(chan struct{}),
+		cfg:             cfg,
+		index:           idx,
+		blobReader:      blobReader,
+		storageStrategy: strategy,
+		stopCh:          make(chan struct{}),
 	}
 
 	// Load or rebuild bloom filter
@@ -85,9 +95,12 @@ func New(path string, opts ...Option) (*Cache, error) {
 	}
 
 	// Initialize approximate size for reactive eviction
-	if totalSize, err := idx.TotalSizeOnDisk(context.Background()); err == nil {
-		c.approxSize.Store(totalSize)
-	}
+	var totalSize int64
+	idx.Scan(context.Background(), func(rec index.Record) error {
+		totalSize += int64(rec.Size)
+		return nil
+	})
+	c.approxSize.Store(totalSize)
 
 	c.memTable = c.newMemTable()
 
@@ -221,23 +234,15 @@ func (c *Cache) loadBloom(ctx context.Context) error {
 
 // rebuildBloom scans all keys from index and builds new bloom filter
 func (c *Cache) rebuildBloom(ctx context.Context) error {
-	// Get all keys from index
-	keys, err := c.index.GetAllKeys(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to get keys from index: %w", err)
-	}
+	// Create new bloom filter
+	filter := bloom.New(uint(c.cfg.BloomEstimatedKeys), c.cfg.BloomFPRate)
 
-	// Create new bloom filter with estimated size
-	estimatedKeys := len(keys)
-	if estimatedKeys < c.cfg.BloomEstimatedKeys {
-		estimatedKeys = c.cfg.BloomEstimatedKeys
-	}
-
-	filter := bloom.New(uint(estimatedKeys), c.cfg.BloomFPRate)
-
-	// Put all keys
-	for _, key := range keys {
-		filter.Add(key)
+	// Scan index and add all keys to bloom
+	if err := c.index.Scan(ctx, func(rec index.Record) error {
+		filter.Add(rec.Key)
+		return nil
+	}); err != nil {
+		return fmt.Errorf("failed to scan index: %w", err)
 	}
 
 	c.bloom.Store(filter)
@@ -292,166 +297,30 @@ func (c *Cache) runEviction(ctx context.Context) error {
 	}
 	defer c.evictionRunning.Store(false)
 
-	totalSize, err := c.index.TotalSizeOnDisk(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to get total size: %w", err)
-	}
+	// Compute total size by scanning index
+	var totalSize int64
+	c.index.Scan(ctx, func(rec index.Record) error {
+		totalSize += int64(rec.Size)
+		return nil
+	})
 
 	if totalSize <= c.cfg.MaxSize {
 		return nil // Under limit
 	}
 
-	// Need to evict - calculate how much to remove with hysteresis
-	// Hysteresis prevents thrashing at the boundary
+	// Calculate how much to remove with hysteresis
 	toEvictBytes := totalSize - c.cfg.MaxSize
 	toEvictBytes += int64(float64(c.cfg.MaxSize) * c.cfg.EvictionHysteresis)
 
-	evictedBytes := int64(0)
-	evictedCount := 0
-
-	// Segment mode: evict entire segments at a time
-	if c.cfg.SegmentSize > 0 {
-		return c.evictSegments(ctx, toEvictBytes)
-	}
-
-	// Per-blob mode: evict individual blobs
-	batchSize := 1000
-	for evictedBytes < toEvictBytes {
-		// Get next batch of oldest records
-		it := c.index.GetOldestRecords(ctx, batchSize)
-		if it.Err() != nil {
-			return fmt.Errorf("failed to get oldest records: %w", it.Err())
-		}
-
-		batchEvicted := 0
-		for it.Next() && evictedBytes < toEvictBytes {
-			record, err := it.Record()
-			if err != nil {
-				it.Close()
-				return fmt.Errorf("failed to get record: %w", err)
-			}
-
-			// Compute file path from key
-			k := base.NewKey(record.Key, c.cfg.Shards)
-			shardDir := fmt.Sprintf("shard-%03d", k.ShardID())
-			blobFile := fmt.Sprintf("%d.blob", k.FileID())
-			blobPath := filepath.Join(c.cfg.Path, "blobs", shardDir, blobFile)
-
-			// Delete blob file
-			if err := os.Remove(blobPath); err != nil && !os.IsNotExist(err) {
-				fmt.Printf("Warning: failed to delete blob %s: %v\n", blobPath, err)
-			}
-
-			// Delete from index
-			if err := c.index.Delete(ctx, k); err != nil {
-				// Log warning but continue
-				fmt.Printf("Warning: failed to delete key from index: %v\n", err)
-			}
-
-			evictedBytes += int64(record.Size)
-			evictedCount++
-			batchEvicted++
-		}
-
-		if err := it.Err(); err != nil {
-			it.Close()
-			return fmt.Errorf("iteration error: %w", err)
-		}
-		it.Close()
-
-		// If batch was empty, we're done (no more entries)
-		if batchEvicted == 0 {
-			break
-		}
+	// Delegate to storage strategy
+	evictedBytes, err := c.storageStrategy.Evict(ctx, toEvictBytes)
+	if err != nil {
+		return err
 	}
 
 	// Update approximate size tracking
 	c.approxSize.Add(-evictedBytes)
 
-	fmt.Printf("Evicted %d entries (%d MB)\n", evictedCount, evictedBytes/(1024*1024))
-	return nil
-}
-
-// evictSegments evicts entire segments for segment-mode caches
-func (c *Cache) evictSegments(ctx context.Context, toEvictBytes int64) error {
-	evictedBytes := int64(0)
-	evictedSegments := 0
-	evictedRecords := 0
-
-	// Track which segments we've already evicted
-	evictedSegmentIDs := make(map[int64]bool)
-
-	batchSize := 1000
-	for evictedBytes < toEvictBytes {
-		// Get oldest records
-		it := c.index.GetOldestRecords(ctx, batchSize)
-		if it.Err() != nil {
-			return fmt.Errorf("failed to get oldest records: %w", it.Err())
-		}
-
-		// Find the oldest segment we haven't evicted yet
-		var targetSegmentID int64 = -1
-		var segmentRecords []index.Record
-
-		for it.Next() {
-			record, err := it.Record()
-			if err != nil {
-				it.Close()
-				return fmt.Errorf("failed to get record: %w", err)
-			}
-
-			// Skip if we already evicted this segment
-			if evictedSegmentIDs[record.SegmentID] {
-				continue
-			}
-
-			// Find first unevicted segment (oldest)
-			if targetSegmentID == -1 {
-				targetSegmentID = record.SegmentID
-			}
-
-			// Collect all records for target segment
-			if record.SegmentID == targetSegmentID {
-				segmentRecords = append(segmentRecords, record)
-			}
-		}
-		it.Close()
-
-		// No more segments to evict
-		if targetSegmentID == -1 || len(segmentRecords) == 0 {
-			break
-		}
-
-		// Delete segment file
-		segmentPath := filepath.Join(c.cfg.Path, "segments", fmt.Sprintf("%d.seg", targetSegmentID))
-		if err := os.Remove(segmentPath); err != nil && !os.IsNotExist(err) {
-			fmt.Printf("Warning: failed to delete segment %s: %v\n", segmentPath, err)
-		}
-
-		// Delete all records for this segment from index
-		segmentBytes := int64(0)
-		for _, record := range segmentRecords {
-			k := base.NewKey(record.Key, c.cfg.Shards)
-			if err := c.index.Delete(ctx, k); err != nil {
-				fmt.Printf("Warning: failed to delete key from index: %v\n", err)
-			}
-			segmentBytes += int64(record.Size)
-			evictedRecords++
-		}
-
-		evictedBytes += segmentBytes
-		evictedSegments++
-		evictedSegmentIDs[targetSegmentID] = true
-
-		fmt.Printf("Evicted segment %d: %d records (%d MB)\n",
-			targetSegmentID, len(segmentRecords), segmentBytes/(1024*1024))
-	}
-
-	// Update approximate size tracking
-	c.approxSize.Add(-evictedBytes)
-
-	fmt.Printf("Evicted %d segments with %d records (%d MB total)\n",
-		evictedSegments, evictedRecords, evictedBytes/(1024*1024))
 	return nil
 }
 

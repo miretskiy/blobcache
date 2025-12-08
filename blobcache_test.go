@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/miretskiy/blobcache/bloom"
+	"github.com/miretskiy/blobcache/index"
 	"github.com/stretchr/testify/require"
 )
 
@@ -308,8 +309,11 @@ func TestCache_Eviction(t *testing.T) {
 	cache.Drain()
 
 	// Check size before eviction
-	totalSize, err := cache.index.TotalSizeOnDisk(ctx)
-	require.NoError(t, err)
+	var totalSize int64
+	cache.index.Scan(ctx, func(rec index.Record) error {
+		totalSize += int64(rec.Size)
+		return nil
+	})
 	require.Equal(t, int64(6*1024*1024), totalSize)
 
 	// Now set limit and trigger eviction manually
@@ -320,8 +324,11 @@ func TestCache_Eviction(t *testing.T) {
 	require.NoError(t, err)
 
 	// Check size after eviction (should be under limit with hysteresis)
-	totalSize, err = cache.index.TotalSizeOnDisk(ctx)
-	require.NoError(t, err)
+	totalSize = 0
+	cache.index.Scan(ctx, func(rec index.Record) error {
+		totalSize += int64(rec.Size)
+		return nil
+	})
 	// With 10% hysteresis, should evict to ~4.5MB (5MB - 10% of 5MB)
 	require.Less(t, totalSize, int64(4600000))
 

@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
-	"sort"
 
 	"go.mills.io/bitcask/v2"
 
@@ -115,95 +114,20 @@ func (idx *BitcaskIndex) Close() error {
 	return idx.db.Close()
 }
 
-// TotalSizeOnDisk returns the total size of all entries
-func (idx *BitcaskIndex) TotalSizeOnDisk(ctx context.Context) (int64, error) {
-	var total int64
-	err := idx.db.Scan(nil, func(key bitcask.Key) error {
+// Scan iterates over all records in the index
+func (idx *BitcaskIndex) Scan(ctx context.Context, fn func(Record) error) error {
+	return idx.db.Scan(nil, func(key bitcask.Key) error {
 		value, err := idx.db.Get(key)
 		if err != nil {
 			return err
 		}
-		var entry Record
-		decodeValue(value, &entry)
-		total += int64(entry.Size)
-		return nil
-	})
-	return total, err
-}
-
-// GetAllKeys returns all keys for bloom filter reconstruction
-func (idx *BitcaskIndex) GetAllKeys(ctx context.Context) ([][]byte, error) {
-	var keys [][]byte
-	err := idx.db.Scan(nil, func(key bitcask.Key) error {
+		var record Record
 		keyCopy := make([]byte, len(key))
 		copy(keyCopy, key)
-		keys = append(keys, keyCopy)
-		return nil
+		record.Key = keyCopy
+		decodeValue(value, &record)
+		return fn(record)
 	})
-	return keys, err
-}
-
-// GetOldestRecords returns iterator over N oldest records by ctime for eviction
-func (idx *BitcaskIndex) GetOldestRecords(ctx context.Context, limit int) RecordIterator {
-	// Bitcask doesn't support ordered iteration, so scan all and sort in memory
-	var entries []Record
-
-	err := idx.db.Scan(nil, func(key bitcask.Key) error {
-		value, err := idx.db.Get(key)
-		if err != nil {
-			return err
-		}
-		var entry Record
-		keyCopy := make([]byte, len(key))
-		copy(keyCopy, key)
-		entry.Key = keyCopy
-		decodeValue(value, &entry)
-		entries = append(entries, entry)
-		return nil
-	})
-	if err != nil {
-		return &BitcaskRecordIterator{err: err}
-	}
-
-	// Sort by ctime ascending (oldest first)
-	sort.Slice(entries, func(i, j int) bool {
-		return entries[i].CTime < entries[j].CTime
-	})
-
-	// Limit results
-	if len(entries) > limit {
-		entries = entries[:limit]
-	}
-
-	// Return iterator
-	return &BitcaskRecordIterator{entries: entries, idx: -1}
-}
-
-// BitcaskRecordIterator implements iteration over sorted in-memory records
-type BitcaskRecordIterator struct {
-	entries []Record
-	idx     int
-	err     error
-}
-
-func (it *BitcaskRecordIterator) Next() bool {
-	it.idx++
-	return it.idx < len(it.entries)
-}
-
-func (it *BitcaskRecordIterator) Record() (Record, error) {
-	if it.idx >= len(it.entries) {
-		return Record{}, fmt.Errorf("iterator exhausted")
-	}
-	return it.entries[it.idx], nil
-}
-
-func (it *BitcaskRecordIterator) Err() error {
-	return it.err
-}
-
-func (it *BitcaskRecordIterator) Close() error {
-	return nil
 }
 
 // PutBatch inserts multiple records

@@ -1,0 +1,175 @@
+package blobcache
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+
+	"github.com/miretskiy/blobcache/base"
+	"github.com/miretskiy/blobcache/index"
+)
+
+// StorageStrategy handles storage-specific operations (eviction, path generation)
+type StorageStrategy interface {
+	// Evict removes oldest data until targetBytes freed
+	// Returns actual bytes evicted
+	Evict(ctx context.Context, targetBytes int64) (int64, error)
+}
+
+// BlobStorage implements per-blob storage strategy
+type BlobStorage struct {
+	paths  BlobPaths
+	shards int
+	index  index.Indexer
+}
+
+// NewBlobStorage creates a per-blob storage strategy
+func NewBlobStorage(basePath string, shards int, idx index.Indexer) *BlobStorage {
+	return &BlobStorage{
+		paths:  BlobPaths(basePath),
+		shards: shards,
+		index:  idx,
+	}
+}
+
+// Evict removes oldest blobs until targetBytes freed
+func (s *BlobStorage) Evict(ctx context.Context, targetBytes int64) (int64, error) {
+	// Scan all records and collect them
+	var records []index.Record
+	if err := s.index.Scan(ctx, func(rec index.Record) error {
+		records = append(records, rec)
+		return nil
+	}); err != nil {
+		return 0, fmt.Errorf("failed to scan index: %w", err)
+	}
+
+	// Sort by ctime (oldest first)
+	sort.Slice(records, func(i, j int) bool {
+		return records[i].CTime < records[j].CTime
+	})
+
+	// Evict oldest until target reached
+	evictedBytes := int64(0)
+	evictedCount := 0
+
+	for _, record := range records {
+		if evictedBytes >= targetBytes {
+			break
+		}
+
+		// Delete blob file using centralized path generation
+		k := base.NewKey(record.Key, s.shards)
+		if err := os.Remove(s.paths.BlobPath(k)); err != nil && !os.IsNotExist(err) {
+			fmt.Printf("Warning: failed to delete blob %s: %v\n", s.paths.BlobPath(k), err)
+		}
+
+		// Delete from index
+		if err := s.index.Delete(ctx, k); err != nil {
+			fmt.Printf("Warning: failed to delete key from index: %v\n", err)
+		}
+
+		evictedBytes += int64(record.Size)
+		evictedCount++
+	}
+
+	fmt.Printf("Evicted %d blobs (%d MB)\n", evictedCount, evictedBytes/(1024*1024))
+	return evictedBytes, nil
+}
+
+// SegmentStorage implements segment-based storage strategy
+type SegmentStorage struct {
+	paths SegmentPaths
+	index index.Indexer
+}
+
+// NewSegmentStorage creates a segment storage strategy
+func NewSegmentStorage(basePath string, idx index.Indexer) *SegmentStorage {
+	return &SegmentStorage{
+		paths: SegmentPaths(basePath),
+		index: idx,
+	}
+}
+
+// Evict removes oldest segments until targetBytes freed
+func (s *SegmentStorage) Evict(ctx context.Context, targetBytes int64) (int64, error) {
+	// Scan index to build segment size map
+	segmentSizes := make(map[int64][]index.Record)
+
+	if err := s.index.Scan(ctx, func(rec index.Record) error {
+		segmentSizes[rec.SegmentID] = append(segmentSizes[rec.SegmentID], rec)
+		return nil
+	}); err != nil {
+		return 0, fmt.Errorf("failed to scan index: %w", err)
+	}
+
+	// Sort segments by minimum CTime (oldest record in segment)
+	type segmentInfo struct {
+		id      int64
+		minTime int64
+		records []index.Record
+		bytes   int64
+	}
+
+	var segments []segmentInfo
+	for segID, records := range segmentSizes {
+		minTime := records[0].CTime
+		totalBytes := int64(0)
+		for _, rec := range records {
+			if rec.CTime < minTime {
+				minTime = rec.CTime
+			}
+			totalBytes += int64(rec.Size)
+		}
+		segments = append(segments, segmentInfo{
+			id:      segID,
+			minTime: minTime,
+			records: records,
+			bytes:   totalBytes,
+		})
+	}
+
+	// Sort by minTime (oldest segments first)
+	sort.Slice(segments, func(i, j int) bool {
+		return segments[i].minTime < segments[j].minTime
+	})
+
+	// Evict segments until target reached
+	evictedBytes := int64(0)
+	evictedSegments := 0
+	evictedRecords := 0
+
+	for _, seg := range segments {
+		if evictedBytes >= targetBytes {
+			break
+		}
+
+		// Find and delete segment file using centralized path generation
+		matches, _ := filepath.Glob(s.paths.SegmentPattern(seg.id))
+		for _, segPath := range matches {
+			if err := os.Remove(segPath); err != nil && !os.IsNotExist(err) {
+				fmt.Printf("Warning: failed to delete segment %s: %v\n", segPath, err)
+			}
+		}
+
+		// Delete all records for this segment
+		for _, record := range seg.records {
+			k := base.NewKey(record.Key, 256) // Shard count doesn't matter for delete
+			if err := s.index.Delete(ctx, k); err != nil {
+				fmt.Printf("Warning: failed to delete key from index: %v\n", err)
+			}
+		}
+
+		evictedBytes += seg.bytes
+		evictedSegments++
+		evictedRecords += len(seg.records)
+
+		fmt.Printf("Evicted segment %d: %d records (%d MB)\n",
+			seg.id, len(seg.records), seg.bytes/(1024*1024))
+	}
+
+	fmt.Printf("Evicted %d segments with %d records (%d MB total)\n",
+		evictedSegments, evictedRecords, evictedBytes/(1024*1024))
+	return evictedBytes, nil
+}

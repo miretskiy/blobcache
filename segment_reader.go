@@ -16,7 +16,7 @@ import (
 
 // SegmentReader reads blobs from segment files with file handle caching
 type SegmentReader struct {
-	basePath     string
+	paths        SegmentPaths
 	cache        sync.Map // segmentID (int64) -> *os.File
 	index        index.Indexer
 	checksumHash func() hash.Hash32
@@ -26,7 +26,7 @@ type SegmentReader struct {
 // NewSegmentReader creates a segment reader
 func NewSegmentReader(basePath string, idx index.Indexer, checksumHash func() hash.Hash32, verifyOnRead bool) *SegmentReader {
 	return &SegmentReader{
-		basePath:     basePath,
+		paths:        SegmentPaths(basePath),
 		index:        idx,
 		checksumHash: checksumHash,
 		verifyOnRead: verifyOnRead,
@@ -75,8 +75,7 @@ func (r *SegmentReader) getSegmentFile(segmentID int64) (*os.File, error) {
 	}
 
 	// Find segment file with workerID suffix
-	pattern := filepath.Join(r.basePath, "segments", fmt.Sprintf("%d-*.seg", segmentID))
-	matches, err := filepath.Glob(pattern)
+	matches, err := filepath.Glob(r.paths.SegmentPattern(segmentID))
 	if err != nil || len(matches) == 0 {
 		return nil, fmt.Errorf("segment file not found for ID %d", segmentID)
 	}

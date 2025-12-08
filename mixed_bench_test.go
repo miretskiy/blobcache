@@ -20,17 +20,20 @@ import (
 //   - Total data: ~25.6 GB written
 //   - Cache limit: 256 GB (Mac) / production ~1TB
 func Benchmark_Mixed(b *testing.B) {
+	// Use /instance_storage on Graviton instances, /tmp otherwise
 	tmpDir := "/tmp/bench-blobcache-mixed"
+	if _, err := os.Stat("/instance_storage"); err == nil {
+		tmpDir = "/instance_storage/bench-blobcache-mixed"
+	}
 	os.RemoveAll(tmpDir)
-	// defer os.RemoveAll(tmpDir)
+	defer os.RemoveAll(tmpDir)
 
 	cache, err := New(tmpDir,
 		WithMaxSize(256<<30), // 256GB for Mac (production ~1TB)
 		WithWriteBufferSize(1<<27),
-		// WithBitcaskIndex(),
 		WithSkipmapIndex(),
 		WithSegmentSize(2<<30),
-		// WithDirectIOWrites(),
+		WithDirectIOWrites(), // Enable DirectIO
 	)
 	if err != nil {
 		b.Fatal(err)

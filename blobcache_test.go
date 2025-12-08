@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/miretskiy/blobcache/bloom"
-	"github.com/miretskiy/blobcache/index"
 	"github.com/stretchr/testify/require"
 )
 
@@ -136,14 +135,14 @@ func TestCache_CustomOptions(t *testing.T) {
 	cache, err := New(tmpDir,
 		WithShards(128),
 		WithBloomFPRate(0.001),
-		WithChecksums(false),
+		// Checksums disabled by default
 	)
 	require.NoError(t, err)
 	defer cache.Close()
 
 	require.Equal(t, 128, cache.cfg.Shards)
 	require.Equal(t, 0.001, cache.cfg.BloomFPRate)
-	require.False(t, cache.cfg.Checksums)
+	require.Nil(t, cache.cfg.ChecksumHash, "checksums should be disabled by default")
 }
 
 func TestCache_PutGet(t *testing.T) {
@@ -288,9 +287,8 @@ func TestCache_Eviction(t *testing.T) {
 	tmpDir, _ := os.MkdirTemp("", "blobcache-test-*")
 	defer os.RemoveAll(tmpDir)
 
-	// Create cache with 5MB limit and 10% hysteresis
+	// Create cache without size limit initially (to test eviction manually)
 	cache, err := New(tmpDir,
-		WithMaxSize(5*1024*1024),
 		WithEvictionHysteresis(0.1),
 	)
 	require.NoError(t, err)
@@ -299,7 +297,7 @@ func TestCache_Eviction(t *testing.T) {
 	ctx := context.Background()
 	value := make([]byte, 1024*1024) // 1MB
 
-	// Fill cache with 6 entries (6MB > 5MB limit)
+	// Fill cache with 6 entries (6MB)
 	for i := 0; i < 6; i++ {
 		key := []byte(fmt.Sprintf("key-%d", i))
 		cache.Put(key, value)
@@ -312,7 +310,10 @@ func TestCache_Eviction(t *testing.T) {
 	// Check size before eviction
 	totalSize, err := cache.index.TotalSizeOnDisk(ctx)
 	require.NoError(t, err)
-	require.Greater(t, totalSize, int64(5*1024*1024))
+	require.Equal(t, int64(6*1024*1024), totalSize)
+
+	// Now set limit and trigger eviction manually
+	cache.cfg.MaxSize = 5 * 1024 * 1024
 
 	// Run eviction
 	err = cache.runEviction(ctx)
@@ -372,122 +373,8 @@ func TestCache_BloomRefresh(t *testing.T) {
 
 //
 // Benchmarks for eviction and bloom refresh
+// (DuckDB-specific bulk population benchmarks removed after DuckDB removal)
 //
-
-// bulkPopulateIndex uses DuckDB's generate_series to quickly insert test data
-// ONLY for testing/benchmarking - bypasses normal Put() path
-func bulkPopulateIndex(cache *Cache, count int) error {
-	ctx := context.Background()
-	// Type assert to DuckDB index (this helper only works with DuckDB)
-	duckdbIndex, ok := cache.index.(*index.Index)
-	if !ok {
-		return fmt.Errorf("bulkPopulateIndex only works with DuckDB index")
-	}
-	db := duckdbIndex.TestingGetDB()
-
-	query := fmt.Sprintf(`
-		INSERT INTO entries (key, shard_id, file_id, size, ctime, mtime)
-		SELECT
-			CAST(CONCAT('key-', i) AS BLOB) as key,
-			i %% 256 as shard_id,
-			i as file_id,
-			1024 as size,
-			(1000000000 + i) as ctime,
-			(1000000000 + i) as mtime
-		FROM generate_series(0, %d) as s(i)
-	`, count-1)
-
-	_, err := db.ExecContext(ctx, query)
-	return err
-}
-
-func BenchmarkCache_BloomRebuild_1M(b *testing.B) {
-	tmpDir, _ := os.MkdirTemp("", "blobcache-bench-*")
-	defer os.RemoveAll(tmpDir)
-
-	cache, _ := New(tmpDir)
-	defer cache.Close()
-
-	// Bulk populate 1M keys using DuckDB generate_series (ONCE)
-	b.Logf("Bulk populating 1M keys...")
-	if err := bulkPopulateIndex(cache, 1_000_000); err != nil {
-		b.Fatal(err)
-	}
-	b.Logf("Done populating")
-
-	ctx := context.Background()
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
-		if err := cache.rebuildBloom(ctx); err != nil {
-			b.Fatal(err)
-		}
-	}
-}
-
-func BenchmarkIndex_TotalSizeOnDisk_1M(b *testing.B) {
-	tmpDir, _ := os.MkdirTemp("", "blobcache-bench-*")
-	defer os.RemoveAll(tmpDir)
-
-	cache, _ := New(tmpDir)
-	defer cache.Close()
-
-	// Bulk populate 1M keys using DuckDB generate_series (ONCE)
-	b.Logf("Bulk populating 1M keys...")
-	if err := bulkPopulateIndex(cache, 1_000_000); err != nil {
-		b.Fatal(err)
-	}
-	b.Logf("Done populating")
-
-	ctx := context.Background()
-	var totalSize int64
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
-		var err error
-		totalSize, err = cache.index.TotalSizeOnDisk(ctx)
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
-	_ = totalSize // Prevent elision
-}
-
-func BenchmarkIndex_GetOldestEntries_1M(b *testing.B) {
-	tmpDir, _ := os.MkdirTemp("", "blobcache-bench-*")
-	defer os.RemoveAll(tmpDir)
-
-	cache, _ := New(tmpDir)
-	defer cache.Close()
-
-	// Bulk populate 1M keys using DuckDB generate_series (ONCE)
-	b.Logf("Bulk populating 1M keys...")
-	if err := bulkPopulateIndex(cache, 1_000_000); err != nil {
-		b.Fatal(err)
-	}
-	b.Logf("Done populating")
-
-	ctx := context.Background()
-	var count int
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
-		it := cache.index.GetOldestEntries(ctx, 1000)
-		count = 0
-		for it.Next() {
-			_, err := it.Entry()
-			if err != nil {
-				b.Fatal(err)
-			}
-			count++
-		}
-		if err := it.Err(); err != nil {
-			b.Fatal(err)
-		}
-		it.Close()
-	}
-	_ = count // Prevent elision
-}
 
 //
 // Tests for memtable

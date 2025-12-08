@@ -19,7 +19,7 @@ func TestSegmentWriter_Buffered(t *testing.T) {
 	require.NoError(t, os.MkdirAll(segDir, 0755))
 
 	// Create segment writer with 10KB segments
-	writer := NewSegmentWriter(tmpDir, 10*1024, false, 0)
+	writer := NewSegmentWriter(tmpDir, 10*1024, false, false, 0)
 	defer writer.Close()
 
 	// Write multiple small values to same segment
@@ -59,7 +59,7 @@ func TestSegmentWriter_DirectIO(t *testing.T) {
 	require.NoError(t, os.MkdirAll(segDir, 0755))
 
 	// Create segment writer with DirectIO
-	writer := NewSegmentWriter(tmpDir, 1024*1024, true, 0)
+	writer := NewSegmentWriter(tmpDir, 1024*1024, true, false, 0)
 	defer writer.Close()
 
 	// Write value (tests leftover handling)
@@ -92,7 +92,7 @@ func TestSegmentWriter_MultipleSegments(t *testing.T) {
 	require.NoError(t, os.MkdirAll(segDir, 0755))
 
 	// Small segment size to trigger multiple segments
-	writer := NewSegmentWriter(tmpDir, 5000, false, 0)
+	writer := NewSegmentWriter(tmpDir, 5000, false, false, 0)
 	defer writer.Close()
 
 	segments := make(map[int64]bool)

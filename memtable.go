@@ -13,9 +13,16 @@ import (
 	"github.com/zhangyunhao116/skipmap"
 )
 
+// memEntry holds value and optional user-provided checksum
+type memEntry struct {
+	value       []byte
+	checksum    uint32 // User-provided checksum
+	hasChecksum bool   // True if checksum was explicitly provided by user
+}
+
 // memFile represents a single memtable with skipmap and size tracking
 type memFile struct {
-	data *skipmap.StringMap[[]byte]
+	data *skipmap.StringMap[*memEntry]
 	size atomic.Int64
 }
 
@@ -23,14 +30,14 @@ type memFile struct {
 func createBlobWriter(cfg config, workerID int) BlobWriter {
 	// Use segments if SegmentSize > 0
 	if cfg.SegmentSize > 0 {
-		return NewSegmentWriter(cfg.Path, cfg.SegmentSize, cfg.DirectIOWrites, workerID)
+		return NewSegmentWriter(cfg.Path, cfg.SegmentSize, cfg.DirectIOWrites, cfg.Fsync, workerID)
 	}
 
 	// Per-blob mode
 	if cfg.DirectIOWrites {
-		return NewDirectIOWriter(cfg.Path, cfg.Shards)
+		return NewDirectIOWriter(cfg.Path, cfg.Shards, cfg.Fsync)
 	}
-	return NewBufferedWriter(cfg.Path, cfg.Shards)
+	return NewBufferedWriter(cfg.Path, cfg.Shards, cfg.Fsync)
 }
 
 // MemTable provides async write buffering with in-memory read support
@@ -68,7 +75,7 @@ func (c *Cache) newMemTable() *MemTable {
 
 	// Initialize active memfile
 	mf := &memFile{
-		data: skipmap.NewString[[]byte](),
+		data: skipmap.NewString[*memEntry](),
 	}
 	mt.active.Store(mf)
 
@@ -82,14 +89,33 @@ func (c *Cache) newMemTable() *MemTable {
 	return mt
 }
 
-// Put stores key-value in memtable
+// Put stores key-value in memtable (checksum will be computed during flush)
 // Caller must ensure key and value are not modified after this call
 func (mt *MemTable) Put(key, value []byte) {
+	mt.putWithChecksum(key, value, nil)
+}
+
+// PutChecksummed stores key-value with an explicit checksum
+// Caller must ensure key and value are not modified after this call
+func (mt *MemTable) PutChecksummed(key, value []byte, checksum uint32) {
+	mt.putWithChecksum(key, value, &checksum)
+}
+
+// putWithChecksum is the internal implementation for Put and PutChecksummed
+// checksum may be nil (will be computed during flush if ChecksumHash configured)
+func (mt *MemTable) putWithChecksum(key, value []byte, checksum *uint32) {
 retry:
 	mf := mt.active.Load()
 
 	keyStr := unsafe.String(unsafe.SliceData(key), len(key))
-	mf.data.Store(keyStr, value)
+	entry := &memEntry{
+		value: value,
+	}
+	if checksum != nil {
+		entry.checksum = *checksum
+		entry.hasChecksum = true
+	}
+	mf.data.Store(keyStr, entry)
 
 	bloom := mt.cache.bloom.Load()
 	bloom.Add(key)
@@ -124,7 +150,7 @@ func (mt *MemTable) doRotateUnderLock(mf *memFile) {
 
 	// Swap to new active
 	newMf := &memFile{
-		data: skipmap.NewString[[]byte](),
+		data: skipmap.NewString[*memEntry](),
 	}
 	if old := mt.active.Swap(newMf); old != mf {
 		panic(fmt.Errorf("active map changed under lock: expected %p found %p", mf, old))
@@ -143,16 +169,16 @@ func (mt *MemTable) Get(key []byte) ([]byte, bool) {
 	keyStr := unsafe.String(unsafe.SliceData(key), len(key))
 
 	mf := mt.active.Load()
-	if value, ok := mf.data.Load(keyStr); ok {
-		return value, true
+	if entry, ok := mf.data.Load(keyStr); ok {
+		return entry.value, true
 	}
 
 	mt.frozen.RLock()
 	defer mt.frozen.RUnlock()
 
 	for i := len(mt.frozen.inflight) - 1; i >= 0; i-- {
-		if value, ok := mt.frozen.inflight[i].data.Load(keyStr); ok {
-			return value, true
+		if entry, ok := mt.frozen.inflight[i].data.Load(keyStr); ok {
+			return entry.value, true
 		}
 	}
 
@@ -194,7 +220,8 @@ func (mt *MemTable) flushMemFile(mf *memFile, writer BlobWriter) {
 	// Phase 1: Write all blob files and collect records for index
 	var records []index.Record
 
-	mf.data.Range(func(keyStr string, value []byte) bool {
+	mf.data.Range(func(keyStr string, entry *memEntry) bool {
+		value := entry.value
 		if len(value) == 0 {
 			return true
 		}
@@ -208,15 +235,33 @@ func (mt *MemTable) flushMemFile(mf *memFile, writer BlobWriter) {
 			return true // Continue with other entries
 		}
 
+		// Compute or use provided checksum
+		var checksum uint32
+		var hasChecksum bool
+
+		if entry.hasChecksum {
+			// User provided explicit checksum
+			checksum = entry.checksum
+			hasChecksum = true
+		} else if mt.cache.cfg.ChecksumHash != nil {
+			// Compute checksum using hash
+			h := mt.cache.cfg.ChecksumHash()
+			h.Write(value)
+			checksum = h.Sum32()
+			hasChecksum = true
+		}
+
 		// Get position for index (segment mode returns segmentID+pos, per-blob returns zeros)
 		pos := writer.Pos()
 
 		records = append(records, index.Record{
-			Key:       k,
-			SegmentID: pos.SegmentID,
-			Pos:       pos.Pos,
-			Size:      len(value),
-			CTime:     now,
+			Key:         k.Raw(),
+			SegmentID:   pos.SegmentID,
+			Pos:         pos.Pos,
+			Size:        len(value),
+			CTime:       now,
+			Checksum:    checksum,
+			HasChecksum: hasChecksum,
 		})
 		return true
 	})
@@ -228,6 +273,21 @@ func (mt *MemTable) flushMemFile(mf *memFile, writer BlobWriter) {
 
 	if err := mt.cache.index.PutBatch(ctx, records); err != nil {
 		fmt.Printf("Warning: index batch insert failed: %v\n", err)
+		return
+	}
+
+	// Phase 3: Update size tracking and trigger reactive eviction if needed
+	var addedBytes int64
+	for _, rec := range records {
+		addedBytes += int64(rec.Size)
+	}
+	newSize := mt.cache.approxSize.Add(addedBytes)
+
+	// Trigger eviction if over limit (reactive)
+	if mt.cache.cfg.MaxSize > 0 && newSize > mt.cache.cfg.MaxSize {
+		if err := mt.cache.runEviction(ctx); err != nil {
+			fmt.Printf("Warning: reactive eviction failed: %v\n", err)
+		}
 	}
 }
 
@@ -262,7 +322,7 @@ func (mt *MemTable) Drain() {
 		mt.frozen.inflight = append(mt.frozen.inflight, mf)
 
 		// Create empty active (drain context, no more writes expected)
-		emptyMf := &memFile{data: skipmap.NewString[[]byte]()}
+		emptyMf := &memFile{data: skipmap.NewString[*memEntry]()}
 		mt.active.Store(emptyMf)
 
 		// Send to flush
@@ -292,7 +352,7 @@ func (mt *MemTable) Close() error {
 func (mt *MemTable) TestingClearMemtable() {
 	// Create new empty memfile
 	newMf := &memFile{
-		data: skipmap.NewString[[]byte](),
+		data: skipmap.NewString[*memEntry](),
 	}
 	mt.active.Store(newMf)
 

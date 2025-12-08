@@ -15,6 +15,7 @@ type SegmentWriter struct {
 	basePath    string
 	segmentSize int64
 	useDirectIO bool
+	fsync       bool
 	workerID    int
 
 	// Current segment state
@@ -26,11 +27,14 @@ type SegmentWriter struct {
 }
 
 // NewSegmentWriter creates a segment writer for a specific worker
-func NewSegmentWriter(basePath string, segmentSize int64, useDirectIO bool, workerID int) *SegmentWriter {
+func NewSegmentWriter(
+	basePath string, segmentSize int64, useDirectIO bool, fsync bool, workerID int,
+) *SegmentWriter {
 	return &SegmentWriter{
 		basePath:    basePath,
 		segmentSize: segmentSize,
 		useDirectIO: useDirectIO,
+		fsync:       fsync,
 		workerID:    workerID,
 	}
 }
@@ -72,7 +76,17 @@ func (w *SegmentWriter) closeCurrentSegment() error {
 		return nil
 	}
 
-	// Just close - no leftover handling needed with per-blob padding
+	// Fdatasync on close if enabled (defensive)
+	// Buffered mode already fsyncs after each write, but sync again to be safe
+	// DirectIO mode doesn't need it but doesn't hurt
+	if w.fsync {
+		if err := fdatasync(w.currentFile); err != nil {
+			w.currentFile.Close()
+			return fmt.Errorf("failed to fdatasync segment: %w", err)
+		}
+	}
+
+	// Close file
 	if err := w.currentFile.Close(); err != nil {
 		return err
 	}
@@ -113,7 +127,7 @@ func (w *SegmentWriter) Write(key base.Key, value []byte) error {
 			return err
 		}
 		w.currentPos += int64(n)
-		// No leftover with this approach
+		// DirectIO doesn't need fdatasync (bypasses OS cache, writes directly to disk)
 	} else {
 		// Buffered write
 		w.lastWritePos = w.currentPos
@@ -124,6 +138,13 @@ func (w *SegmentWriter) Write(key base.Key, value []byte) error {
 			return err
 		}
 		w.currentPos += int64(n)
+
+		// Fdatasync after each write if enabled (not needed for DirectIO)
+		if w.fsync {
+			if err := fdatasync(w.currentFile); err != nil {
+				return fmt.Errorf("failed to fdatasync after write: %w", err)
+			}
+		}
 	}
 
 	return nil

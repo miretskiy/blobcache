@@ -14,13 +14,15 @@ import (
 type DirectIOWriter struct {
 	basePath string
 	shards   int
+	fsync    bool
 }
 
 // NewDirectIOWriter creates a DirectIO blob writer
-func NewDirectIOWriter(basePath string, shards int) *DirectIOWriter {
+func NewDirectIOWriter(basePath string, shards int, fsync bool) *DirectIOWriter {
 	return &DirectIOWriter{
 		basePath: basePath,
 		shards:   shards,
+		fsync:    fsync,
 	}
 }
 
@@ -62,6 +64,14 @@ func (w *DirectIOWriter) Write(key base.Key, value []byte) error {
 	if _, err := f.Write(bufToWrite); err != nil {
 		os.Remove(tempPath)
 		return fmt.Errorf("failed to write data: %w", err)
+	}
+
+	// Fdatasync if enabled (data only, not metadata)
+	if w.fsync {
+		if err := fdatasync(f); err != nil {
+			os.Remove(tempPath)
+			return fmt.Errorf("failed to fdatasync: %w", err)
+		}
 	}
 
 	// Close file before truncate

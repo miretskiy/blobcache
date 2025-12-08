@@ -24,12 +24,12 @@ func TestBitcaskIndex_PutGet(t *testing.T) {
 	key := base.NewKey([]byte("test-key"), numShards)
 	now := time.Now().UnixNano()
 
-	// Put an entry
-	err = idx.Put(ctx, key, 1024, now)
+	// Put a record
+	err = idx.Put(ctx, key, &Record{Size: 1024, CTime: now})
 	require.NoError(t, err)
 
 	// Get it back
-	var entry Entry
+	var entry Record
 	err = idx.Get(ctx, key, &entry)
 	require.NoError(t, err)
 
@@ -48,7 +48,7 @@ func TestBitcaskIndex_GetNotFound(t *testing.T) {
 
 	const numShards = 256
 	key := base.NewKey([]byte("nonexistent"), numShards)
-	var entry Entry
+	var entry Record
 	err = idx.Get(context.Background(), key, &entry)
 
 	require.ErrorIs(t, err, ErrNotFound)
@@ -67,14 +67,14 @@ func TestBitcaskIndex_Delete(t *testing.T) {
 
 	// Insert
 	now := time.Now().UnixNano()
-	idx.Put(ctx, key, 500, now)
+	idx.Put(ctx, key, &Record{Size: 500, CTime: now})
 
 	// Delete
 	err := idx.Delete(ctx, key)
 	require.NoError(t, err)
 
 	// Verify gone
-	var entry Entry
+	var entry Record
 	err = idx.Get(ctx, key, &entry)
 	require.ErrorIs(t, err, ErrNotFound)
 
@@ -98,11 +98,11 @@ func TestBitcaskIndex_TotalSizeOnDisk(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, int64(0), total)
 
-	// Put entries
+	// Put records
 	now := time.Now().UnixNano()
-	idx.Put(ctx, base.NewKey([]byte("key1"), numShards), 100, now)
-	idx.Put(ctx, base.NewKey([]byte("key2"), numShards), 200, now)
-	idx.Put(ctx, base.NewKey([]byte("key3"), numShards), 300, now)
+	idx.Put(ctx, base.NewKey([]byte("key1"), numShards), &Record{Size: 100, CTime: now})
+	idx.Put(ctx, base.NewKey([]byte("key2"), numShards), &Record{Size: 200, CTime: now})
+	idx.Put(ctx, base.NewKey([]byte("key3"), numShards), &Record{Size: 300, CTime: now})
 
 	total, err = idx.TotalSizeOnDisk(ctx)
 	require.NoError(t, err)
@@ -115,7 +115,7 @@ func TestBitcaskIndex_TotalSizeOnDisk(t *testing.T) {
 	require.Equal(t, int64(400), total)
 }
 
-func TestBitcaskIndex_GetOldestEntries(t *testing.T) {
+func TestBitcaskIndex_GetOldestRecords(t *testing.T) {
 	tmpDir, _ := os.MkdirTemp("", "bitcask-test-*")
 	defer os.RemoveAll(tmpDir)
 
@@ -125,25 +125,25 @@ func TestBitcaskIndex_GetOldestEntries(t *testing.T) {
 	ctx := context.Background()
 	const numShards = 256
 
-	// Put entries with different ctimes
+	// Put records with different ctimes
 	now := time.Now().UnixNano()
-	idx.Put(ctx, base.NewKey([]byte("key1"), numShards), 100, now)
-	idx.Put(ctx, base.NewKey([]byte("key2"), numShards), 200, now+1000)
-	idx.Put(ctx, base.NewKey([]byte("key3"), numShards), 300, now+2000)
+	idx.Put(ctx, base.NewKey([]byte("key1"), numShards), &Record{Size: 100, CTime: now})
+	idx.Put(ctx, base.NewKey([]byte("key2"), numShards), &Record{Size: 200, CTime: now + 1000})
+	idx.Put(ctx, base.NewKey([]byte("key3"), numShards), &Record{Size: 300, CTime: now + 2000})
 
-	// Get oldest 2 entries
-	it := idx.GetOldestEntries(ctx, 2)
+	// Get oldest 2 records
+	it := idx.GetOldestRecords(ctx, 2)
 	defer it.Close()
 
 	require.True(t, it.Next())
-	entry1, err := it.Entry()
+	rec1, err := it.Record()
 	require.NoError(t, err)
-	require.Equal(t, 100, entry1.Size) // Oldest (now)
+	require.Equal(t, 100, rec1.Size) // Oldest (now)
 
 	require.True(t, it.Next())
-	entry2, err := it.Entry()
+	rec2, err := it.Record()
 	require.NoError(t, err)
-	require.Equal(t, 200, entry2.Size) // Second oldest (now+1000)
+	require.Equal(t, 200, rec2.Size) // Second oldest (now+1000)
 
 	require.False(t, it.Next()) // Should only return 2
 }
@@ -164,15 +164,15 @@ func TestBitcaskIndex_PutBatch(t *testing.T) {
 	key2 := base.NewKey([]byte("key2"), numShards)
 
 	records := []Record{
-		{Key: key1, Size: 100, CTime: now},
-		{Key: key2, Size: 200, CTime: now + 1000},
+		{Key: key1.Raw(), Size: 100, CTime: now},
+		{Key: key2.Raw(), Size: 200, CTime: now + 1000},
 	}
 
 	err := idx.PutBatch(ctx, records)
 	require.NoError(t, err)
 
 	// Verify entries exist
-	var entry Entry
+	var entry Record
 	err = idx.Get(ctx, key1, &entry)
 	require.NoError(t, err)
 	require.Equal(t, 100, entry.Size)

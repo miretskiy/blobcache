@@ -1,7 +1,10 @@
 package blobcache
 
 import (
+	"bytes"
+	"context"
 	"fmt"
+	"hash"
 	"io"
 	"os"
 	"path/filepath"
@@ -13,28 +16,55 @@ import (
 
 // SegmentReader reads blobs from segment files with file handle caching
 type SegmentReader struct {
-	basePath string
-	cache    sync.Map // segmentID (int64) -> *os.File
+	basePath     string
+	cache        sync.Map // segmentID (int64) -> *os.File
+	index        index.Indexer
+	checksumHash func() hash.Hash32
+	verifyOnRead bool
 }
 
 // NewSegmentReader creates a segment reader
-func NewSegmentReader(basePath string) *SegmentReader {
+func NewSegmentReader(basePath string, idx index.Indexer, checksumHash func() hash.Hash32, verifyOnRead bool) *SegmentReader {
 	return &SegmentReader{
-		basePath: basePath,
+		basePath:     basePath,
+		index:        idx,
+		checksumHash: checksumHash,
+		verifyOnRead: verifyOnRead,
 	}
 }
 
 // Get reads a blob from a segment file at the specified position
-func (r *SegmentReader) Get(key base.Key, entry *index.Entry) (io.Reader, bool) {
+func (r *SegmentReader) Get(key base.Key) (io.Reader, bool) {
+	// Lookup position from index
+	var record index.Record
+	if err := r.index.Get(context.TODO(), key, &record); err != nil {
+		return nil, false
+	}
+
 	// Get or open segment file
-	file, err := r.getSegmentFile(entry.SegmentID)
+	file, err := r.getSegmentFile(record.SegmentID)
 	if err != nil {
 		return nil, false
 	}
 
-	// Return SectionReader for the blob's range in the file
-	// SectionReader doesn't close the underlying cached file
-	return io.NewSectionReader(file, entry.Pos, int64(entry.Size)), true
+	// Read blob data from segment
+	data := make([]byte, record.Size)
+	n, err := file.ReadAt(data, record.Pos)
+	if err != nil && err != io.EOF {
+		return nil, false
+	}
+	if n != record.Size {
+		return nil, false
+	}
+
+	reader := bytes.NewReader(data)
+
+	// Wrap with checksum verification if enabled
+	if r.verifyOnRead && r.checksumHash != nil && record.HasChecksum {
+		return newChecksumVerifyingReader(reader, r.checksumHash, record.Checksum), true
+	}
+
+	return reader, true
 }
 
 // getSegmentFile returns cached file or opens it

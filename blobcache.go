@@ -24,6 +24,10 @@ type Cache struct {
 	bloom      atomic.Pointer[bloom.Filter]
 	memTable   *MemTable
 
+	// Size tracking for reactive eviction
+	approxSize      atomic.Int64 // Approximate total size (updated during flush/eviction)
+	evictionRunning atomic.Bool  // Prevents concurrent evictions
+
 	// Background workers
 	stopCh chan struct{}
 	wg     sync.WaitGroup
@@ -42,7 +46,7 @@ func New(path string, opts ...Option) (*Cache, error) {
 		return nil, fmt.Errorf("initialization failed: %w", err)
 	}
 
-	// Open index (DuckDB, Bitcask, or Skipmap based on config)
+	// Open index (Bitcask or Skipmap based on config)
 	idx, err := func() (index.Indexer, error) {
 		if cfg.UseSkipmapIndex {
 			// Durable skipmap backed by Bitcask for segments
@@ -52,25 +56,19 @@ func New(path string, opts ...Option) (*Cache, error) {
 			// Pure in-memory for per-blob mode
 			return index.NewSkipmapIndex(), nil
 		}
-		if cfg.UseBitcaskIndex {
-			return index.NewBitcaskIndex(path)
-		}
-		// DuckDB index doesn't support segments yet
-		if cfg.SegmentSize > 0 {
-			panic("Segment mode requires Bitcask or Skipmap index")
-		}
-		return index.NewDuckDBIndex(path)
+		// Default to Bitcask index
+		return index.NewBitcaskIndex(path)
 	}()
 	if err != nil {
 		return nil, fmt.Errorf("failed to open index: %w", err)
 	}
 
-	// Create blob reader based on config
+	// Create blob reader based on config (readers hold index reference)
 	var blobReader BlobReader
 	if cfg.SegmentSize > 0 {
-		blobReader = NewSegmentReader(path)
+		blobReader = NewSegmentReader(path, idx, cfg.ChecksumHash, cfg.VerifyOnRead)
 	} else {
-		blobReader = NewBufferedReader(path, cfg.Shards)
+		blobReader = NewBufferedReader(path, cfg.Shards, idx, cfg.ChecksumHash, cfg.VerifyOnRead)
 	}
 
 	c := &Cache{
@@ -84,6 +82,11 @@ func New(path string, opts ...Option) (*Cache, error) {
 	if err := c.loadBloom(context.Background()); err != nil {
 		idx.Close()
 		return nil, fmt.Errorf("failed to load bloom: %w", err)
+	}
+
+	// Initialize approximate size for reactive eviction
+	if totalSize, err := idx.TotalSizeOnDisk(context.Background()); err == nil {
+		c.approxSize.Store(totalSize)
 	}
 
 	c.memTable = c.newMemTable()
@@ -283,6 +286,12 @@ func (c *Cache) runEviction(ctx context.Context) error {
 		return nil // Eviction disabled
 	}
 
+	// Prevent concurrent evictions (multiple flush workers could trigger)
+	if !c.evictionRunning.CompareAndSwap(false, true) {
+		return nil // Another eviction already running
+	}
+	defer c.evictionRunning.Store(false)
+
 	totalSize, err := c.index.TotalSizeOnDisk(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get total size: %w", err)
@@ -300,25 +309,30 @@ func (c *Cache) runEviction(ctx context.Context) error {
 	evictedBytes := int64(0)
 	evictedCount := 0
 
-	// Evict in batches until target reached
+	// Segment mode: evict entire segments at a time
+	if c.cfg.SegmentSize > 0 {
+		return c.evictSegments(ctx, toEvictBytes)
+	}
+
+	// Per-blob mode: evict individual blobs
 	batchSize := 1000
 	for evictedBytes < toEvictBytes {
-		// Get next batch of oldest entries
-		it := c.index.GetOldestEntries(ctx, batchSize)
+		// Get next batch of oldest records
+		it := c.index.GetOldestRecords(ctx, batchSize)
 		if it.Err() != nil {
-			return fmt.Errorf("failed to get oldest entries: %w", it.Err())
+			return fmt.Errorf("failed to get oldest records: %w", it.Err())
 		}
 
 		batchEvicted := 0
 		for it.Next() && evictedBytes < toEvictBytes {
-			entry, err := it.Entry()
+			record, err := it.Record()
 			if err != nil {
 				it.Close()
-				return fmt.Errorf("failed to get entry: %w", err)
+				return fmt.Errorf("failed to get record: %w", err)
 			}
 
 			// Compute file path from key
-			k := base.NewKey(entry.Key, c.cfg.Shards)
+			k := base.NewKey(record.Key, c.cfg.Shards)
 			shardDir := fmt.Sprintf("shard-%03d", k.ShardID())
 			blobFile := fmt.Sprintf("%d.blob", k.FileID())
 			blobPath := filepath.Join(c.cfg.Path, "blobs", shardDir, blobFile)
@@ -334,7 +348,7 @@ func (c *Cache) runEviction(ctx context.Context) error {
 				fmt.Printf("Warning: failed to delete key from index: %v\n", err)
 			}
 
-			evictedBytes += int64(entry.Size)
+			evictedBytes += int64(record.Size)
 			evictedCount++
 			batchEvicted++
 		}
@@ -351,7 +365,93 @@ func (c *Cache) runEviction(ctx context.Context) error {
 		}
 	}
 
+	// Update approximate size tracking
+	c.approxSize.Add(-evictedBytes)
+
 	fmt.Printf("Evicted %d entries (%d MB)\n", evictedCount, evictedBytes/(1024*1024))
+	return nil
+}
+
+// evictSegments evicts entire segments for segment-mode caches
+func (c *Cache) evictSegments(ctx context.Context, toEvictBytes int64) error {
+	evictedBytes := int64(0)
+	evictedSegments := 0
+	evictedRecords := 0
+
+	// Track which segments we've already evicted
+	evictedSegmentIDs := make(map[int64]bool)
+
+	batchSize := 1000
+	for evictedBytes < toEvictBytes {
+		// Get oldest records
+		it := c.index.GetOldestRecords(ctx, batchSize)
+		if it.Err() != nil {
+			return fmt.Errorf("failed to get oldest records: %w", it.Err())
+		}
+
+		// Find the oldest segment we haven't evicted yet
+		var targetSegmentID int64 = -1
+		var segmentRecords []index.Record
+
+		for it.Next() {
+			record, err := it.Record()
+			if err != nil {
+				it.Close()
+				return fmt.Errorf("failed to get record: %w", err)
+			}
+
+			// Skip if we already evicted this segment
+			if evictedSegmentIDs[record.SegmentID] {
+				continue
+			}
+
+			// Find first unevicted segment (oldest)
+			if targetSegmentID == -1 {
+				targetSegmentID = record.SegmentID
+			}
+
+			// Collect all records for target segment
+			if record.SegmentID == targetSegmentID {
+				segmentRecords = append(segmentRecords, record)
+			}
+		}
+		it.Close()
+
+		// No more segments to evict
+		if targetSegmentID == -1 || len(segmentRecords) == 0 {
+			break
+		}
+
+		// Delete segment file
+		segmentPath := filepath.Join(c.cfg.Path, "segments", fmt.Sprintf("%d.seg", targetSegmentID))
+		if err := os.Remove(segmentPath); err != nil && !os.IsNotExist(err) {
+			fmt.Printf("Warning: failed to delete segment %s: %v\n", segmentPath, err)
+		}
+
+		// Delete all records for this segment from index
+		segmentBytes := int64(0)
+		for _, record := range segmentRecords {
+			k := base.NewKey(record.Key, c.cfg.Shards)
+			if err := c.index.Delete(ctx, k); err != nil {
+				fmt.Printf("Warning: failed to delete key from index: %v\n", err)
+			}
+			segmentBytes += int64(record.Size)
+			evictedRecords++
+		}
+
+		evictedBytes += segmentBytes
+		evictedSegments++
+		evictedSegmentIDs[targetSegmentID] = true
+
+		fmt.Printf("Evicted segment %d: %d records (%d MB)\n",
+			targetSegmentID, len(segmentRecords), segmentBytes/(1024*1024))
+	}
+
+	// Update approximate size tracking
+	c.approxSize.Add(-evictedBytes)
+
+	fmt.Printf("Evicted %d segments with %d records (%d MB total)\n",
+		evictedSegments, evictedRecords, evictedBytes/(1024*1024))
 	return nil
 }
 
@@ -405,9 +505,25 @@ func (c *Cache) UnsafePut(key, value []byte) {
 	c.memTable.Put(key, value)
 }
 
+// PutChecksummed stores key-value with an explicit checksum (makes copies for safety)
+// The checksum will be validated if WithVerifyOnRead is enabled
+func (c *Cache) PutChecksummed(key, value []byte, checksum uint32) {
+	keyCopy := make([]byte, len(key))
+	copy(keyCopy, key)
+	valueCopy := make([]byte, len(value))
+	copy(valueCopy, value)
+	c.memTable.PutChecksummed(keyCopy, valueCopy, checksum)
+}
+
+// UnsafePutChecksummed stores key-value with checksum without copying
+// Caller must ensure key and value are not modified after this call
+func (c *Cache) UnsafePutChecksummed(key, value []byte, checksum uint32) {
+	c.memTable.PutChecksummed(key, value, checksum)
+}
+
 // Get retrieves a value by key as a Reader
 // Returns (reader, true) if found, (nil, false) if not found
-// For file-backed readers, caller should close when done
+// Checksums are verified internally if WithVerifyOnRead is enabled
 func (c *Cache) Get(key []byte) (io.Reader, bool) {
 	// 1. Check bloom filter (lock-free, <1 ns)
 	bloom := c.bloom.Load()
@@ -421,15 +537,7 @@ func (c *Cache) Get(key []byte) (io.Reader, bool) {
 	}
 
 	// 3. Read from disk using BlobReader
+	// Reader handles index lookup and checksum verification internally
 	k := base.NewKey(key, c.cfg.Shards)
-
-	// For segment mode, need index lookup
-	var entry index.Entry
-	if c.cfg.SegmentSize > 0 {
-		if err := c.index.Get(context.Background(), k, &entry); err != nil {
-			return nil, false
-		}
-	}
-
-	return c.blobReader.Get(k, &entry)
+	return c.blobReader.Get(k)
 }

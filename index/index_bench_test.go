@@ -30,7 +30,7 @@ func Benchmark_IndexLookup(b *testing.B) {
 	records := make([]Record, numKeys)
 	for i := 0; i < numKeys; i++ {
 		records[i] = Record{
-			Key:       keys[i],
+			Key:       keys[i].Raw(),
 			SegmentID: int64(i / 1000),
 			Pos:       int64((i % 1000) * 1024),
 			Size:      1024,
@@ -53,7 +53,7 @@ func Benchmark_IndexLookup(b *testing.B) {
 		b.ReportMetric(populateTime.Seconds(), "populate-sec")
 		b.StartTimer()
 
-		var entry Entry
+		var entry Record
 		for i := 0; i < b.N; i++ {
 			err := idx.Get(ctx, keys[i%numKeys], &entry)
 			if err != nil {
@@ -81,7 +81,7 @@ func Benchmark_IndexLookup(b *testing.B) {
 		b.ReportMetric(populateTime.Seconds(), "populate-sec")
 
 		b.StartTimer()
-		var entry Entry
+		var entry Record
 		for i := 0; i < b.N; i++ {
 			err := idx.Get(ctx, keys[i%numKeys], &entry)
 			if err != nil {
@@ -111,7 +111,7 @@ func Benchmark_IndexLookup(b *testing.B) {
 		b.ReportMetric(populateTime.Seconds(), "populate-sec")
 		b.StartTimer()
 
-		var entry Entry
+		var entry Record
 		for i := 0; i < b.N; i++ {
 			err := idx.Get(ctx, keys[i%numKeys], &entry)
 			if err != nil {

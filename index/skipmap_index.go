@@ -15,7 +15,7 @@ import (
 // Optionally backed by Bitcask for durability
 type SkipmapIndex struct {
 	// In-memory skipmap for fast lookups
-	data *skipmap.StringMap[*Entry]
+	data *skipmap.StringMap[*Record]
 
 	// Optional persistent backing store
 	bitcask *BitcaskIndex
@@ -24,7 +24,7 @@ type SkipmapIndex struct {
 // NewSkipmapIndex creates a pure in-memory skipmap index (no persistence)
 func NewSkipmapIndex() *SkipmapIndex {
 	return &SkipmapIndex{
-		data: skipmap.NewString[*Entry](),
+		data: skipmap.NewString[*Record](),
 	}
 }
 
@@ -38,7 +38,7 @@ func NewDurableSkipmapIndex(basePath string) (*SkipmapIndex, error) {
 	}
 
 	// Create skipmap
-	data := skipmap.NewString[*Entry]()
+	data := skipmap.NewString[*Record]()
 
 	// Load all entries from Bitcask into skipmap
 	ctx := context.Background()
@@ -49,7 +49,7 @@ func NewDurableSkipmapIndex(basePath string) (*SkipmapIndex, error) {
 	}
 
 	for _, keyBytes := range keys {
-		var entry Entry
+		var entry Record
 		k := base.NewKey(keyBytes, 256) // Reconstruct Key (shard count doesn't matter for Get)
 		if err := bitcask.Get(ctx, k, &entry); err != nil {
 			continue // Skip errors
@@ -66,27 +66,24 @@ func NewDurableSkipmapIndex(basePath string) (*SkipmapIndex, error) {
 	}, nil
 }
 
-// Put inserts or updates an entry
-func (idx *SkipmapIndex) Put(ctx context.Context, key base.Key, size int, ctime int64) error {
-	entry := &Entry{
-		Key:       key.Raw(),
-		SegmentID: 0,
-		Pos:       0,
-		Size:      size,
-		CTime:     ctime,
+// Put inserts or updates a record
+func (idx *SkipmapIndex) Put(ctx context.Context, key base.Key, record *Record) error {
+	// Set record key if not already set
+	if record.Key == nil {
+		record.Key = key.Raw()
 	}
 	keyStr := unsafe.String(unsafe.SliceData(key.Raw()), len(key.Raw()))
-	idx.data.Store(keyStr, entry)
+	idx.data.Store(keyStr, record)
 
 	// Write to Bitcask if durable
 	if idx.bitcask != nil {
-		return idx.bitcask.Put(ctx, key, size, ctime)
+		return idx.bitcask.Put(ctx, key, record)
 	}
 	return nil
 }
 
 // Get retrieves an entry
-func (idx *SkipmapIndex) Get(ctx context.Context, key base.Key, entry *Entry) error {
+func (idx *SkipmapIndex) Get(ctx context.Context, key base.Key, entry *Record) error {
 	keyStr := unsafe.String(unsafe.SliceData(key.Raw()), len(key.Raw()))
 	stored, ok := idx.data.Load(keyStr)
 	if !ok {
@@ -121,7 +118,7 @@ func (idx *SkipmapIndex) Close() error {
 // TotalSizeOnDisk returns total size of all entries
 func (idx *SkipmapIndex) TotalSizeOnDisk(ctx context.Context) (int64, error) {
 	var total atomic.Int64
-	idx.data.Range(func(key string, entry *Entry) bool {
+	idx.data.Range(func(key string, entry *Record) bool {
 		total.Add(int64(entry.Size))
 		return true
 	})
@@ -131,7 +128,7 @@ func (idx *SkipmapIndex) TotalSizeOnDisk(ctx context.Context) (int64, error) {
 // GetAllKeys returns all keys for bloom filter reconstruction
 func (idx *SkipmapIndex) GetAllKeys(ctx context.Context) ([][]byte, error) {
 	var keys [][]byte
-	idx.data.Range(func(key string, entry *Entry) bool {
+	idx.data.Range(func(key string, entry *Record) bool {
 		keyCopy := make([]byte, len(entry.Key))
 		copy(keyCopy, entry.Key)
 		keys = append(keys, keyCopy)
@@ -140,11 +137,11 @@ func (idx *SkipmapIndex) GetAllKeys(ctx context.Context) ([][]byte, error) {
 	return keys, nil
 }
 
-// GetOldestEntries returns iterator over N oldest entries by ctime
-func (idx *SkipmapIndex) GetOldestEntries(ctx context.Context, limit int) EntryIteratorInterface {
+// GetOldestRecords returns iterator over N oldest records by ctime
+func (idx *SkipmapIndex) GetOldestRecords(ctx context.Context, limit int) RecordIterator {
 	// Collect all entries and sort by ctime
-	var entries []*Entry
-	idx.data.Range(func(key string, entry *Entry) bool {
+	var entries []*Record
+	idx.data.Range(func(key string, entry *Record) bool {
 		entries = append(entries, entry)
 		return true
 	})
@@ -159,33 +156,33 @@ func (idx *SkipmapIndex) GetOldestEntries(ctx context.Context, limit int) EntryI
 		entries = entries[:limit]
 	}
 
-	return &SkipmapEntryIterator{entries: entries, idx: -1}
+	return &SkipmapRecordIterator{entries: entries, idx: -1}
 }
 
-// SkipmapEntryIterator iterates over in-memory sorted entries
-type SkipmapEntryIterator struct {
-	entries []*Entry
+// SkipmapRecordIterator iterates over in-memory sorted records
+type SkipmapRecordIterator struct {
+	entries []*Record
 	idx     int
 	err     error
 }
 
-func (it *SkipmapEntryIterator) Next() bool {
+func (it *SkipmapRecordIterator) Next() bool {
 	it.idx++
 	return it.idx < len(it.entries)
 }
 
-func (it *SkipmapEntryIterator) Entry() (Entry, error) {
+func (it *SkipmapRecordIterator) Record() (Record, error) {
 	if it.idx >= len(it.entries) {
-		return Entry{}, fmt.Errorf("iterator exhausted")
+		return Record{}, fmt.Errorf("iterator exhausted")
 	}
 	return *it.entries[it.idx], nil
 }
 
-func (it *SkipmapEntryIterator) Err() error {
+func (it *SkipmapRecordIterator) Err() error {
 	return it.err
 }
 
-func (it *SkipmapEntryIterator) Close() error {
+func (it *SkipmapRecordIterator) Close() error {
 	return nil
 }
 
@@ -193,14 +190,15 @@ func (it *SkipmapEntryIterator) Close() error {
 func (idx *SkipmapIndex) PutBatch(ctx context.Context, records []Record) error {
 	// Store in skipmap
 	for _, rec := range records {
-		entry := &Entry{
-			Key:       rec.Key.Raw(),
+		entry := &Record{
+			Key:       rec.Key,
 			SegmentID: rec.SegmentID,
 			Pos:       rec.Pos,
 			Size:      rec.Size,
 			CTime:     rec.CTime,
+			Checksum:  rec.Checksum,
 		}
-		keyStr := unsafe.String(unsafe.SliceData(rec.Key.Raw()), len(rec.Key.Raw()))
+		keyStr := unsafe.String(unsafe.SliceData(rec.Key), len(rec.Key))
 		idx.data.Store(keyStr, entry)
 	}
 

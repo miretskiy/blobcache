@@ -13,13 +13,15 @@ import (
 type BufferedWriter struct {
 	basePath string
 	shards   int
+	fsync    bool
 }
 
 // NewBufferedWriter creates a buffered blob writer
-func NewBufferedWriter(basePath string, shards int) *BufferedWriter {
+func NewBufferedWriter(basePath string, shards int, fsync bool) *BufferedWriter {
 	return &BufferedWriter{
 		basePath: basePath,
 		shards:   shards,
+		fsync:    fsync,
 	}
 }
 
@@ -34,8 +36,29 @@ func (w *BufferedWriter) Write(key base.Key, value []byte) error {
 	finalPath := filepath.Join(shardPath, blobFile)
 
 	// Write to temp file
-	if err := os.WriteFile(tempPath, value, 0o644); err != nil {
-		return fmt.Errorf("failed to write temp file: %w", err)
+	f, err := os.Create(tempPath)
+	if err != nil {
+		return fmt.Errorf("failed to create temp file: %w", err)
+	}
+
+	if _, err := f.Write(value); err != nil {
+		f.Close()
+		os.Remove(tempPath)
+		return fmt.Errorf("failed to write data: %w", err)
+	}
+
+	// Fdatasync if enabled (data only, not metadata)
+	if w.fsync {
+		if err := fdatasync(f); err != nil {
+			f.Close()
+			os.Remove(tempPath)
+			return fmt.Errorf("failed to fdatasync: %w", err)
+		}
+	}
+
+	if err := f.Close(); err != nil {
+		os.Remove(tempPath)
+		return fmt.Errorf("failed to close temp file: %w", err)
 	}
 
 	// Atomic rename to final location

@@ -2,6 +2,8 @@ package blobcache
 
 import (
 	"errors"
+	"hash"
+	"hash/crc32"
 	"time"
 )
 
@@ -19,12 +21,11 @@ type config struct {
 	BloomEstimatedKeys    int
 	BloomRefreshInterval  time.Duration
 	OrphanCleanupInterval time.Duration
-	Checksums             bool
+	ChecksumHash          func() hash.Hash32 // Factory for checksum hash (nil = disabled)
 	Fsync                 bool
 	VerifyOnRead          bool
 	DirectIOWrites        bool // Use DirectIO for writes
-	UseBitcaskIndex       bool // Use Bitcask instead of DuckDB for index
-	UseSkipmapIndex       bool // Use in-memory skipmap index (fastest, no persistence)
+	UseSkipmapIndex       bool // Use in-memory skipmap index (fastest, no persistence); Bitcask is the default
 }
 
 // Option configures BlobCache
@@ -105,14 +106,26 @@ func WithBloomRefreshInterval(d time.Duration) Option {
 	})
 }
 
-// WithChecksums enables/disables CRC32 checksums (default: true)
-func WithChecksums(enabled bool) Option {
+// WithChecksum enables CRC32 checksums (hardware accelerated)
+func WithChecksum() Option {
 	return funcOpt(func(c *config) {
-		c.Checksums = enabled
+		c.ChecksumHash = func() hash.Hash32 {
+			return crc32.NewIEEE()
+		}
 	})
 }
 
-// WithFsync enables/disables fsync on writes (default: false, cache semantics)
+// WithChecksumHash enables checksums with a custom hash factory
+// Example: WithChecksumHash(crc32.NewIEEE) or WithChecksumHash(xxhash.New)
+func WithChecksumHash(factory func() hash.Hash32) Option {
+	return funcOpt(func(c *config) {
+		c.ChecksumHash = factory
+	})
+}
+
+// WithFsync enables fdatasync on writes (default: false, cache semantics)
+// Uses fdatasync(2) on Linux and F_FULLFSYNC on Darwin for data durability
+// Note: Syncing data flushes only - metadata (mtime, etc.) not synced since immutable blobs don't need it
 func WithFsync(enabled bool) Option {
 	return funcOpt(func(c *config) {
 		c.Fsync = enabled
@@ -144,12 +157,11 @@ func WithDirectIOWrites() Option {
 	})
 }
 
-// WithBitcaskIndex uses Bitcask instead of DuckDB for index (default: false)
-// Bitcask provides simpler embedded storage with in-memory hash table
-// Note: GetOldestEntries requires full scan and sort in memory
+// WithBitcaskIndex is deprecated - Bitcask is now the default index
+// This option is kept for backwards compatibility but has no effect
 func WithBitcaskIndex() Option {
 	return funcOpt(func(c *config) {
-		c.UseBitcaskIndex = true
+		// No-op: Bitcask is now the default
 	})
 }
 
@@ -209,11 +221,10 @@ func defaultConfig(path string) config {
 		BloomEstimatedKeys:    1_000_000,         // 1M keys → ~1.2 MB bloom
 		BloomRefreshInterval:  10 * time.Minute,
 		OrphanCleanupInterval: 1 * time.Hour,
-		Checksums:             true,
+		ChecksumHash:          nil, // Disabled by default - use WithChecksum() or WithChecksumHash() to enable
 		Fsync:                 false,
 		VerifyOnRead:          false,
 		DirectIOWrites:        false,
-		UseBitcaskIndex:       false,
 		UseSkipmapIndex:       false,
 	}
 }

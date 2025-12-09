@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	
+	"github.com/stretchr/testify/require"
 )
 
 func TestBloom_AddTest(t *testing.T) {
@@ -235,4 +237,153 @@ func BenchmarkConcurrentAdd(b *testing.B) {
 			i++
 		}
 	})
+}
+
+func TestRecordAdditions_Basic(t *testing.T) {
+	filter := New(1000, 0.01)
+
+	// Start recording
+	stop, consume := filter.RecordAdditions()
+
+	// Add some keys while recording
+	filter.Add([]byte("key1"))
+	filter.Add([]byte("key2"))
+	filter.Add([]byte("key3"))
+
+	// Stop recording
+	stop()
+
+	// Create new filter and replay
+	newFilter := New(1000, 0.01)
+	consume(newFilter.AddHash)
+
+	// Verify all recorded keys are in new filter
+	require.True(t, newFilter.Test([]byte("key1")))
+	require.True(t, newFilter.Test([]byte("key2")))
+	require.True(t, newFilter.Test([]byte("key3")))
+}
+
+func TestRecordAdditions_ConcurrentAdds(t *testing.T) {
+	filter := New(10000, 0.01)
+
+	// Start recording
+	stop, consume := filter.RecordAdditions()
+
+	// Add keys concurrently
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				key := []byte{byte(id), byte(j)}
+				filter.Add(key)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	// Stop and consume
+	stop()
+
+	newFilter := New(10000, 0.01)
+	consume(newFilter.AddHash)
+
+	// Verify all 1000 keys present
+	for i := 0; i < 10; i++ {
+		for j := 0; j < 100; j++ {
+			key := []byte{byte(i), byte(j)}
+			require.True(t, newFilter.Test(key), "key %v should be present", key)
+		}
+	}
+}
+
+func TestRebuildBloom_ConcurrentWrites(t *testing.T) {
+	// Simulate rebuild scenario: existing keys + concurrent additions
+
+	// Initial filter with some keys
+	oldFilter := New(10000, 0.01)
+	for i := 0; i < 1000; i++ {
+		oldFilter.Add([]byte{byte(i >> 8), byte(i)})
+	}
+
+	// Start recording
+	stop, consume := oldFilter.RecordAdditions()
+
+	// Simulate concurrent writes during rebuild
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 1000; i < 1100; i++ {
+			oldFilter.Add([]byte{byte(i >> 8), byte(i)})
+		}
+	}()
+
+	// Build new filter from "index" (simulate first 1000 keys)
+	newFilter := New(10000, 0.01)
+	for i := 0; i < 1000; i++ {
+		newFilter.Add([]byte{byte(i >> 8), byte(i)})
+	}
+
+	// Wait for concurrent adds
+	wg.Wait()
+	stop()
+
+	// Replay recorded additions
+	consume(newFilter.AddHash)
+
+	// Verify all 1100 keys present (1000 from index + 100 concurrent)
+	for i := 0; i < 1100; i++ {
+		key := []byte{byte(i >> 8), byte(i)}
+		require.True(t, newFilter.Test(key), "key %d should be present", i)
+	}
+}
+
+func TestRecordAdditions_StopPreventsRecording(t *testing.T) {
+	filter := New(1000, 0.01)
+
+	stop, consume := filter.RecordAdditions()
+
+	// Add while recording
+	filter.Add([]byte("recorded"))
+
+	// Stop
+	stop()
+
+	// Add after stop (should NOT be recorded)
+	filter.Add([]byte("not-recorded"))
+
+	// Replay
+	newFilter := New(1000, 0.01)
+	consume(newFilter.AddHash)
+
+	// Only first key should be in new filter
+	require.True(t, newFilter.Test([]byte("recorded")))
+	require.False(t, newFilter.Test([]byte("not-recorded")))
+}
+
+func TestRecordAdditions_MultipleConsumes(t *testing.T) {
+	filter := New(1000, 0.01)
+
+	stop, consume := filter.RecordAdditions()
+
+	filter.Add([]byte("key1"))
+	filter.Add([]byte("key2"))
+
+	// First consume
+	newFilter := New(1000, 0.01)
+	consume(newFilter.AddHash)
+
+	// Add more (still recording)
+	filter.Add([]byte("key3"))
+
+	stop()
+
+	// Second consume (should get key3)
+	consume(newFilter.AddHash)
+
+	require.True(t, newFilter.Test([]byte("key1")))
+	require.True(t, newFilter.Test([]byte("key2")))
+	require.True(t, newFilter.Test([]byte("key3")))
 }

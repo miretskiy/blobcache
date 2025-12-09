@@ -103,7 +103,7 @@ func (idx *SkipmapIndex) Close() error {
 	return nil
 }
 
-// Scan iterates over all records in the index
+// Range iterates over all records in the index
 func (idx *SkipmapIndex) Range(ctx context.Context, fn func(Record) error) error {
 	var err error
 	idx.data.Range(func(key string, record *Record) bool {
@@ -117,16 +117,8 @@ func (idx *SkipmapIndex) Range(ctx context.Context, fn func(Record) error) error
 func (idx *SkipmapIndex) PutBatch(ctx context.Context, records []Record) error {
 	// Store in skipmap
 	for _, rec := range records {
-		entry := &Record{
-			Key:       rec.Key,
-			SegmentID: rec.SegmentID,
-			Pos:       rec.Pos,
-			Size:      rec.Size,
-			CTime:     rec.CTime,
-			Checksum:  rec.Checksum,
-		}
 		keyStr := unsafe.String(unsafe.SliceData(rec.Key), len(rec.Key))
-		idx.data.Store(keyStr, entry)
+		idx.data.Store(keyStr, &rec)
 	}
 
 	// Write to Bitcask if durable

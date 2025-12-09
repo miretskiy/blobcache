@@ -239,6 +239,15 @@ func (c *Cache) rebuildBloom(ctx context.Context) error {
 	// Create new bloom filter
 	filter := bloom.New(uint(c.cfg.BloomEstimatedKeys), c.cfg.BloomFPRate)
 
+	// Arrange for the current bloom filter to capture any additions
+	// while we work on rebuilding (only if bloom already exists)
+	var stopRecording func()
+	var consumeRecording func(bloom.HashConsumer)
+	if oldFilter := c.bloom.Load(); oldFilter != nil {
+		stopRecording, consumeRecording = oldFilter.RecordAdditions()
+		defer stopRecording()
+	}
+
 	// Range index and add all keys to bloom
 	if err := c.index.Range(ctx, func(rec index.Record) error {
 		filter.Add(rec.Key)
@@ -247,7 +256,18 @@ func (c *Cache) rebuildBloom(ctx context.Context) error {
 		return fmt.Errorf("failed to scan index: %w", err)
 	}
 
+	// Replay recorded additions (if any)
+	if consumeRecording != nil {
+		consumeRecording(filter.AddHash)
+	}
+
 	c.bloom.Store(filter)
+
+	// Defensive: catch any additions between consume and swap
+	if consumeRecording != nil {
+		consumeRecording(filter.AddHash)
+	}
+
 	return nil
 }
 
@@ -336,8 +356,8 @@ func (c *Cache) bloomRefreshWorker() {
 	for {
 		select {
 		case <-ticker.C:
-			c.rebuildBloom(context.Background())
-			c.saveBloom()
+			_ = c.rebuildBloom(context.Background())
+			_ = c.saveBloom()
 		case <-c.stopCh:
 			return
 		}

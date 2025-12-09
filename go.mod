@@ -19,6 +19,7 @@ require (
 	github.com/mattetti/filebuffer v1.0.1 // indirect
 	github.com/sirupsen/logrus v1.9.3 // indirect
 	github.com/zhangyunhao116/fastrand v0.3.0 // indirect
+	github.com/zhangyunhao116/skipset v0.13.0 // indirect
 )
 
 require (

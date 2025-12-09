@@ -334,15 +334,13 @@ func (mt *MemTable) Drain() {
 }
 
 // Close shuts down workers and waits for completion
-func (mt *MemTable) Close() error {
+func (mt *MemTable) Close() {
 	select {
 	case <-mt.stopCh:
-		return nil
 	default:
 		close(mt.stopCh)
 	}
 	mt.wg.Wait()
-	return nil
 }
 
 // TestingClearMemtable clears active memfile

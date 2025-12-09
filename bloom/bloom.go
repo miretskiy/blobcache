@@ -7,14 +7,16 @@ import (
 	"sync/atomic"
 
 	"github.com/cespare/xxhash/v2"
+	"github.com/zhangyunhao116/skipset"
 )
 
 // Filter is a lock-free bloom filter using atomic operations
 // Combines fastbloom's atomic CAS approach with RocksDB's FastLocalBloom algorithm
 type Filter struct {
-	data []uint32 // Bit vector (accessed atomically)
-	m    uint     // Filter size in bits
-	k    uint     // Number of hash functions (probes)
+	data      []uint32 // Bit vector (accessed atomically)
+	m         uint     // Filter size in bits
+	k         uint     // Number of hash functions (probes)
+	recording atomic.Pointer[skipset.Int64Set]
 }
 
 // New creates a bloom filter optimized for n elements with target false positive rate
@@ -32,7 +34,14 @@ func New(estimatedKeys uint, fpRate float64) *Filter {
 // Add inserts a key into the bloom filter (lock-free, concurrent-safe)
 func (f *Filter) Add(key []byte) {
 	h := xxhash.Sum64(key)
+	if rec := f.recording.Load(); rec != nil {
+		rec.Add(int64(h))
+	}
+	f.AddHash(h)
+}
 
+// AddHash inserts specified hash into this filter.
+func (f *Filter) AddHash(h uint64) {
 	for i := uint(0); i < f.k; i++ {
 		// RocksDB FastLocalBloom: use high bits for bit position
 		bit := uint(h>>23) % f.m
@@ -77,6 +86,28 @@ func (f *Filter) Test(key []byte) bool {
 	}
 
 	return true
+}
+
+type HashConsumer func(h uint64)
+
+// RecordAdditions arranges for this filter to record all added hashes either
+// stopRecording or consumeRecording function is invoked.
+func (f *Filter) RecordAdditions() (
+	stopRecording func(),
+	consumeRecording func(consumer HashConsumer),
+) {
+	set := skipset.NewInt64()
+	f.recording.Store(set)
+	stopRecording = func() {
+		f.recording.Store(nil)
+	}
+	consumeRecording = func(consumer HashConsumer) {
+		set.Range(func(k int64) bool {
+			consumer(uint64(k))
+			return true
+		})
+	}
+	return stopRecording, consumeRecording
 }
 
 // Serialize returns the bloom filter as bytes (caller controls storage)

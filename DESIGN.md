@@ -45,20 +45,21 @@ Primary optimization: Single bloom filter check (1 ns) vs 455 checks (45 µs)
 1. **Global Bloom Filter (Lock-Free)**
    - Single filter for all keys (not per-file)
    - Lock-free atomic operations (1 ns reads, 12 ns writes)
-   - Rebuilt periodically from index (configurable: 5-10min or on FP rate threshold) (40 ms for 4M keys)
-   - Stored in DuckDB (not separate files)
+   - Rebuilt periodically from index (configurable intervals)
+   - Persisted to bloom.dat file
 
-2. **DuckDB Index (Analytical)**
-   - Key → (segment_id, offset, size, ctime)
-   - Exceptional query performance (0.1-0.5s for FIFO scans)
-   - ACID transactions, crash recovery via WAL
-   - Zero-alloc Get() API (caller-provided Entry)
+2. **Bitcask Index (Default) or Skipmap (Fast)**
+   - Key → Record{SegmentID, Pos, Size, CTime, Checksum, HasChecksum}
+   - Bitcask: Embedded persistent storage with in-memory hash table
+   - Skipmap: Pure in-memory (fastest) or durable Skipmap backed by Bitcask
+   - Scan() method for flexible iteration (bloom rebuild, eviction, size tracking)
 
 3. **Segment-Based Blob Storage (NVMe-Optimized)**
-   - Large segment files (1GB - 10GB each)
+   - Large segment files (2GB default)
    - Multiple blobs packed sequentially in each segment
-   - Designed for high-performance NVMe (1+ GB/s)
-   - Batched writes reduce syscall overhead
+   - Designed for high-performance NVMe (1+ GB/s sustained)
+   - Batched writes via MemTable reduce syscall overhead
+   - DirectIO support for bypassing OS cache
 
 **Data flow:**
 
@@ -93,18 +94,20 @@ Get:  Bloom check (1 ns) → Query index for segment+offset → pread() from seg
 
 ```
 /data/blobcache/
-├── db/
-│   ├── index.duckdb          # DuckDB index + bloom filter storage
-│   └── wal/                  # DuckDB WAL (crash recovery)
+├── bitcask-index/            # Bitcask index files (default)
+│   ├── datafile              # Key-value pairs
+│   └── hint                  # Index file for fast startup
+├── bloom.dat                 # Serialized bloom filter
 └── segments/
     ├── 1733183456789123456-00.seg    # timestamp-workerID.seg
     ├── 1733183456812456789-01.seg    # Multiple blobs per segment
-    ├── 1733183456834567890-02.seg    # Large files (1GB - 10GB each)
-    └── ...                           # Hundreds to thousands of files
-                                      # Flat directory (no sharding needed)
+    ├── 1733183456834567890-02.seg    # Large files (2GB default)
+    └── ...                           # Flat directory (no sharding needed)
 ```
 
-**Note:** Bloom filter stored IN DuckDB (as BLOB column), not separate files.
+**Index options:**
+- Bitcask (default): Persistent embedded storage
+- Skipmap (fast): In-memory only or backed by Bitcask
 
 ### Why Segment-Based Storage?
 
@@ -122,55 +125,47 @@ Get:  Bloom check (1 ns) → Query index for segment+offset → pread() from seg
 
 ---
 
-## Database Schema
+## Index Storage
 
-```sql
-CREATE TABLE entries (
-    key BLOB PRIMARY KEY,
-    segment_id BIGINT NOT NULL,   -- Which segment file
-    offset BIGINT NOT NULL,       -- Byte offset in segment
-    size INTEGER NOT NULL,        -- Blob size in bytes
-    ctime BIGINT NOT NULL         -- Creation time (for FIFO)
-);
-
-CREATE INDEX idx_segment_ctime ON entries(segment_id, ctime);
-CREATE INDEX idx_ctime ON entries(ctime);  -- For FIFO eviction
-
--- Bloom filter storage (single global filter)
-CREATE TABLE bloom_filter (
-    version INTEGER PRIMARY KEY,  -- For versioning
-    data BLOB NOT NULL,           -- Serialized bloom filter
-    created_at BIGINT NOT NULL
-);
-
--- Segment metadata (optional, for stats)
-CREATE TABLE segments (
-    segment_id BIGINT PRIMARY KEY,
-    created_at BIGINT NOT NULL,
-    size BIGINT NOT NULL,         -- Total bytes in segment
-    blob_count INTEGER NOT NULL   -- Number of blobs
-);
+**Bitcask encoding (default index):**
+```
+Key: raw key bytes
+Value: SegmentID(8) + Pos(8) + Size(4) + CTime(8) + Flags(1) + [Checksum(4) if HasChecksum]
+       = 29 bytes (no checksum) or 33 bytes (with checksum)
 ```
 
-**Why DuckDB:**
-- Embedded (no separate process)
-- Exceptional analytical performance:
-  - Scans 4M rows in ~40 ms
-  - `SELECT segment_id, SUM(size) ... GROUP BY segment_id ORDER BY MIN(ctime)` in 0.1-0.5s
-  - Perfect for segment-level FIFO eviction
-  - Batch inserts via Appender API (no primary key violations)
-- ACID transactions
-- Built-in WAL (crash recovery)
-- Can store bloom filter (BLOB column)
+**Flags byte:**
+- Bit 0: HasChecksum (checksum field valid)
+- Bits 1-7: Reserved for future use
+
+**Record structure:**
+```go
+type Record struct {
+    Key         []byte // Raw key bytes
+    SegmentID   int64  // Segment ID (timestamp-workerID)
+    Pos         int64  // Byte offset within segment
+    Size        int    // Blob size in bytes
+    CTime       int64  // Creation time (for FIFO eviction)
+    Checksum    uint32 // CRC32 checksum (if HasChecksum=true)
+    HasChecksum bool   // True if checksum field is valid
+}
+```
+
+**Indexer interface (minimal):**
+- Put(key, record) - Insert/update record
+- Get(key, record) - Lookup record
+- Delete(key) - Remove record
+- Scan(fn) - Iterate all records (for bloom rebuild, eviction, size tracking)
+- PutBatch(records) - Atomic batch insert
+- Close() - Shutdown
 
 **File mapping:** `segments/{timestamp}-{worker_id}.seg`
-- segment_id: `{unix_nanos}-{worker_id}` (e.g., `1733183456789123456-03`)
-- timestamp: Matches ctime in DuckDB (easy debugging/correlation)
-- worker_id: I/O worker number (0-5 for 6 concurrent writers)
-- offset: Byte position within segment file
-- size: Length of blob data
+- SegmentID: `{unix_nanos}-{worker_id}` (e.g., `1733183456789123456-03`)
+- Pos: Byte offset within segment file
+- Size: Length of blob data
+- Checksum: Optional CRC32 for data integrity
 
-**No directory scan on restart:** timestamp-based IDs eliminate need to find max ID
+**No directory scan on restart:** Timestamp-based IDs eliminate need to find max ID
 
 ---
 
@@ -219,31 +214,42 @@ func Add(key) {
 ## API Design
 
 ```go
-// Required argument (not optional)
-func NewBlobCache(path string, opts ...Option) (*BlobCache, error)
+// Create cache with functional options
+func New(path string, opts ...Option) (*Cache, error)
+
+// Start background workers (eviction, bloom refresh)
+func (c *Cache) Start() (closer func() error, error)
 
 // Core operations
-Put(ctx context.Context, key, value []byte) error
-Get(ctx context.Context, key []byte) ([]byte, error)
-Delete(ctx context.Context, key []byte) error
+Put(key, value []byte)                                    // Safe (copies data)
+UnsafePut(key, value []byte)                             // Zero-copy (caller owns)
+PutChecksummed(key, value []byte, checksum uint32)       // With explicit checksum
+UnsafePutChecksummed(key, value []byte, checksum uint32) // Zero-copy with checksum
+Get(key []byte) (io.Reader, bool)                        // Returns reader, not []byte
 Close() error
-Drain() error  // Flush write buffer before close
+Drain()  // Wait for memtable flush
 
 // Options (functional pattern)
 WithMaxSize(int64) Option
-WithSegmentSize(int64) Option  // Default: 1GB
-WithChecksums(bool) Option     // Default: true
-WithFsync(bool) Option          // Default: false
-WithVerifyOnRead(bool) Option  // Default: false
+WithSegmentSize(int64) Option       // Default: 0 (one blob per file), use 2GB for segments
+WithChecksum() Option               // Enable CRC32 checksums
+WithChecksumHash(func() hash.Hash32) Option  // Custom hash (e.g., xxhash)
+WithVerifyOnRead(bool) Option       // Enable checksum verification on reads
+WithFsync(bool) Option              // Enable fdatasync (default: false)
+WithDirectIOWrites() Option         // Use DirectIO for writes
+WithSkipmapIndex() Option          // Use in-memory skipmap index
+WithWriteBufferSize(int64) Option  // Memtable size (default: 100MB)
+WithMaxInflightBatches(int) Option // Concurrent flush workers (default: 6)
 ```
 
 **Defaults:**
-- MaxSize: 80% of disk capacity (auto-detected)
-- SegmentSize: 1GB (like RocksDB memtable)
-- Eviction: Segment-level FIFO (by creation time)
-- Checksums: Enabled (detect corruption)
-- Fsync: Disabled (cache semantics, fast)
+- MaxSize: 0 (unlimited, set explicitly for production)
+- SegmentSize: 0 (per-blob mode, use 2GB for production)
+- Checksums: Disabled (opt-in via WithChecksum)
+- Fsync: Disabled (cache semantics, uses fdatasync when enabled)
 - VerifyOnRead: Disabled (opt-in)
+- DirectIO: Disabled (opt-in for production)
+- WriteBufferSize: 100MB (use 1GB for production)
 
 ---
 
@@ -392,69 +398,123 @@ Runs in background once per day:
 
 ## Implementation Status
 
-**Completed (~40% done, 4-5 hours):**
-- ✅ Design doc
-- ✅ Options pattern
-- ✅ Key (hash-based deterministic fileID)
-- ✅ Index layer (DuckDB, zero-alloc, tested)
-- ✅ Bloom filter (lock-free, 4× faster than alternatives, benchmarked)
+**✅ Completed (Production-Ready):**
 
-**Next (Segment-based rewrite, ~2-3 weeks):**
-- [ ] Phase 1: Write buffer and segment writer
-- [ ] Phase 2: Segment reader with file handle caching
-- [ ] Phase 3: Segment-level FIFO eviction
-- [ ] Phase 4: Update benchmarks for higher hit rate
-- [ ] End-to-end tests
-- [ ] CPU profiling comparison
+**Core Features:**
+- ✅ Segment-based storage with DirectIO support
+- ✅ MemTable with async flush workers (RocksDB-style batching)
+- ✅ Lock-free bloom filter (4× faster than alternatives)
+- ✅ Bitcask index (default) + Skipmap index (optional)
+- ✅ Streaming checksum verification (hash.Hash32 interface)
+- ✅ Storage strategies for eviction (BlobStorage, SegmentStorage)
+- ✅ Reactive size tracking with eviction triggers
+- ✅ Centralized path generation (BlobPaths, SegmentPaths)
+- ✅ Platform-optimized fdatasync (Linux: fdatasync, Darwin: F_FULLFSYNC)
 
-**Final (~1 week):**
-- [ ] Metrics integration
-- [ ] Stress tests (4M keys, 1 TB)
-- [ ] Production validation plan
-- [ ] Performance comparison with RocksDB
+**API:**
+- ✅ Clean interface: Get(key) → Reader, Put(key, value)
+- ✅ PutChecksummed for explicit checksums
+- ✅ WithChecksum(), WithChecksumHash() for data integrity
+- ✅ WithSegmentSize(), WithDirectIOWrites(), etc.
 
-**Total estimate: 3-4 weeks**
+**Testing:**
+- ✅ Comprehensive unit tests (all packages)
+- ✅ Integration tests (segment mode, DirectIO, skipmap)
+- ✅ Checksum reader tests (9 edge cases including 1-byte reads)
+- ✅ Production benchmark vs RocksDB on Graviton
+
+**Performance validated:**
+- ✅ 2.77× faster than RocksDB (1.04 vs 0.38 GB/s)
+- ✅ 45× less memory (2.2GB vs 100GB)
+- ✅ 3.75× less CPU (2 cores vs 7.5 cores)
+- ✅ No compaction overhead (append-only architecture)
 
 ---
 
 ## Decision Log
 
-**Key decisions:**
-1. ✅ Segment-based storage (multiple blobs per file)
-2. ✅ 1GB segments (like RocksDB memtable size)
-3. ✅ Lock-free bloom (atomic CAS, not mutex)
-4. ✅ Bloom stored in DuckDB (not separate files)
-5. ✅ Segment-level FIFO eviction (no LRU)
-6. ✅ DB-first deletion order (then filesystem)
-7. ✅ Daily orphan cleanup (not on startup)
-8. ✅ Zero-alloc Get() API (caller-provided Entry)
-9. ✅ xxHash (7 GB/s, proven)
-10. ✅ pread() for concurrent segment reads
+**Major decisions:**
+1. ✅ Segment-based storage (multiple blobs per file) - 99.9% fewer syscalls
+2. ✅ 2GB segments (optimal for NVMe throughput)
+3. ✅ Lock-free bloom (atomic CAS, not mutex) - 4× faster
+4. ✅ Bitcask index (removed DuckDB) - simpler, sufficient performance
+5. ✅ Skipmap option (in-memory + optional Bitcask backing) - fastest reads
+6. ✅ Segment-level FIFO eviction via storage strategies
+7. ✅ Streaming checksums (hash.Hash32) - error on final Read(), not Close
+8. ✅ Get() returns io.Reader (not []byte) - caller controls reading
+9. ✅ Storage strategies (BlobStorage, SegmentStorage) - clean architecture
+10. ✅ Centralized paths (BlobPaths, SegmentPaths) - zero-allocation string types
+11. ✅ Fdatasync (not fsync) - 2-5× faster, sufficient for immutable blobs
+12. ✅ Record.HasChecksum flag - mid-lifecycle restart safe
 
-**Pivoted from one-blob-per-file:**
-- ❌ Initial design: one file per blob
-- ❌ Problem: 70% CPU in syscalls (os.WriteFile overhead)
-- ✅ Solution: Batch blobs into segments (99.9% fewer syscalls)
+**Architecture evolution:**
+- ❌ DuckDB → ✅ Bitcask/Skipmap (simpler, removed dependency)
+- ❌ One blob per file → ✅ Segment-based (70% CPU in syscalls → <20%)
+- ❌ Entry type → ✅ Record type (single consistent naming)
+- ❌ Scatter path generation → ✅ Centralized in paths.go
+- ❌ Eviction in Indexer → ✅ Storage strategies (clean boundaries)
+
+**Checksum design:**
+- ✅ hash.Hash32 interface (stdlib compatibility)
+- ✅ Streaming verification (incremental hashing as data flows)
+- ✅ Error on final Read() (more resilient than Close errors)
+- ✅ HasChecksum flag for backwards compatibility
 
 **Out of scope:**
 - ❌ Range queries
 - ❌ Sorted iteration
 - ❌ Compression (caller-controlled)
-- ❌ Compaction (FIFO only)
+- ❌ Compaction (append-only architecture)
 - ❌ Per-blob eviction (segment-level only)
-- ❌ LRU tracking (segment FIFO only)
+- ❌ LRU tracking (FIFO only)
 
 **Design validated through:**
-- Production RocksDB analysis (455 L0 files, 1M keys, 450 GB)
-- Benchmark comparison: Blobcache 29% faster than RocksDB
-- CPU profiling: 70% time in syscalls led to segment design
-- Bloom filter benchmarks (4× faster than alternatives)
+- Production RocksDB analysis (455 L0 files causing 45µs CPU per negative lookup)
+- Graviton benchmark: **2.77× faster, 45× less memory, 3.75× less CPU than RocksDB**
+- CPU profiling: Identified and fixed syscall overhead
+- Bloom filter: 4× faster than alternatives, lock-free design
 
 ---
 
 ## Benchmark Results
 
-### RocksDB vs Blobcache Comparison (2025-12-01)
+### Production Benchmark: AWS Graviton m7gd.8xlarge (2025-12-08)
+
+**Hardware:**
+- 32 vCPU (Graviton 3)
+- 128 GB RAM
+- 1.7TB NVMe instance storage
+- Disk capacity: ~2GB/s read, ~1GB/s write (independent channels)
+
+**Test configuration:**
+- 2.56M operations (256K writes × 1MB = 256GB written, 2.3M reads)
+- Mixed workload: 10% writes, 45% read hits, 45% read misses
+- Matches production workload pattern
+- RocksDB config: 1GB memtable, 6 inflight, FIFO compaction, DirectIO
+
+| Metric | RocksDB v6.20.3 | Blobcache | Improvement |
+|--------|-----------------|-----------|-------------|
+| **Latency** | 259,316 ns/op | 93,448 ns/op | **2.77x faster** |
+| **Write Throughput** | 0.376 GB/s | 1.042 GB/s | **2.77x faster** |
+| **Duration** | 18+ minutes | 4.2 minutes | **4.3x faster** |
+| **Memory** | 100.6 GB | 2.2 GB | **45x less** |
+| **CPU** | 7.5 cores | 2 cores | **3.75x less** |
+| **I/O Pattern** | Variable (compaction storms) | Steady | Predictable |
+| **Disk Utilization** | 95-100% (variable) | 100% (saturated) | Consistent |
+
+**RocksDB overhead observed:**
+- Created 11GB compaction files (12×960MB → 1×11GB)
+- Memory grew from 86GB → 100GB during run
+- Massive kernel I/O merging (94% write merges, 61% read merges)
+- Variable throughput (0.8-1.1 GB/s writes during compaction)
+
+**Blobcache advantages:**
+- ✅ **No compaction overhead** - all 1.04 GB/s is useful work
+- ✅ **Predictable performance** - no compaction storms
+- ✅ **Minimal resources** - 2 cores, 2GB RAM
+- ✅ **Simple operations** - append-only, no background merges
+
+### Early Benchmark: Apple M4 Max (2025-12-01)
 
 **Test configuration:**
 - 2.56M operations (256K writes, 2.3M reads)
@@ -470,7 +530,7 @@ Runs in background once per day:
 | I/O Pattern | Large transactions (563-704 KB/t) | Small transactions (250-407 KB/t) | More overhead |
 | File Count | ~455 SST files | 256K files | 1000× more files |
 
-**Key finding:** Blobcache was faster overall, but 70% CPU in syscalls indicates room for improvement.
+**Key finding:** Blobcache was faster overall, but 70% CPU in syscalls led to segment-based architecture.
 
 ### Segment-Based Architecture Benefits
 

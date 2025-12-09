@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/miretskiy/blobcache/base"
 	"github.com/stretchr/testify/require"
 )
 
@@ -20,8 +19,7 @@ func TestBitcaskIndex_PutGet(t *testing.T) {
 	defer idx.Close()
 
 	ctx := context.Background()
-	const numShards = 256
-	key := base.NewKey([]byte("test-key"), numShards)
+	key := []byte("test-key")
 	now := time.Now().UnixNano()
 
 	// Put a record
@@ -46,8 +44,7 @@ func TestBitcaskIndex_GetNotFound(t *testing.T) {
 	require.NoError(t, err)
 	defer idx.Close()
 
-	const numShards = 256
-	key := base.NewKey([]byte("nonexistent"), numShards)
+	key := []byte("nonexistent")
 	var entry Record
 	err = idx.Get(context.Background(), key, &entry)
 
@@ -62,8 +59,8 @@ func TestBitcaskIndex_Delete(t *testing.T) {
 	defer idx.Close()
 
 	ctx := context.Background()
-	const numShards = 256
-	key := base.NewKey([]byte("delete-me"), numShards)
+
+	key := []byte("delete-me")
 
 	// Insert
 	now := time.Now().UnixNano()
@@ -91,17 +88,16 @@ func TestBitcaskIndex_Scan(t *testing.T) {
 	defer idx.Close()
 
 	ctx := context.Background()
-	const numShards = 256
 
 	// Put records
 	now := time.Now().UnixNano()
-	idx.Put(ctx, base.NewKey([]byte("key1"), numShards), &Record{Size: 100, CTime: now})
-	idx.Put(ctx, base.NewKey([]byte("key2"), numShards), &Record{Size: 200, CTime: now + 1000})
-	idx.Put(ctx, base.NewKey([]byte("key3"), numShards), &Record{Size: 300, CTime: now + 2000})
+	idx.Put(ctx, []byte("key1"), &Record{Size: 100, CTime: now})
+	idx.Put(ctx, []byte("key2"), &Record{Size: 200, CTime: now + 1000})
+	idx.Put(ctx, []byte("key3"), &Record{Size: 300, CTime: now + 2000})
 
-	// Scan all records
+	// Range all records
 	var scanned []Record
-	err := idx.Scan(ctx, func(rec Record) error {
+	err := idx.Range(ctx, func(rec Record) error {
 		scanned = append(scanned, rec)
 		return nil
 	})
@@ -126,16 +122,15 @@ func TestBitcaskIndex_PutBatch(t *testing.T) {
 	defer idx.Close()
 
 	ctx := context.Background()
-	const numShards = 256
 
 	// Batch insert multiple records
 	now := time.Now().UnixNano()
-	key1 := base.NewKey([]byte("key1"), numShards)
-	key2 := base.NewKey([]byte("key2"), numShards)
+	key1 := []byte("key1")
+	key2 := []byte("key2")
 
 	records := []Record{
-		{Key: key1.Raw(), Size: 100, CTime: now},
-		{Key: key2.Raw(), Size: 200, CTime: now + 1000},
+		{Key: key1, Size: 100, CTime: now},
+		{Key: key2, Size: 200, CTime: now + 1000},
 	}
 
 	err := idx.PutBatch(ctx, records)

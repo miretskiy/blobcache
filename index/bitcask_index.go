@@ -8,8 +8,6 @@ import (
 	"path/filepath"
 
 	"go.mills.io/bitcask/v2"
-
-	"github.com/miretskiy/blobcache/base"
 )
 
 // BitcaskIndex implements Index using Bitcask for metadata storage
@@ -80,18 +78,18 @@ func decodeValue(buf []byte, record *Record) {
 }
 
 // Put inserts or updates a record
-func (idx *BitcaskIndex) Put(ctx context.Context, key base.Key, record *Record) error {
+func (idx *BitcaskIndex) Put(ctx context.Context, key []byte, record *Record) error {
 	// Set record key if not already set
 	if record.Key == nil {
-		record.Key = key.Raw()
+		record.Key = key
 	}
 	value := encodeValue(record)
-	return idx.db.Put(key.Raw(), value)
+	return idx.db.Put(key, value)
 }
 
 // Get retrieves an entry (caller provides Record to avoid allocation)
-func (idx *BitcaskIndex) Get(ctx context.Context, key base.Key, entry *Record) error {
-	value, err := idx.db.Get(key.Raw())
+func (idx *BitcaskIndex) Get(ctx context.Context, key []byte, entry *Record) error {
+	value, err := idx.db.Get(key)
 	if errors.Is(err, bitcask.ErrKeyNotFound) {
 		return ErrNotFound
 	}
@@ -99,14 +97,14 @@ func (idx *BitcaskIndex) Get(ctx context.Context, key base.Key, entry *Record) e
 		return err
 	}
 
-	entry.Key = key.Raw()
+	entry.Key = key
 	decodeValue(value, entry)
 	return nil
 }
 
 // Delete removes an entry (writes tombstone in Bitcask)
-func (idx *BitcaskIndex) Delete(ctx context.Context, key base.Key) error {
-	return idx.db.Delete(key.Raw())
+func (idx *BitcaskIndex) Delete(ctx context.Context, key []byte) error {
+	return idx.db.Delete(key)
 }
 
 // Close closes the index
@@ -115,7 +113,7 @@ func (idx *BitcaskIndex) Close() error {
 }
 
 // Scan iterates over all records in the index
-func (idx *BitcaskIndex) Scan(ctx context.Context, fn func(Record) error) error {
+func (idx *BitcaskIndex) Range(ctx context.Context, fn func(Record) error) error {
 	return idx.db.Scan(nil, func(key bitcask.Key) error {
 		value, err := idx.db.Get(key)
 		if err != nil {

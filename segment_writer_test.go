@@ -5,7 +5,6 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/miretskiy/blobcache/base"
 	"github.com/stretchr/testify/require"
 )
 
@@ -16,14 +15,14 @@ func TestSegmentWriter_Buffered(t *testing.T) {
 
 	// Create segments directory
 	segDir := filepath.Join(tmpDir, "segments")
-	require.NoError(t, os.MkdirAll(segDir, 0755))
+	require.NoError(t, os.MkdirAll(segDir, 0o755))
 
 	// Create segment writer with 10KB segments
 	writer := NewSegmentWriter(tmpDir, 10*1024, false, false, 0)
 	defer writer.Close()
 
 	// Write multiple small values to same segment
-	key1 := base.NewKey([]byte("key1"), 256)
+	key1 := []byte("key1")
 	value1 := make([]byte, 1000)
 	err = writer.Write(key1, value1)
 	require.NoError(t, err)
@@ -31,7 +30,7 @@ func TestSegmentWriter_Buffered(t *testing.T) {
 	require.NotEqual(t, 0, pos1.SegmentID) // Timestamp-based segment ID
 	require.Equal(t, int64(0), pos1.Pos)
 
-	key2 := base.NewKey([]byte("key2"), 256)
+	key2 := []byte("key2")
 	value2 := make([]byte, 2000)
 	err = writer.Write(key2, value2)
 	require.NoError(t, err)
@@ -40,7 +39,7 @@ func TestSegmentWriter_Buffered(t *testing.T) {
 	require.Equal(t, int64(1000), pos2.Pos)          // After first value
 
 	// Write large value to trigger rotation
-	key3 := base.NewKey([]byte("key3"), 256)
+	key3 := []byte("key3")
 	value3 := make([]byte, 15000) // Exceeds 10KB segment size
 	err = writer.Write(key3, value3)
 	require.NoError(t, err)
@@ -56,14 +55,14 @@ func TestSegmentWriter_DirectIO(t *testing.T) {
 
 	// Create segments directory
 	segDir := filepath.Join(tmpDir, "segments")
-	require.NoError(t, os.MkdirAll(segDir, 0755))
+	require.NoError(t, os.MkdirAll(segDir, 0o755))
 
 	// Create segment writer with DirectIO
 	writer := NewSegmentWriter(tmpDir, 1024*1024, true, false, 0)
 	defer writer.Close()
 
 	// Write value (tests leftover handling)
-	key := base.NewKey([]byte("test-key"), 256)
+	key := []byte("test-key")
 	value := make([]byte, 5000) // Unaligned size
 	for i := range value {
 		value[i] = byte(i % 256)
@@ -89,7 +88,7 @@ func TestSegmentWriter_MultipleSegments(t *testing.T) {
 
 	// Create segments directory
 	segDir := filepath.Join(tmpDir, "segments")
-	require.NoError(t, os.MkdirAll(segDir, 0755))
+	require.NoError(t, os.MkdirAll(segDir, 0o755))
 
 	// Small segment size to trigger multiple segments
 	writer := NewSegmentWriter(tmpDir, 5000, false, false, 0)
@@ -99,7 +98,7 @@ func TestSegmentWriter_MultipleSegments(t *testing.T) {
 
 	// Write 5 values, should span multiple segments
 	for i := 0; i < 5; i++ {
-		key := base.NewKey([]byte{byte(i)}, 256)
+		key := []byte{byte(i)}
 		value := make([]byte, 2000)
 		err := writer.Write(key, value)
 		require.NoError(t, err)

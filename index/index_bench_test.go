@@ -6,21 +6,17 @@ import (
 	"os"
 	"testing"
 	"time"
-
-	"github.com/miretskiy/blobcache/base"
 )
 
 // Benchmark_IndexLookup compares index Get() performance with 1M keys
 // Run with: go test -bench=Benchmark_IndexLookup -benchtime=1000000x -count=10
 func Benchmark_IndexLookup(b *testing.B) {
 	const numKeys = 1_000_000
-	const numShards = 256
 
 	// Generate keys upfront
-	keys := make([]base.Key, numKeys)
+	keys := make([][]byte, numKeys)
 	for i := 0; i < numKeys; i++ {
-		keyBytes := []byte(fmt.Sprintf("key-%d", i))
-		keys[i] = base.NewKey(keyBytes, numShards)
+		keys[i] = []byte(fmt.Sprintf("key-%d", i))
 	}
 
 	ctx := context.Background()
@@ -30,7 +26,7 @@ func Benchmark_IndexLookup(b *testing.B) {
 	records := make([]Record, numKeys)
 	for i := 0; i < numKeys; i++ {
 		records[i] = Record{
-			Key:       keys[i].Raw(),
+			Key:       keys[i],
 			SegmentID: int64(i / 1000),
 			Pos:       int64((i % 1000) * 1024),
 			Size:      1024,

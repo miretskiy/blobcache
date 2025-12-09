@@ -11,10 +11,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/miretskiy/blobcache/base"
 	"github.com/miretskiy/blobcache/bloom"
 	"github.com/miretskiy/blobcache/index"
 )
+
+// Key is a cache key providing type safety (strong type, not alias)
+type Key []byte
 
 // Cache is a high-performance blob storage with bloom filter optimization
 type Cache struct {
@@ -96,7 +98,7 @@ func New(path string, opts ...Option) (*Cache, error) {
 
 	// Initialize approximate size for reactive eviction
 	var totalSize int64
-	idx.Scan(context.Background(), func(rec index.Record) error {
+	idx.Range(context.Background(), func(rec index.Record) error {
 		totalSize += int64(rec.Size)
 		return nil
 	})
@@ -237,8 +239,8 @@ func (c *Cache) rebuildBloom(ctx context.Context) error {
 	// Create new bloom filter
 	filter := bloom.New(uint(c.cfg.BloomEstimatedKeys), c.cfg.BloomFPRate)
 
-	// Scan index and add all keys to bloom
-	if err := c.index.Scan(ctx, func(rec index.Record) error {
+	// Range index and add all keys to bloom
+	if err := c.index.Range(ctx, func(rec index.Record) error {
 		filter.Add(rec.Key)
 		return nil
 	}); err != nil {
@@ -299,7 +301,7 @@ func (c *Cache) runEviction(ctx context.Context) error {
 
 	// Compute total size by scanning index
 	var totalSize int64
-	c.index.Scan(ctx, func(rec index.Record) error {
+	c.index.Range(ctx, func(rec index.Record) error {
 		totalSize += int64(rec.Size)
 		return nil
 	})
@@ -360,7 +362,7 @@ func (c *Cache) orphanCleanupWorker() {
 }
 
 // Put stores a key-value pair (makes copies for safety)
-func (c *Cache) Put(key, value []byte) {
+func (c *Cache) Put(key Key, value []byte) {
 	keyCopy := make([]byte, len(key))
 	copy(keyCopy, key)
 	valueCopy := make([]byte, len(value))
@@ -370,13 +372,13 @@ func (c *Cache) Put(key, value []byte) {
 
 // UnsafePut stores key-value without copying
 // Caller must ensure key and value are not modified after this call
-func (c *Cache) UnsafePut(key, value []byte) {
+func (c *Cache) UnsafePut(key Key, value []byte) {
 	c.memTable.Put(key, value)
 }
 
 // PutChecksummed stores key-value with an explicit checksum (makes copies for safety)
 // The checksum will be validated if WithVerifyOnRead is enabled
-func (c *Cache) PutChecksummed(key, value []byte, checksum uint32) {
+func (c *Cache) PutChecksummed(key Key, value []byte, checksum uint32) {
 	keyCopy := make([]byte, len(key))
 	copy(keyCopy, key)
 	valueCopy := make([]byte, len(value))
@@ -386,15 +388,15 @@ func (c *Cache) PutChecksummed(key, value []byte, checksum uint32) {
 
 // UnsafePutChecksummed stores key-value with checksum without copying
 // Caller must ensure key and value are not modified after this call
-func (c *Cache) UnsafePutChecksummed(key, value []byte, checksum uint32) {
+func (c *Cache) UnsafePutChecksummed(key Key, value []byte, checksum uint32) {
 	c.memTable.PutChecksummed(key, value, checksum)
 }
 
 // Get retrieves a value by key as a Reader
 // Returns (reader, true) if found, (nil, false) if not found
 // Checksums are verified internally if WithVerifyOnRead is enabled
-func (c *Cache) Get(key []byte) (io.Reader, bool) {
-	// 1. Check bloom filter (lock-free, <1 ns)
+func (c *Cache) Get(key Key) (io.Reader, bool) {
+	// 1. Check bloom filter (lock-free)
 	bloom := c.bloom.Load()
 	if !bloom.Test(key) {
 		return nil, false
@@ -407,6 +409,5 @@ func (c *Cache) Get(key []byte) (io.Reader, bool) {
 
 	// 3. Read from disk using BlobReader
 	// Reader handles index lookup and checksum verification internally
-	k := base.NewKey(key, c.cfg.Shards)
-	return c.blobReader.Get(k)
+	return c.blobReader.Get(key)
 }

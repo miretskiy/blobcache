@@ -2,8 +2,6 @@ package blobcache
 
 import (
 	"io"
-
-	"github.com/miretskiy/blobcache/base"
 )
 
 // WritePosition tracks where data was written (for index)
@@ -17,7 +15,7 @@ type BlobWriter interface {
 	io.Closer
 
 	// Write writes a blob
-	Write(key base.Key, value []byte) error
+	Write(key Key, value []byte) error
 
 	// Pos returns the current write position (for index tracking)
 	// Called after Write() to get position for the last written blob

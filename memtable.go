@@ -8,7 +8,6 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/miretskiy/blobcache/base"
 	"github.com/miretskiy/blobcache/index"
 	"github.com/zhangyunhao116/skipmap"
 )
@@ -91,19 +90,19 @@ func (c *Cache) newMemTable() *MemTable {
 
 // Put stores key-value in memtable (checksum will be computed during flush)
 // Caller must ensure key and value are not modified after this call
-func (mt *MemTable) Put(key, value []byte) {
+func (mt *MemTable) Put(key Key, value []byte) {
 	mt.putWithChecksum(key, value, nil)
 }
 
 // PutChecksummed stores key-value with an explicit checksum
 // Caller must ensure key and value are not modified after this call
-func (mt *MemTable) PutChecksummed(key, value []byte, checksum uint32) {
+func (mt *MemTable) PutChecksummed(key Key, value []byte, checksum uint32) {
 	mt.putWithChecksum(key, value, &checksum)
 }
 
 // putWithChecksum is the internal implementation for Put and PutChecksummed
 // checksum may be nil (will be computed during flush if ChecksumHash configured)
-func (mt *MemTable) putWithChecksum(key, value []byte, checksum *uint32) {
+func (mt *MemTable) putWithChecksum(key Key, value []byte, checksum *uint32) {
 retry:
 	mf := mt.active.Load()
 
@@ -165,7 +164,7 @@ func (mt *MemTable) doRotateUnderLock(mf *memFile) {
 }
 
 // Get retrieves value from active or frozen memfiles
-func (mt *MemTable) Get(key []byte) ([]byte, bool) {
+func (mt *MemTable) Get(key Key) ([]byte, bool) {
 	keyStr := unsafe.String(unsafe.SliceData(key), len(key))
 
 	mf := mt.active.Load()
@@ -227,10 +226,9 @@ func (mt *MemTable) flushMemFile(mf *memFile, writer BlobWriter) {
 		}
 
 		key := unsafe.Slice(unsafe.StringData(keyStr), len(keyStr))
-		k := base.NewKey(key, mt.cache.cfg.Shards)
 
 		// Write blob via writer interface
-		if err := writer.Write(k, value); err != nil {
+		if err := writer.Write(key, value); err != nil {
 			fmt.Printf("Warning: blob write failed for key %x: %v\n", key, err)
 			return true // Continue with other entries
 		}
@@ -255,7 +253,7 @@ func (mt *MemTable) flushMemFile(mf *memFile, writer BlobWriter) {
 		pos := writer.Pos()
 
 		records = append(records, index.Record{
-			Key:         k.Raw(),
+			Key:         key,
 			SegmentID:   pos.SegmentID,
 			Pos:         pos.Pos,
 			Size:        len(value),

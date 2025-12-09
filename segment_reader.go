@@ -4,13 +4,11 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"hash"
 	"io"
 	"os"
 	"path/filepath"
 	"sync"
 
-	"github.com/miretskiy/blobcache/base"
 	"github.com/miretskiy/blobcache/index"
 )
 
@@ -19,22 +17,24 @@ type SegmentReader struct {
 	paths        SegmentPaths
 	cache        sync.Map // segmentID (int64) -> *os.File
 	index        index.Indexer
-	checksumHash func() hash.Hash32
+	hasher       Hasher
 	verifyOnRead bool
 }
 
 // NewSegmentReader creates a segment reader
-func NewSegmentReader(basePath string, idx index.Indexer, checksumHash func() hash.Hash32, verifyOnRead bool) *SegmentReader {
+func NewSegmentReader(
+	basePath string, idx index.Indexer, hasher Hasher, verifyOnRead bool,
+) *SegmentReader {
 	return &SegmentReader{
 		paths:        SegmentPaths(basePath),
 		index:        idx,
-		checksumHash: checksumHash,
+		hasher:       hasher,
 		verifyOnRead: verifyOnRead,
 	}
 }
 
 // Get reads a blob from a segment file at the specified position
-func (r *SegmentReader) Get(key base.Key) (io.Reader, bool) {
+func (r *SegmentReader) Get(key Key) (io.Reader, bool) {
 	// Lookup position from index
 	var record index.Record
 	if err := r.index.Get(context.TODO(), key, &record); err != nil {
@@ -60,8 +60,8 @@ func (r *SegmentReader) Get(key base.Key) (io.Reader, bool) {
 	reader := bytes.NewReader(data)
 
 	// Wrap with checksum verification if enabled
-	if r.verifyOnRead && r.checksumHash != nil && record.HasChecksum {
-		return newChecksumVerifyingReader(reader, r.checksumHash, record.Checksum), true
+	if r.verifyOnRead && r.hasher != nil && record.HasChecksum {
+		return newChecksumVerifyingReader(reader, r.hasher, record.Checksum), true
 	}
 
 	return reader, true
@@ -101,19 +101,10 @@ func (r *SegmentReader) getSegmentFile(segmentID int64) (*os.File, error) {
 func (r *SegmentReader) Close() error {
 	r.cache.Range(func(key, value any) bool {
 		if file, ok := value.(*os.File); ok {
-			file.Close()
+			_ = file.Close()
 		}
 		r.cache.Delete(key)
 		return true
 	})
 	return nil
-}
-
-// RemoveSegment closes and removes a segment from cache (called when segment is deleted)
-func (r *SegmentReader) RemoveSegment(segmentID int64) {
-	if cached, ok := r.cache.LoadAndDelete(segmentID); ok {
-		if file, ok := cached.(*os.File); ok {
-			file.Close()
-		}
-	}
 }

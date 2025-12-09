@@ -6,6 +6,8 @@ import (
 	"io"
 )
 
+type Hasher func() hash.Hash32
+
 // checksumVerifyingReader wraps a reader and verifies checksum on final read
 type checksumVerifyingReader struct {
 	r        io.Reader
@@ -15,10 +17,10 @@ type checksumVerifyingReader struct {
 }
 
 // newChecksumVerifyingReader creates a reader that verifies checksum on EOF
-func newChecksumVerifyingReader(r io.Reader, hashFactory func() hash.Hash32, expected uint32) io.Reader {
+func newChecksumVerifyingReader(r io.Reader, hasher Hasher, expected uint32) io.Reader {
 	return &checksumVerifyingReader{
 		r:        r,
-		hash:     hashFactory(),
+		hash:     hasher(),
 		expected: expected,
 	}
 }

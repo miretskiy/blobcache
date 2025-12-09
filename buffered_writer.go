@@ -3,8 +3,6 @@ package blobcache
 import (
 	"fmt"
 	"os"
-
-	"github.com/miretskiy/blobcache/base"
 )
 
 // BufferedWriter writes blobs using standard buffered I/O with atomic temp+rename
@@ -16,13 +14,13 @@ type BufferedWriter struct {
 // NewBufferedWriter creates a buffered blob writer
 func NewBufferedWriter(basePath string, shards int, fsync bool) *BufferedWriter {
 	return &BufferedWriter{
-		paths: BlobPaths(basePath),
+		paths: NewBlobPaths(basePath, shards),
 		fsync: fsync,
 	}
 }
 
 // Write writes a blob atomically using temp file + rename
-func (w *BufferedWriter) Write(key base.Key, value []byte) error {
+func (w *BufferedWriter) Write(key Key, value []byte) error {
 	tempPath := w.paths.TempBlobPath(key)
 	finalPath := w.paths.BlobPath(key)
 

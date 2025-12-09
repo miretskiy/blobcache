@@ -5,7 +5,6 @@ import (
 	"os"
 	"time"
 
-	"github.com/miretskiy/blobcache/base"
 	"github.com/ncw/directio"
 )
 
@@ -94,7 +93,7 @@ func (w *SegmentWriter) closeCurrentSegment() error {
 }
 
 // Write writes a blob to current segment
-func (w *SegmentWriter) Write(key base.Key, value []byte) error {
+func (w *SegmentWriter) Write(key Key, value []byte) error {
 	// Open new segment if needed or if this write would exceed segment size
 	if w.currentFile == nil || w.currentPos+int64(len(value)) > w.segmentSize {
 		if err := w.openNewSegment(); err != nil {

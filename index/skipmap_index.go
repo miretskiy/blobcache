@@ -4,7 +4,6 @@ import (
 	"context"
 	"unsafe"
 
-	"github.com/miretskiy/blobcache/base"
 	"github.com/zhangyunhao116/skipmap"
 )
 
@@ -39,7 +38,7 @@ func NewDurableSkipmapIndex(basePath string) (*SkipmapIndex, error) {
 
 	// Load all entries from Bitcask into skipmap
 	ctx := context.Background()
-	if err := bitcask.Scan(ctx, func(record Record) error {
+	if err := bitcask.Range(ctx, func(record Record) error {
 		keyStr := unsafe.String(unsafe.SliceData(record.Key), len(record.Key))
 		recordCopy := record // Copy to heap
 		data.Store(keyStr, &recordCopy)
@@ -56,12 +55,12 @@ func NewDurableSkipmapIndex(basePath string) (*SkipmapIndex, error) {
 }
 
 // Put inserts or updates a record
-func (idx *SkipmapIndex) Put(ctx context.Context, key base.Key, record *Record) error {
+func (idx *SkipmapIndex) Put(ctx context.Context, key []byte, record *Record) error {
 	// Set record key if not already set
 	if record.Key == nil {
-		record.Key = key.Raw()
+		record.Key = key
 	}
-	keyStr := unsafe.String(unsafe.SliceData(key.Raw()), len(key.Raw()))
+	keyStr := unsafe.String(unsafe.SliceData(key), len(key))
 	idx.data.Store(keyStr, record)
 
 	// Write to Bitcask if durable
@@ -72,8 +71,8 @@ func (idx *SkipmapIndex) Put(ctx context.Context, key base.Key, record *Record) 
 }
 
 // Get retrieves an entry
-func (idx *SkipmapIndex) Get(ctx context.Context, key base.Key, entry *Record) error {
-	keyStr := unsafe.String(unsafe.SliceData(key.Raw()), len(key.Raw()))
+func (idx *SkipmapIndex) Get(ctx context.Context, key []byte, entry *Record) error {
+	keyStr := unsafe.String(unsafe.SliceData(key), len(key))
 	stored, ok := idx.data.Load(keyStr)
 	if !ok {
 		return ErrNotFound
@@ -85,8 +84,8 @@ func (idx *SkipmapIndex) Get(ctx context.Context, key base.Key, entry *Record) e
 }
 
 // Delete removes an entry
-func (idx *SkipmapIndex) Delete(ctx context.Context, key base.Key) error {
-	keyStr := unsafe.String(unsafe.SliceData(key.Raw()), len(key.Raw()))
+func (idx *SkipmapIndex) Delete(ctx context.Context, key []byte) error {
+	keyStr := unsafe.String(unsafe.SliceData(key), len(key))
 	idx.data.Delete(keyStr)
 
 	// Delete from Bitcask if durable
@@ -105,7 +104,7 @@ func (idx *SkipmapIndex) Close() error {
 }
 
 // Scan iterates over all records in the index
-func (idx *SkipmapIndex) Scan(ctx context.Context, fn func(Record) error) error {
+func (idx *SkipmapIndex) Range(ctx context.Context, fn func(Record) error) error {
 	var err error
 	idx.data.Range(func(key string, record *Record) bool {
 		err = fn(*record)

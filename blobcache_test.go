@@ -310,7 +310,7 @@ func TestCache_Eviction(t *testing.T) {
 
 	// Check size before eviction
 	var totalSize int64
-	cache.index.Scan(ctx, func(rec index.Record) error {
+	cache.index.Range(ctx, func(rec index.Record) error {
 		totalSize += int64(rec.Size)
 		return nil
 	})
@@ -325,7 +325,7 @@ func TestCache_Eviction(t *testing.T) {
 
 	// Check size after eviction (should be under limit with hysteresis)
 	totalSize = 0
-	cache.index.Scan(ctx, func(rec index.Record) error {
+	cache.index.Range(ctx, func(rec index.Record) error {
 		totalSize += int64(rec.Size)
 		return nil
 	})

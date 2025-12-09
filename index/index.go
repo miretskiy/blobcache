@@ -3,8 +3,6 @@ package index
 import (
 	"context"
 	"errors"
-
-	"github.com/miretskiy/blobcache/base"
 )
 
 // Record represents a cached blob's metadata
@@ -19,31 +17,16 @@ type Record struct {
 }
 
 // Indexer defines the index operations
-// TODO: Cleanup context usage - currently inconsistent (some methods use it, memtable doesn't)
 type Indexer interface {
-	Put(ctx context.Context, key base.Key, record *Record) error
-	Get(ctx context.Context, key base.Key, record *Record) error
-	Delete(ctx context.Context, key base.Key) error
+	Put(ctx context.Context, key []byte, record *Record) error
+	Get(ctx context.Context, key []byte, record *Record) error
+	Delete(ctx context.Context, key []byte) error
 	Close() error
 	PutBatch(ctx context.Context, records []Record) error
-	Scan(ctx context.Context, fn func(Record) error) error
-}
-
-// KeyValue holds a key with metadata for bulk insert
-type KeyValue struct {
-	Key  base.Key
-	Size int
+	Range(ctx context.Context, fn func(Record) error) error
 }
 
 // Common errors
 var (
 	ErrNotFound = errors.New("key not found")
 )
-
-// RecordIterator provides iteration over records
-type RecordIterator interface {
-	Next() bool
-	Record() (Record, error)
-	Err() error
-	Close() error
-}

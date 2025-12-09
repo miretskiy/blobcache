@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"sort"
 
-	"github.com/miretskiy/blobcache/base"
 	"github.com/miretskiy/blobcache/index"
 )
 
@@ -28,7 +27,7 @@ type BlobStorage struct {
 // NewBlobStorage creates a per-blob storage strategy
 func NewBlobStorage(basePath string, shards int, idx index.Indexer) *BlobStorage {
 	return &BlobStorage{
-		paths:  BlobPaths(basePath),
+		paths:  NewBlobPaths(basePath, shards),
 		shards: shards,
 		index:  idx,
 	}
@@ -36,9 +35,9 @@ func NewBlobStorage(basePath string, shards int, idx index.Indexer) *BlobStorage
 
 // Evict removes oldest blobs until targetBytes freed
 func (s *BlobStorage) Evict(ctx context.Context, targetBytes int64) (int64, error) {
-	// Scan all records and collect them
+	// Range all records and collect them
 	var records []index.Record
-	if err := s.index.Scan(ctx, func(rec index.Record) error {
+	if err := s.index.Range(ctx, func(rec index.Record) error {
 		records = append(records, rec)
 		return nil
 	}); err != nil {
@@ -60,13 +59,13 @@ func (s *BlobStorage) Evict(ctx context.Context, targetBytes int64) (int64, erro
 		}
 
 		// Delete blob file using centralized path generation
-		k := base.NewKey(record.Key, s.shards)
-		if err := os.Remove(s.paths.BlobPath(k)); err != nil && !os.IsNotExist(err) {
-			fmt.Printf("Warning: failed to delete blob %s: %v\n", s.paths.BlobPath(k), err)
+		blobPath := s.paths.BlobPath(record.Key)
+		if err := os.Remove(blobPath); err != nil && !os.IsNotExist(err) {
+			fmt.Printf("Warning: failed to delete blob %s: %v\n", blobPath, err)
 		}
 
 		// Delete from index
-		if err := s.index.Delete(ctx, k); err != nil {
+		if err := s.index.Delete(ctx, record.Key); err != nil {
 			fmt.Printf("Warning: failed to delete key from index: %v\n", err)
 		}
 
@@ -94,10 +93,10 @@ func NewSegmentStorage(basePath string, idx index.Indexer) *SegmentStorage {
 
 // Evict removes oldest segments until targetBytes freed
 func (s *SegmentStorage) Evict(ctx context.Context, targetBytes int64) (int64, error) {
-	// Scan index to build segment size map
+	// Range index to build segment size map
 	segmentSizes := make(map[int64][]index.Record)
 
-	if err := s.index.Scan(ctx, func(rec index.Record) error {
+	if err := s.index.Range(ctx, func(rec index.Record) error {
 		segmentSizes[rec.SegmentID] = append(segmentSizes[rec.SegmentID], rec)
 		return nil
 	}); err != nil {
@@ -155,8 +154,7 @@ func (s *SegmentStorage) Evict(ctx context.Context, targetBytes int64) (int64, e
 
 		// Delete all records for this segment
 		for _, record := range seg.records {
-			k := base.NewKey(record.Key, 256) // Shard count doesn't matter for delete
-			if err := s.index.Delete(ctx, k); err != nil {
+			if err := s.index.Delete(ctx, record.Key); err != nil {
 				fmt.Printf("Warning: failed to delete key from index: %v\n", err)
 			}
 		}

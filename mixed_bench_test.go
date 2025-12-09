@@ -2,13 +2,12 @@ package blobcache
 
 import (
 	"fmt"
+	"io"
 	"math/rand"
 	"os"
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/miretskiy/blobcache/base"
 )
 
 // Benchmark_Mixed runs a mixed workload: 10% write, 45% hit-read, 45% miss-read
@@ -74,22 +73,21 @@ func Benchmark_Mixed(b *testing.B) {
 					reader, found := cache.Get(key)
 					numReads.Add(1)
 					if found {
-						// Read the full 1MB value (single read syscall, not chunked)
-						// var buf [1024 * 1024]byte
-						// io.ReadFull(reader, buf[:])
-						_ = reader
+						var buf [1024 * 1024]byte
+						_, _ = io.ReadFull(reader, buf[:])
 						numFound.Add(1)
 					} else {
-						k := base.NewKey(key, cache.cfg.Shards)
-						b.Logf("MUST_GET FAIL [worker=%d]: key=%s id=%d\n", workerID, string(key),
-							k.FileID())
+						b.Logf("Failed to find %s", key)
 					}
 				}
 			} else {
 				// 45% reads with miss prefix (tests bloom filter)
 				keyID := rng.Int63n(int64(b.N))
 				key := []byte(fmt.Sprintf("miss-%d", keyID))
-				_, _ = cache.Get(key)
+				_, found := cache.Get(key)
+				if found {
+					b.Logf("Expected missing, but found instead %s", key)
+				}
 			}
 		}
 	})

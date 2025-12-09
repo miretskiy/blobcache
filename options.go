@@ -22,8 +22,8 @@ type config struct {
 	BloomRefreshInterval  time.Duration
 	OrphanCleanupInterval time.Duration
 	ChecksumHash          func() hash.Hash32 // Factory for checksum hash (nil = disabled)
-	Fsync                 bool
 	VerifyOnRead          bool
+	Fsync                 bool
 	DirectIOWrites        bool // Use DirectIO for writes
 	UseSkipmapIndex       bool // Use in-memory skipmap index (fastest, no persistence); Bitcask is the default
 }

@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/miretskiy/blobcache/base"
 	"github.com/ncw/directio"
 )
 
@@ -17,7 +16,7 @@ type DirectIOWriter struct {
 // NewDirectIOWriter creates a DirectIO blob writer
 func NewDirectIOWriter(basePath string, shards int, fsync bool) *DirectIOWriter {
 	return &DirectIOWriter{
-		paths: BlobPaths(basePath),
+		paths: NewBlobPaths(basePath, shards),
 		fsync: fsync,
 	}
 }
@@ -25,7 +24,7 @@ func NewDirectIOWriter(basePath string, shards int, fsync bool) *DirectIOWriter 
 // isAligned is defined in platform-specific files (directio_darwin.go, directio_linux.go)
 
 // Write writes a blob atomically using DirectIO with temp file + truncate + rename
-func (w *DirectIOWriter) Write(key base.Key, value []byte) error {
+func (w *DirectIOWriter) Write(key Key, value []byte) error {
 	tempPath := w.paths.TempBlobPath(key)
 	finalPath := w.paths.BlobPath(key)
 

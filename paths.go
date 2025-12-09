@@ -5,28 +5,44 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/miretskiy/blobcache/base"
+	"github.com/cespare/xxhash/v2"
 )
 
-// BlobPaths is a basePath for per-blob storage with path generation methods
-type BlobPaths string
+// BlobPaths encapsulates basePath and sharding configuration for per-blob storage
+type BlobPaths struct {
+	basePath string
+	shards   int
+}
+
+// NewBlobPaths creates a path generator with sharding configuration
+func NewBlobPaths(basePath string, shards int) BlobPaths {
+	return BlobPaths{basePath: basePath, shards: shards}
+}
+
+// hash computes shardID and fileID from key
+func (p BlobPaths) hash(key []byte) (shardID int, fileID uint64) {
+	h := xxhash.Sum64(key)
+	return int(h % uint64(p.shards)), h >> 32
+}
 
 // BlobPath returns the path for a blob file
-func (p BlobPaths) BlobPath(key base.Key) string {
-	return filepath.Join(string(p), "blobs",
-		fmt.Sprintf("shard-%03d", key.ShardID()),
-		fmt.Sprintf("%d.blob", key.FileID()))
+func (p BlobPaths) BlobPath(key Key) string {
+	shardID, fileID := p.hash(key)
+	return filepath.Join(p.basePath, "blobs",
+		fmt.Sprintf("shard-%03d", shardID),
+		fmt.Sprintf("%d.blob", fileID))
 }
 
 // TempBlobPath returns a temporary path for atomic writes
-func (p BlobPaths) TempBlobPath(key base.Key) string {
-	shardDir := filepath.Join(string(p), "blobs", fmt.Sprintf("shard-%03d", key.ShardID()))
-	return filepath.Join(shardDir, fmt.Sprintf(".tmp-%d-%d.blob", key.FileID(), time.Now().UnixNano()))
+func (p BlobPaths) TempBlobPath(key Key) string {
+	shardID, fileID := p.hash(key)
+	shardDir := filepath.Join(p.basePath, "blobs", fmt.Sprintf("shard-%03d", shardID))
+	return filepath.Join(shardDir, fmt.Sprintf(".tmp-%d-%d.blob", fileID, time.Now().UnixNano()))
 }
 
 // ShardDir returns the shard directory path
 func (p BlobPaths) ShardDir(shardID int) string {
-	return filepath.Join(string(p), "blobs", fmt.Sprintf("shard-%03d", shardID))
+	return filepath.Join(p.basePath, "blobs", fmt.Sprintf("shard-%03d", shardID))
 }
 
 // SegmentPaths is a basePath for segment storage with path generation methods

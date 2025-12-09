@@ -1,559 +1,976 @@
 # BlobCache Design Document
 
+## Executive Summary
+
+BlobCache is a high-performance blob caching system optimized for append-heavy workloads where RocksDB's compaction overhead becomes prohibitive. In production scenarios with high miss rates (52% negative lookups), RocksDB's FIFO compaction creates hundreds of SST files, forcing every lookup to cascade through multiple bloom filter checks - wasting significant CPU on the most common operation.
+
+**Primary use case:** Local NVMe caching layer for large blobs (100KB-10MB) where unified bloom filters eliminate multi-file lookup cascades.
+
+**Key innovations:**
+1. **Unified bloom filter** - Single filter for all keys eliminates cascading checks across hundreds of SST files
+2. **Immutable blob storage** - Write-once architecture eliminates compaction (all disk bandwidth available for ingestion)
+3. **Streaming checksums** - Incremental verification as data flows, errors surfaced immediately on Read()
+
+**Production benchmark (AWS Graviton m7gd.8xlarge, 256GB workload):**
+- **2.77× faster** than RocksDB (1.04 GB/s vs 0.38 GB/s)
+- **45× less memory** (2.2GB vs 100GB)
+- **3.75× less CPU** (2 cores vs 7.5 cores)
+- **No compaction storms** - predictable, consistent performance
+
+**Trade-offs:** Brand new system (not battle-tested), segment mode has coarse-grained eviction (can't delete individual blobs within segments), FIFO only (no LRU), append-only (no updates).
+
+---
+
 ## Motivation
 
-### Production Problem Analysis
+### Production Problem
 
-**Service:** logs-event-store-reader (logs-storage namespace)
-**RocksDB Config:** FIFO compaction, 960 MB memtables, 455 L0 files at peak
-**Fleet Cost:** 5,200 cores for 10B queries/day across ~10K pods
+**Service:** logs-event-store-reader (Datadog logs storage infrastructure)
 
-**Root cause analysis:**
-- 52% negative lookups (keys not found)
-- Each negative: 455 bloom filter checks × 100ns = 45 µs CPU
-- Fleet-wide: 5.2B negative lookups/day × 45 µs = 5,000 cores
-- Write path: ~200 cores (memtable + compaction)
+**Workload characteristics:**
+- Large blob storage (100KB-10MB per blob, 900KB average)
+- Append-heavy (write-once, read-many, evict-by-age)
+- High miss rate (52% of requests for keys not in cache)
 
-**Attempts to optimize RocksDB:**
-- ❌ Block cache: Values too large (400 KB avg), no benefit
-- ❌ Leveled compaction: 10-15× write amp exceeds disk capacity (1,048 MB/s NVMe)
-- ❌ Universal compaction: 5-8× write amp still exceeds disk
-- ❌ Aggressive intra-L0: Creates larger files that never compact again (worse read amp)
-- ✅ RocksDB FIFO is already optimal for these constraints
+**RocksDB configuration (FIFO compaction):**
+- 960MB memtables
+- 6 memtables in-flight
+- FIFO compaction with 2× write amplification
+- Disabled block cache (values too large)
+- 455 L0 SST files observed (800+ files at peak load)
 
-**Conclusion:** Need different architecture, not RocksDB tuning.
+### The Performance Problem
+
+**Read amplification kills us:**
+
+RocksDB's FIFO compaction trades low write amplification (2×) for **extremely high read amplification**. Each Get() checks bloom filters sequentially (all loaded in memory) until a match is found. Example with 455 files (busy node, peak is 800+):
+
+```
+Negative lookup (52% of requests):
+  Must check ALL bloom filters (key not found)
+  = 455 bloom filter checks × 100ns each
+  = 45,500ns = 45µs CPU per request
+
+Positive lookup (48% of requests):
+  Statistical average: ~50% of files checked before match
+  = 227 bloom filter checks × 100ns each
+  = 22,700ns = 22µs CPU per request
+```
+
+**This is inherent to FIFO compaction.** The number varies (200-800+ files) based on ingestion rate and eviction timing. At peak (800+ files), negative lookups cost 80µs+. The fundamental problem: bloom filters must be checked sequentially, and for negative lookups (most common), every single file must be checked.
+
+### Why RocksDB Features Don't Help
+
+RocksDB provides powerful capabilities that our workload **doesn't use** - they're pure overhead:
+
+**Unused features (pure overhead):**
+- **Range scans**: We only do point lookups (Get by key)
+- **Range deletions**: We evict entire files, not key ranges
+- **Iterators (forward/backward)**: No iteration needed
+- **Block cache**: Values too large (900KB avg) - cache would need 100GB+
+- **SSTable metadata**: Index blocks, filter blocks, data blocks - all overhead for large values
+- **Compaction strategies**: Leveled/Universal need 5-15× write amp (exceeds disk capacity)
+- **Point updates/deletes**: Append-only workload, no updates
+
+**What we actually need:**
+- ✅ Fast negative lookups (bloom filter)
+- ✅ Fast positive lookups (index + disk read)
+- ✅ Batched writes (memtable)
+- ✅ FIFO eviction
+
+**Root cause:** RocksDB is a general-purpose LSM storage engine. For specialized workloads (append-only caching), its generality becomes overhead.
+
+### Compaction Tax
+
+**FIFO compaction is optimal** for our disk constraints (1GB/s write capacity), but comes with costs:
+
+**During our benchmark (256GB written):**
+- RocksDB created 12 SST files (960MB each = 11.5GB)
+- FIFO triggered: Compact 12 files → 1 merged file (11GB)
+- This requires:
+  - **Read**: 11.5GB from disk (streamed in blocks)
+  - **Merge-sort**: CPU intensive, sorting blocks from 12 files
+  - **Write**: 11GB merged output back to disk
+- All while handling new writes!
+
+**Result:**
+- Only ~0.4 GB/s available for new data ingestion
+- Remaining ~0.6 GB/s consumed by compaction I/O
+- 7.5 cores for merge operations
+- 100GB memory usage (78% of available RAM)
+
+**For logs caching, compaction provides zero value** - we never read old data once it's evicted. The compaction is pure maintenance overhead.
 
 ---
 
-## Design Goals
+## Solution Overview
 
-**Target: 75% fleet CPU reduction** (5,200 → 1,300 cores)
+### Baseline Performance
 
-Primary optimization: Single bloom filter check (1 ns) vs 455 checks (45 µs)
+**For caching large blobs on local NVMe, a simple file-per-blob strategy already performs well** - often matching or exceeding RocksDB in our early benchmarks. The combination of large blob sizes (900KB average) and fast local NVMe storage means that simple approaches are competitive.
 
-**What it is:** High-performance blob cache with bloom filter optimization
-**What it is NOT:** General-purpose storage engine
+**RocksDB's blob mode:** RocksDB offers a "blob" feature designed for large values, storing them separately from the LSM tree. We have not evaluated this mode recently. Historical attempts were problematic, though the specific issues are no longer documented. This design takes a different approach: purpose-built for immutable blob caching rather than adapting a general LSM engine.
+
+### Core Insights
+
+**What we eliminate:**
+1. **Compaction** - Immutable blobs never merge, no compaction needed
+2. **Multi-file bloom checks** - Single global bloom filter
+3. **SST file overhead** - Simple segment files (no index blocks, filter blocks, etc.)
+
+**What we keep from RocksDB:**
+1. **MemTable design** - Batch writes, async flush with multiple workers
+2. **Write buffer sizing** - 1GB memtables, 6 inflight (matches production)
+3. **DirectIO** - Bypass OS cache for predictable write latency
+
+**What we add:**
+1. **Unified bloom filter** - Lock-free, atomic operations
+2. **Streaming checksums** - hash.Hash32 interface, verify on Read()
+3. **Storage strategies** - Clean architecture for eviction logic
+
+### System Design Philosophy
+
+**Optimize for:**
+- ✅ Negative lookups (52% of requests) - 1ns bloom check
+- ✅ Write throughput - No compaction stealing bandwidth
+- ✅ Predictability - No compaction storms
+- ✅ Simplicity - Append and evict, that's it
+
+**Accept trade-offs:**
+- ❌ Segment mode: No point deletes (segment-level eviction only)
+- ❌ No updates (append-only)
+- ❌ No range queries (not needed)
+- ❌ Coarser eviction granularity in segment mode
+
+**Cache semantics:** Recent write loss acceptable (no fsync by default), corruption detected (optional checksums), simple FIFO eviction.
 
 ---
-
-## High-Level Design
-
-### Core Architecture
-
-**Three components working together:**
-
-1. **Global Bloom Filter (Lock-Free)**
-   - Single filter for all keys (not per-file)
-   - Lock-free atomic operations (1 ns reads, 12 ns writes)
-   - Rebuilt periodically from index (configurable intervals)
-   - Persisted to bloom.dat file
-
-2. **Bitcask Index (Default) or Skipmap (Fast)**
-   - Key → Record{SegmentID, Pos, Size, CTime, Checksum, HasChecksum}
-   - Bitcask: Embedded persistent storage with in-memory hash table
-   - Skipmap: Pure in-memory (fastest) or durable Skipmap backed by Bitcask
-   - Scan() method for flexible iteration (bloom rebuild, eviction, size tracking)
-
-3. **Segment-Based Blob Storage (NVMe-Optimized)**
-   - Large segment files (2GB default)
-   - Multiple blobs packed sequentially in each segment
-   - Designed for high-performance NVMe (1+ GB/s sustained)
-   - Batched writes via MemTable reduce syscall overhead
-   - DirectIO support for bypassing OS cache
-
-**Data flow:**
-
-```
-Put:  Add to write buffer → When full, flush segment → Batch update index & bloom
-Get:  Bloom check (1 ns) → Query index for segment+offset → pread() from segment
-```
-
-### Design Decisions Optimized for Hot Path
-
-**Prioritize read speed:**
-- ✅ Lock-free bloom (no mutex contention on reads)
-- ✅ Single bloom check (not 455 like RocksDB)
-- ✅ pread() for concurrent reads from segments (no locks)
-- ✅ Zero-alloc Get() (caller-provided Entry)
-
-**Accept trade-offs for simplicity:**
-- ✅ Deletes don't update bloom (accept FPs, rebuild periodically)
-- ✅ Segment-level eviction (evict entire segments, not individual blobs)
-- ✅ No LRU tracking (simple FIFO by segment creation time)
-- ✅ Daily orphan cleanup (not on startup)
-
-**Hardware assumptions:**
-- High-performance NVMe (1+ GB/s write, <1 ms latency)
-- Sequential writes perform better than random small files
-- Batching reduces syscall overhead
-
 
 ## Architecture
 
-### Directory Structure
+### Component Overview
 
 ```
-/data/blobcache/
-├── bitcask-index/            # Bitcask index files (default)
-│   ├── datafile              # Key-value pairs
-│   └── hint                  # Index file for fast startup
-├── bloom.dat                 # Serialized bloom filter
-└── segments/
-    ├── 1733183456789123456-00.seg    # timestamp-workerID.seg
-    ├── 1733183456812456789-01.seg    # Multiple blobs per segment
-    ├── 1733183456834567890-02.seg    # Large files (2GB default)
-    └── ...                           # Flat directory (no sharding needed)
+┌───────────────────────────────────────────────────────────┐
+│                         Cache                             │
+│                                                           │
+│  ┌──────────────┐  ┌──────────────┐  ┌─────────────────┐  │
+│  │ Bloom Filter │  │   MemTable   │  │ Storage Strategy│  │
+│  │  (Lock-Free) │  │  (Batching)  │  │   (Eviction)    │  │
+│  │              │  │              │  │                 │  │
+│  │  • 1ns Test  │  │• Async flush │  │• BlobStorage    │  │
+│  │  • Single    │  │• Configurable│  │• SegmentStorage │  │
+│  │  • Atomic    │  │  workers     │  │                 │  │
+│  └──────┬───────┘  └──────┬───────┘  └────────┬────────┘  │
+│         │                 │                   │           │
+│         └────────┬────────┴───────────────────┘           │
+│                  │                                        │
+│         ┌────────▼────────────────────┐                   │
+│         │   Index (Bitcask/Skipmap)   │                   │
+│         │                             │                   │
+│         │  Scan() → eviction, bloom   │                   │
+│         │  Get() → segment lookup     │                   │
+│         │  PutBatch() → flush         │                   │
+│         └────────┬────────────────────┘                   │
+│                  │                                        │
+│    ┌─────────────┴──────────────┐                         │
+│    │                            │                         │
+│  ┌─▼────────────┐      ┌────────▼─────────┐               │
+│  │ BlobReader   │      │   BlobWriter     │               │
+│  │              │      │                  │               │
+│  │• Buffered    │      │ • Buffered       │               │
+│  │• Segment     │      │ • DirectIO       │               │
+│  │• Checksum    │      │ • Segment        │               │
+│  └──────────────┘      └──────────────────┘               │
+└───────────────────────────────────────────────────────────┘
 ```
 
-**Index options:**
-- Bitcask (default): Persistent embedded storage
-- Skipmap (fast): In-memory only or backed by Bitcask
+The system has four main components working together:
 
-### Why Segment-Based Storage?
+1. **Bloom Filter** - Fast negative lookup rejection (1ns)
+2. **MemTable** - Batched write buffering with async flush
+3. **Index** - Key → segment position lookup (Bitcask or Skipmap)
+4. **Storage Strategy** - Eviction logic (blob-specific or segment-specific)
 
-**Benchmark Analysis (2025-12-01):**
-- Initial implementation: one blob per file
-- CPU profiling showed `os.WriteFile` consuming 64-70% CPU time
-- This is syscall overhead (open/write/close for each blob)
-- 256K blobs = 768K syscalls (3× per file)
+Plus supporting components:
+- **BlobReader/Writer** - Abstraction for file I/O strategies
+- **Path managers** - Centralized filename generation
+- **Checksum verifier** - Streaming data integrity
 
-**Segment-based solution:**
-- Batch 1,000-10,000 blobs per segment file
-- Reduces file count by 1000× (256K files → 256 segments)
-- Reduces syscalls by 99.9% (768K → 768 syscalls)
-- Sequential writes (better I/O performance)
+### Write Path
+
+```
+Application
+    ↓ Put(key, value)
+MemTable (lock-free skipmap)
+    ↓ [accumulate until 1GB]
+Rotation (atomic pointer swap)
+    ↓ Send to flush channel
+Flush Worker (1 of 6)
+    ↓ Range over entries
+BlobWriter.Write(key, value)
+    ↓ Append to segment file
+    ↓ Compute checksum
+Collect Records[]
+    ↓ After all written
+Index.PutBatch(records)
+    ↓ Batch insert metadata
+Update approxSize
+    ↓ If > MaxSize
+Reactive Eviction (immediate)
+```
+
+**Key design:**
+- Lock-free puts (skipmap has no global lock)
+- Rotation only when buffer full (configurable, production uses 1GB)
+- Multiple flush workers process batches concurrently (default 6, configurable)
+- Batched index updates (efficient)
+- Immediate eviction response to spikes
+
+### Read Path
+
+```
+Application
+    ↓ Get(key)
+Bloom Filter Test (1ns)
+    ↓ false? → return (nil, false)
+    ↓ true (or might exist)
+MemTable.Get(key)
+    ↓ found? → return bytes.Reader(value)
+    ↓ not in memtable
+Index.Get(key) → Record
+    ↓ Lookup SegmentID, Pos, Size
+BlobReader.Get(key)
+    ↓ Open segment file (cached)
+    ↓ ReadAt(pos, size)
+    ↓ Wrap with checksum verifier if enabled
+Return io.Reader
+```
+
+**Performance:**
+- Negative: **1ns** (bloom rejects)
+- Positive (cached): **~1µs** (memtable hit)
+- Positive (disk): **~2-3ms** (index lookup + disk read)
+
+Compare to RocksDB negative: **45µs** (455 bloom checks)
+
+### Eviction (Dual Mode)
+
+**Reactive (immediate):**
+- Triggered by memtable flush when size > MaxSize
+- Prevents cache bloat during traffic spikes
+- Atomic flag prevents concurrent evictions (multiple flush workers could trigger simultaneously)
+
+**Background (safety net):**
+- Runs every 60 seconds
+- Catches gradual growth
+- Ensures size stays under limit
+
+**Process:**
+1. Compute total size (Scan index, sum sizes)
+2. If > MaxSize: Calculate toEvict with hysteresis (10% extra)
+3. Delegate to StorageStrategy.Evict(toEvict)
+4. Update approxSize tracking
 
 ---
 
-## Index Storage
+## Component Deep Dive
 
-**Bitcask encoding (default index):**
+### Bloom Filter - Unified Lock-Free Design
+
+**The problem blobcache solves:**
+
+RocksDB's FIFO compaction creates many L0 files (200-600 depending on ingestion rate). Each file has its own bloom filter. For negative lookups, RocksDB must check EVERY file's bloom filter sequentially:
+
 ```
-Key: raw key bytes
-Value: SegmentID(8) + Pos(8) + Size(4) + CTime(8) + Flags(1) + [Checksum(4) if HasChecksum]
-       = 29 bytes (no checksum) or 33 bytes (with checksum)
+File 001: bloom.Test(key) → false
+File 002: bloom.Test(key) → false
+File 003: bloom.Test(key) → false
+...
+File 455: bloom.Test(key) → false
+Total: 455 × 100ns = 45µs
 ```
 
-**Flags byte:**
-- Bit 0: HasChecksum (checksum field valid)
-- Bits 1-7: Reserved for future use
+**Our solution:** Single global bloom filter
+```
+Global bloom.Test(key) → false
+Total: 1ns
+```
 
-**Record structure:**
+**Size estimation for production:**
+
+For 1M keys with 1% false positive rate:
+- Bits needed: -ln(0.01) / (ln(2))² × 1M ≈ 9.6 bits/key
+- Total: 9.6M bits = 1.2MB
+- With uint32 array: 300K words × 4 bytes = 1.2MB
+
+For 4M keys:
+- 4.8MB bloom filter
+- Rebuild time: 40ms (scan 4M keys from index)
+- Memory overhead: Negligible (<5MB)
+
+**Atomic operations trade-off:**
+
+**Why atomic (not mutex):**
+- Test(): Single atomic load = 1ns
+- Add(): CAS loop = 12ns (retry on contention)
+- Concurrent Test(): 0.95ns (perfect scaling, no lock)
+
+**Why not mutex:**
+- Mutex acquire/release: 10-20ns even uncontended
+- Under contention: 50-100ns+
+- Would make Test() 10-20× slower
+
+**Precision trade-off:**
+- Atomic Add() uses CAS loop (may retry on concurrent writes)
+- Rare: Only when same word written concurrently
+- Acceptable: Retry overhead (1-2ns) << mutex overhead (10-20ns)
+
+**Rebuild strategy:**
+- Deletes don't update bloom (would need atomic bit clear - complex)
+- Instead: Rebuild periodically (10min default)
+- Scan index (fast), create new filter, atomic pointer swap
+- Accept temporary false positives after deletes
+- Simpler, cleaner design
+
+### MemTable - Batched Async Flush
+
+**Design goal:** Match RocksDB's write efficiency while staying simpler.
+
+**Why multiple frozen memtables (like RocksDB):**
+
+Imagine single memtable with synchronous flush:
+```
+Write 1GB → Flush blocks → Can't accept new writes → 1-2 second stall
+```
+
+With multiple memtables (production config: 6):
+```
+Active memtable: Accepting writes (lock-free)
+Frozen #1-N: Flushing concurrently (N I/O workers)
+```
+
+**Benefits:**
+- ✅ **Avoids blocking writes**: Active memtable usually available
+- ✅ **Saturates disk**: Multiple workers × concurrent I/O = full bandwidth
+- ✅ **Bounded memory**: Max N×bufferSize (production: 6×1GB = 6GB)
+
+**Configuration trade-offs:**
+
+| Setting | Memory | I/O Depth | Throughput | When to use |
+|---------|--------|-----------|------------|-------------|
+| 1GB × 6 workers | 6GB | High | 1.04 GB/s | Production (match RocksDB) |
+| 512MB × 6 workers | 3GB | High | 1.04 GB/s | Memory-constrained |
+| 1GB × 3 workers | 3GB | Medium | 0.8 GB/s | Lower memory + throughput |
+| 100MB × 6 workers | 600MB | Medium | 0.6 GB/s | Development/testing |
+
+**More workers ≠ better (for disk-bound workloads):**
+- Production (6 workers) already saturates 1GB/s disk
+- Doubling to 12 workers would increase memory (12GB) without improving throughput
+- Disk-bound, not CPU-bound (in our benchmark scenario)
+
+**Backpressure mechanism:**
+- When MaxInflightBatches full (production: 6), next Put() blocks
+- Currently implemented with mutex + condition variable
+- Prevents unbounded memory growth during traffic spikes
+
+### Index - Bitcask vs DuckDB Decision
+
+**Why we chose Bitcask over DuckDB:**
+
+**DuckDB (original design):**
+- Analytical queries: `SELECT segment_id, SUM(size) FROM entries GROUP BY segment_id ORDER BY MIN(ctime)`
+- Fast aggregations: `SELECT SUM(size) FROM entries` in 40ms for 4M rows
+- Nice to have, but not essential
+
+**Bitcask (current):**
+- Simple embedded key-value store
+- In-memory hash table for O(1) lookups
+- Persistent (append-only log + hint file)
+- No CGO, no SQL, smaller binary
+
+**Decision rationale:**
+1. **Scan() is sufficient**: Eviction can scan and sort in memory (fast enough)
+2. **Simpler**: No SQL engine, easier to debug/maintain
+3. **Proven**: Battle-tested in Riak and other systems
+4. **Lighter**: Fewer dependencies, smaller attack surface
+
+**Skipmap option for speed:**
+- Pure in-memory for fastest reads (lock-free skipmap)
+- Optional Bitcask backing for durability
+- Best for segment mode (rebuilt from segments on restart)
+- Trade-off: Requires segment mode (can't rebuild per-blob)
+
+**Durability model:**
+
+Both indexes are eventually durable:
+- **Bitcask**: Append-only log flushed to disk, hint file for fast restart
+- **Skipmap**: Backed by Bitcask writes (durable) + in-memory reads (fast)
+
+**Consistency:**
+- Index updated AFTER blob written to disk
+- Crash before index update: Orphaned segment (acceptable for cache)
+- Crash after index update: Complete, blob readable
+- Checksums detect corruption (optional)
+
+### Storage Strategies - Clean Eviction Architecture
+
+**The problem:** Eviction logic fundamentally differs between storage modes.
+
+**Per-blob mode:**
+- Need to delete individual files
+- Must sort ALL records by CTime (oldest first)
+- Path generation: `blobs/shard-XXX/YYY.blob`
+
+**Segment mode:**
+- Delete entire segment files
+- Group records by SegmentID, sort segments by age
+- Path generation: `segments/TIMESTAMP-WORKER.seg`
+
+**Original design:**
 ```go
-type Record struct {
-    Key         []byte // Raw key bytes
-    SegmentID   int64  // Segment ID (timestamp-workerID)
-    Pos         int64  // Byte offset within segment
-    Size        int    // Blob size in bytes
-    CTime       int64  // Creation time (for FIFO eviction)
-    Checksum    uint32 // CRC32 checksum (if HasChecksum=true)
-    HasChecksum bool   // True if checksum field is valid
+func runEviction() {
+    if segmentMode {
+        // ... 50 lines of segment logic ...
+    } else {
+        // ... 50 lines of blob logic ...
+    }
 }
 ```
 
-**Indexer interface (minimal):**
-- Put(key, record) - Insert/update record
-- Get(key, record) - Lookup record
-- Delete(key) - Remove record
-- Scan(fn) - Iterate all records (for bloom rebuild, eviction, size tracking)
-- PutBatch(records) - Atomic batch insert
-- Close() - Shutdown
+**Current design (good):**
+```go
+type StorageStrategy interface {
+    Evict(ctx, targetBytes) (evictedBytes, error)
+}
 
-**File mapping:** `segments/{timestamp}-{worker_id}.seg`
-- SegmentID: `{unix_nanos}-{worker_id}` (e.g., `1733183456789123456-03`)
-- Pos: Byte offset within segment file
-- Size: Length of blob data
-- Checksum: Optional CRC32 for data integrity
+type BlobStorage struct {
+    paths BlobPaths  // Encapsulates path generation
+    index Indexer
+}
 
-**No directory scan on restart:** Timestamp-based IDs eliminate need to find max ID
+type SegmentStorage struct {
+    paths SegmentPaths  // Different path structure
+    index Indexer
+}
+```
+
+**Benefits:**
+1. **Single Responsibility** - Each strategy owns its eviction logic
+2. **Testable** - Unit test BlobStorage.Evict() in isolation
+3. **Path encapsulation** - No scattered `fmt.Sprintf("shard-%03d")` everywhere
+4. **Clean Indexer** - Only Scan() method (generic, usable by both strategies)
+
+**Path managers (zero-allocation):**
+```go
+type BlobPaths string      // Just the basePath
+type SegmentPaths string   // Just the basePath
+
+// Methods return constructed paths
+func (p BlobPaths) BlobPath(key) string
+func (p SegmentPaths) SegmentPath(id, worker) string
+```
+
+Benefits: Value types (not pointers), no allocations, type-safe (can't mix blob/segment paths).
+
+### Checksums - Streaming Verification Design
+
+**Design philosophy:**
+
+Traditional approach: Read entire blob, compute checksum, compare, return data.
+- ❌ Forces eager reading (even if caller only needs 1KB)
+- ❌ Duplicates code (every reader must implement)
+- ❌ Close errors ignored (`defer file.Close()` swallows errors)
+
+**Our approach:** Streaming verification with stdlib interface.
+
+**Use hash.Hash32 (not custom Checksummer):**
+- ✅ Standard library interface (hash/crc32, hash/xxhash compatibility)
+- ✅ Proven, well-understood semantics
+- ✅ Incremental hashing (Write() method)
+- ✅ Existing implementations (crc32.NewIEEE(), etc.)
+
+**Why this works:**
+1. **Lazy**: Checksums only computed for data caller actually reads
+2. **Resilient**: Error returned where caller will see it (on Read)
+3. **Efficient**: No buffering, hash computed incrementally
+4. **Reusable**: Same wrapper for all readers (no duplication)
+
+**Mid-lifecycle restart support:**
+
+`Record.HasChecksum` flag enables safe restarts:
+- Old data: `HasChecksum=false` (skip verification)
+- New data: `HasChecksum=true` (verify if VerifyOnRead enabled)
+- Avoids `checksum=0` ambiguity (0 is a valid CRC32 value)
+- Flags byte encoding for future extensions
+
+**Test coverage:**
+- 9 comprehensive tests including edge cases
+- 1-byte-at-a-time streaming (extreme case)
+- Checksum mismatch detection and error caching
+- Empty data, large data (10MB), varying chunk sizes
+
+### Readers and Writers - DirectIO Analysis
+
+**BlobReader interface:**
+```go
+type BlobReader interface {
+    Get(key base.Key) (io.Reader, bool)
+    Close() error
+}
+```
+
+**Implementations:**
+- **BufferedReader**: Per-blob mode, standard I/O
+- **SegmentReader**: Segment mode, file handle caching
+
+**BlobWriter interface:**
+```go
+type BlobWriter interface {
+    Write(key base.Key, value []byte) error
+    Pos() WritePosition  // Returns SegmentID, Pos for index
+    Close() error
+}
+```
+
+**Implementations:**
+- **BufferedWriter**: Standard I/O with atomic temp+rename
+- **DirectIOWriter**: O_DIRECT with aligned writes
+- **SegmentWriter**: Append to large files (buffered or DirectIO)
+
+**DirectIO: The Controversial Choice**
+
+**When DirectIO helps (production Linux):**
+- ✅ Predictable latency (no kernel writeback interference)
+- ✅ Consistent throughput (1.04 GB/s, no variance; if you can saturate)
+- ✅ No dirty page writeback storms
+- ✅ Better for 24/7 production (no surprises)
+
+**When DirectIO hurts (and might hurt blobcache):**
+- ❌ **Synchronous writes**: Each write waits for disk acknowledgment
+  - Buffered I/O: Write returns immediately (kernel buffers in page cache)
+  - DirectIO: Write blocks until disk confirms (~1ms per 1MB)
+- ❌ **Higher memory pressure**: More inflight batches needed during writes
+  - Buffered: Kernel absorbs spikes in page cache
+  - DirectIO: Must buffer in userspace (more frozen memtables)
+- ❌ **Defeats page cache for recent reads**:
+  - 45% of benchmark reads are "hits" (recent writes from same worker)
+  - Buffered: Likely in page cache (RAM speed, ~1ns)
+  - DirectIO: Must read from disk (1-3ms)
+- ❌ **Alignment overhead**: Padding to 4KB, then truncate
+
+**Why RocksDB uses DirectIO:**
+- Compaction reads OLD data (not in page cache anyway)
+- DirectIO helps compaction avoid polluting cache
+- Different access pattern than blobcache
+
+**Why blobcache might NOT want DirectIO:**
+- Workload: Write data, shortly after read it (benchmark pattern)
+- Page cache hit rate could be very high (recent data cached)
+- DirectIO bypasses this benefit
+
+**Current status:**
+- DirectIO is optional (WithDirectIOWrites)
+- Benchmark tested with DirectIO enabled (for RocksDB parity)
+- Open question: Would buffered I/O be faster for blobcache's workload?
+
+**Recommendation:** Benchmark both modes on production hardware. Page cache might provide significant benefit for recently-written data.
+
+### Readers/Writers - Fdatasync Strategy
+
+**Per-blob writes (atomic temp+rename):**
+```
+1. Write to temp file (.tmp-{fileID}-{timestamp}.blob)
+2. Fdatasync (if enabled)
+3. Close temp file
+4. Atomic rename to final path
+```
+
+**Segment writes (append to long-lived file):**
+```
+Buffered mode:
+1. Append blob to segment
+2. Fdatasync after EACH blob (durability for long-lived file)
+
+DirectIO mode:
+1. Append blob (already bypasses cache)
+2. Fdatasync only on segment close (redundant but defensive)
+```
+
+**Why fdatasync (not fsync):**
+- **2-5× faster** (Linux: data-only, skips metadata sync)
+- **Sufficient**: Blob size stored in index (not filesystem metadata)
+- **Immutable**: Don't care about mtime
+- **Platform**: Linux uses fdatasync(2), Darwin uses F_FULLFSYNC (no fdatasync exists)
+
+**When enabled (WithFsync):**
+- ❌ **Not recommended** for caching (defeats purpose of speed)
+- ✅ **Use for**: Durable storage where data loss unacceptable
+- Trade-off: Lower throughput for durability
 
 ---
 
-## Bloom Filter Implementation
+## Performance Analysis
 
-**Lock-free design** (NOT mutex-based):
+### Benchmark Results Interpretation
+
+**AWS Graviton m7gd.8xlarge (production-class hardware):**
+- 32 cores, 128GB RAM, 1.7TB NVMe
+- Disk: 536K read IOPS, 268K write IOPS (independent channels)
+- **No SLC cache** - consistent sustained performance
+
+**Test:** 2.56M operations (256K writes = 256GB, 2.3M reads)
+- Workload: 10% writes, 45% hits (worker's own recent writes), 45% misses
+- Both systems: 1GB memtable, 6 inflight, DirectIO, no compression
+
+**Results:**
+
+| Metric | RocksDB | Blobcache | Ratio |
+|--------|---------|-----------|-------|
+| Latency | 259µs | 93µs | 2.77× faster |
+| Throughput | 0.38 GB/s | 1.04 GB/s | 2.77× faster |
+| Duration | 18.7 min | 4.2 min | 4.45× faster |
+| Memory | 100.6GB | 2.2GB | 45.7× less |
+| CPU | 7.5 cores | 2 cores | 3.75× less |
+
+**Disk bandwidth breakdown:**
+
+| System | User Writes | Compaction Read | Compaction Write | Total I/O | % Useful |
+|--------|-------------|-----------------|------------------|-----------|----------|
+| Blobcache | 1.04 GB/s | 0 | 0 | 1.04 GB/s | **100%** |
+| RocksDB | ~0.4 GB/s | ~0.3 GB/s | ~0.3 GB/s | ~1.0 GB/s | **40%** |
+
+**Key insight:** RocksDB reports 0.38 GB/s "write throughput" but uses ~1 GB/s total disk I/O. Only 40% is new data ingestion - the rest is compaction maintenance. Blobcache's 1.04 GB/s is 100% useful work.
+
+**Memory usage:**
+
+| System | Memory Used | % of 128GB RAM |
+|--------|-------------|----------------|
+| Blobcache | 2.2GB | 1.7% |
+| RocksDB | 100.6GB | 78% |
+
+**Observation:** RocksDB benchmark used 78% of available memory (100.6GB on 128GB machine), while blobcache used 1.7% (2.2GB).
+
+This difference could stem from various factors - bloom filters loaded in memory for 455 files, SST metadata structures, CGO boundary overhead, or features we haven't implemented (that may be valuable). It's also possible blobcache has simplifications or bugs that will require more memory as the implementation matures.
+
+The current observed state: one benchmark uses 2-5% of RAM, the other uses 70-80%.
+
+**CPU usage:**
+- RocksDB: 7.5 cores (merge-sorting 11GB files)
+- Blobcache: 2 cores (lock-free writes, simple appends)
+
+**Consistency:**
+- RocksDB: Variable (0.8-1.1 GB/s swings during compaction)
+- Blobcache: Steady 1.04 GB/s (no interference)
+
+### Platform Differences
+
+**Mac M4 vs Linux Graviton:**
+
+| Characteristic | Mac M4 Max | AWS Graviton |
+|----------------|------------|--------------|
+| **SLC cache** | ~6GB (burst 3-4 GB/s) | None (consistent 1 GB/s) |
+| **Sustained throughput** | 1-1.5 GB/s (after SLC) | 1.04 GB/s (always) |
+| **DirectIO benefit** | ❌ Slower (SLC faster) | ✅ Essential (no page cache games) |
+| **Benchmark value** | Misleading (burst) | Production-realistic |
+| **Fdatasync** | F_FULLFSYNC (fcntl) | syscall.Fdatasync() |
+
+**Lesson:** Always validate on production hardware. Mac's SLC cache makes it look faster than reality, and DirectIO shows opposite performance characteristics.
+
+**Page cache considerations:**
+
+Benchmark workload: 45% reads are "hits" (worker reads its own recent writes).
+
+**With page cache (buffered I/O):**
+- Recent writes likely cached in RAM
+- Reads served at memory speed (~1ns)
+- Lower apparent disk read load
+
+**With DirectIO:**
+- Bypasses page cache
+- All reads hit disk (1-3ms)
+- Higher disk utilization
+
+**Open question:** Is DirectIO actually beneficial for blobcache?
+- RocksDB compaction reads OLD data (not cached anyway)
+- Blobcache reads RECENT data (likely cached)
+- Further benchmarking needed to measure page cache hit benefit
+
+---
+
+## Configuration Guide
+
+### Production Settings (Linux)
+
 ```go
-type Filter struct {
-    data []uint32  // Bit vector
-}
+cache, _ := New("/data/blobcache",
+    // Capacity
+    WithMaxSize(1<<40),              // 1TB total
+    WithSegmentSize(2<<30),          // 2GB segments
+    WithEvictionHysteresis(0.1),     // Evict 10% extra
 
-// Lock-free read (atomic.Load)
+    // Write buffering (match RocksDB)
+    WithWriteBufferSize(1<<30),      // 1GB memtable
+    WithMaxInflightBatches(6),       // 6 concurrent flushes
+
+    // Performance
+    WithDirectIOWrites(),            // Debatable - test both!
+    WithSkipmapIndex(),              // Fastest reads (in-memory)
+
+    // Integrity
+    WithChecksum(),                  // CRC32 on writes
+    WithVerifyOnRead(false),         // Don't verify (trust checksums exist)
+
+    // Durability
+    WithFsync(false),                // Cache can lose recent writes
+)
+```
+
+**Why these settings:**
+- **1GB memtable**: Matches RocksDB production (960MB)
+- **6 inflight**: Saturates disk, matches RocksDB max_write_buffer_number
+- **2GB segments**: Sweet spot (not too many files, not too large)
+- **DirectIO**: Currently used, but should test without (page cache might help)
+- **Skipmap**: Fastest index (trade: requires segment mode)
+- **Checksums ON, Verify OFF**: Detect corruption, don't pay read penalty
+- **No fsync**: Cache semantics (speed > durability)
+
+### Development Settings (Mac)
+
+```go
+cache, _ := New("/tmp/blobcache",
+    WithMaxSize(10<<30),             // 10GB (smaller for quick iteration)
+    WithSegmentSize(1<<30),          // 1GB segments
+    WithWriteBufferSize(100<<20),    // 100MB (faster test cycles)
+    WithMaxInflightBatches(6),       // Same concurrency
+    // No DirectIO (slower on Mac, SLC cache is faster)
+    // No checksums (faster development iteration)
+)
+```
+
+---
+
+## Trade-offs & Limitations
+
+### 1. NOT Battle-Tested
+
+**Critical caveat:** This is a brand new system (December 2025).
+
+**RocksDB has:**
+- 10+ years in production
+- Millions of deployments
+- Every edge case discovered and fixed
+- Mature ecosystem
+
+**Blobcache has:**
+- Comprehensive unit tests
+- Integration tests
+- One production benchmark
+- **No production runtime yet**
+
+**What this means:**
+- ❌ Unknown failure modes exist
+- ❌ Edge cases not yet discovered
+- ❌ Performance under extreme load untested (though verified through benchmarks)
+- ✅ Simple design reduces surface area (fewer things can go wrong)
+
+### 2. Segment Mode: Coarse-Grained Eviction
+
+**Limitation (segment mode only):** Can't delete individual blobs within a segment.
+
+**Consequences:**
+- Evicting a 2GB segment might delete 10,000 blobs
+- Some blobs in that segment might be newer/hotter; but that's exactly what RocksDB FIO strategy does anyway.
+- Wasted space until segment evicted
+
+**Per-blob mode:** Supports fine-grained deletion (one file per blob).
+
+**Why acceptable:**
+- ✅ Cache semantics (imprecise eviction OK)
+- ✅ Simplicity (no per-blob tracking)
+- ✅ Performance (one file delete, not 10,000)
+
+
+### 3. FIFO Only (No LRU)
+
+**Limitation:** Eviction by age, not access frequency.
+* Possible follow up: file per blob strategy enables LRU based eviction.
+
+**Consequences:**
+- Can't keep frequently-accessed data and evict cold data
+- FIFO might evict popular segment before unpopular one
+
+**Why acceptable:**
+- ✅ Simpler (no access time tracking)
+- ✅ Fast eviction (no LRU bookkeeping)
+- ✅ Good enough for many workloads
+
+**Not acceptable for:** Workloads with strong access patterns (20% of data gets 80% of requests).
+
+### 4. Append-Only (No Updates/Deletes)
+
+**Limitation:** Can't update or delete individual blobs.
+
+**Consequences:**
+- Space not reclaimed until segment evicted
+- Can't correct corrupted data in-place
+
+**Why acceptable:**
+- ✅ Write-once-read-many workload
+- ✅ Cache can be rebuilt from source (S3)
+
+**Not acceptable for:** Mutable data stores.
+
+### 5. Memory During Eviction
+
+**Limitation:** Eviction loads all records into memory.
+
+**Current behavior:**
+- BlobStorage: Scan all records, sort by CTime in memory
+- SegmentStorage: Scan all records, group by SegmentID in memory
+
+**Memory overhead:**
+- 1M records × ~50 bytes each = 50MB
+- 10M records = 500MB
+- 100M records = 5GB
+
+**Acceptable** for expected scale (1-10M records).
+**Not acceptable** for 100M+ records (would need streaming sort).
+
+---
+
+## When To Use Blobcache
+
+### ✅ Perfect For:
+- Append-heavy workloads (logs, metrics, events, immutable artifacts)
+- Large blobs (100KB-10MB) where bloom filters provide value
+- High miss rates (bloom filter rejection is critical path)
+- FIFO eviction acceptable (age-based, not access-based)
+- Cache semantics (data loss acceptable, rebuild from source)
+- Need predictable performance (no compaction surprises)
+
+### ❌ NOT Suitable For:
+- Point updates or deletes (append-only architecture)
+- Range queries or sorted iteration (hash-based index)
+- Small values (<10KB) where RocksDB's block cache helps
+- LRU eviction required (only FIFO supported)
+- Strong durability requirements (cache can lose recent writes)
+- Battle-tested requirement (this is new, not proven at scale)
+
+---
+
+## Appendix
+
+### A. Implementation Details
+
+**Bloom filter implementation:**
+```go
+// Lock-free atomic operations
 func Test(key) bool {
     word := atomic.LoadUint32(&data[index])
     return word & mask != 0
 }
 
-// Lock-free write (atomic.CompareAndSwap)
 func Add(key) {
     for {
-        orig := atomic.LoadUint32(&data[index])
-        if atomic.CompareAndSwapUint32(&data[index], orig, orig|mask) {
+        old := atomic.LoadUint32(&data[index])
+        if atomic.CompareAndSwapUint32(&data[index], old, old|mask) {
             break
         }
     }
 }
 ```
 
-**Performance (benchmarked):**
-- Test: 1 ns/op (1000× faster than RocksDB's 100 ns!)
-- Add: 12 ns/op
-- Concurrent test: 0.95 ns/op (perfect scaling)
-- **4× faster than bits-and-blooms library**
-
-**Combines:**
-- fastbloom: Atomic operations for lock-free
-- RocksDB: Golden ratio probing (h *= 0x9e3779b9)
-- xxHash: 7 GB/s hashing
-
-**Storage:** Serialized and stored in DuckDB bloom_filter table (not separate files)
-
-**Rebuild:** Query all keys from DuckDB (40 ms for 4M keys), build new filter, atomic swap
-
----
-
-## API Design
-
-```go
-// Create cache with functional options
-func New(path string, opts ...Option) (*Cache, error)
-
-// Start background workers (eviction, bloom refresh)
-func (c *Cache) Start() (closer func() error, error)
-
-// Core operations
-Put(key, value []byte)                                    // Safe (copies data)
-UnsafePut(key, value []byte)                             // Zero-copy (caller owns)
-PutChecksummed(key, value []byte, checksum uint32)       // With explicit checksum
-UnsafePutChecksummed(key, value []byte, checksum uint32) // Zero-copy with checksum
-Get(key []byte) (io.Reader, bool)                        // Returns reader, not []byte
-Close() error
-Drain()  // Wait for memtable flush
-
-// Options (functional pattern)
-WithMaxSize(int64) Option
-WithSegmentSize(int64) Option       // Default: 0 (one blob per file), use 2GB for segments
-WithChecksum() Option               // Enable CRC32 checksums
-WithChecksumHash(func() hash.Hash32) Option  // Custom hash (e.g., xxhash)
-WithVerifyOnRead(bool) Option       // Enable checksum verification on reads
-WithFsync(bool) Option              // Enable fdatasync (default: false)
-WithDirectIOWrites() Option         // Use DirectIO for writes
-WithSkipmapIndex() Option          // Use in-memory skipmap index
-WithWriteBufferSize(int64) Option  // Memtable size (default: 100MB)
-WithMaxInflightBatches(int) Option // Concurrent flush workers (default: 6)
+**Record encoding (Bitcask):**
+```
+SegmentID(8) + Pos(8) + Size(4) + CTime(8) + Flags(1) + [Checksum(4)]
+= 29-33 bytes
 ```
 
-**Defaults:**
-- MaxSize: 0 (unlimited, set explicitly for production)
-- SegmentSize: 0 (per-blob mode, use 2GB for production)
-- Checksums: Disabled (opt-in via WithChecksum)
-- Fsync: Disabled (cache semantics, uses fdatasync when enabled)
-- VerifyOnRead: Disabled (opt-in)
-- DirectIO: Disabled (opt-in for production)
-- WriteBufferSize: 100MB (use 1GB for production)
-
----
-
-## Write Path
-
+**Key hashing:**
 ```go
-// Concurrency model: 1 batcher + N I/O workers (N = MaxInflightBatches, default 6)
-type MemTable struct {
-    entries chan Entry           // Batcher accumulates entries
-    batches chan []Entry         // I/O workers process batches in parallel
-}
-
-Put(key, value):
-1. Enqueue to memtable (non-blocking)
-   - Batcher goroutine accumulates into batches
-   - When batch reaches maxSize (1GB), sends to I/O worker
-
-2. I/O worker processes batch:
-   a. Generate segment ID: {unix_nanos}-{worker_id}
-   b. Create segment file: segments/{segment_id}.seg
-   c. Write all blobs sequentially to segment
-   d. Batch insert to DuckDB (Appender API)
-   e. Batch update bloom filter
-
-3. Multiple I/O workers run concurrently (6 by default)
-   - Each worker generates its own timestamp-based segment IDs
-   - No coordination needed between workers
+h := xxhash.Sum64(key)
+shardID := h % numShards
+fileID := h >> 32
 ```
 
-**Batching benefits:**
-- 1,000-10,000 blobs per segment
-- 1 file open/close per segment (not per blob)
-- Sequential writes (better disk performance)
-- Batch DuckDB inserts (avoid primary key violations)
+### B. Directory Structure
+
+**Segment mode:**
+```
+/data/blobcache/
+├── bitcask-index/
+│   ├── 000000.data
+│   └── 000000.hint
+├── bloom.dat
+└── segments/
+    ├── 1733183456789123456-00.seg  (2GB, worker 0)
+    ├── 1733183456812456789-01.seg  (2GB, worker 1)
+    └── ...
+```
+
+**Per-blob mode:**
+```
+/data/blobcache/
+├── bitcask-index/
+├── bloom.dat
+└── blobs/
+    ├── shard-000/
+    │   ├── 12345.blob
+    │   └── 67890.blob
+    ├── shard-001/
+    └── ... (256 shards)
+```
+
+### C. Error Handling Philosophy
+
+**Cache semantics:**
+- Recent write loss acceptable (no fsync by default)
+- Corruption detected (optional checksums)
+- Eviction can be imprecise (segment-level granularity)
+
+**Warnings (not errors):**
+- Failed blob delete → log, continue
+- Index error → log, continue
+- Eviction error → log, retry later
 
 **Crash scenarios:**
-- Buffer not flushed: Data lost (acceptable for cache)
-- During segment write: Partial segment (detected on startup, deleted)
-- After segment, before DB: Orphaned segment (cleaned daily)
-- After DB: Complete ✓
+- During segment write: Orphaned partial segment (ignore on startup)
+- After segment, before index: Orphaned complete segment (no index entry)
+- After index update: Success (blob readable)
+
+### D. Comparison to Alternatives
+
+**vs RocksDB:**
+- Blobcache: 2.77× faster, 45× less memory, no compaction
+- Use when: Append-only, FIFO eviction OK, cache semantics
+- Avoid when: Need updates/deletes, range queries, battle-tested
+
+**vs BadgerDB:** Similar LSM design, would have same compaction issues
+
+**vs BoltDB:** B+tree, single-writer, not suitable for high-throughput
+
+**vs Filesystem:** Tried (70% CPU in syscalls), led to segments
 
 ---
 
-## Read Path
+## Conclusion
 
-```go
-Get(key):
-1. Bloom filter check (~1 ns, lock-free load)
-   → If no: return ErrNotFound (fast rejection!)
+BlobCache demonstrates that **specialized design beats general-purpose** for append-heavy caching:
+- Eliminates RocksDB's compaction overhead (11GB merge files during 256GB write!)
+- Single bloom filter (45,000× faster negative lookups)
+- Simple architecture (append, evict, done)
 
-2. Query DuckDB index (~50 µs)
-   SELECT segment_id, offset, size FROM entries WHERE key = ?
-   → If not found: return ErrNotFound (bloom FP)
+**Production readiness:**
+- ✅ Benchmark validated (2.77× faster)
+- ✅ Comprehensive tests
+- ❌ **Not battle-tested** (new system, gradual rollout required)
+- ❌ **Unknown failure modes** exist (expect surprises)
 
-3. Open segment file (or use cached file handle)
+**Recommended approach:**
+1. Shadow production traffic (validate bloom FP rate, memory usage)
+2. Gradual rollout with extensive monitoring
+3. Keep RocksDB as fallback during migration
+4. Test both with/without DirectIO (page cache might help)
 
-4. pread(segment_file, offset, size) (~2-3 ms for 400 KB)
-   - pread() is thread-safe (no locking)
-   - Can read from same segment concurrently
-
-5. Verify checksum if opted in
-```
-
-**Performance:**
-- Negative: ~1 ns (vs RocksDB's 45 µs) - **45,000× faster**
-- Positive: ~2-3 ms (same as RocksDB, disk I/O limited)
-
-**File handle caching:**
-- Keep N most recent segment files open (e.g., 100 handles)
-- LRU eviction of file handles
-- Reduces open() syscalls on hot segments
-
----
-
-## Eviction & Cleanup
-
-### Eviction (Background Worker)
-
-**Segment-Level FIFO** - simpler than per-blob eviction:
-
-```go
-evictIfNeeded():
-1. Query DuckDB for total size (fast aggregate)
-   SELECT SUM(size) FROM entries
-
-2. If over limit, query oldest segments:
-   SELECT segment_id, SUM(size) as segment_size
-   FROM entries
-   GROUP BY segment_id
-   ORDER BY MIN(ctime) ASC
-
-3. Delete entire segments:
-   a. DELETE FROM entries WHERE segment_id IN (...)
-   b. rm segments/{segment_id}.seg
-   c. Bloom filter: NOT updated (accept FPs, rebuild periodically)
-
-4. Repeat until under size limit
-```
-
-**Advantages:**
-- ✅ Simple FIFO by segment creation time
-- ✅ One file delete per segment (not per blob)
-- ✅ Batch DuckDB deletes (efficient)
-- ✅ No LRU complexity (no access time tracking needed)
-
-**Trade-offs:**
-- ❌ Cannot evict individual blobs
-- ❌ May evict some newer blobs in old segments
-- ✅ Acceptable for cache semantics (simplicity > precision)
-
-**Order:** DB first, then filesystem
-- Get() returns ErrNotFound immediately after DB delete
-- Orphaned segments if crash (cleaned daily)
-- Acceptable for cache semantics
-
-### Orphan Cleanup (Daily, Not Startup)
-
-Runs in background once per day:
-- Compare filesystem to DB
-- Delete orphaned segments
-- Verify segment integrity (check file sizes)
-
-**Startup is fast (<100 ms)** - no filesystem scan!
-
----
-
-## Performance Projections
-
-**Conservative estimate: 75% fleet reduction**
-
-| Component | RocksDB | BlobCache | Reduction |
-|-----------|---------|-----------|-----------|
-| Reads (negative) | 3,000 cores | 60 cores | 98% |
-| Reads (positive) | 2,000 cores | 1,000 cores | 50% |
-| Writes | 200 cores | 240 cores | -20% (worse) |
-| **Total** | **5,200 cores** | **1,300 cores** | **75%** |
-
-**Why conservative:**
-- Index queries may be slower than expected
-- Filesystem overhead may be higher
-- DuckDB insert latency TBD
-
-**Realistic target: 3,900 cores saved**
-
----
-
-## Implementation Status
-
-**✅ Completed (Production-Ready):**
-
-**Core Features:**
-- ✅ Segment-based storage with DirectIO support
-- ✅ MemTable with async flush workers (RocksDB-style batching)
-- ✅ Lock-free bloom filter (4× faster than alternatives)
-- ✅ Bitcask index (default) + Skipmap index (optional)
-- ✅ Streaming checksum verification (hash.Hash32 interface)
-- ✅ Storage strategies for eviction (BlobStorage, SegmentStorage)
-- ✅ Reactive size tracking with eviction triggers
-- ✅ Centralized path generation (BlobPaths, SegmentPaths)
-- ✅ Platform-optimized fdatasync (Linux: fdatasync, Darwin: F_FULLFSYNC)
-
-**API:**
-- ✅ Clean interface: Get(key) → Reader, Put(key, value)
-- ✅ PutChecksummed for explicit checksums
-- ✅ WithChecksum(), WithChecksumHash() for data integrity
-- ✅ WithSegmentSize(), WithDirectIOWrites(), etc.
-
-**Testing:**
-- ✅ Comprehensive unit tests (all packages)
-- ✅ Integration tests (segment mode, DirectIO, skipmap)
-- ✅ Checksum reader tests (9 edge cases including 1-byte reads)
-- ✅ Production benchmark vs RocksDB on Graviton
-
-**Performance validated:**
-- ✅ 2.77× faster than RocksDB (1.04 vs 0.38 GB/s)
-- ✅ 45× less memory (2.2GB vs 100GB)
-- ✅ 3.75× less CPU (2 cores vs 7.5 cores)
-- ✅ No compaction overhead (append-only architecture)
-
----
-
-## Decision Log
-
-**Major decisions:**
-1. ✅ Segment-based storage (multiple blobs per file) - 99.9% fewer syscalls
-2. ✅ 2GB segments (optimal for NVMe throughput)
-3. ✅ Lock-free bloom (atomic CAS, not mutex) - 4× faster
-4. ✅ Bitcask index (removed DuckDB) - simpler, sufficient performance
-5. ✅ Skipmap option (in-memory + optional Bitcask backing) - fastest reads
-6. ✅ Segment-level FIFO eviction via storage strategies
-7. ✅ Streaming checksums (hash.Hash32) - error on final Read(), not Close
-8. ✅ Get() returns io.Reader (not []byte) - caller controls reading
-9. ✅ Storage strategies (BlobStorage, SegmentStorage) - clean architecture
-10. ✅ Centralized paths (BlobPaths, SegmentPaths) - zero-allocation string types
-11. ✅ Fdatasync (not fsync) - 2-5× faster, sufficient for immutable blobs
-12. ✅ Record.HasChecksum flag - mid-lifecycle restart safe
-
-**Architecture evolution:**
-- ❌ DuckDB → ✅ Bitcask/Skipmap (simpler, removed dependency)
-- ❌ One blob per file → ✅ Segment-based (70% CPU in syscalls → <20%)
-- ❌ Entry type → ✅ Record type (single consistent naming)
-- ❌ Scatter path generation → ✅ Centralized in paths.go
-- ❌ Eviction in Indexer → ✅ Storage strategies (clean boundaries)
-
-**Checksum design:**
-- ✅ hash.Hash32 interface (stdlib compatibility)
-- ✅ Streaming verification (incremental hashing as data flows)
-- ✅ Error on final Read() (more resilient than Close errors)
-- ✅ HasChecksum flag for backwards compatibility
-
-**Out of scope:**
-- ❌ Range queries
-- ❌ Sorted iteration
-- ❌ Compression (caller-controlled)
-- ❌ Compaction (append-only architecture)
-- ❌ Per-blob eviction (segment-level only)
-- ❌ LRU tracking (FIFO only)
-
-**Design validated through:**
-- Production RocksDB analysis (455 L0 files causing 45µs CPU per negative lookup)
-- Graviton benchmark: **2.77× faster, 45× less memory, 3.75× less CPU than RocksDB**
-- CPU profiling: Identified and fixed syscall overhead
-- Bloom filter: 4× faster than alternatives, lock-free design
-
----
-
-## Benchmark Results
-
-### Production Benchmark: AWS Graviton m7gd.8xlarge (2025-12-08)
-
-**Hardware:**
-- 32 vCPU (Graviton 3)
-- 128 GB RAM
-- 1.7TB NVMe instance storage
-- Disk capacity: ~2GB/s read, ~1GB/s write (independent channels)
-
-**Test configuration:**
-- 2.56M operations (256K writes × 1MB = 256GB written, 2.3M reads)
-- Mixed workload: 10% writes, 45% read hits, 45% read misses
-- Matches production workload pattern
-- RocksDB config: 1GB memtable, 6 inflight, FIFO compaction, DirectIO
-
-| Metric | RocksDB v6.20.3 | Blobcache | Improvement |
-|--------|-----------------|-----------|-------------|
-| **Latency** | 259,316 ns/op | 93,448 ns/op | **2.77x faster** |
-| **Write Throughput** | 0.376 GB/s | 1.042 GB/s | **2.77x faster** |
-| **Duration** | 18+ minutes | 4.2 minutes | **4.3x faster** |
-| **Memory** | 100.6 GB | 2.2 GB | **45x less** |
-| **CPU** | 7.5 cores | 2 cores | **3.75x less** |
-| **I/O Pattern** | Variable (compaction storms) | Steady | Predictable |
-| **Disk Utilization** | 95-100% (variable) | 100% (saturated) | Consistent |
-
-**RocksDB overhead observed:**
-- Created 11GB compaction files (12×960MB → 1×11GB)
-- Memory grew from 86GB → 100GB during run
-- Massive kernel I/O merging (94% write merges, 61% read merges)
-- Variable throughput (0.8-1.1 GB/s writes during compaction)
-
-**Blobcache advantages:**
-- ✅ **No compaction overhead** - all 1.04 GB/s is useful work
-- ✅ **Predictable performance** - no compaction storms
-- ✅ **Minimal resources** - 2 cores, 2GB RAM
-- ✅ **Simple operations** - append-only, no background merges
-
-### Early Benchmark: Apple M4 Max (2025-12-01)
-
-**Test configuration:**
-- 2.56M operations (256K writes, 2.3M reads)
-- 1MB blobs
-- 10% write, 90% read workload
-- Apple M4 Max
-
-| Metric | RocksDB | Blobcache (initial) | Difference |
-|--------|---------|---------------------|------------|
-| Duration | 71.5s | 55.4s | **29% faster** |
-| Write Throughput | 3.50 GB/s | 4.51 GB/s | **29% faster** |
-| CPU in syscalls | ~30% | **70%** | Problem identified |
-| I/O Pattern | Large transactions (563-704 KB/t) | Small transactions (250-407 KB/t) | More overhead |
-| File Count | ~455 SST files | 256K files | 1000× more files |
-
-**Key finding:** Blobcache was faster overall, but 70% CPU in syscalls led to segment-based architecture.
-
-### Segment-Based Architecture Benefits
-
-**Expected improvements:**
-- Syscall reduction: 768K → 768 (99.9% fewer)
-- File count: 256K → 256 (1000× fewer)
-- CPU in syscalls: 70% → 20-30%
-- Maintain 29% speed advantage
-- Sequential writes (better I/O)
-
-**Comparison:**
-
-| Feature | RocksDB | Blobcache (One-File) | Blobcache (Segment) |
-|---------|---------|----------------------|---------------------|
-| Bloom checks | 455 | 1 | 1 |
-| Files created | ~455 | 256,000 | 256 |
-| Syscall overhead | Low | High (70% CPU) | Low |
-| Write batching | Yes | No | Yes |
-| Eviction | FIFO by file | Per-blob | Per-segment |
-
-**Best of both worlds:**
-- ✅ Single bloom filter (45,000× CPU savings)
-- ✅ Batched writes (like RocksDB)
-- ✅ Low syscall overhead
-- ✅ No compaction overhead
-- ✅ Simpler than RocksDB
+**Bottom line:** For Datadog's logs caching use case (avoid S3 re-downloads), blobcache eliminates RocksDB's compaction tax. Worth the risk of a new system for 2.77× performance gain, but proceed carefully.

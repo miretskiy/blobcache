@@ -310,9 +310,9 @@ func TestCache_Eviction(t *testing.T) {
 
 	// Check size before eviction
 	var totalSize int64
-	cache.index.Range(ctx, func(rec index.Record) error {
-		totalSize += int64(rec.Size)
-		return nil
+	cache.index.Range(ctx, func(rec index.KeyValue) bool {
+		totalSize += int64(rec.Val.Size)
+		return true
 	})
 	require.Equal(t, int64(6*1024*1024), totalSize)
 
@@ -325,9 +325,9 @@ func TestCache_Eviction(t *testing.T) {
 
 	// Check size after eviction (should be under limit with hysteresis)
 	totalSize = 0
-	cache.index.Range(ctx, func(rec index.Record) error {
-		totalSize += int64(rec.Size)
-		return nil
+	cache.index.Range(ctx, func(rec index.KeyValue) bool {
+		totalSize += int64(rec.Val.Size)
+		return true
 	})
 	// With 10% hysteresis, should evict to ~4.5MB (5MB - 10% of 5MB)
 	require.Less(t, totalSize, int64(4600000))

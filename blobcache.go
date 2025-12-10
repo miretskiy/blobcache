@@ -16,7 +16,7 @@ import (
 )
 
 // Key is a cache key providing type safety (strong type, not alias)
-type Key []byte
+type Key = index.Key
 
 // Cache is a high-performance blob storage with bloom filter optimization
 type Cache struct {
@@ -87,9 +87,9 @@ func New(path string, opts ...Option) (*Cache, error) {
 
 	// Initialize approximate size for reactive eviction
 	var totalSize int64
-	idx.Range(context.Background(), func(rec index.Record) error {
-		totalSize += int64(rec.Size)
-		return nil
+	idx.Range(context.Background(), func(kv index.KeyValue) bool {
+		totalSize += int64(kv.Val.Size)
+		return true
 	})
 	c.approxSize.Store(totalSize)
 
@@ -238,9 +238,9 @@ func (c *Cache) rebuildBloom(ctx context.Context) error {
 	}
 
 	// Range index and add all keys to bloom
-	if err := c.index.Range(ctx, func(rec index.Record) error {
-		filter.Add(rec.Key)
-		return nil
+	if err := c.index.Range(ctx, func(kv index.KeyValue) bool {
+		filter.Add(kv.Key)
+		return true
 	}); err != nil {
 		return fmt.Errorf("failed to scan index: %w", err)
 	}
@@ -310,9 +310,9 @@ func (c *Cache) runEviction(ctx context.Context) error {
 
 	// Compute total size by scanning index
 	var totalSize int64
-	c.index.Range(ctx, func(rec index.Record) error {
-		totalSize += int64(rec.Size)
-		return nil
+	c.index.Range(ctx, func(kv index.KeyValue) bool {
+		totalSize += int64(kv.Val.Size)
+		return true
 	})
 
 	if totalSize <= c.cfg.MaxSize {

@@ -36,7 +36,7 @@ func NewSegmentReader(
 // Get reads a blob from a segment file at the specified position
 func (r *SegmentReader) Get(key Key) (io.Reader, bool) {
 	// Lookup position from index
-	var record index.Record
+	var record index.Value
 	if err := r.index.Get(context.TODO(), key, &record); err != nil {
 		return nil, false
 	}

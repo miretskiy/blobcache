@@ -36,17 +36,17 @@ func NewBlobStorage(basePath string, shards int, idx index.Indexer) *BlobStorage
 // Evict removes oldest blobs until targetBytes freed
 func (s *BlobStorage) Evict(ctx context.Context, targetBytes int64) (int64, error) {
 	// Range all records and collect them
-	var records []index.Record
-	if err := s.index.Range(ctx, func(rec index.Record) error {
+	var records []index.KeyValue
+	if err := s.index.Range(ctx, func(rec index.KeyValue) bool {
 		records = append(records, rec)
-		return nil
+		return true
 	}); err != nil {
 		return 0, fmt.Errorf("failed to scan index: %w", err)
 	}
 
 	// Sort by ctime (oldest first)
 	sort.Slice(records, func(i, j int) bool {
-		return records[i].CTime < records[j].CTime
+		return records[i].Val.CTime < records[j].Val.CTime
 	})
 
 	// Evict oldest until target reached
@@ -69,7 +69,7 @@ func (s *BlobStorage) Evict(ctx context.Context, targetBytes int64) (int64, erro
 			fmt.Printf("Warning: failed to delete key from index: %v\n", err)
 		}
 
-		evictedBytes += int64(record.Size)
+		evictedBytes += int64(record.Val.Size)
 		evictedCount++
 	}
 
@@ -94,11 +94,11 @@ func NewSegmentStorage(basePath string, idx index.Indexer) *SegmentStorage {
 // Evict removes oldest segments until targetBytes freed
 func (s *SegmentStorage) Evict(ctx context.Context, targetBytes int64) (int64, error) {
 	// Range index to build segment size map
-	segmentSizes := make(map[int64][]index.Record)
+	segmentSizes := make(map[int64][]index.KeyValue)
 
-	if err := s.index.Range(ctx, func(rec index.Record) error {
-		segmentSizes[rec.SegmentID] = append(segmentSizes[rec.SegmentID], rec)
-		return nil
+	if err := s.index.Range(ctx, func(rec index.KeyValue) bool {
+		segmentSizes[rec.Val.SegmentID] = append(segmentSizes[rec.Val.SegmentID], rec)
+		return true
 	}); err != nil {
 		return 0, fmt.Errorf("failed to scan index: %w", err)
 	}
@@ -107,19 +107,19 @@ func (s *SegmentStorage) Evict(ctx context.Context, targetBytes int64) (int64, e
 	type segmentInfo struct {
 		id      int64
 		minTime int64
-		records []index.Record
+		records []index.KeyValue
 		bytes   int64
 	}
 
 	var segments []segmentInfo
 	for segID, records := range segmentSizes {
-		minTime := records[0].CTime
+		minTime := records[0].Val.CTime
 		totalBytes := int64(0)
 		for _, rec := range records {
-			if rec.CTime < minTime {
-				minTime = rec.CTime
+			if rec.Val.CTime < minTime {
+				minTime = rec.Val.CTime
 			}
-			totalBytes += int64(rec.Size)
+			totalBytes += int64(rec.Val.Size)
 		}
 		segments = append(segments, segmentInfo{
 			id:      segID,

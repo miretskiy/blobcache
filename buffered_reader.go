@@ -43,7 +43,7 @@ func (r *BufferedReader) Get(key Key) (io.Reader, bool) {
 	// Wrap with checksum verification if enabled
 	if r.verifyOnRead && r.hasher != nil {
 		// Lookup checksum from index
-		var record index.Record
+		var record index.Value
 		if err := r.index.Get(context.TODO(), key, &record); err != nil {
 			// Not in index, skip verification
 			return reader, true

@@ -23,11 +23,11 @@ func TestBitcaskIndex_PutGet(t *testing.T) {
 	now := time.Now().UnixNano()
 
 	// Put a record
-	err = idx.Put(ctx, key, &Record{Size: 1024, CTime: now})
+	err = idx.Put(ctx, key, Value{Size: 1024, CTime: now})
 	require.NoError(t, err)
 
 	// Get it back
-	var entry Record
+	var entry Value
 	err = idx.Get(ctx, key, &entry)
 	require.NoError(t, err)
 
@@ -45,7 +45,7 @@ func TestBitcaskIndex_GetNotFound(t *testing.T) {
 	defer idx.Close()
 
 	key := []byte("nonexistent")
-	var entry Record
+	var entry Value
 	err = idx.Get(context.Background(), key, &entry)
 
 	require.ErrorIs(t, err, ErrNotFound)
@@ -64,14 +64,14 @@ func TestBitcaskIndex_Delete(t *testing.T) {
 
 	// Insert
 	now := time.Now().UnixNano()
-	idx.Put(ctx, key, &Record{Size: 500, CTime: now})
+	idx.Put(ctx, key, Value{Size: 500, CTime: now})
 
 	// Delete
 	err := idx.Delete(ctx, key)
 	require.NoError(t, err)
 
 	// Verify gone
-	var entry Record
+	var entry Value
 	err = idx.Get(ctx, key, &entry)
 	require.ErrorIs(t, err, ErrNotFound)
 
@@ -91,15 +91,15 @@ func TestBitcaskIndex_Scan(t *testing.T) {
 
 	// Put records
 	now := time.Now().UnixNano()
-	idx.Put(ctx, []byte("key1"), &Record{Size: 100, CTime: now})
-	idx.Put(ctx, []byte("key2"), &Record{Size: 200, CTime: now + 1000})
-	idx.Put(ctx, []byte("key3"), &Record{Size: 300, CTime: now + 2000})
+	idx.Put(ctx, []byte("key1"), Value{Size: 100, CTime: now})
+	idx.Put(ctx, []byte("key2"), Value{Size: 200, CTime: now + 1000})
+	idx.Put(ctx, []byte("key3"), Value{Size: 300, CTime: now + 2000})
 
 	// Range all records
-	var scanned []Record
-	err := idx.Range(ctx, func(rec Record) error {
-		scanned = append(scanned, rec)
-		return nil
+	var scanned []KeyValue
+	err := idx.Range(ctx, func(kv KeyValue) bool {
+		scanned = append(scanned, kv)
+		return true
 	})
 	require.NoError(t, err)
 	require.Equal(t, 3, len(scanned))
@@ -107,7 +107,7 @@ func TestBitcaskIndex_Scan(t *testing.T) {
 	// Verify all records present
 	sizes := make(map[int]bool)
 	for _, rec := range scanned {
-		sizes[rec.Size] = true
+		sizes[rec.Val.Size] = true
 	}
 	require.True(t, sizes[100])
 	require.True(t, sizes[200])
@@ -128,16 +128,16 @@ func TestBitcaskIndex_PutBatch(t *testing.T) {
 	key1 := []byte("key1")
 	key2 := []byte("key2")
 
-	records := []Record{
-		{Key: key1, Size: 100, CTime: now},
-		{Key: key2, Size: 200, CTime: now + 1000},
+	records := []KeyValue{
+		{Key: key1, Val: Value{Size: 100, CTime: now}},
+		{Key: key2, Val: Value{Size: 200, CTime: now + 1000}},
 	}
 
 	err := idx.PutBatch(ctx, records)
 	require.NoError(t, err)
 
 	// Verify entries exist
-	var entry Record
+	var entry Value
 	err = idx.Get(ctx, key1, &entry)
 	require.NoError(t, err)
 	require.Equal(t, 100, entry.Size)

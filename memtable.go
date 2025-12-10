@@ -217,7 +217,7 @@ func (mt *MemTable) flushMemFile(mf *memFile, writer BlobWriter) {
 	now := time.Now().UnixNano()
 
 	// Phase 1: Write all blob files and collect records for index
-	var records []index.Record
+	var records []index.KeyValue
 
 	mf.data.Range(func(keyStr string, entry *memEntry) bool {
 		value := entry.value
@@ -252,14 +252,16 @@ func (mt *MemTable) flushMemFile(mf *memFile, writer BlobWriter) {
 		// Get position for index (segment mode returns segmentID+pos, per-blob returns zeros)
 		pos := writer.Pos()
 
-		records = append(records, index.Record{
-			Key:         key,
-			SegmentID:   pos.SegmentID,
-			Pos:         pos.Pos,
-			Size:        len(value),
-			CTime:       now,
-			Checksum:    checksum,
-			HasChecksum: hasChecksum,
+		records = append(records, index.KeyValue{
+			Key: key,
+			Val: index.Value{
+				SegmentID:   pos.SegmentID,
+				Pos:         pos.Pos,
+				Size:        len(value),
+				CTime:       now,
+				Checksum:    checksum,
+				HasChecksum: hasChecksum,
+			},
 		})
 		return true
 	})
@@ -277,7 +279,7 @@ func (mt *MemTable) flushMemFile(mf *memFile, writer BlobWriter) {
 	// Phase 3: Update size tracking and trigger reactive eviction if needed
 	var addedBytes int64
 	for _, rec := range records {
-		addedBytes += int64(rec.Size)
+		addedBytes += int64(rec.Val.Size)
 	}
 	newSize := mt.cache.approxSize.Add(addedBytes)
 

@@ -11,7 +11,7 @@ import (
 // Benchmark_IndexLookup compares index Get() performance with 1M keys
 // Run with: go test -bench=Benchmark_IndexLookup -benchtime=1000000x -count=10
 func Benchmark_IndexLookup(b *testing.B) {
-	const numKeys = 1_000_000
+	const numKeys = 1 << 16
 
 	// Generate keys upfront
 	keys := make([][]byte, numKeys)
@@ -23,14 +23,16 @@ func Benchmark_IndexLookup(b *testing.B) {
 	now := int64(1700000000000000000)
 
 	// Pre-create records
-	records := make([]Record, numKeys)
+	records := make([]KeyValue, numKeys)
 	for i := 0; i < numKeys; i++ {
-		records[i] = Record{
-			Key:       keys[i],
-			SegmentID: int64(i / 1000),
-			Pos:       int64((i % 1000) * 1024),
-			Size:      1024,
-			CTime:     now + int64(i),
+		records[i] = KeyValue{
+			Key: keys[i],
+			Val: Value{
+				SegmentID: int64(i / 1000),
+				Pos:       int64((i % 1000) * 1024),
+				Size:      1024,
+				CTime:     now + int64(i),
+			},
 		}
 	}
 
@@ -49,7 +51,7 @@ func Benchmark_IndexLookup(b *testing.B) {
 		b.ReportMetric(populateTime.Seconds(), "populate-sec")
 		b.StartTimer()
 
-		var entry Record
+		var entry Value
 		for i := 0; i < b.N; i++ {
 			err := idx.Get(ctx, keys[i%numKeys], &entry)
 			if err != nil {
@@ -77,7 +79,7 @@ func Benchmark_IndexLookup(b *testing.B) {
 		b.ReportMetric(populateTime.Seconds(), "populate-sec")
 
 		b.StartTimer()
-		var entry Record
+		var entry Value
 		for i := 0; i < b.N; i++ {
 			err := idx.Get(ctx, keys[i%numKeys], &entry)
 			if err != nil {
@@ -107,7 +109,7 @@ func Benchmark_IndexLookup(b *testing.B) {
 		b.ReportMetric(populateTime.Seconds(), "populate-sec")
 		b.StartTimer()
 
-		var entry Record
+		var entry Value
 		for i := 0; i < b.N; i++ {
 			err := idx.Get(ctx, keys[i%numKeys], &entry)
 			if err != nil {

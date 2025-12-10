@@ -11,7 +11,7 @@ import (
 // Optionally backed by Bitcask for durability
 type SkipmapIndex struct {
 	// In-memory skipmap for fast lookups
-	data *skipmap.StringMap[*Record]
+	data *skipmap.StringMap[Value]
 
 	// Optional persistent backing store
 	bitcask *BitcaskIndex
@@ -20,7 +20,7 @@ type SkipmapIndex struct {
 // NewSkipmapIndex creates a pure in-memory skipmap index (no persistence)
 func NewSkipmapIndex() *SkipmapIndex {
 	return &SkipmapIndex{
-		data: skipmap.NewString[*Record](),
+		data: skipmap.NewString[Value](),
 	}
 }
 
@@ -34,15 +34,14 @@ func NewDurableSkipmapIndex(basePath string) (*SkipmapIndex, error) {
 	}
 
 	// Create skipmap
-	data := skipmap.NewString[*Record]()
+	data := skipmap.NewString[Value]()
 
 	// Load all entries from Bitcask into skipmap
 	ctx := context.Background()
-	if err := bitcask.Range(ctx, func(record Record) error {
-		keyStr := unsafe.String(unsafe.SliceData(record.Key), len(record.Key))
-		recordCopy := record // Copy to heap
-		data.Store(keyStr, &recordCopy)
-		return nil
+	if err := bitcask.Range(ctx, func(kv KeyValue) bool {
+		keyStr := unsafe.String(unsafe.SliceData(kv.Key), len(kv.Key))
+		data.Store(keyStr, kv.Val)
+		return true
 	}); err != nil {
 		bitcask.Close()
 		return nil, err
@@ -55,11 +54,7 @@ func NewDurableSkipmapIndex(basePath string) (*SkipmapIndex, error) {
 }
 
 // Put inserts or updates a record
-func (idx *SkipmapIndex) Put(ctx context.Context, key []byte, record *Record) error {
-	// Set record key if not already set
-	if record.Key == nil {
-		record.Key = key
-	}
+func (idx *SkipmapIndex) Put(ctx context.Context, key Key, record Value) error {
 	keyStr := unsafe.String(unsafe.SliceData(key), len(key))
 	idx.data.Store(keyStr, record)
 
@@ -71,7 +66,7 @@ func (idx *SkipmapIndex) Put(ctx context.Context, key []byte, record *Record) er
 }
 
 // Get retrieves an entry
-func (idx *SkipmapIndex) Get(ctx context.Context, key []byte, entry *Record) error {
+func (idx *SkipmapIndex) Get(ctx context.Context, key Key, val *Value) error {
 	keyStr := unsafe.String(unsafe.SliceData(key), len(key))
 	stored, ok := idx.data.Load(keyStr)
 	if !ok {
@@ -79,12 +74,12 @@ func (idx *SkipmapIndex) Get(ctx context.Context, key []byte, entry *Record) err
 	}
 
 	// Copy data to caller's entry
-	*entry = *stored
+	*val = stored
 	return nil
 }
 
 // Delete removes an entry
-func (idx *SkipmapIndex) Delete(ctx context.Context, key []byte) error {
+func (idx *SkipmapIndex) Delete(ctx context.Context, key Key) error {
 	keyStr := unsafe.String(unsafe.SliceData(key), len(key))
 	idx.data.Delete(keyStr)
 
@@ -104,21 +99,21 @@ func (idx *SkipmapIndex) Close() error {
 }
 
 // Range iterates over all records in the index
-func (idx *SkipmapIndex) Range(ctx context.Context, fn func(Record) error) error {
+func (idx *SkipmapIndex) Range(ctx context.Context, fn func(KeyValue) bool) error {
 	var err error
-	idx.data.Range(func(key string, record *Record) bool {
-		err = fn(*record)
-		return err == nil // Continue if no error
+	idx.data.Range(func(keyStr string, record Value) bool {
+		key := unsafe.Slice(unsafe.StringData(keyStr), len(keyStr))
+		return fn(KeyValue{Key: key, Val: record})
 	})
 	return err
 }
 
 // PutBatch inserts multiple records
-func (idx *SkipmapIndex) PutBatch(ctx context.Context, records []Record) error {
+func (idx *SkipmapIndex) PutBatch(ctx context.Context, records []KeyValue) error {
 	// Store in skipmap
 	for _, rec := range records {
 		keyStr := unsafe.String(unsafe.SliceData(rec.Key), len(rec.Key))
-		idx.data.Store(keyStr, &rec)
+		idx.data.Store(keyStr, rec.Val)
 	}
 
 	// Write to Bitcask if durable

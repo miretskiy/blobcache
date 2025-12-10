@@ -24,7 +24,7 @@ func NewDirectIOWriter(basePath string, shards int, fsync bool) *DirectIOWriter 
 // isAligned is defined in platform-specific files (directio_darwin.go, directio_linux.go)
 
 // Write writes a blob atomically using DirectIO with temp file + truncate + rename
-func (w *DirectIOWriter) Write(key Key, value []byte) error {
+func (w *DirectIOWriter) Write(key Key, value []byte, checksum uint32) error {
 	tempPath := w.paths.TempBlobPath(key)
 	finalPath := w.paths.BlobPath(key)
 

@@ -143,7 +143,7 @@ func TestCache_CustomOptions(t *testing.T) {
 
 	require.Equal(t, 128, cache.cfg.Shards)
 	require.Equal(t, 0.001, cache.cfg.BloomFPRate)
-	require.Nil(t, cache.cfg.ChecksumHash, "checksums should be disabled by default")
+	require.Nil(t, cache.cfg.Resilience.ChecksumHash, "checksums should be disabled by default")
 }
 
 func TestCache_PutGet(t *testing.T) {

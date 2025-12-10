@@ -18,13 +18,13 @@ func TestSegmentWriter_Buffered(t *testing.T) {
 	require.NoError(t, os.MkdirAll(segDir, 0o755))
 
 	// Create segment writer with 10KB segments
-	writer := NewSegmentWriter(tmpDir, 10*1024, false, false, 0)
+	writer := NewSegmentWriter(tmpDir, 10*1024, 0, IOConfig{}, ResilienceConfig{})
 	defer writer.Close()
 
 	// Write multiple small values to same segment
 	key1 := []byte("key1")
 	value1 := make([]byte, 1000)
-	err = writer.Write(key1, value1)
+	err = writer.Write(key1, value1, 0)
 	require.NoError(t, err)
 	pos1 := writer.Pos()
 	require.NotEqual(t, 0, pos1.SegmentID) // Timestamp-based segment ID
@@ -32,7 +32,7 @@ func TestSegmentWriter_Buffered(t *testing.T) {
 
 	key2 := []byte("key2")
 	value2 := make([]byte, 2000)
-	err = writer.Write(key2, value2)
+	err = writer.Write(key2, value2, 0)
 	require.NoError(t, err)
 	pos2 := writer.Pos()
 	require.Equal(t, pos1.SegmentID, pos2.SegmentID) // Same segment
@@ -41,7 +41,7 @@ func TestSegmentWriter_Buffered(t *testing.T) {
 	// Write large value to trigger rotation
 	key3 := []byte("key3")
 	value3 := make([]byte, 15000) // Exceeds 10KB segment size
-	err = writer.Write(key3, value3)
+	err = writer.Write(key3, value3, 0)
 	require.NoError(t, err)
 	pos3 := writer.Pos()
 	require.NotEqual(t, pos1.SegmentID, pos3.SegmentID) // New segment
@@ -58,7 +58,7 @@ func TestSegmentWriter_DirectIO(t *testing.T) {
 	require.NoError(t, os.MkdirAll(segDir, 0o755))
 
 	// Create segment writer with DirectIO
-	writer := NewSegmentWriter(tmpDir, 1024*1024, true, false, 0)
+	writer := NewSegmentWriter(tmpDir, 1024*1024, 0, IOConfig{}, ResilienceConfig{})
 	defer writer.Close()
 
 	// Write value (tests leftover handling)
@@ -68,7 +68,7 @@ func TestSegmentWriter_DirectIO(t *testing.T) {
 		value[i] = byte(i % 256)
 	}
 
-	err = writer.Write(key, value)
+	err = writer.Write(key, value, 0)
 	require.NoError(t, err)
 
 	pos := writer.Pos()
@@ -91,7 +91,7 @@ func TestSegmentWriter_MultipleSegments(t *testing.T) {
 	require.NoError(t, os.MkdirAll(segDir, 0o755))
 
 	// Small segment size to trigger multiple segments
-	writer := NewSegmentWriter(tmpDir, 5000, false, false, 0)
+	writer := NewSegmentWriter(tmpDir, 5000, 0, IOConfig{}, ResilienceConfig{})
 	defer writer.Close()
 
 	segments := make(map[int64]bool)
@@ -100,7 +100,7 @@ func TestSegmentWriter_MultipleSegments(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		key := []byte{byte(i)}
 		value := make([]byte, 2000)
-		err := writer.Write(key, value)
+		err := writer.Write(key, value, 0)
 		require.NoError(t, err)
 
 		pos := writer.Pos()

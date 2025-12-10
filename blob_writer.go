@@ -15,7 +15,8 @@ type BlobWriter interface {
 	io.Closer
 
 	// Write writes a blob
-	Write(key Key, value []byte) error
+	// checksum is the blob's checksum (0 if not computed)
+	Write(key Key, value []byte, checksum uint32) error
 
 	// Pos returns the current write position (for index tracking)
 	// Called after Write() to get position for the last written blob

@@ -20,7 +20,7 @@ func NewBufferedWriter(basePath string, shards int, fsync bool) *BufferedWriter 
 }
 
 // Write writes a blob atomically using temp file + rename
-func (w *BufferedWriter) Write(key Key, value []byte) error {
+func (w *BufferedWriter) Write(key Key, value []byte, checksum uint32) error {
 	tempPath := w.paths.TempBlobPath(key)
 	finalPath := w.paths.BlobPath(key)
 

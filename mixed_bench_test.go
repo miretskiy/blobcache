@@ -37,6 +37,11 @@ func Benchmark_Mixed(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
+	stop, err := cache.Start()
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer stop()
 
 	var numReads, numFound atomic.Int64
 	var numWrites, completedWrites atomic.Int64 // Pre-allocates key IDs

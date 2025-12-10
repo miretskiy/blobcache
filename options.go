@@ -7,6 +7,19 @@ import (
 	"time"
 )
 
+// IOConfig holds I/O strategy settings
+type IOConfig struct {
+	DirectIO bool // Use O_DIRECT (bypass OS cache)
+	Fsync    bool // Use fdatasync for durability
+}
+
+// ResilienceConfig holds data integrity settings
+type ResilienceConfig struct {
+	ChecksumHash Hasher           // Hash factory for checksums (nil = disabled)
+	VerifyOnRead bool             // Verify checksums on reads
+	Checksums    ChecksumHandling // Whether to include checksums in segment footers
+}
+
 // config holds internal configuration
 type config struct {
 	Path                  string
@@ -21,10 +34,8 @@ type config struct {
 	BloomEstimatedKeys    int
 	BloomRefreshInterval  time.Duration
 	OrphanCleanupInterval time.Duration
-	ChecksumHash          func() hash.Hash32 // Factory for checksum hash (nil = disabled)
-	VerifyOnRead          bool
-	Fsync                 bool
-	DirectIOWrites        bool // Use DirectIO for writes
+	IO                    IOConfig
+	Resilience            ResilienceConfig
 	UseSkipmapIndex       bool // Use in-memory skipmap index (fastest, no persistence); Bitcask is the default
 }
 
@@ -109,17 +120,19 @@ func WithBloomRefreshInterval(d time.Duration) Option {
 // WithChecksum enables CRC32 checksums (hardware accelerated)
 func WithChecksum() Option {
 	return funcOpt(func(c *config) {
-		c.ChecksumHash = func() hash.Hash32 {
+		c.Resilience.ChecksumHash = func() hash.Hash32 {
 			return crc32.NewIEEE()
 		}
+		c.Resilience.Checksums = IncludeChecksums
 	})
 }
 
 // WithChecksumHash enables checksums with a custom hash factory
 // Example: WithChecksumHash(crc32.NewIEEE) or WithChecksumHash(xxhash.New)
-func WithChecksumHash(factory func() hash.Hash32) Option {
+func WithChecksumHash(factory Hasher) Option {
 	return funcOpt(func(c *config) {
-		c.ChecksumHash = factory
+		c.Resilience.ChecksumHash = factory
+		c.Resilience.Checksums = IncludeChecksums
 	})
 }
 
@@ -128,14 +141,14 @@ func WithChecksumHash(factory func() hash.Hash32) Option {
 // Note: Syncing data flushes only - metadata (mtime, etc.) not synced since immutable blobs don't need it
 func WithFsync(enabled bool) Option {
 	return funcOpt(func(c *config) {
-		c.Fsync = enabled
+		c.IO.Fsync = enabled
 	})
 }
 
 // WithVerifyOnRead enables checksum verification on reads (default: false, opt-in)
 func WithVerifyOnRead(enabled bool) Option {
 	return funcOpt(func(c *config) {
-		c.VerifyOnRead = enabled
+		c.Resilience.VerifyOnRead = enabled
 	})
 }
 
@@ -153,7 +166,7 @@ func WithSegmentSize(size int64) Option {
 // Provides better sustained throughput for large workloads by bypassing OS cache
 func WithDirectIOWrites() Option {
 	return funcOpt(func(c *config) {
-		c.DirectIOWrites = true
+		c.IO.DirectIO = true
 	})
 }
 
@@ -221,10 +234,15 @@ func defaultConfig(path string) config {
 		BloomEstimatedKeys:    1_000_000,         // 1M keys → ~1.2 MB bloom
 		BloomRefreshInterval:  10 * time.Minute,
 		OrphanCleanupInterval: 1 * time.Hour,
-		ChecksumHash:          nil, // Disabled by default - use WithChecksum() or WithChecksumHash() to enable
-		Fsync:                 false,
-		VerifyOnRead:          false,
-		DirectIOWrites:        false,
-		UseSkipmapIndex:       false,
+		IO: IOConfig{
+			DirectIO: false,
+			Fsync:    false,
+		},
+		Resilience: ResilienceConfig{
+			ChecksumHash: nil, // Disabled by default - use WithChecksum()
+			VerifyOnRead: false,
+			Checksums:    OmitChecksums,
+		},
+		UseSkipmapIndex: false,
 	}
 }

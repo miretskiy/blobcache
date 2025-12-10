@@ -5,6 +5,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/cespare/xxhash/v2"
 	"github.com/ncw/directio"
 )
 
@@ -12,27 +13,29 @@ import (
 type SegmentWriter struct {
 	paths       SegmentPaths
 	segmentSize int64
-	useDirectIO bool
-	fsync       bool
+	io          IOConfig
+	resilience  ResilienceConfig
 	workerID    int
 
 	// Current segment state
 	currentFile  *os.File
 	currentID    int64
 	currentPos   int64
-	lastWritePos int64  // Position of last Write() for Pos()
-	leftover     []byte // For DirectIO alignment
+	lastWritePos int64           // Position of last Write() for Pos()
+	leftover     []byte          // For DirectIO alignment
+	records      []SegmentRecord // Records for footer
 }
 
 // NewSegmentWriter creates a segment writer for a specific worker
 func NewSegmentWriter(
-	basePath string, segmentSize int64, useDirectIO bool, fsync bool, workerID int,
+	basePath string, segmentSize int64, workerID int,
+	io IOConfig, resilience ResilienceConfig,
 ) *SegmentWriter {
 	return &SegmentWriter{
 		paths:       SegmentPaths(basePath),
 		segmentSize: segmentSize,
-		useDirectIO: useDirectIO,
-		fsync:       fsync,
+		io:          io,
+		resilience:  resilience,
 		workerID:    workerID,
 	}
 }
@@ -53,7 +56,7 @@ func (w *SegmentWriter) openNewSegment() error {
 	segmentPath := w.paths.SegmentPath(w.currentID, w.workerID)
 
 	var err error
-	if w.useDirectIO {
+	if w.io.DirectIO {
 		w.currentFile, err = directio.OpenFile(segmentPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	} else {
 		w.currentFile, err = os.OpenFile(segmentPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
@@ -65,6 +68,7 @@ func (w *SegmentWriter) openNewSegment() error {
 
 	w.currentPos = 0
 	w.leftover = nil
+	w.records = nil // Reset records for new segment
 	return nil
 }
 
@@ -74,10 +78,20 @@ func (w *SegmentWriter) closeCurrentSegment() error {
 		return nil
 	}
 
-	// Fdatasync on close if enabled (defensive)
-	// Buffered mode already fsyncs after each write, but sync again to be safe
-	// DirectIO mode doesn't need it but doesn't hurt
-	if w.fsync {
+	// Write footer with all records for this segment
+	if len(w.records) > 0 {
+		// Encode footer (p0 is where footer starts = current position)
+		footerBytes := EncodeFooter(w.currentPos, w.records, w.resilience.Checksums)
+
+		// Write footer to file
+		if _, err := w.currentFile.Write(footerBytes); err != nil {
+			w.currentFile.Close()
+			return fmt.Errorf("failed to write footer: %w", err)
+		}
+	}
+
+	// Fdatasync on close if enabled (after footer written)
+	if w.io.Fsync {
 		if err := fdatasync(w.currentFile); err != nil {
 			w.currentFile.Close()
 			return fmt.Errorf("failed to fdatasync segment: %w", err)
@@ -93,7 +107,7 @@ func (w *SegmentWriter) closeCurrentSegment() error {
 }
 
 // Write writes a blob to current segment
-func (w *SegmentWriter) Write(key Key, value []byte) error {
+func (w *SegmentWriter) Write(key Key, value []byte, checksum uint32) error {
 	// Open new segment if needed or if this write would exceed segment size
 	if w.currentFile == nil || w.currentPos+int64(len(value)) > w.segmentSize {
 		if err := w.openNewSegment(); err != nil {
@@ -101,7 +115,18 @@ func (w *SegmentWriter) Write(key Key, value []byte) error {
 		}
 	}
 
-	if w.useDirectIO {
+	// Track record for footer
+	// Note: Hash uses xxhash.Sum64 (for path generation compatibility)
+	// not the checksum hasher (which is for data integrity)
+	rec := SegmentRecord{
+		Hash:     xxhash.Sum64(key),
+		Pos:      w.currentPos,
+		Size:     int64(len(value)),
+		Checksum: checksum,
+	}
+	w.records = append(w.records, rec)
+
+	if w.io.DirectIO {
 		// Each blob is padded individually (no cross-blob leftover)
 		// This wastes space but keeps blob addressing simple
 		w.lastWritePos = w.currentPos
@@ -138,7 +163,7 @@ func (w *SegmentWriter) Write(key Key, value []byte) error {
 		w.currentPos += int64(n)
 
 		// Fdatasync after each write if enabled (not needed for DirectIO)
-		if w.fsync {
+		if w.io.Fsync {
 			if err := fdatasync(w.currentFile); err != nil {
 				return fmt.Errorf("failed to fdatasync after write: %w", err)
 			}

@@ -69,9 +69,9 @@ func New(path string, opts ...Option) (*Cache, error) {
 	// Create blob reader based on config (readers hold index reference)
 	var blobReader BlobReader
 	if cfg.SegmentSize > 0 {
-		blobReader = NewSegmentReader(path, idx, cfg.ChecksumHash, cfg.VerifyOnRead)
+		blobReader = NewSegmentReader(path, idx, cfg.Resilience.ChecksumHash, cfg.Resilience.VerifyOnRead)
 	} else {
-		blobReader = NewBufferedReader(path, cfg.Shards, idx, cfg.ChecksumHash, cfg.VerifyOnRead)
+		blobReader = NewBufferedReader(path, cfg.Shards, idx, cfg.Resilience.ChecksumHash, cfg.Resilience.VerifyOnRead)
 	}
 
 	// Create storage strategy for eviction

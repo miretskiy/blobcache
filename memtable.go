@@ -29,14 +29,14 @@ type memFile struct {
 func createBlobWriter(cfg config, workerID int) BlobWriter {
 	// Use segments if SegmentSize > 0
 	if cfg.SegmentSize > 0 {
-		return NewSegmentWriter(cfg.Path, cfg.SegmentSize, cfg.DirectIOWrites, cfg.Fsync, workerID)
+		return NewSegmentWriter(cfg.Path, cfg.SegmentSize, workerID, cfg.IO, cfg.Resilience)
 	}
 
 	// Per-blob mode
-	if cfg.DirectIOWrites {
-		return NewDirectIOWriter(cfg.Path, cfg.Shards, cfg.Fsync)
+	if cfg.IO.DirectIO {
+		return NewDirectIOWriter(cfg.Path, cfg.Shards, cfg.IO.Fsync)
 	}
-	return NewBufferedWriter(cfg.Path, cfg.Shards, cfg.Fsync)
+	return NewBufferedWriter(cfg.Path, cfg.Shards, cfg.IO.Fsync)
 }
 
 // MemTable provides async write buffering with in-memory read support
@@ -227,12 +227,6 @@ func (mt *MemTable) flushMemFile(mf *memFile, writer BlobWriter) {
 
 		key := unsafe.Slice(unsafe.StringData(keyStr), len(keyStr))
 
-		// Write blob via writer interface
-		if err := writer.Write(key, value); err != nil {
-			fmt.Printf("Warning: blob write failed for key %x: %v\n", key, err)
-			return true // Continue with other entries
-		}
-
 		// Compute or use provided checksum
 		var checksum uint32
 		var hasChecksum bool
@@ -241,12 +235,18 @@ func (mt *MemTable) flushMemFile(mf *memFile, writer BlobWriter) {
 			// User provided explicit checksum
 			checksum = entry.checksum
 			hasChecksum = true
-		} else if mt.cache.cfg.ChecksumHash != nil {
+		} else if mt.cache.cfg.Resilience.ChecksumHash != nil {
 			// Compute checksum using hash
-			h := mt.cache.cfg.ChecksumHash()
+			h := mt.cache.cfg.Resilience.ChecksumHash()
 			h.Write(value)
 			checksum = h.Sum32()
 			hasChecksum = true
+		}
+
+		// Write blob via writer interface (pass checksum for footer)
+		if err := writer.Write(key, value, checksum); err != nil {
+			fmt.Printf("Warning: blob write failed for key %x: %v\n", key, err)
+			return true // Continue with other entries
 		}
 
 		// Get position for index (segment mode returns segmentID+pos, per-blob returns zeros)

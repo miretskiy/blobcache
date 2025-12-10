@@ -49,19 +49,8 @@ func New(path string, opts ...Option) (*Cache, error) {
 		return nil, fmt.Errorf("initialization failed: %w", err)
 	}
 
-	// Open index (Bitcask or Skipmap based on config)
-	idx, err := func() (index.Indexer, error) {
-		if cfg.UseSkipmapIndex {
-			// Durable skipmap backed by Bitcask for segments
-			if cfg.SegmentSize > 0 {
-				return index.NewDurableSkipmapIndex(path)
-			}
-			// Pure in-memory for per-blob mode
-			return index.NewSkipmapIndex(), nil
-		}
-		// Default to Bitcask index
-		return index.NewBitcaskIndex(path)
-	}()
+	// Open index (always DurableSkipmap: skipmap backed by Bitcask)
+	idx, err := index.NewDurableSkipmapIndex(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open index: %w", err)
 	}

@@ -14,9 +14,7 @@ func TestCache_SkipmapIndex(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	// Create cache with skipmap index and segments
-	cache, err := New(tmpDir,
-		WithSkipmapIndex(),
-		WithSegmentSize(10*1024*1024))
+	cache, err := New(tmpDir, WithSegmentSize(10*1024*1024))
 	require.NoError(t, err)
 	defer cache.Close()
 
@@ -37,9 +35,7 @@ func TestCache_SkipmapIndexMultipleKeys(t *testing.T) {
 	require.NoError(t, err)
 	defer os.RemoveAll(tmpDir)
 
-	cache, err := New(tmpDir,
-		WithSkipmapIndex(),
-		WithSegmentSize(5*1024*1024))
+	cache, err := New(tmpDir, WithSegmentSize(5*1024*1024))
 	require.NoError(t, err)
 	defer cache.Close()
 

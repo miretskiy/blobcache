@@ -112,7 +112,7 @@ func (idx *BitcaskIndex) Close() error {
 	return idx.db.Close()
 }
 
-// Scan iterates over all records in the index
+// Range iterates over all records in the index
 func (idx *BitcaskIndex) Range(ctx context.Context, fn func(Record) error) error {
 	return idx.db.Scan(nil, func(key bitcask.Key) error {
 		value, err := idx.db.Get(key)

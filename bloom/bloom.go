@@ -3,6 +3,8 @@ package bloom
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
+	"hash/crc32"
 	"math"
 	"sync/atomic"
 
@@ -110,7 +112,12 @@ func (f *Filter) RecordAdditions() (
 	return stopRecording, consumeRecording
 }
 
-// Serialize returns the bloom filter as bytes (caller controls storage)
+const (
+	bloomMagic = 0xB100F1173DAA // Magic number for bloom file validation
+)
+
+// Serialize returns the bloom filter as bytes with checksum footer
+// Format: [m:8][k:4][data...][checksum(4)][magic(8)]
 func (f *Filter) Serialize() ([]byte, error) {
 	// Snapshot data atomically
 	snapshot := make([]uint32, len(f.data))
@@ -118,30 +125,57 @@ func (f *Filter) Serialize() ([]byte, error) {
 		snapshot[i] = atomic.LoadUint32(&f.data[i])
 	}
 
-	// Encode: [m:8][k:4][data...]
-	buf := make([]byte, 12+len(snapshot)*4)
-	binary.LittleEndian.PutUint64(buf[0:8], uint64(f.m))
-	binary.LittleEndian.PutUint32(buf[8:12], uint32(f.k))
+	// Encode bloom data: [m:8][k:8][data...]
+	// Both m and k are uint64 for consistency (k could be uint8 since it's <20, but alignment)
+	bloomData := make([]byte, 16+len(snapshot)*4)
+	binary.LittleEndian.PutUint64(bloomData[0:8], uint64(f.m))
+	binary.LittleEndian.PutUint64(bloomData[8:16], uint64(f.k))
 
 	for i, word := range snapshot {
-		binary.LittleEndian.PutUint32(buf[12+i*4:], word)
+		binary.LittleEndian.PutUint32(bloomData[16+i*4:], word)
 	}
 
-	return buf, nil
+	// Append checksum footer
+	checksum := crc32.ChecksumIEEE(bloomData)
+	footer := make([]byte, 12)
+	binary.LittleEndian.PutUint32(footer[0:4], checksum)
+	binary.LittleEndian.PutUint64(footer[4:12], bloomMagic)
+
+	return append(bloomData, footer...), nil
 }
 
-// Deserialize creates a bloom filter from bytes
+// Deserialize creates a bloom filter from bytes with validation
+// Format: [m:8][k:4][data...][checksum(4)][magic(8)]
+// Validates magic and checksum, returns error if corrupted
 func Deserialize(data []byte) (*Filter, error) {
-	if len(data) < 12 {
+	if len(data) < 24 { // Minimum: m(8) + k(4) + checksum(4) + magic(8)
 		return nil, ErrInvalidFormat
 	}
 
-	m := uint(binary.LittleEndian.Uint64(data[0:8]))
-	k := uint(binary.LittleEndian.Uint32(data[8:12]))
+	// Extract and validate footer
+	footerStart := len(data) - 12
+	bloomData := data[:footerStart]
+	checksum := binary.LittleEndian.Uint32(data[footerStart : footerStart+4])
+	magic := binary.LittleEndian.Uint64(data[footerStart+4 : footerStart+12])
 
-	words := make([]uint32, (len(data)-12)/4)
+	// Validate magic
+	if magic != bloomMagic {
+		return nil, fmt.Errorf("invalid bloom magic: %x (expected %x)", magic, bloomMagic)
+	}
+
+	// Validate checksum
+	computed := crc32.ChecksumIEEE(bloomData)
+	if computed != checksum {
+		return nil, fmt.Errorf("bloom checksum mismatch: computed %x != stored %x", computed, checksum)
+	}
+
+	// Decode bloom data: [m:8][k:8][data...]
+	m := uint(binary.LittleEndian.Uint64(bloomData[0:8]))
+	k := uint(binary.LittleEndian.Uint64(bloomData[8:16]))
+
+	words := make([]uint32, (len(bloomData)-16)/4)
 	for i := range words {
-		words[i] = binary.LittleEndian.Uint32(data[12+i*4:])
+		words[i] = binary.LittleEndian.Uint32(bloomData[16+i*4:])
 	}
 
 	return &Filter{

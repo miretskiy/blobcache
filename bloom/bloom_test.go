@@ -1,6 +1,7 @@
 package bloom
 
 import (
+	"encoding/binary"
 	"fmt"
 	"sync"
 	"testing"
@@ -386,4 +387,39 @@ func TestRecordAdditions_MultipleConsumes(t *testing.T) {
 	require.True(t, newFilter.Test([]byte("key1")))
 	require.True(t, newFilter.Test([]byte("key2")))
 	require.True(t, newFilter.Test([]byte("key3")))
+}
+
+func TestBloom_ChecksumValidation(t *testing.T) {
+	filter := New(1000, 0.01)
+	filter.Add([]byte("test"))
+
+	data, err := filter.Serialize()
+	require.NoError(t, err)
+
+	// Corrupt checksum (last 12 bytes are footer)
+	footerStart := len(data) - 12
+	data[footerStart] = 0xFF
+	data[footerStart+1] = 0xFF
+
+	// Should fail to deserialize
+	_, err = Deserialize(data)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "checksum mismatch")
+}
+
+func TestBloom_MagicValidation(t *testing.T) {
+	filter := New(1000, 0.01)
+	filter.Add([]byte("test"))
+
+	data, err := filter.Serialize()
+	require.NoError(t, err)
+
+	// Corrupt magic (last 8 bytes of footer)
+	footerStart := len(data) - 12
+	binary.LittleEndian.PutUint64(data[footerStart+4:], 0xDEADBEEF)
+
+	// Should fail to deserialize
+	_, err = Deserialize(data)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "invalid bloom magic")
 }

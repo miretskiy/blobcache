@@ -205,18 +205,17 @@ func checkOrInitialize(cfg config) error {
 
 // loadBloom loads bloom filter from storage or rebuilds from index
 func (c *Cache) loadBloom(ctx context.Context) error {
-	// Try to load from file first
 	bloomPath := filepath.Join(c.cfg.Path, "bloom.dat")
 	data, err := os.ReadFile(bloomPath)
 
 	if err == nil {
-		// Load existing bloom filter
+		// Deserialize validates checksum and magic
 		filter, err := bloom.Deserialize(data)
 		if err == nil {
 			c.bloom.Store(filter)
 			return nil
 		}
-		// Failed to deserialize - rebuild below
+		// Corrupted - rebuild below
 	}
 
 	// Bloom missing or corrupt - rebuild from index
@@ -260,13 +259,14 @@ func (c *Cache) rebuildBloom(ctx context.Context) error {
 	return nil
 }
 
-// saveBloom persists bloom filter to disk
+// saveBloom persists bloom filter to disk with atomic write
 func (c *Cache) saveBloom() error {
 	filter := c.bloom.Load()
 	if filter == nil {
 		return nil
 	}
 
+	// Serialize includes checksum and magic
 	data, err := filter.Serialize()
 	if err != nil {
 		return err

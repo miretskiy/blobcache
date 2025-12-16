@@ -31,14 +31,17 @@ func NewStorage(cfg config, idx *index.Index) *Storage {
 
 // Close closes all cached file handles
 func (s *Storage) Close() error {
+	var errs []error
 	s.cache.Range(func(key, value any) bool {
 		if file, ok := value.(*os.File); ok {
-			_ = file.Close()
+			if err := file.Close(); err != nil {
+				errs = append(errs, err)
+			}
 		}
 		s.cache.Delete(key)
 		return true
 	})
-	return nil
+	return errors.Join(errs...)
 }
 
 // Get reads a blob from a segment file at the specified position

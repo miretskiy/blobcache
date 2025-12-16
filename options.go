@@ -32,11 +32,14 @@ type config struct {
 	MaxInflightBatches int   // Max batches queued (like RocksDB max_write_buffer_number)
 	BloomFPRate        float64
 	BloomEstimatedKeys int
-	IO                 IOConfig
-	Resilience           ResilienceConfig
+	IO         IOConfig
+	Resilience ResilienceConfig
 
 	// Testing hooks
-	onSegmentEvicted func(segmentID int64)
+	onSegmentEvicted       func(segmentID int64)
+	testingInjectWriteErr  func() error // Called before writer.Write() in flush
+	testingInjectIndexErr  func() error // Called before index.PutBatch() in flush
+	testingInjectEvictErr  func() error // Called in runEviction()
 }
 
 // Option configures BlobCache
@@ -165,6 +168,27 @@ func WithTestingFlushOnPut() Option {
 func WithTestingOnSegmentEvicted(fn func(segmentID int64)) Option {
 	return funcOpt(func(c *config) {
 		c.onSegmentEvicted = fn
+	})
+}
+
+// WithTestingInjectWriteError injects errors during blob writes in flush worker
+func WithTestingInjectWriteError(fn func() error) Option {
+	return funcOpt(func(c *config) {
+		c.testingInjectWriteErr = fn
+	})
+}
+
+// WithTestingInjectIndexError injects errors during index updates in flush worker
+func WithTestingInjectIndexError(fn func() error) Option {
+	return funcOpt(func(c *config) {
+		c.testingInjectIndexErr = fn
+	})
+}
+
+// WithTestingInjectEvictError injects errors during eviction
+func WithTestingInjectEvictError(fn func() error) Option {
+	return funcOpt(func(c *config) {
+		c.testingInjectEvictErr = fn
 	})
 }
 

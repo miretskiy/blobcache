@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"os"
 	"sync/atomic"
 	"time"
 
@@ -103,11 +102,9 @@ func (idx *Index) DeleteSegment(segment metadata.SegmentRecord) error {
 	return idx.segments.Delete(segment.IndexKey)
 }
 
-// Close closes the Bitcask backing store if present
-func (idx *Index) Close() {
-	if err := idx.segments.Close(); err != nil {
-		fmt.Fprintf(os.Stderr, "failed to close segments: %v\n", err)
-	}
+// Close closes the Bitcask backing store
+func (idx *Index) Close() error {
+	return idx.segments.Close()
 }
 
 // ForEachSegment iterates over all segment records in the index

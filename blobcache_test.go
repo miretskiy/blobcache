@@ -71,10 +71,12 @@ func TestCache_StartClose(t *testing.T) {
 	require.NoError(t, err)
 
 	// Close gracefully
-	closer()
+	err = closer()
+	require.NoError(t, err)
 
 	// Close again should be safe
-	cache.Close()
+	err = cache.Close()
+	require.NoError(t, err)
 }
 
 func TestCache_CloseWithoutStart(t *testing.T) {
@@ -85,7 +87,8 @@ func TestCache_CloseWithoutStart(t *testing.T) {
 	require.NoError(t, err)
 
 	// Close without Start should be safe
-	cache.Close()
+	err = cache.Close()
+	require.NoError(t, err)
 }
 
 func TestCache_CustomOptions(t *testing.T) {

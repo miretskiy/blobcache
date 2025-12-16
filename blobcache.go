@@ -2,6 +2,7 @@ package blobcache
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -31,9 +32,39 @@ type Cache struct {
 	approxSize      atomic.Int64 // Approximate total size (updated during flush/eviction)
 	evictionRunning atomic.Bool  // Prevents concurrent evictions
 
+	// Background error tracking
+	bgError atomic.Pointer[error] // First background error (nil = healthy)
+
 	// Background workers
 	stopCh chan struct{}
 	wg     sync.WaitGroup
+}
+
+// degradedMode interface allows memtable to check/set degraded state
+// without direct dependency on Cache
+type degradedMode interface {
+	isDegraded() bool
+	setDegraded(error)
+}
+
+// Cache implements degradedMode interface
+func (c *Cache) isDegraded() bool {
+	return c.bgError.Load() != nil
+}
+
+func (c *Cache) setDegraded(err error) {
+	if c.bgError.CompareAndSwap(nil, &err) {
+		log.Error("entering degraded mode (memory-only)", "error", err)
+	}
+}
+
+// BGError returns any background error (nil if healthy)
+// Once set, this is permanent until cache restart
+func (c *Cache) BGError() error {
+	if ptr := c.bgError.Load(); ptr != nil {
+		return *ptr
+	}
+	return nil
 }
 
 // New creates a Cache at the specified path with optional configuration
@@ -78,7 +109,7 @@ func New(path string, opts ...Option) (*Cache, error) {
 
 // Start begins background operations (eviction worker)
 // Returns a closer function for graceful shutdown
-func (c *Cache) Start() (func(), error) {
+func (c *Cache) Start() (func() error, error) {
 	// Start eviction worker (checks every 60 seconds)
 	c.wg.Add(1)
 	go c.evictionWorker()
@@ -89,20 +120,25 @@ func (c *Cache) Start() (func(), error) {
 
 // Close gracefully shuts down all background workers and saves state
 // Safe to call multiple times and safe to call even if Start() was never called
-func (c *Cache) Close() {
+// Does NOT drain memtable - caller should call Drain() first if needed
+func (c *Cache) Close() error {
 	// Signal workers to stop (idempotent)
 	select {
 	case <-c.stopCh:
-		return
+		return nil
 	default:
 		close(c.stopCh)
 	}
 
-	// Close memtable (does NOT drain - caller should call Drain() if needed)
+	// Close memtable (does NOT drain)
 	c.memTable.Close()
 	c.wg.Wait()
-	c.storage.Close()
-	c.index.Close()
+
+	// Collect all close errors
+	return errors.Join(
+		c.storage.Close(),
+		c.index.Close(),
+	)
 }
 
 // Drain waits for all pending memtable writes to complete
@@ -193,8 +229,11 @@ func (c *Cache) evictionWorker() {
 	for {
 		select {
 		case <-ticker.C:
-			if c.MaxSize > 0 {
-				c.runEviction(c.MaxSize)
+			if c.MaxSize > 0 && !c.isDegraded() {
+				if err := c.runEviction(c.MaxSize); err != nil {
+					c.setDegraded(err)
+					return // Stop eviction permanently
+				}
 			}
 		case <-c.stopCh:
 			return
@@ -204,6 +243,13 @@ func (c *Cache) evictionWorker() {
 
 // runEviction evicts oldest entries if cache size exceeds limit
 func (c *Cache) runEviction(maxCacheSize int64) error {
+	// Testing: inject eviction error
+	if c.testingInjectEvictErr != nil {
+		if err := c.testingInjectEvictErr(); err != nil {
+			return err
+		}
+	}
+
 	// Prevent concurrent evictions (multiple flush workers could trigger)
 	if !c.evictionRunning.CompareAndSwap(false, true) {
 		return nil // Another eviction already running
@@ -250,12 +296,18 @@ func (c *Cache) runEviction(maxCacheSize int64) error {
 		}
 		evictedCount += len(segment.Records)
 
+		// Try to delete segment file (best effort)
 		p := getSegmentPath(c.Path, c.Shards, segment.SegmentID)
 		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
-			fmt.Printf("Warning: failed to remove segment %s: %v\n", p, err)
+			log.Warn("failed to remove segment file",
+				"path", p,
+				"error", err)
+			// Continue - index consistency more important than disk cleanup
 		}
+
+		// Index delete MUST succeed - critical for consistency
 		if err := c.index.DeleteSegment(segment); err != nil {
-			return err
+			return fmt.Errorf("index delete failed: %w", err)
 		}
 
 		if c.onSegmentEvicted != nil {
@@ -263,7 +315,9 @@ func (c *Cache) runEviction(maxCacheSize int64) error {
 		}
 	}
 
-	fmt.Printf("Evicted %d blobs (%d MB)\n", evictedCount, evictedBytes/(1024*1024))
+	log.Info("eviction completed",
+		"evicted_blobs", evictedCount,
+		"evicted_mb", evictedBytes/(1024*1024))
 
 	// Rebuild bloom filter after eviction to remove stale entries
 	if evictedCount > 0 {
@@ -323,9 +377,10 @@ func (c *Cache) PutBatch(kvs []index.KeyValue) error {
 	newSize := c.approxSize.Add(addedBytes)
 
 	// Trigger eviction if over limit (reactive)
-	if c.MaxSize > 0 && newSize > c.MaxSize {
+	if c.MaxSize > 0 && newSize > c.MaxSize && !c.isDegraded() {
 		if err := c.runEviction(c.MaxSize); err != nil {
-			fmt.Printf("Warning: reactive eviction failed: %v\n", err)
+			c.setDegraded(err)
+			return err
 		}
 	}
 	return nil

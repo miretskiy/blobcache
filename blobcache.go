@@ -258,9 +258,21 @@ func (c *Cache) runEviction(maxCacheSize int64) error {
 		if err := c.index.DeleteSegment(segment); err != nil {
 			return err
 		}
+
+		if c.onSegmentEvicted != nil {
+			c.onSegmentEvicted(segment.SegmentID)
+		}
 	}
 
 	fmt.Printf("Evicted %d blobs (%d MB)\n", evictedCount, evictedBytes/(1024*1024))
+
+	// Rebuild bloom filter after eviction to remove stale entries
+	if evictedCount > 0 {
+		if err := c.rebuildBloom(); err != nil {
+			return fmt.Errorf("failed to rebuild bloom after eviction: %w", err)
+		}
+	}
+
 	return nil
 }
 

@@ -36,6 +36,9 @@ type config struct {
 	BloomRefreshInterval time.Duration
 	IO                   IOConfig
 	Resilience           ResilienceConfig
+
+	// Testing hooks
+	onSegmentEvicted func(segmentID int64)
 }
 
 // Option configures BlobCache
@@ -164,6 +167,13 @@ func WithKeyHasher(hasher KeyHasherFn) Option {
 func WithTestingFlushOnPut() Option {
 	return funcOpt(func(c *config) {
 		c.SegmentSize = 0
+	})
+}
+
+// WithTestingOnSegmentEvicted sets a callback invoked when segments are evicted
+func WithTestingOnSegmentEvicted(fn func(segmentID int64)) Option {
+	return funcOpt(func(c *config) {
+		c.onSegmentEvicted = fn
 	})
 }
 

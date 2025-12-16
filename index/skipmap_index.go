@@ -166,7 +166,6 @@ func (idx *Index) PutBatch(records []KeyValue) error {
 func (idx *Index) putSegment(records []KeyValue) error {
 	seg := metadata.SegmentRecord{
 		Records: nil,
-		CTime:   time.Now(),
 	}
 
 	txn := idx.segments.Transaction()
@@ -199,7 +198,12 @@ func (idx *Index) putSegment(records []KeyValue) error {
 				}
 				seg = segment
 			} else {
-				seg.CTime = rec.Val.CTime
+				// Use provided CTime if non-zero, otherwise default to now
+				if rec.Val.CTime.IsZero() {
+					seg.CTime = time.Now()
+				} else {
+					seg.CTime = rec.Val.CTime
+				}
 				seg.SegmentID = rec.Val.SegmentID
 			}
 		} else {

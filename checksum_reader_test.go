@@ -180,7 +180,7 @@ func TestChecksumVerifyingReader_PartialReads(t *testing.T) {
 }
 
 func TestChecksumVerifyingReader_EmptyData(t *testing.T) {
-	data := []byte{}
+	var data []byte
 	expected := crc32.ChecksumIEEE(data) // Checksum of empty data
 
 	reader := newChecksumVerifyingReader(
@@ -197,7 +197,7 @@ func TestChecksumVerifyingReader_EmptyData(t *testing.T) {
 }
 
 func TestChecksumVerifyingReader_EmptyData_WrongChecksum(t *testing.T) {
-	data := []byte{}
+	var data []byte
 	wrongChecksum := uint32(999)
 
 	reader := newChecksumVerifyingReader(

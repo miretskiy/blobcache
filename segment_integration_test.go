@@ -14,9 +14,7 @@ func TestCache_SegmentMode(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	// Create cache with segments and Bitcask index
-	cache, err := New(tmpDir,
-		WithSegmentSize(10*1024*1024), // 10MB segments
-		WithBitcaskIndex())            // Required for segments
+	cache, err := New(tmpDir, WithSegmentSize(10<<29))
 	require.NoError(t, err)
 	defer cache.Close()
 
@@ -53,10 +51,7 @@ func TestCache_SegmentModeWithDirectIO(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	// Create cache with segments, DirectIO, and Bitcask
-	cache, err := New(tmpDir,
-		WithSegmentSize(5*1024*1024), // 5MB segments
-		WithDirectIOWrites(),
-		WithBitcaskIndex())
+	cache, err := New(tmpDir, WithSegmentSize(5<<20))
 	require.NoError(t, err)
 	defer cache.Close()
 

@@ -1,126 +1,134 @@
 package index
 
 import (
-	"context"
+	"os"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 )
 
-func TestSkipmapIndex_PutGet(t *testing.T) {
-	idx := NewSkipmapIndex()
-	defer idx.Close()
+func newIndex(t *testing.T) (*Index, func()) {
+	tmpDir, err := os.MkdirTemp("", "segments-test-*")
+	if err != nil {
+		_ = os.RemoveAll(tmpDir)
+		t.Fatal(err)
+	}
+	idx, err := NewIndex(tmpDir)
+	if err != nil {
+		_ = os.RemoveAll(tmpDir)
+		t.Fatal(err)
+	}
+	return idx, func() {
+		idx.Close()
+		_ = os.RemoveAll(tmpDir)
+	}
+}
 
-	ctx := context.Background()
-	key := []byte("test-key")
-	now := time.Now().UnixNano()
+func TestSkipmapIndex_PutGet(t *testing.T) {
+	idx, cleanup := newIndex(t)
+	defer cleanup()
+
+	var key Key = 123
+	now := time.Now()
 
 	// Put a record
-	err := idx.Put(ctx, key, Value{Size: 1024, CTime: now})
+	err := idx.PutBlob(key, Value{Size: 1024, CTime: now})
 	require.NoError(t, err)
 
 	// Get it back
 	var entry Value
-	err = idx.Get(ctx, key, &entry)
+	err = idx.Get(key, &entry)
 	require.NoError(t, err)
 
 	// Verify
-	require.Equal(t, 1024, entry.Size)
+	require.EqualValues(t, 1024, entry.Size)
 	require.Equal(t, now, entry.CTime)
 }
 
 func TestSkipmapIndex_GetNotFound(t *testing.T) {
-	idx := NewSkipmapIndex()
-	defer idx.Close()
+	idx, cleanup := newIndex(t)
+	defer cleanup()
 
-	key := []byte("nonexistent")
 	var entry Value
-	err := idx.Get(context.Background(), key, &entry)
-
+	err := idx.Get(Key(123), &entry)
 	require.ErrorIs(t, err, ErrNotFound)
 }
 
 func TestSkipmapIndex_Delete(t *testing.T) {
-	idx := NewSkipmapIndex()
-	defer idx.Close()
+	idx, cleanup := newIndex(t)
+	defer cleanup()
 
-	ctx := context.Background()
-	key := []byte("delete-me")
-
+	key := Key(123)
 	// Insert
-	now := time.Now().UnixNano()
-	idx.Put(ctx, key, Value{Size: 500, CTime: now})
+	now := time.Now()
+	require.NoError(t, idx.PutBlob(key, Value{Size: 500, CTime: now}))
 
 	// Delete
-	err := idx.Delete(ctx, key)
-	require.NoError(t, err)
+	idx.DeleteBlob(key)
 
 	// Verify gone
 	var entry Value
-	err = idx.Get(ctx, key, &entry)
+	err := idx.Get(key, &entry)
 	require.ErrorIs(t, err, ErrNotFound)
 }
 
 func TestSkipmapIndex_PutBatch(t *testing.T) {
-	idx := NewSkipmapIndex()
-	defer idx.Close()
+	idx, cleanup := newIndex(t)
+	defer cleanup()
 
-	ctx := context.Background()
 	// Batch insert
-	now := time.Now().UnixNano()
-	key1 := []byte("key1")
-	key2 := []byte("key2")
+	now := time.Now()
+	key1 := Key(123)
+	key2 := Key(321)
 
 	records := []KeyValue{
 		{Key: key1, Val: Value{SegmentID: 100, Pos: 0, Size: 100, CTime: now}},
-		{Key: key2, Val: Value{SegmentID: 100, Pos: 100, Size: 200, CTime: now + 1000}},
+		{Key: key2, Val: Value{SegmentID: 100, Pos: 100, Size: 200, CTime: now}},
 	}
 
-	err := idx.PutBatch(ctx, records)
+	err := idx.PutBatch(records)
 	require.NoError(t, err)
 
 	// Verify entries exist
 	var entry Value
-	err = idx.Get(ctx, key1, &entry)
+	err = idx.Get(key1, &entry)
 	require.NoError(t, err)
-	require.Equal(t, 100, entry.Size)
+	require.EqualValues(t, 100, entry.Size)
 	require.Equal(t, int64(100), entry.SegmentID)
 	require.Equal(t, int64(0), entry.Pos)
 
-	err = idx.Get(ctx, key2, &entry)
+	err = idx.Get(key2, &entry)
 	require.NoError(t, err)
-	require.Equal(t, 200, entry.Size)
-	require.Equal(t, int64(100), entry.Pos)
+	require.EqualValues(t, 200, entry.Size)
+	require.EqualValues(t, 100, entry.Pos)
 }
 
 func TestSkipmapIndex_Scan(t *testing.T) {
-	idx := NewSkipmapIndex()
-	defer idx.Close()
-
-	ctx := context.Background()
+	idx, cleanup := newIndex(t)
+	defer cleanup()
 
 	// Put records
-	now := time.Now().UnixNano()
-	idx.Put(ctx, Key("key1"), Value{Size: 100, CTime: now})
-	idx.Put(ctx, Key("key2"), Value{Size: 200, CTime: now + 1000})
-	idx.Put(ctx, Key("key3"), Value{Size: 300, CTime: now + 2000})
+	now := time.Now()
+	for i := 0; i < 10; i++ {
+		err := idx.PutBlob(
+			Key(i),
+			Value{
+				Size:  int64(100 * (i + 1)),
+				CTime: now.Add(time.Duration(i) * time.Hour),
+			})
+		require.NoError(t, err)
+
+	}
 
 	// Range all records
 	var scanned []KeyValue
-	err := idx.Range(ctx, func(kv KeyValue) bool {
+	idx.ForEachBlob(func(kv KeyValue) bool {
 		scanned = append(scanned, kv)
 		return true
 	})
-	require.NoError(t, err)
-	require.Equal(t, 3, len(scanned))
-
-	// Verify all records present
-	sizes := make(map[int]bool)
+	require.Equal(t, 10, len(scanned))
 	for _, rec := range scanned {
-		sizes[rec.Val.Size] = true
+		require.EqualValues(t, 0, rec.Val.Size%100)
 	}
-	require.True(t, sizes[100])
-	require.True(t, sizes[200])
-	require.True(t, sizes[300])
 }

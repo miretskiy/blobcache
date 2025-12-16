@@ -1,14 +1,13 @@
 package blobcache
 
 import (
-	"context"
 	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
-	"unsafe"
 
 	"github.com/miretskiy/blobcache/index"
+	"github.com/miretskiy/blobcache/metadata"
 	"github.com/zhangyunhao116/skipmap"
 )
 
@@ -21,27 +20,17 @@ type memEntry struct {
 
 // memFile represents a single memtable with skipmap and size tracking
 type memFile struct {
-	data *skipmap.StringMap[*memEntry]
+	data *skipmap.Uint64Map[*memEntry]
 	size atomic.Int64
-}
-
-// createBlobWriter creates appropriate writer based on config
-func createBlobWriter(cfg config, workerID int) BlobWriter {
-	// Use segments if SegmentSize > 0
-	if cfg.SegmentSize > 0 {
-		return NewSegmentWriter(cfg.Path, cfg.SegmentSize, workerID, cfg.IO, cfg.Resilience)
-	}
-
-	// Per-blob mode
-	if cfg.IO.DirectIO {
-		return NewDirectIOWriter(cfg.Path, cfg.Shards, cfg.IO.Fsync)
-	}
-	return NewBufferedWriter(cfg.Path, cfg.Shards, cfg.IO.Fsync)
 }
 
 // MemTable provides async write buffering with in-memory read support
 // Uses atomic memFile pointer for lock-free writes
 type MemTable struct {
+	config
+	batcher
+	newWriter func() BlobWriter
+
 	// Active memfile - currently accepting writes (lock-free)
 	active atomic.Pointer[memFile]
 
@@ -52,37 +41,41 @@ type MemTable struct {
 		cond     *sync.Cond
 	}
 
+	seq atomic.Int64
+
 	// Background flush workers
 	flushCh chan *memFile
 	stopCh  chan struct{}
 	wg      sync.WaitGroup
 
-	cache           *Cache
 	writeBufferSize int64
 }
 
 // newMemTable creates a memtable with skipmap-based storage
-func (c *Cache) newMemTable() *MemTable {
+func (c *Cache) newMemTable(cfg config, storage *Storage) *MemTable {
 	mt := &MemTable{
-		flushCh:         make(chan *memFile, c.cfg.MaxInflightBatches),
-		stopCh:          make(chan struct{}),
-		cache:           c,
-		writeBufferSize: c.cfg.WriteBufferSize,
+		config:  cfg,
+		batcher: c,
+		flushCh: make(chan *memFile, c.MaxInflightBatches),
+		stopCh:  make(chan struct{}),
+		newWriter: func() BlobWriter {
+			return storage.NewSegmentWriter()
+		},
+		writeBufferSize: c.WriteBufferSize,
 	}
-	mt.frozen.inflight = make([]*memFile, 0)
 	mt.frozen.cond = sync.NewCond(&mt.frozen)
+	mt.seq.Store(time.Now().UnixNano())
 
 	// Initialize active memfile
 	mf := &memFile{
-		data: skipmap.NewString[*memEntry](),
+		data: skipmap.NewUint64[*memEntry](),
 	}
 	mt.active.Store(mf)
 
 	// Start I/O workers for flushing memfiles
-	for i := 0; i < c.cfg.MaxInflightBatches; i++ {
-		mt.wg.Add(1)
-		workerID := i
-		go mt.flushWorker(workerID)
+	mt.wg.Add(c.MaxInflightBatches)
+	for i := 0; i < c.MaxInflightBatches; i++ {
+		go mt.flushWorker()
 	}
 
 	return mt
@@ -101,12 +94,11 @@ func (mt *MemTable) PutChecksummed(key Key, value []byte, checksum uint32) {
 }
 
 // putWithChecksum is the internal implementation for Put and PutChecksummed
-// checksum may be nil (will be computed during flush if ChecksumHash configured)
+// checksum may be nil (will be computed during flush if ChecksumHasher configured)
 func (mt *MemTable) putWithChecksum(key Key, value []byte, checksum *uint32) {
 retry:
 	mf := mt.active.Load()
 
-	keyStr := unsafe.String(unsafe.SliceData(key), len(key))
 	entry := &memEntry{
 		value: value,
 	}
@@ -114,10 +106,7 @@ retry:
 		entry.checksum = *checksum
 		entry.hasChecksum = true
 	}
-	mf.data.Store(keyStr, entry)
-
-	bloom := mt.cache.bloom.Load()
-	bloom.Add(key)
+	mf.data.Store(uint64(key), entry)
 
 	newSize := mf.size.Add(int64(len(value)))
 	if newSize >= mt.writeBufferSize {
@@ -136,7 +125,7 @@ retry:
 // CALLER MUST HOLD mt.frozen.Lock()
 func (mt *MemTable) doRotateUnderLock(mf *memFile) {
 	// Wait for space FIRST, before modifying any state
-	for len(mt.frozen.inflight) >= mt.cache.cfg.MaxInflightBatches {
+	for len(mt.frozen.inflight) >= mt.MaxInflightBatches {
 		mt.frozen.cond.Wait()
 		// After Wait(), check if another thread already rotated this mf
 		if mt.active.Load() != mf {
@@ -149,7 +138,7 @@ func (mt *MemTable) doRotateUnderLock(mf *memFile) {
 
 	// Swap to new active
 	newMf := &memFile{
-		data: skipmap.NewString[*memEntry](),
+		data: skipmap.NewUint64[*memEntry](),
 	}
 	if old := mt.active.Swap(newMf); old != mf {
 		panic(fmt.Errorf("active map changed under lock: expected %p found %p", mf, old))
@@ -165,10 +154,8 @@ func (mt *MemTable) doRotateUnderLock(mf *memFile) {
 
 // Get retrieves value from active or frozen memfiles
 func (mt *MemTable) Get(key Key) ([]byte, bool) {
-	keyStr := unsafe.String(unsafe.SliceData(key), len(key))
-
 	mf := mt.active.Load()
-	if entry, ok := mf.data.Load(keyStr); ok {
+	if entry, ok := mf.data.Load(uint64(key)); ok {
 		return entry.value, true
 	}
 
@@ -176,7 +163,7 @@ func (mt *MemTable) Get(key Key) ([]byte, bool) {
 	defer mt.frozen.RUnlock()
 
 	for i := len(mt.frozen.inflight) - 1; i >= 0; i-- {
-		if entry, ok := mt.frozen.inflight[i].data.Load(keyStr); ok {
+		if entry, ok := mt.frozen.inflight[i].data.Load(uint64(key)); ok {
 			return entry.value, true
 		}
 	}
@@ -185,11 +172,11 @@ func (mt *MemTable) Get(key Key) ([]byte, bool) {
 }
 
 // flushWorker processes frozen memfiles
-func (mt *MemTable) flushWorker(workerID int) {
+func (mt *MemTable) flushWorker() {
 	defer mt.wg.Done()
 
 	// Create per-worker blob writer
-	writer := createBlobWriter(mt.cache.cfg, workerID)
+	writer := mt.newWriter()
 	defer writer.Close()
 
 	for {
@@ -213,38 +200,32 @@ func (mt *MemTable) flushWorker(workerID int) {
 }
 
 func (mt *MemTable) flushMemFile(mf *memFile, writer BlobWriter) {
-	ctx := context.Background()
-	now := time.Now().UnixNano()
+	now := time.Now()
 
 	// Phase 1: Write all blob files and collect records for index
 	var records []index.KeyValue
 
-	mf.data.Range(func(keyStr string, entry *memEntry) bool {
+	mf.data.Range(func(key uint64, entry *memEntry) bool {
 		value := entry.value
 		if len(value) == 0 {
 			return true
 		}
 
-		key := unsafe.Slice(unsafe.StringData(keyStr), len(keyStr))
-
 		// Compute or use provided checksum
-		var checksum uint32
-		var hasChecksum bool
+		checksum := metadata.InvalidChecksum
 
 		if entry.hasChecksum {
 			// User provided explicit checksum
-			checksum = entry.checksum
-			hasChecksum = true
-		} else if mt.cache.cfg.Resilience.ChecksumHash != nil {
+			checksum = uint64(entry.checksum)
+		} else if mt.Resilience.ChecksumHasher != nil {
 			// Compute checksum using hash
-			h := mt.cache.cfg.Resilience.ChecksumHash()
+			h := mt.Resilience.ChecksumHasher()
 			h.Write(value)
-			checksum = h.Sum32()
-			hasChecksum = true
+			checksum = uint64(h.Sum32())
 		}
 
 		// Write blob via writer interface (pass checksum for footer)
-		if err := writer.Write(key, value, checksum); err != nil {
+		if err := writer.Write(Key(key), value, checksum); err != nil {
 			fmt.Printf("Warning: blob write failed for key %x: %v\n", key, err)
 			return true // Continue with other entries
 		}
@@ -253,14 +234,13 @@ func (mt *MemTable) flushMemFile(mf *memFile, writer BlobWriter) {
 		pos := writer.Pos()
 
 		records = append(records, index.KeyValue{
-			Key: key,
+			Key: Key(key),
 			Val: index.Value{
-				SegmentID:   pos.SegmentID,
-				Pos:         pos.Pos,
-				Size:        len(value),
-				CTime:       now,
-				Checksum:    checksum,
-				HasChecksum: hasChecksum,
+				SegmentID: pos.SegmentID,
+				Pos:       pos.Pos,
+				Size:      int64(len(value)),
+				CTime:     now,
+				Checksum:  checksum,
 			},
 		})
 		return true
@@ -271,23 +251,9 @@ func (mt *MemTable) flushMemFile(mf *memFile, writer BlobWriter) {
 		return
 	}
 
-	if err := mt.cache.index.PutBatch(ctx, records); err != nil {
+	if err := mt.PutBatch(records); err != nil {
 		fmt.Printf("Warning: index batch insert failed: %v\n", err)
 		return
-	}
-
-	// Phase 3: Update size tracking and trigger reactive eviction if needed
-	var addedBytes int64
-	for _, rec := range records {
-		addedBytes += int64(rec.Val.Size)
-	}
-	newSize := mt.cache.approxSize.Add(addedBytes)
-
-	// Trigger eviction if over limit (reactive)
-	if mt.cache.cfg.MaxSize > 0 && newSize > mt.cache.cfg.MaxSize {
-		if err := mt.cache.runEviction(ctx); err != nil {
-			fmt.Printf("Warning: reactive eviction failed: %v\n", err)
-		}
 	}
 }
 
@@ -314,7 +280,7 @@ func (mt *MemTable) Drain() {
 	mf := mt.active.Load()
 	if mf.size.Load() > 0 {
 		// Wait for space in inflight
-		for len(mt.frozen.inflight) >= mt.cache.cfg.MaxInflightBatches {
+		for len(mt.frozen.inflight) >= mt.MaxInflightBatches {
 			mt.frozen.cond.Wait()
 		}
 
@@ -322,7 +288,7 @@ func (mt *MemTable) Drain() {
 		mt.frozen.inflight = append(mt.frozen.inflight, mf)
 
 		// Create empty active (drain context, no more writes expected)
-		emptyMf := &memFile{data: skipmap.NewString[*memEntry]()}
+		emptyMf := &memFile{data: skipmap.NewUint64[*memEntry]()}
 		mt.active.Store(emptyMf)
 
 		// Send to flush
@@ -350,7 +316,7 @@ func (mt *MemTable) Close() {
 func (mt *MemTable) TestingClearMemtable() {
 	// Create new empty memfile
 	newMf := &memFile{
-		data: skipmap.NewString[*memEntry](),
+		data: skipmap.NewUint64[*memEntry](),
 	}
 	mt.active.Store(newMf)
 

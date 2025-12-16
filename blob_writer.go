@@ -16,7 +16,7 @@ type BlobWriter interface {
 
 	// Write writes a blob
 	// checksum is the blob's checksum (0 if not computed)
-	Write(key Key, value []byte, checksum uint32) error
+	Write(key Key, value []byte, checksum uint64) error
 
 	// Pos returns the current write position (for index tracking)
 	// Called after Write() to get position for the last written blob

@@ -1,124 +1,225 @@
 package index
 
 import (
-	"context"
-	"unsafe"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"os"
+	"sync/atomic"
+	"time"
 
+	"go.mills.io/bitcask/v2"
+
+	"github.com/miretskiy/blobcache/metadata"
 	"github.com/zhangyunhao116/skipmap"
 )
 
-// SkipmapIndex implements a fast in-memory index using skipmap
-// Optionally backed by Bitcask for durability
-type SkipmapIndex struct {
-	// In-memory skipmap for fast lookups
-	data *skipmap.StringMap[Value]
+// Index has a fast in-memory store backed by skipmap, along
+// with segments index.
+type Index struct {
+	// In-memory skipmap for fast lookups for blob metadata.
+	blobs *skipmap.Uint64Map[Value]
 
-	// Optional persistent backing store
-	bitcask *BitcaskIndex
+	// Durable index, backed by disk (with write ahead log).
+	// Stores metadata.SegmentRecords.
+	segments *bitcask.Bitcask
+
+	// segment sequence number.
+	seq atomic.Int64
 }
 
-// NewSkipmapIndex creates a pure in-memory skipmap index (no persistence)
-func NewSkipmapIndex() *SkipmapIndex {
-	return &SkipmapIndex{
-		data: skipmap.NewString[Value](),
-	}
-}
-
-// NewDurableSkipmapIndex creates a skipmap index backed by Bitcask
-// Reads are served from in-memory skipmap, writes go to both
-func NewDurableSkipmapIndex(basePath string) (*SkipmapIndex, error) {
-	// Open Bitcask
-	bitcask, err := NewBitcaskIndex(basePath)
+// NewIndex creates a pure in-memory skipmap index (no persistence)
+func NewIndex(basePath string) (*Index, error) {
+	db, err := openOrCreateBitcask(basePath)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to open bitcask: %w", err)
 	}
 
-	// Create skipmap
-	data := skipmap.NewString[Value]()
+	blobs := skipmap.NewUint64[Value]()
 
-	// Load all entries from Bitcask into skipmap
-	ctx := context.Background()
-	if err := bitcask.Range(ctx, func(kv KeyValue) bool {
-		keyStr := unsafe.String(unsafe.SliceData(kv.Key), len(kv.Key))
-		data.Store(keyStr, kv.Val)
-		return true
-	}); err != nil {
-		bitcask.Close()
-		return nil, err
+	// Load all entries from Bitcask segments into in-memory skipmap.
+	if err := db.ForEach(
+		func(key bitcask.Key) error {
+			v, err := db.Get(key)
+			if err != nil {
+				return err
+			}
+			segment, err := metadata.DecodeSegmentRecord(v)
+			if err != nil {
+				return err
+			}
+			for _, rec := range segment.Records {
+				v := Value{
+					Pos:       rec.Pos,
+					Size:      rec.Size,
+					Checksum:  rec.Checksum,
+					SegmentID: segment.SegmentID,
+					CTime:     segment.CTime,
+				}
+				blobs.Store(rec.Hash, v)
+			}
+			return nil
+		}); err != nil {
+		return nil, errors.Join(err, db.Close())
 	}
 
-	return &SkipmapIndex{
-		data:    data,
-		bitcask: bitcask,
-	}, nil
+	idx := Index{
+		blobs:    blobs,
+		segments: db,
+	}
+	idx.seq.Store(time.Now().UnixNano())
+	return &idx, nil
 }
 
-// Put inserts or updates a record
-func (idx *SkipmapIndex) Put(ctx context.Context, key Key, record Value) error {
-	keyStr := unsafe.String(unsafe.SliceData(key), len(key))
-	idx.data.Store(keyStr, record)
-
-	// Write to Bitcask if durable
-	if idx.bitcask != nil {
-		return idx.bitcask.Put(ctx, key, record)
-	}
-	return nil
-}
-
-// Get retrieves an entry
-func (idx *SkipmapIndex) Get(ctx context.Context, key Key, val *Value) error {
-	keyStr := unsafe.String(unsafe.SliceData(key), len(key))
-	stored, ok := idx.data.Load(keyStr)
+// Get retrieves blob entry.
+func (idx *Index) Get(key Key, val *Value) error {
+	stored, ok := idx.blobs.Load(uint64(key))
 	if !ok {
 		return ErrNotFound
 	}
 
-	// Copy data to caller's entry
+	// Copy blobs to caller's entry
 	*val = stored
 	return nil
 }
 
-// Delete removes an entry
-func (idx *SkipmapIndex) Delete(ctx context.Context, key Key) error {
-	keyStr := unsafe.String(unsafe.SliceData(key), len(key))
-	idx.data.Delete(keyStr)
+// PutBlob -- intended for tests -- puts a single blob entry into the index.
+// Equivalent to creating a single element batch.
+func (idx *Index) PutBlob(key Key, val Value) error {
+	return idx.PutBatch([]KeyValue{{Key: key, Val: val}})
+}
 
-	// Delete from Bitcask if durable
-	if idx.bitcask != nil {
-		return idx.bitcask.Delete(ctx, key)
+// DeleteBlob -- intended for tests -- deletes a single blob entry from the index.
+// Segment containing the blob not updated.
+func (idx *Index) DeleteBlob(key Key) {
+	idx.blobs.Delete(uint64(key))
+}
+
+// DeleteSegment removes all records associated with the specified segment record.
+func (idx *Index) DeleteSegment(segment metadata.SegmentRecord) error {
+	for _, rec := range segment.Records {
+		idx.blobs.Delete(rec.Hash)
 	}
-	return nil
+	return idx.segments.Delete(segment.IndexKey)
 }
 
 // Close closes the Bitcask backing store if present
-func (idx *SkipmapIndex) Close() error {
-	if idx.bitcask != nil {
-		return idx.bitcask.Close()
+func (idx *Index) Close() {
+	if err := idx.segments.Close(); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to close segments: %v\n", err)
 	}
-	return nil
 }
 
-// Range iterates over all records in the index
-func (idx *SkipmapIndex) Range(ctx context.Context, fn func(KeyValue) bool) error {
-	var err error
-	idx.data.Range(func(keyStr string, record Value) bool {
-		key := unsafe.Slice(unsafe.StringData(keyStr), len(keyStr))
-		return fn(KeyValue{Key: key, Val: record})
+// ForEachSegment iterates over all segment records in the index
+func (idx *Index) ForEachSegment(fn ScanSegmentFn) error {
+	return idx.segments.ForEach(
+		func(key bitcask.Key) error {
+			v, err := idx.segments.Get(key)
+			if err != nil {
+				return err
+			}
+			rec, err := metadata.DecodeSegmentRecord(v)
+			if err != nil {
+				return err
+			}
+			rec.IndexKey = key
+			fn(rec)
+			return nil
+		})
+}
+
+// ForEachBlob iterates over all blob records.
+func (idx *Index) ForEachBlob(fn KeyValueFn) {
+	idx.blobs.Range(func(key uint64, record Value) bool {
+		//key := record.
+		return fn(KeyValue{Key: Key(key), Val: record})
 	})
-	return err
 }
 
-// PutBatch inserts multiple records
-func (idx *SkipmapIndex) PutBatch(ctx context.Context, records []KeyValue) error {
-	// Store in skipmap
-	for _, rec := range records {
-		keyStr := unsafe.String(unsafe.SliceData(rec.Key), len(rec.Key))
-		idx.data.Store(keyStr, rec.Val)
+func (idx *Index) makeSegmentKey() []byte {
+	return binary.LittleEndian.AppendUint64(nil, uint64(idx.seq.Add(1)))
+}
+
+func (idx *Index) getSegmentKey(s int64) []byte {
+	return binary.LittleEndian.AppendUint64(nil, uint64(s))
+}
+
+// PutBatch inserts multiple records.
+func (idx *Index) PutBatch(records []KeyValue) error {
+	if len(records) == 0 {
+		return nil
 	}
 
-	// Write to Bitcask if durable
-	if idx.bitcask != nil {
-		return idx.bitcask.PutBatch(ctx, records)
+	// Bin the records by segmentID
+	segments := make(map[int64][]KeyValue)
+	for _, record := range records {
+		segments[record.Val.SegmentID] = append(segments[record.Val.SegmentID], record)
+	}
+	for _, segment := range segments {
+		if err := idx.putSegment(segment); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+func (idx *Index) putSegment(records []KeyValue) error {
+	seg := metadata.SegmentRecord{
+		Records: nil,
+		CTime:   time.Now(),
+	}
+
+	txn := idx.segments.Transaction()
+	defer txn.Discard()
+
+	flushSegment := func() error {
+		if len(seg.Records) == 0 {
+			return nil
+		}
+		data := metadata.AppendSegmentRecord(nil, seg)
+		seg.Records = seg.Records[:0]
+		return txn.Put(idx.makeSegmentKey(), data)
+	}
+
+	for _, rec := range records {
+		idx.blobs.Store(uint64(rec.Key), rec.Val)
+
+		if len(seg.Records) == maxBlobsPerSegment {
+			if err := flushSegment(); err != nil {
+				return err
+			}
+		}
+
+		if len(seg.Records) == 0 {
+			// We may be appending to this segment -- load it.
+			if v, err := txn.Get(idx.getSegmentKey(rec.Val.SegmentID)); err == nil {
+				segment, err := metadata.DecodeSegmentRecord(v)
+				if err != nil {
+					return err
+				}
+				seg = segment
+			} else {
+				seg.CTime = rec.Val.CTime
+				seg.SegmentID = rec.Val.SegmentID
+			}
+		} else {
+			if seg.CTime != rec.Val.CTime || seg.SegmentID != rec.Val.SegmentID {
+				return fmt.Errorf("inconsistent segment record: %s != %s or %d != %d", seg.CTime,
+					rec.Val.CTime, seg.SegmentID, rec.Val.SegmentID)
+			}
+		}
+
+		seg.Records = append(seg.Records, metadata.BlobRecord{
+			Hash:     uint64(rec.Key),
+			Pos:      rec.Val.Pos,
+			Size:     rec.Val.Size,
+			Checksum: rec.Val.Checksum,
+		})
+	}
+
+	if err := flushSegment(); err != nil {
+		return err
+	}
+
+	return txn.Commit()
 }

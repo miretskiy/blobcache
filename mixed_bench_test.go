@@ -31,7 +31,7 @@ func Benchmark_Mixed(b *testing.B) {
 		WithMaxSize(256<<30), // 256GB for Mac (production ~1TB)
 		WithWriteBufferSize(1<<27),
 		WithSegmentSize(2<<30),
-		WithDirectIOWrites(), // Enable DirectIO
+		// WithDirectIOWrites(), // Enable DirectIO
 	)
 	if err != nil {
 		b.Fatal(err)

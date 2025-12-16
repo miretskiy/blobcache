@@ -1,41 +1,41 @@
 package blobcache
 
 import (
-	"errors"
 	"hash"
 	"hash/crc32"
 	"time"
+
+	"github.com/cespare/xxhash/v2"
 )
 
 // IOConfig holds I/O strategy settings
 type IOConfig struct {
-	DirectIO bool // Use O_DIRECT (bypass OS cache)
-	Fsync    bool // Use fdatasync for durability
+	DirectIO  bool // Use O_DIRECT (bypass OS cache)
+	FDataSync bool // Use fdatasync for durability
 }
 
 // ResilienceConfig holds data integrity settings
 type ResilienceConfig struct {
-	ChecksumHash Hasher           // Hash factory for checksums (nil = disabled)
-	VerifyOnRead bool             // Verify checksums on reads
-	Checksums    ChecksumHandling // Whether to include checksums in segment footers
+	ChecksumHasher Hasher // Hash factory for checksums (nil = disabled)
+	VerifyOnRead   bool   // Verify checksums on reads
 }
+
+type KeyHasherFn func(b []byte) uint64
 
 // config holds internal configuration
 type config struct {
-	Path                  string
-	MaxSize               int64
-	Shards                int // Number of shard directories (default: 256)
-	EvictionStrategy      EvictionStrategy
-	EvictionHysteresis    float64 // Percentage over MaxSize to evict (e.g., 0.1 = evict 10% extra)
-	WriteBufferSize       int64   // Memtable batch size in bytes (like RocksDB write_buffer_size)
-	SegmentSize           int64   // Target segment file size (0 = one blob per file)
-	MaxInflightBatches    int     // Max batches queued (like RocksDB max_write_buffer_number)
-	BloomFPRate           float64
-	BloomEstimatedKeys    int
-	BloomRefreshInterval  time.Duration
-	OrphanCleanupInterval time.Duration
-	IO                    IOConfig
-	Resilience            ResilienceConfig
+	Path                 string
+	MaxSize              int64
+	KeyHasher            KeyHasherFn
+	Shards               int   // Number of shard directories (default: 256)
+	WriteBufferSize      int64 // Memtable batch size in bytes (like RocksDB write_buffer_size)
+	SegmentSize          int64 // Target segment file size (0 = one blob per file)
+	MaxInflightBatches   int   // Max batches queued (like RocksDB max_write_buffer_number)
+	BloomFPRate          float64
+	BloomEstimatedKeys   int
+	BloomRefreshInterval time.Duration
+	IO                   IOConfig
+	Resilience           ResilienceConfig
 }
 
 // Option configures BlobCache
@@ -62,22 +62,6 @@ func WithMaxSize(size int64) Option {
 func WithShards(n int) Option {
 	return funcOpt(func(c *config) {
 		c.Shards = n
-	})
-}
-
-// WithEvictionStrategy sets how files are selected for eviction
-func WithEvictionStrategy(strategy EvictionStrategy) Option {
-	return funcOpt(func(c *config) {
-		c.EvictionStrategy = strategy
-	})
-}
-
-// WithEvictionHysteresis sets extra percentage to evict beyond target (default: 0.1 = 10%)
-// This prevents thrashing at the eviction boundary by creating a buffer zone.
-// Example: With MaxSize=100MB and Hysteresis=0.1, eviction will remove 110MB when triggered.
-func WithEvictionHysteresis(pct float64) Option {
-	return funcOpt(func(c *config) {
-		c.EvictionHysteresis = pct
 	})
 }
 
@@ -119,10 +103,9 @@ func WithBloomRefreshInterval(d time.Duration) Option {
 // WithChecksum enables CRC32 checksums (hardware accelerated)
 func WithChecksum() Option {
 	return funcOpt(func(c *config) {
-		c.Resilience.ChecksumHash = func() hash.Hash32 {
+		c.Resilience.ChecksumHasher = func() hash.Hash32 {
 			return crc32.NewIEEE()
 		}
-		c.Resilience.Checksums = IncludeChecksums
 	})
 }
 
@@ -130,17 +113,16 @@ func WithChecksum() Option {
 // Example: WithChecksumHash(crc32.NewIEEE) or WithChecksumHash(xxhash.New)
 func WithChecksumHash(factory Hasher) Option {
 	return funcOpt(func(c *config) {
-		c.Resilience.ChecksumHash = factory
-		c.Resilience.Checksums = IncludeChecksums
+		c.Resilience.ChecksumHasher = factory
 	})
 }
 
-// WithFsync enables fdatasync on writes (default: false, cache semantics)
+// WithFDataSync enables fdatasync on writes (default: false, cache semantics)
 // Uses fdatasync(2) on Linux and F_FULLFSYNC on Darwin for data durability
 // Note: Syncing data flushes only - metadata (mtime, etc.) not synced since immutable blobs don't need it
-func WithFsync(enabled bool) Option {
+func WithFDataSync(enabled bool) Option {
 	return funcOpt(func(c *config) {
-		c.IO.Fsync = enabled
+		c.IO.FDataSync = enabled
 	})
 }
 
@@ -169,69 +151,34 @@ func WithDirectIOWrites() Option {
 	})
 }
 
-// WithBitcaskIndex is deprecated - Bitcask is now the default index
-// This option is kept for backwards compatibility but has no effect
-func WithBitcaskIndex() Option {
+// WithKeyHasher configures this cache to use specified key hasher
+// Default: xxhash
+func WithKeyHasher(hasher KeyHasherFn) Option {
 	return funcOpt(func(c *config) {
-		// No-op: Bitcask is now the default
+		c.KeyHasher = hasher
 	})
 }
 
-// WithOrphanCleanupInterval sets how often orphaned files are cleaned (default: 24h, 0 = disabled)
-func WithOrphanCleanupInterval(d time.Duration) Option {
+// WithTestingFlushOnPut configures this cache to create separate files
+// for each key.
+func WithTestingFlushOnPut() Option {
 	return funcOpt(func(c *config) {
-		c.OrphanCleanupInterval = d
+		c.SegmentSize = 0
 	})
 }
-
-// EvictionStrategy determines how files are selected for eviction
-type EvictionStrategy int
-
-const (
-	EvictByCTime EvictionStrategy = iota // Oldest created (FIFO)
-	EvictByMTime                         // Least recently modified (LRU)
-)
-
-func (e EvictionStrategy) String() string {
-	switch e {
-	case EvictByCTime:
-		return "ctime"
-	case EvictByMTime:
-		return "mtime"
-	default:
-		return "ctime"
-	}
-}
-
-// Common errors
-var (
-	ErrNotFound  = errors.New("key not found")
-	ErrCorrupted = errors.New("data corruption detected")
-)
 
 // defaultConfig returns sensible defaults (path set by caller)
 func defaultConfig(path string) config {
 	return config{
-		Path:                  path,
-		MaxSize:               0, // TODO: Auto-detect 80% of disk capacity
-		Shards:                256,
-		EvictionStrategy:      EvictByCTime,
-		EvictionHysteresis:    0.1,               // Evict 10% extra to prevent thrashing
-		WriteBufferSize:       100 * 1024 * 1024, // 100MB (production ~1GB)
-		SegmentSize:           0,                 // 0 = one blob per file
-		MaxInflightBatches:    6,                 // Max batches queued
-		BloomFPRate:           0.01,              // 1% FP rate
-		BloomEstimatedKeys:    1_000_000,         // 1M keys → ~1.2 MB bloom
-		BloomRefreshInterval:  10 * time.Minute,
-		OrphanCleanupInterval: 1 * time.Hour,
-		IO: IOConfig{
-			DirectIO: false,
-			Fsync:    false,
-		},
-		Resilience: ResilienceConfig{
-			ChecksumHash: nil, // Disabled by default - use WithChecksum()
-			VerifyOnRead: false,
-			Checksums:    OmitChecksums,
-		},
+		Path:                 path,
+		MaxSize:              0, // TODO: Auto-detect 80% of disk capacity
+		KeyHasher:            func(b []byte) uint64 { return xxhash.Sum64(b) },
+		Shards:               0,
+		WriteBufferSize:      100 * 1024 * 1024, // 100MB (production ~1GB)
+		SegmentSize:          32 << 20,          // 32MB
+		MaxInflightBatches:   6,                 // Max batches queued
+		BloomFPRate:          0.01,              // 1% FP rate
+		BloomEstimatedKeys:   1_000_000,         // 1M keys → ~1.2 MB bloom
+		BloomRefreshInterval: 10 * time.Minute,
 	}
 }

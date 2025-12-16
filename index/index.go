@@ -3,7 +3,7 @@ package index
 import (
 	"errors"
 	"time"
-
+	
 	"github.com/miretskiy/blobcache/metadata"
 )
 
@@ -12,13 +12,23 @@ type Key uint64
 
 // Value represents a cached blob's metadata
 type Value struct {
-	Pos      int64 // Position within segment (0 for per-blob mode)
-	Size     int64
+	Pos      int64  // Byte offset within segment file
+	Size     int64  // Blob size in bytes
 	Checksum uint64 // CRC32 checksum of the blob data; metadata.InvalidChecksum if not set.
 
-	// Information associated with the segment this value/blob belongs to.
-	CTime     time.Time // Creation time
-	SegmentID int64     // Segment ID (0 for per-blob mode)
+	// Segment metadata
+	ctime     time.Time // Creation time (unexported - use CTime() accessor or TestingSetCTime())
+	SegmentID int64     // Unique segment file identifier
+}
+
+// CTime returns the creation time of this value
+func (v Value) CTime() time.Time {
+	return v.ctime
+}
+
+// TestingSetCTime sets the creation time (for testing only)
+func (v *Value) TestingSetCTime(t time.Time) {
+	v.ctime = t
 }
 
 // KeyValue represents key and value.

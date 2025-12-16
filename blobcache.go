@@ -76,7 +76,7 @@ func New(path string, opts ...Option) (*Cache, error) {
 	return c, nil
 }
 
-// Start begins background operations (eviction, bloom refresh, orphan cleanup)
+// Start begins background operations (eviction worker)
 // Returns a closer function for graceful shutdown
 func (c *Cache) Start() (func(), error) {
 	// Start eviction worker (checks every 60 seconds)
@@ -183,7 +183,7 @@ func (c *Cache) rebuildBloom() error {
 
 // Background workers
 
-// evictionWorker checks size and evicts old files when over limit
+// evictionWorker checks size and evicts old segments when over limit
 func (c *Cache) evictionWorker() {
 	defer c.wg.Done()
 
@@ -227,8 +227,7 @@ func (c *Cache) runEviction(maxCacheSize int64) error {
 		return nil // Under limit
 	}
 
-	// Calculate how much to remove no need for (hysteresis since we remove
-	// entire segment)
+	// Calculate how much to remove (no hysteresis needed since we remove entire segments)
 	toEvictBytes := totalSize - maxCacheSize
 
 	// Sort by ctime (oldest first)
@@ -245,7 +244,7 @@ func (c *Cache) runEviction(maxCacheSize int64) error {
 			break
 		}
 
-		// Delete blob file using centralized path generation
+		// Delete segment file and update counters
 		for _, rec := range segment.Records {
 			evictedBytes += rec.Size
 		}

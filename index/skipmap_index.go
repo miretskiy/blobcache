@@ -54,8 +54,8 @@ func NewIndex(basePath string) (*Index, error) {
 					Size:      rec.Size,
 					Checksum:  rec.Checksum,
 					SegmentID: segment.SegmentID,
-					CTime:     segment.CTime,
 				}
+				v.ctime = segment.CTime
 				blobs.Store(rec.Hash, v)
 			}
 			return nil
@@ -199,17 +199,20 @@ func (idx *Index) putSegment(records []KeyValue) error {
 				seg = segment
 			} else {
 				// Use provided CTime if non-zero, otherwise default to now
-				if rec.Val.CTime.IsZero() {
+				if rec.Val.CTime().IsZero() {
 					seg.CTime = time.Now()
 				} else {
-					seg.CTime = rec.Val.CTime
+					seg.CTime = rec.Val.CTime()
 				}
 				seg.SegmentID = rec.Val.SegmentID
 			}
 		} else {
-			if seg.CTime != rec.Val.CTime || seg.SegmentID != rec.Val.SegmentID {
-				return fmt.Errorf("inconsistent segment record: %s != %s or %d != %d", seg.CTime,
-					rec.Val.CTime, seg.SegmentID, rec.Val.SegmentID)
+			// Validate consistency (but allow zero CTime which means "use segment's CTime")
+			if !rec.Val.CTime().IsZero() && seg.CTime != rec.Val.CTime() {
+				return fmt.Errorf("inconsistent segment CTime: %s != %s", seg.CTime, rec.Val.CTime())
+			}
+			if seg.SegmentID != rec.Val.SegmentID {
+				return fmt.Errorf("inconsistent segment ID: %d != %d", seg.SegmentID, rec.Val.SegmentID)
 			}
 		}
 

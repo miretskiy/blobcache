@@ -33,7 +33,9 @@ func TestSkipmapIndex_PutGet(t *testing.T) {
 	now := time.Now()
 
 	// Put a record
-	err := idx.PutBlob(key, Value{Size: 1024, CTime: now})
+	val := Value{Size: 1024}
+	val.TestingSetCTime(now)
+	err := idx.PutBlob(key, val)
 	require.NoError(t, err)
 
 	// Get it back
@@ -43,7 +45,7 @@ func TestSkipmapIndex_PutGet(t *testing.T) {
 
 	// Verify
 	require.EqualValues(t, 1024, entry.Size)
-	require.Equal(t, now, entry.CTime)
+	require.Equal(t, now, entry.CTime())
 }
 
 func TestSkipmapIndex_GetNotFound(t *testing.T) {
@@ -62,7 +64,9 @@ func TestSkipmapIndex_Delete(t *testing.T) {
 	key := Key(123)
 	// Insert
 	now := time.Now()
-	require.NoError(t, idx.PutBlob(key, Value{Size: 500, CTime: now}))
+	val := Value{Size: 500}
+	val.TestingSetCTime(now)
+	require.NoError(t, idx.PutBlob(key, val))
 
 	// Delete
 	idx.DeleteBlob(key)
@@ -82,9 +86,14 @@ func TestSkipmapIndex_PutBatch(t *testing.T) {
 	key1 := Key(123)
 	key2 := Key(321)
 
+	val1 := Value{SegmentID: 100, Pos: 0, Size: 100}
+	val1.TestingSetCTime(now)
+	val2 := Value{SegmentID: 100, Pos: 100, Size: 200}
+	val2.TestingSetCTime(now)
+
 	records := []KeyValue{
-		{Key: key1, Val: Value{SegmentID: 100, Pos: 0, Size: 100, CTime: now}},
-		{Key: key2, Val: Value{SegmentID: 100, Pos: 100, Size: 200, CTime: now}},
+		{Key: key1, Val: val1},
+		{Key: key2, Val: val2},
 	}
 
 	err := idx.PutBatch(records)
@@ -111,14 +120,12 @@ func TestSkipmapIndex_Scan(t *testing.T) {
 	// Put records
 	now := time.Now()
 	for i := 0; i < 10; i++ {
-		err := idx.PutBlob(
-			Key(i),
-			Value{
-				Size:  int64(100 * (i + 1)),
-				CTime: now.Add(time.Duration(i) * time.Hour),
-			})
+		val := Value{
+			Size: int64(100 * (i + 1)),
+		}
+		val.TestingSetCTime(now.Add(time.Duration(i) * time.Hour))
+		err := idx.PutBlob(Key(i), val)
 		require.NoError(t, err)
-
 	}
 
 	// Range all records

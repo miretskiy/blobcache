@@ -32,14 +32,15 @@ func Benchmark_BloomRebuild(b *testing.B) {
 				entries := make([]index.KeyValue, keysPerSegment)
 				now := time.Now()
 				for k := 0; k < keysPerSegment; k++ {
+					val := index.Value{
+						SegmentID: int64(i >> 10),
+						Pos:       int64(i % 1000),
+						Size:      1024,
+					}
+					val.TestingSetCTime(now)
 					entries[k] = index.KeyValue{
 						Key: index.Key(i),
-						Val: index.Value{
-							SegmentID: int64(i >> 10),
-							Pos:       int64(i % 1000),
-							Size:      1024,
-							CTime:     now,
-						},
+						Val: val,
 					}
 				}
 				if err := idx.PutBatch(entries); err != nil {

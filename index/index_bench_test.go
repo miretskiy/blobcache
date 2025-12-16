@@ -16,14 +16,15 @@ func Benchmark_IndexLookup(b *testing.B) {
 	// Pre-create records
 	records := make([]KeyValue, numKeys)
 	for i := 0; i < numKeys; i++ {
+		val := Value{
+			SegmentID: 0,
+			Pos:       int64((i % 1000) * 1024),
+			Size:      1024,
+		}
+		val.TestingSetCTime(now)
 		records[i] = KeyValue{
 			Key: Key(i),
-			Val: Value{
-				SegmentID: 0,
-				Pos:       int64((i % 1000) * 1024),
-				Size:      1024,
-				CTime:     now,
-			},
+			Val: val,
 		}
 	}
 

@@ -236,13 +236,13 @@ func TestCache_Eviction(t *testing.T) {
 	err = cache.runEviction(5 << 10)
 	require.NoError(t, err)
 
-	// Check size after eviction (should be under limit with hysteresis)
+	// Check size after eviction (should be under limit)
 	totalSize = 0
 	cache.index.ForEachBlob(func(kv index.KeyValue) bool {
 		totalSize += kv.Val.Size
 		return true
 	})
-	// With 10% hysteresis, should evict to ~4.5MB (5MB - 10% of 5MB)
+	// Should evict enough to get under 5KB limit
 	require.Less(t, totalSize, int64(6<<10))
 
 	// Clear memtable so evicted keys are truly not found
@@ -279,15 +279,16 @@ func TestCache_ReactiveEviction(t *testing.T) {
 		for i := 0; i < 6; i++ {
 			key := []byte(fmt.Sprintf("key-%d", i))
 			h := cache.KeyHasher(key)
+			val := index.Value{
+				SegmentID: int64(i), // Each key gets its own segment
+				Pos:       0,
+				Size:      1024, // 1KB each
+				Checksum:  0,
+			}
+			val.TestingSetCTime(baseTime.Add(time.Duration(i) * time.Second))
 			batch[i] = index.KeyValue{
 				Key: Key(h),
-				Val: index.Value{
-					SegmentID: int64(i), // Each key gets its own segment
-					Pos:       0,
-					Size:      1024, // 1KB each
-					Checksum:  0,
-					CTime:     baseTime.Add(time.Duration(i) * time.Second), // Deterministic times
-				},
+				Val: val,
 			}
 		}
 
@@ -342,15 +343,16 @@ func TestCache_ReactiveEviction(t *testing.T) {
 		for i := 0; i < 2; i++ {
 			key := []byte(fmt.Sprintf("old-key-%d", i))
 			h := cache.KeyHasher(key)
+			val := index.Value{
+				SegmentID: int64(i),
+				Pos:       0,
+				Size:      1024, // 1KB each
+				Checksum:  0,
+			}
+			val.TestingSetCTime(baseTime.Add(time.Duration(i) * time.Second))
 			oldBatch[i] = index.KeyValue{
 				Key: Key(h),
-				Val: index.Value{
-					SegmentID: int64(i),
-					Pos:       0,
-					Size:      1024, // 1KB each
-					Checksum:  0,
-					CTime:     baseTime.Add(time.Duration(i) * time.Second),
-				},
+				Val: val,
 			}
 		}
 		err = cache.PutBatch(oldBatch)
@@ -370,15 +372,16 @@ func TestCache_ReactiveEviction(t *testing.T) {
 		for i := 0; i < 3; i++ {
 			key := []byte(fmt.Sprintf("batch-key-%d", i))
 			h := cache.KeyHasher(key)
+			val := index.Value{
+				SegmentID: int64(100 + i), // Different segment IDs
+				Pos:       0,
+				Size:      1024, // 1KB each
+				Checksum:  0,
+			}
+			val.TestingSetCTime(baseTime.Add(time.Duration(100+i) * time.Second))
 			batch[i] = index.KeyValue{
 				Key: Key(h),
-				Val: index.Value{
-					SegmentID: int64(100 + i), // Different segment IDs
-					Pos:       0,
-					Size:      1024, // 1KB each
-					Checksum:  0,
-					CTime:     baseTime.Add(time.Duration(100+i) * time.Second), // Much newer
-				},
+				Val: val,
 			}
 		}
 

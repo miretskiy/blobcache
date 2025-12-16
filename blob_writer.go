@@ -6,8 +6,8 @@ import (
 
 // WritePosition tracks where data was written (for index)
 type WritePosition struct {
-	SegmentID int64 // Segment ID (0 for per-blob mode)
-	Pos       int64 // Position within segment (0 for per-blob mode)
+	SegmentID int64 // Unique segment file identifier
+	Pos       int64 // Byte offset within segment file
 }
 
 // BlobWriter abstracts blob file writing strategies

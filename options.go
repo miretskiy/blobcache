@@ -3,7 +3,6 @@ package blobcache
 import (
 	"hash"
 	"hash/crc32"
-	"time"
 
 	"github.com/cespare/xxhash/v2"
 )
@@ -27,14 +26,13 @@ type config struct {
 	Path                 string
 	MaxSize              int64
 	KeyHasher            KeyHasherFn
-	Shards               int   // Number of shard directories (default: 256)
+	Shards               int   // Number of shard directories (default: 0 = no sharding)
 	WriteBufferSize      int64 // Memtable batch size in bytes (like RocksDB write_buffer_size)
-	SegmentSize          int64 // Target segment file size (0 = one blob per file)
-	MaxInflightBatches   int   // Max batches queued (like RocksDB max_write_buffer_number)
-	BloomFPRate          float64
-	BloomEstimatedKeys   int
-	BloomRefreshInterval time.Duration
-	IO                   IOConfig
+	SegmentSize          int64 // Target segment file size (0 = flush on every write, for testing)
+	MaxInflightBatches int   // Max batches queued (like RocksDB max_write_buffer_number)
+	BloomFPRate        float64
+	BloomEstimatedKeys int
+	IO                 IOConfig
 	Resilience           ResilienceConfig
 
 	// Testing hooks
@@ -60,7 +58,7 @@ func WithMaxSize(size int64) Option {
 	})
 }
 
-// WithShards sets the number of filesystem shards (default: 256)
+// WithShards sets the number of filesystem shards (default: 0 = no sharding)
 // Can only be set for new cache (not for existing)
 func WithShards(n int) Option {
 	return funcOpt(func(c *config) {
@@ -93,13 +91,6 @@ func WithBloomFPRate(rate float64) Option {
 func WithBloomEstimatedKeys(n int) Option {
 	return funcOpt(func(c *config) {
 		c.BloomEstimatedKeys = n
-	})
-}
-
-// WithBloomRefreshInterval sets how often bloom filter is rebuilt and persisted (default: 24h)
-func WithBloomRefreshInterval(d time.Duration) Option {
-	return funcOpt(func(c *config) {
-		c.BloomRefreshInterval = d
 	})
 }
 
@@ -136,9 +127,9 @@ func WithVerifyOnRead(enabled bool) Option {
 	})
 }
 
-// WithSegmentSize sets target segment file size (default: 0 = one blob per file)
-// When > 0, multiple blobs are written to large segment files
-// Reduces file count and syscall overhead for high-throughput workloads
+// WithSegmentSize sets target segment file size (default: 32MB)
+// Multiple blobs are written to large segment files up to this size
+// Set to 0 to flush on every write (testing mode - creates one segment per blob)
 func WithSegmentSize(size int64) Option {
 	return funcOpt(func(c *config) {
 		c.SegmentSize = size
@@ -180,15 +171,14 @@ func WithTestingOnSegmentEvicted(fn func(segmentID int64)) Option {
 // defaultConfig returns sensible defaults (path set by caller)
 func defaultConfig(path string) config {
 	return config{
-		Path:                 path,
-		MaxSize:              0, // TODO: Auto-detect 80% of disk capacity
-		KeyHasher:            func(b []byte) uint64 { return xxhash.Sum64(b) },
-		Shards:               0,
-		WriteBufferSize:      100 * 1024 * 1024, // 100MB (production ~1GB)
-		SegmentSize:          32 << 20,          // 32MB
-		MaxInflightBatches:   6,                 // Max batches queued
-		BloomFPRate:          0.01,              // 1% FP rate
-		BloomEstimatedKeys:   1_000_000,         // 1M keys → ~1.2 MB bloom
-		BloomRefreshInterval: 10 * time.Minute,
+		Path:               path,
+		MaxSize:            0, // TODO: Auto-detect 80% of disk capacity
+		KeyHasher:          func(b []byte) uint64 { return xxhash.Sum64(b) },
+		Shards:             0,
+		WriteBufferSize:    100 * 1024 * 1024, // 100MB (production ~1GB)
+		SegmentSize:        32 << 20,          // 32MB
+		MaxInflightBatches: 6,                 // Max batches queued
+		BloomFPRate:        0.01,              // 1% FP rate
+		BloomEstimatedKeys: 1_000_000,         // 1M keys → ~1.2 MB bloom
 	}
 }

@@ -630,6 +630,158 @@ return io.NewSectionReader(file, record.Pos, record.Size), true
 
 ---
 
+## Foyer Investigation (Rust Hybrid Cache)
+
+### Background
+
+[Foyer](https://github.com/foyer-rs/foyer) is a hybrid cache library in Rust, inspired by Facebook's CacheLib, designed to seamlessly integrate memory and disk caching. Given the team's interest in Rust rewrites, we investigated whether foyer could replace blobcache for disk-centric caching workloads.
+
+### Architectural Discovery
+
+**Foyer's design philosophy:**
+- **Primary tier: Memory cache** (LRU/LFU eviction for hot data)
+- **Secondary tier: Disk storage** (overflow for evicted cold data)
+- Optimized for read-heavy workloads with memory-sized working sets
+
+**Two operating modes:**
+1. **WriteOnEviction** (default): Data written to disk only when evicted from memory
+2. **WriteOnInsertion**: Data written to disk immediately on every insert
+
+**This is fundamentally opposite to blobcache:**
+- Blobcache: Disk-first (memory is write buffer)
+- Foyer: Memory-first (disk is overflow storage)
+
+### Configuration Attempts
+
+**Initial attempts (WriteOnInsertion):**
+
+| Config | Disk Written | Issue |
+|--------|--------------|-------|
+| Pure defaults (16MB buffers) | 40GB (16%) | Entries silently dropped |
+| 8GB buffers, 8 flushers | 40GB (16%) | No improvement |
+| 16GB buffers, 8 flushers | 104GB (40%) | Still dropping 60% |
+| 16GB buffers, 32 flushers | 31GB (12%) | More parallelism made it worse |
+
+**Root cause identified:**
+
+Foyer uses **unbounded channels** for async processing:
+- Workers generate writes at **21 GB/s** (256GB in 12 seconds)
+- Flushers write at **~1 GB/s** (disk limit)
+- **20× mismatch** between generation and persistence
+
+**Drop points:**
+1. **submit_queue_size check** (engine.rs:593): When total queued exceeds threshold
+2. **buffer.push() failure** (flusher.rs:432): When per-flusher buffer full
+
+With default `buffer_pool_size = 16MB` and `submit_queue_size_threshold = 16MB`, most entries dropped.
+
+**No backpressure mechanism** - `insert()` is synchronous and returns immediately. Entries queued to unbounded channels, then silently dropped when buffers fill.
+
+### Working Configuration
+
+**To actually persist all data, required:**
+```rust
+.with_buffer_pool_size(256 * 1024 * 1024 * 1024)  // 256GB (!)
+.with_submit_queue_size_threshold(256 * 1024 * 1024 * 1024)  // 256GB
+.with_flushers(32)
+.memory(100 * 1024 * 1024)  // 100MB (minimal)
+.with_policy(HybridCachePolicy::WriteOnInsertion)
+```
+
+**Results:**
+- **Throughput: 0.69 GB/s** (252GB in 360 seconds)
+- **Memory: 48GB RSS** (38% of 128GB RAM)
+- **Data written: 252GB** (98% of expected, finally works!)
+
+### Comparison to Blobcache
+
+| Metric | Blobcache | Foyer | Ratio |
+|--------|-----------|-------|-------|
+| **Throughput** | 1.21 GB/s | 0.69 GB/s | **1.75× faster** |
+| **Duration** | 87s | 360s | **4.1× faster** |
+| **Memory (RSS)** | 10GB | 48GB | **4.8× less** |
+| **Buffer config** | 8GB | 256GB | **32× smaller** |
+| **Config complexity** | Simple | Extreme | — |
+| **Data persisted** | 256GB | 252GB | Both ✓ |
+
+### Why Foyer Underperforms
+
+**1. Architectural Mismatch**
+
+Foyer optimizes for:
+- Small hot working set in memory
+- Disk as overflow/archive
+- Read-heavy workloads
+
+Benchmark measures:
+- Continuous high-rate writes to disk
+- Disk-sized dataset (256GB)
+- Write-heavy workload
+
+**2. Excessive Buffering Required**
+
+Workers generate data **20× faster than disk writes** (21 GB/s vs 1 GB/s).
+
+- Blobcache: Blocks when 8 batches queued (backpressure at 8GB)
+- Foyer: Needs 256GB buffers to avoid drops (no backpressure)
+
+**3. Design Trade-offs**
+
+Foyer's design choices:
+- **Unbounded channels** → No backpressure, grows memory unbounded
+- **Silent drops** → Entries lost when buffers full
+- **WriteOnInsertion** → Every entry must reach disk (but can't keep up)
+
+**These are reasonable for foyer's intended use case** (memory cache), but wrong for disk-centric caching.
+
+### Lessons Learned
+
+**1. Language doesn't determine performance at I/O limits**
+
+Both implementations are **I/O bound** (84% CPU in syscalls). Disk throughput ceiling (1.14 GB/s per fio) is the limit, not language efficiency.
+
+**Rust advantages don't apply here:**
+- Zero-copy I/O: Can't bypass page cache without hurting reads
+- CPU efficiency: Irrelevant when disk-bound (only 2-3 cores used)
+- Fancy I/O patterns (io_uring): FIO showed <5% improvement over psync
+
+**2. Architecture matters more than language**
+
+Blobcache's disk-first design:
+- Optimized for this workload
+- Simple (2K lines)
+- Backpressure prevents drops
+
+Foyer's memory-first design:
+- Optimized for different workload
+- More complex
+- Silent drops under write pressure
+
+**3. Tool selection requires workload understanding**
+
+Choosing foyer because "Rust is better" ignores:
+- Foyer designed for memory-centric caching
+- Requires 32× buffer allocation to work
+- Still 1.75× slower than blobcache
+
+**Engineering and design trump language ideology.**
+
+### Conclusion
+
+**Foyer is not suitable for disk-centric caching** workloads where:
+- Data volumes exceed memory capacity
+- Sustained write rates approach disk bandwidth
+- Data persistence is required
+
+**Foyer excels at:**
+- Memory-sized working sets
+- Read-heavy workloads
+- Best-effort caching with disk overflow
+
+**For avoiding S3 trips with large data volumes, blobcache's disk-first architecture is the correct design choice.**
+
+---
+
 ## Trade-offs & Limitations
 
 ### 1. NOT Battle-Tested

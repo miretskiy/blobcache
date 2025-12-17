@@ -24,3 +24,9 @@ func isAligned(block []byte) bool {
 	alignment := int(uintptr(unsafe.Pointer(&block[0])) & uintptr(directio.AlignSize-1))
 	return alignment == 0
 }
+
+// fallocate pre-allocates disk space for a file
+// Reduces fragmentation and improves write performance
+func fallocate(f *os.File, size int64) error {
+	return syscall.Fallocate(int(f.Fd()), 0, 0, size)
+}

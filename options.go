@@ -3,7 +3,7 @@ package blobcache
 import (
 	"hash"
 	"hash/crc32"
-
+	
 	"github.com/cespare/xxhash/v2"
 )
 
@@ -23,23 +23,24 @@ type KeyHasherFn func(b []byte) uint64
 
 // config holds internal configuration
 type config struct {
-	Path                 string
-	MaxSize              int64
-	KeyHasher            KeyHasherFn
-	Shards               int   // Number of shard directories (default: 0 = no sharding)
-	WriteBufferSize      int64 // Memtable batch size in bytes (like RocksDB write_buffer_size)
-	SegmentSize          int64 // Target segment file size (0 = flush on every write, for testing)
+	Path               string
+	MaxSize            int64
+	KeyHasher          KeyHasherFn
+	Shards             int   // Number of shard directories (default: 0 = no sharding)
+	WriteBufferSize    int64 // Memtable batch size in bytes (like RocksDB write_buffer_size)
+	SegmentSize        int64 // Target segment file size (0 = flush on every write, for testing)
 	MaxInflightBatches int   // Max batches queued (like RocksDB max_write_buffer_number)
+	FlushConcurrency   int   // How many flush workers to have; default: MaxInflightBatches
 	BloomFPRate        float64
 	BloomEstimatedKeys int
-	IO         IOConfig
-	Resilience ResilienceConfig
-
+	IO                 IOConfig
+	Resilience         ResilienceConfig
+	
 	// Testing hooks
-	onSegmentEvicted       func(segmentID int64)
-	testingInjectWriteErr  func() error // Called before writer.Write() in flush
-	testingInjectIndexErr  func() error // Called before index.PutBatch() in flush
-	testingInjectEvictErr  func() error // Called in runEviction()
+	onSegmentEvicted      func(segmentID int64)
+	testingInjectWriteErr func() error // Called before writer.Write() in flush
+	testingInjectIndexErr func() error // Called before index.PutBatch() in flush
+	testingInjectEvictErr func() error // Called in runEviction()
 }
 
 // Option configures BlobCache
@@ -192,6 +193,22 @@ func WithTestingInjectEvictError(fn func() error) Option {
 	})
 }
 
+// WithMaxInflightBatches configures blob cache with the specified number
+// of the outstanding (waiting for flush) memtables write buffers (memtables).
+func WithMaxInflightBatches(n int) Option {
+	return funcOpt(func(c *config) {
+		c.MaxInflightBatches = n
+	})
+}
+
+// WithFlushConcurrency configures blobcache with the specified number
+// of "flushers" -- go routines performing IO.
+func WithFlushConcurrency(n int) Option {
+	return funcOpt(func(c *config) {
+		c.FlushConcurrency = n
+	})
+}
+
 // defaultConfig returns sensible defaults (path set by caller)
 func defaultConfig(path string) config {
 	return config{
@@ -202,6 +219,7 @@ func defaultConfig(path string) config {
 		WriteBufferSize:    100 * 1024 * 1024, // 100MB (production ~1GB)
 		SegmentSize:        32 << 20,          // 32MB
 		MaxInflightBatches: 6,                 // Max batches queued
+		FlushConcurrency:   6,                 // same as MaxInflightBatches
 		BloomFPRate:        0.01,              // 1% FP rate
 		BloomEstimatedKeys: 1_000_000,         // 1M keys → ~1.2 MB bloom
 	}

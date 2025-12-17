@@ -75,8 +75,8 @@ func (c *Cache) newMemTable(cfg config, storage *Storage) *MemTable {
 	mt.active.Store(mf)
 	
 	// Start I/O workers for flushing memfiles
-	mt.wg.Add(c.MaxInflightBatches)
-	for i := 0; i < c.MaxInflightBatches; i++ {
+	mt.wg.Add(c.FlushConcurrency)
+	for i := 0; i < c.FlushConcurrency; i++ {
 		go mt.flushWorker()
 	}
 	
@@ -130,31 +130,31 @@ func (mt *MemTable) doRotateUnderLock(mf *memFile) {
 	if !mt.isDegraded() {
 		for len(mt.frozen.inflight) >= mt.MaxInflightBatches {
 			mt.frozen.cond.Wait()
-
+			
 			// After wait, check if another thread already rotated this mf
 			if mt.active.Load() != mf {
 				return // Already rotated by another thread
 			}
 		}
 	}
-
+	
 	// Add current memfile to frozen list (preserves most recent data)
 	mt.frozen.inflight = append(mt.frozen.inflight, mf)
-
+	
 	// Degraded mode: drop oldest if over capacity (AFTER adding current)
 	if mt.isDegraded() && len(mt.frozen.inflight) > mt.MaxInflightBatches {
 		oldest := mt.frozen.inflight[0]
 		mt.frozen.inflight = mt.frozen.inflight[1:]
-
+		
 		log.Warn("degraded mode: dropped oldest unflushed memtable",
 			"size_bytes", oldest.size.Load())
-
+		
 		// Note: Bloom filter not updated - will accumulate false positives
 		// for dropped keys. Acceptable in degraded mode (causes extra disk lookups)
-
+		
 		mt.frozen.cond.Broadcast()
 	}
-
+	
 	// Swap to new active
 	newMf := &memFile{
 		data: skipmap.NewUint64[*memEntry](),
@@ -162,13 +162,13 @@ func (mt *MemTable) doRotateUnderLock(mf *memFile) {
 	if old := mt.active.Swap(newMf); old != mf {
 		panic(fmt.Errorf("active map changed under lock: expected %p found %p", mf, old))
 	}
-
+	
 	// Degraded mode: don't send to workers (they've stopped)
 	// Memfile stays in frozen.inflight, will be dropped on next rotation if over capacity
 	if mt.isDegraded() {
 		return
 	}
-
+	
 	// Send to flush workers
 	select {
 	case mt.flushCh <- mf:

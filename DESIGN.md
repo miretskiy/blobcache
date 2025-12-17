@@ -420,6 +420,216 @@ Blobcache used 2.2GB (1.7% of RAM).
 
 ---
 
+## Performance Optimization Investigation
+
+### Understanding the Hardware Ceiling
+
+**The Single File Trap:**
+
+Initial fio benchmarks showed misleading results:
+
+```bash
+# WRONG - measures page cache filling, not disk!
+fio --ioengine=libaio --filename=./testfile.img --size=64G
+# Result: 5.1 GB/s ❌ (only 64GB written, fits in RAM)
+
+fio --ioengine=psync --filename=./testfile.img --size=64G
+# Result: Similar inflation ❌ (same problem)
+```
+
+**The problem:** Single 64GB file on 128GB RAM machine writes to page cache, not disk. Fast initial write, but not sustained.
+
+**Correct measurement (sustained disk writes):**
+
+```bash
+sudo fio --name=sustained_ingestion \
+  --ioengine=psync --rw=write --bs=1M --iodepth=64 \
+  --numjobs=16 --size=64G --time_based --runtime=120 \
+  --group_reporting --fallocate=posix --end_fsync=1
+```
+
+**Why this works:**
+- **No --filename** → Creates 16 separate files (one per job)
+- **--time_based --runtime=120** → Runs 120s, writes far more than 64GB (exceeds page cache)
+- **--end_fsync=1** → Forces real disk sync before reporting
+- **--fallocate=posix** → Pre-allocates space (reduces fragmentation)
+
+**Results:**
+- **psync (synchronous, like Go): 1.14 GB/s** ← Real ceiling for buffered I/O
+- **libaio with correct setup**: ~1.17 GB/s (marginal improvement)
+- **io_uring**: Similar to libaio (~1.17 GB/s)
+
+**Key finding:** I/O engine doesn't matter much for throughput with enough parallelism (numjobs=16). The filesystem and buffered I/O path limit sustained writes to **~1.14 GB/s on EXT4**.
+
+### Write Overhead Microbenchmarks
+
+Created microbenchmarks to understand syscall overhead:
+
+**Results (Linux Graviton):**
+- **/dev/null: 2.7 TB/s** - Invalid (kernel special-cases /dev/null, not representative)
+- **Single temp file: 1.19 GB/s** - Baseline for single-threaded buffered writes
+- **Parallel temp files: 1.50 GB/s** - Multiple workers reduce contention
+
+**Key insight:** /dev/null results are meaningless (kernel optimizations). Real buffered file writes top out at **1.2-1.5 GB/s** for this workload.
+
+### Configuration Tuning Results
+
+**Baseline (original config):**
+```go
+WithWriteBufferSize(128<<20),   // 128MB
+WithMaxInflightBatches(32),     // 32 outstanding
+// FlushConcurrency = MaxInflightBatches (coupled)
+```
+**Result: 1.04 GB/s**
+
+**Attempt 1: Higher parallelism**
+```go
+WithFlushConcurrency(64),       // 64 workers
+WithFlushConcurrency(128),      // 128 workers
+```
+**Result: Minimal gain** (~1.06-1.09 GB/s)
+
+**Finding:** More workers don't help - not the bottleneck.
+
+**Attempt 2: Larger batches**
+```go
+WithWriteBufferSize(512<<20),   // 512MB memtables
+WithMaxInflightBatches(8),
+WithFlushConcurrency(8),
+```
+**Result: 1.097 GB/s** (~5% improvement)
+
+**Finding:** Larger batches reduce index update frequency (less Bitcask overhead).
+
+**Attempt 3: Even larger batches**
+```go
+WithWriteBufferSize(1<<30),     // 1GB memtables (~1,000 blobs per batch)
+WithMaxInflightBatches(8),      // 8GB total buffer
+WithFlushConcurrency(4),        // Fewer workers
+WithSegmentSize(2<<30),         // 2GB segments
+```
+**Result: 1.118 GB/s** (~7% improvement over baseline)
+
+**Finding:** Larger batches amortize index transaction overhead better.
+
+**Attempt 4: Add fallocate**
+
+Pre-allocate segment space to reduce fragmentation:
+- Linux: `syscall.Fallocate()`
+- Darwin: `fcntl(F_PREALLOCATE)`
+
+**Result: 1.21 GB/s** (~16% improvement over baseline, ~8% over previous)
+
+**Finding:** fallocate reduces fragmentation, improves write performance.
+
+**Final optimized config:**
+```go
+WithWriteBufferSize(1<<30),     // 1GB memtables
+WithMaxInflightBatches(8),      // 8GB total buffer
+WithFlushConcurrency(4),        // 4 workers
+WithSegmentSize(2<<30),         // 2GB segments
+// fallocate enabled automatically
+```
+
+**Performance: 1.21 GB/s write throughput**
+- **106% of fio psync ceiling** (1.14 GB/s)
+- **81% of parallel file writes ceiling** (1.50 GB/s)
+- Exceeds fio because mixed workload allows read/write I/O overlap
+
+### Architectural Improvements
+
+**1. Decoupled FlushConcurrency from MaxInflightBatches**
+
+**Before:** Workers count = frozen memtable limit (coupled)
+
+**After:**
+- **MaxInflightBatches** - Controls memory pressure (max frozen memtables)
+- **FlushConcurrency** - Controls I/O parallelism (number of workers)
+- **Channel sized to MaxInflightBatches** (not FlushConcurrency)
+
+**Why:** Allows independent tuning of memory footprint vs I/O depth.
+
+**Example:**
+```go
+WithMaxInflightBatches(8),   // 8GB memory (8 × 1GB)
+WithFlushConcurrency(4),     // 4 workers processing the 8 batches
+```
+
+**2. Platform-Neutral fallocate**
+
+Pre-allocates segment space on creation:
+- **Linux:** `syscall.Fallocate()` (POSIX fallocate(2))
+- **Darwin:** `fcntl(F_PREALLOCATE)` with Fstore_t (Mac-specific)
+
+**Why:** Reduces fragmentation, keeps writes more sequential as filesystem ages.
+
+**Impact:** ~8% throughput improvement (1.12 → 1.21 GB/s)
+
+**3. Lazy Reader (SectionReader)**
+
+**Before:** Eagerly allocated 1MB buffer per Get()
+```go
+data := make([]byte, record.Size)  // 1MB allocation
+file.ReadAt(data, record.Pos)
+return bytes.NewReader(data)
+```
+
+**After:** Returns lazy SectionReader
+```go
+return io.NewSectionReader(file, record.Pos, record.Size), true
+```
+
+**Why:**
+- Caller may not read full blob
+- Eliminates ~1.15TB of allocations in benchmark
+- Cleaner design (truly lazy)
+
+**Impact:** No throughput change for full-read workloads, but better for partial reads.
+
+### CPU Profiling Findings
+
+**Profile breakdown (with lazy reader and fallocate):**
+- **84% in syscalls**
+  - **68% reads** (pread syscalls from Get operations)
+  - **16% writes** (write/pwrite syscalls)
+- **7% memmove** (memory copies)
+- **4% memclr** (buffer zeroing)
+- **<1% mallocgc** (down from 2% with eager allocation)
+- **<1% skipmap** (index lookups)
+- **<1% bloom** (filter operations)
+- **Rest: GC, runtime overhead**
+
+**Key findings:**
+1. **I/O bound, not CPU bound** - 84% in syscalls is expected
+2. **Read-dominated** - 68% of CPU on reads despite being write-focused benchmark
+3. **No optimization opportunities** - Syscall overhead is fundamental to buffered I/O model
+4. **Lazy reader helped** - Reduced mallocgc from 2% to <1%
+
+**Bottleneck identified:** Userspace→kernel copy during write() syscalls is the limiting factor. This is fundamental to Go's standard I/O and buffered filesystem I/O on Linux.
+
+### Hardware Ceiling Analysis
+
+**fio findings:**
+- **Async I/O (libaio/io_uring):** Marginal benefit over psync (~2.5% improvement)
+- **psync (synchronous):** 1.14 GB/s with proper measurement
+- **I/O depth doesn't matter** for psync (synchronous operations, depth always 1)
+- **Parallelism matters:** 16 jobs achieve full throughput
+
+**Blobcache achieves 1.21 GB/s** - slightly higher than fio's psync due to:
+- Mixed workload allows read/write I/O overlap
+- Concurrent reads don't block writes
+- NVMe can handle simultaneous read/write operations
+
+**Conclusion:** Blobcache is **optimized** for buffered synchronous I/O model. The 1.21 GB/s represents near-maximum throughput achievable with Go's standard file I/O on this hardware/filesystem combination.
+
+**To go significantly faster would require:**
+- io_uring integration (minimal gain, ~2-5%)
+- DirectIO (tested previously, hurts more than helps for mixed workload)
+- Different filesystem tuning
+- Batching syscalls differently (not possible with current Go I/O APIs)
+
+---
+
 ## Trade-offs & Limitations
 
 ### 1. NOT Battle-Tested

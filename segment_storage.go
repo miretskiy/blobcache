@@ -1,7 +1,6 @@
 package blobcache
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -56,17 +55,8 @@ func (r *Storage) Get(key Key) (io.Reader, bool) {
 		return nil, false
 	}
 
-	// Read blob data from segment
-	data := make([]byte, record.Size)
-	n, err := file.ReadAt(data, record.Pos)
-	if err != nil && err != io.EOF {
-		return nil, false
-	}
-	if int64(n) != record.Size {
-		return nil, false
-	}
-
-	reader := bytes.NewReader(data)
+	// Use SectionReader for lazy reading (reads only when caller reads)
+	reader := io.NewSectionReader(file, record.Pos, record.Size)
 
 	// Wrap with checksum verification if enabled
 	if r.Resilience.VerifyOnRead && r.Resilience.ChecksumHasher != nil &&
@@ -156,6 +146,16 @@ func (w *SegmentWriter) openNewSegment() error {
 
 	if err != nil {
 		return err
+	}
+
+	// Pre-allocate segment size to reduce fragmentation
+	if w.SegmentSize > 0 {
+		if err := fallocate(w.currentFile, w.SegmentSize); err != nil {
+			// Non-fatal - log but continue (fallback to growing file)
+			log.Warn("failed to pre-allocate segment space",
+				"size", w.SegmentSize,
+				"error", err)
+		}
 	}
 
 	w.currentPos = 0

@@ -12,3 +12,12 @@
 .claude/
 .idea/
 librocksdb.a
+
+# Rust build artifacts
+target/
+Cargo.lock
+*.rlib
+*.so
+*.dylib
+*.dll
+*.exe

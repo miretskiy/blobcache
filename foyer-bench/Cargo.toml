@@ -1,0 +1,20 @@
+[package]
+name = "foyer-bench"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Use official published foyer crate
+foyer = "0.21"
+foyer-storage = "0.21"
+tokio = { version = "1", features = ["full"] }
+rand = "0.8"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+num_cpus = "1"
+leaky-bucket = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

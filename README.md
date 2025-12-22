@@ -152,6 +152,33 @@ go test -bench=Benchmark_Mixed -benchtime=2560000x
 - Write overhead microbenchmarks
 - Integration tests with degraded mode scenarios
 
+## Recovery
+
+If the cache index becomes corrupted (e.g., after an unclean shutdown), use the recovery tool:
+
+```bash
+go build ./cmd/blobcache-recover
+./blobcache-recover --recover --path=/path/to/cache
+```
+
+The recovery tool:
+- Scans all segment files and validates their footers
+- Removes corrupt or incomplete segments
+- Rebuilds the index from scratch
+- Rebuilds the bloom filter
+
+See [cmd/blobcache-recover/README.md](cmd/blobcache-recover/README.md) for detailed usage.
+
+**Programmatic recovery:**
+```go
+// Instead of New(), use RecoverIndex() to rebuild from segment files
+cache, err := blobcache.RecoverIndex("/path/to/cache")
+if err != nil {
+    log.Fatal(err)
+}
+defer cache.Close()
+```
+
 ## Documentation
 
 - **[DESIGN.md](DESIGN.md)**: Complete design philosophy, performance analysis, and foyer comparison

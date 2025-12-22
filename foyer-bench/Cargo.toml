@@ -13,6 +13,7 @@ clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 num_cpus = "1"
 leaky-bucket = "1"
+hdrhistogram = "7"
 
 [profile.release]
 opt-level = 3

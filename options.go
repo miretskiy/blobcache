@@ -3,7 +3,7 @@ package blobcache
 import (
 	"hash"
 	"hash/crc32"
-	
+
 	"github.com/cespare/xxhash/v2"
 )
 
@@ -35,7 +35,7 @@ type config struct {
 	BloomEstimatedKeys int
 	IO                 IOConfig
 	Resilience         ResilienceConfig
-	
+
 	// Testing hooks
 	onSegmentEvicted      func(segmentID int64)
 	testingInjectWriteErr func() error // Called before writer.Write() in flush

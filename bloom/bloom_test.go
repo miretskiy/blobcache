@@ -2,8 +2,11 @@ package bloom
 
 import (
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/HdrHistogram/hdrhistogram-go"
 	"github.com/stretchr/testify/require"
 )
 
@@ -145,6 +148,162 @@ func BenchmarkAdd(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		filter.Add(uint64(i))
 	}
+}
+
+func BenchmarkTestParallel(b *testing.B) {
+	// Create filter sized for 1M keys, populate with 10K (1% full - realistic)
+	filter := New(1000000, 0.01)
+	for i := 0; i < 10000; i++ {
+		filter.Add(uint64(i))
+	}
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			// Test keys not in filter (should be rejected by bloom)
+			filter.Test(uint64(i + 2000000))
+			i++
+		}
+	})
+}
+
+// BenchmarkConcurrentRealistic measures bloom filter under realistic concurrent load
+// Uses b.RunParallel with batched timing to reduce measurement overhead
+func BenchmarkConcurrentRealistic(b *testing.B) {
+	// Production-sized filter: 10M keys, 1% FP rate
+	filter := New(10000000, 0.01)
+
+	// Pre-populate (simulates warm cache)
+	for i := 0; i < 100000; i++ {
+		filter.Add(uint64(i))
+	}
+
+	const batchSize = 10000 // Measure time for 10K ops to reduce overhead
+
+	type workerHist struct {
+		testHist *hdrhistogram.Histogram
+		addHist  *hdrhistogram.Histogram
+		mu       sync.Mutex
+	}
+
+	var histograms sync.Map // map[int]*workerHist (workerID -> hist)
+	var totalTests, totalAdds atomic.Int64
+	var workerID atomic.Int64
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		myID := int(workerID.Add(1))
+
+		hist := &workerHist{
+			testHist: hdrhistogram.New(1, 60*1000*1000*1000, 3),
+			addHist:  hdrhistogram.New(1, 60*1000*1000*1000, 3),
+		}
+		histograms.Store(myID, hist)
+
+		keyBase := uint64(myID * 1000000)
+		opsInBatch := 0
+		var batchStart time.Time
+		testInBatch, addInBatch := 0, 0
+
+		for pb.Next() {
+			if opsInBatch == 0 {
+				batchStart = time.Now()
+			}
+
+			// 90% Test, 10% Add
+			if opsInBatch%10 == 0 {
+				filter.Add(keyBase + uint64(opsInBatch))
+				addInBatch++
+			} else {
+				filter.Test(keyBase + uint64(opsInBatch))
+				testInBatch++
+			}
+
+			opsInBatch++
+
+			// Record batch when full
+			if opsInBatch >= batchSize {
+				elapsed := time.Since(batchStart).Nanoseconds()
+
+				if testInBatch > 0 {
+					avgNs := elapsed * int64(testInBatch) / int64(opsInBatch) / int64(testInBatch)
+					hist.mu.Lock()
+					hist.testHist.RecordValue(avgNs)
+					hist.mu.Unlock()
+					totalTests.Add(int64(testInBatch))
+				}
+
+				if addInBatch > 0 {
+					avgNs := elapsed * int64(addInBatch) / int64(opsInBatch) / int64(addInBatch)
+					hist.mu.Lock()
+					hist.addHist.RecordValue(avgNs)
+					hist.mu.Unlock()
+					totalAdds.Add(int64(addInBatch))
+				}
+
+				opsInBatch, testInBatch, addInBatch = 0, 0, 0
+			}
+		}
+
+		// Record final partial batch
+		if opsInBatch > 0 {
+			elapsed := time.Since(batchStart).Nanoseconds()
+			if testInBatch > 0 {
+				avgNs := elapsed * int64(testInBatch) / int64(opsInBatch) / int64(testInBatch)
+				hist.mu.Lock()
+				hist.testHist.RecordValue(avgNs)
+				hist.mu.Unlock()
+				totalTests.Add(int64(testInBatch))
+			}
+			if addInBatch > 0 {
+				avgNs := elapsed * int64(addInBatch) / int64(opsInBatch) / int64(addInBatch)
+				hist.mu.Lock()
+				hist.addHist.RecordValue(avgNs)
+				hist.mu.Unlock()
+				totalAdds.Add(int64(addInBatch))
+			}
+		}
+	})
+
+	// Merge all worker histograms
+	mergedTest := hdrhistogram.New(1, 60*1000*1000*1000, 3)
+	mergedAdd := hdrhistogram.New(1, 60*1000*1000*1000, 3)
+
+	histograms.Range(func(key, value interface{}) bool {
+		h := value.(*workerHist)
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		if h.testHist.TotalCount() > 0 {
+			mergedTest.Merge(h.testHist)
+		}
+		if h.addHist.TotalCount() > 0 {
+			mergedAdd.Merge(h.addHist)
+		}
+		return true
+	})
+
+	// Report results via ReportMetric for easy reading
+	if mergedTest.TotalCount() > 0 {
+		b.ReportMetric(mergedTest.Mean(), "test-avg-ns")
+		b.ReportMetric(float64(mergedTest.ValueAtQuantile(0.50)), "test-p50-ns")
+		b.ReportMetric(float64(mergedTest.ValueAtQuantile(0.90)), "test-p90-ns")
+		b.ReportMetric(float64(mergedTest.ValueAtQuantile(0.95)), "test-p95-ns")
+		b.ReportMetric(float64(mergedTest.ValueAtQuantile(0.99)), "test-p99-ns")
+		b.ReportMetric(float64(mergedTest.Max()), "test-max-ns")
+	}
+
+	if mergedAdd.TotalCount() > 0 {
+		b.ReportMetric(mergedAdd.Mean(), "add-avg-ns")
+		b.ReportMetric(float64(mergedAdd.ValueAtQuantile(0.50)), "add-p50-ns")
+		b.ReportMetric(float64(mergedAdd.ValueAtQuantile(0.90)), "add-p90-ns")
+		b.ReportMetric(float64(mergedAdd.ValueAtQuantile(0.95)), "add-p95-ns")
+		b.ReportMetric(float64(mergedAdd.ValueAtQuantile(0.99)), "add-p99-ns")
+		b.ReportMetric(float64(mergedAdd.Max()), "add-max-ns")
+	}
+
+	b.ReportMetric(float64(totalTests.Load()), "total-tests")
+	b.ReportMetric(float64(totalAdds.Load()), "total-adds")
 }
 
 func TestRecordAdditions_StopPreventsRecording(t *testing.T) {

@@ -1,3 +1,5 @@
+github.com/HdrHistogram/hdrhistogram-go v1.2.0 h1:XMJkDWuz6bM9Fzy7zORuVFKH7ZJY41G2q8KWhVGkNiY=
+github.com/HdrHistogram/hdrhistogram-go v1.2.0/go.mod h1:CiIeGiHSd06zjX+FypuEJ5EQ07KKtxZ+8J6hszwVQig=
 github.com/abcum/lcp v0.0.0-20201209214815-7a3f3840be81 h1:uHogIJ9bXH75ZYrXnVShHIyywFiUZ7OOabwd9Sfd8rw=
 github.com/abcum/lcp v0.0.0-20201209214815-7a3f3840be81/go.mod h1:6ZvnjTZX1LNo1oLpfaJK8h+MXqHxcBFBIwkgsv+xlv0=
 github.com/andybalholm/brotli v1.1.1 h1:PR2pgnyFznKEugtsUo0xLdDop5SKXd5Qf5ysW+7XdTA=
@@ -70,6 +72,7 @@ github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 h1:Jamvg5psRI
 github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/rogpeppe/go-internal v1.9.0 h1:73kH8U+JUqXU8lRuOHeVHaa/SZPifC7BkcraZVejAe8=
 github.com/rogpeppe/go-internal v1.9.0/go.mod h1:WtVeX8xhTBvf0smdhujwtBcq4Qrzq/fJaraNFVN+nFs=
+github.com/rogpeppe/go-internal v1.14.1/go.mod h1:MaRKkUm5W0goXpeCfT7UZI6fk/L7L7so1lCWt35ZSgc=
 github.com/sirupsen/logrus v1.9.3 h1:dueUQJ1C2q9oE3F7wvmSGAaVtTmUizReu6fjN8uqzbQ=
 github.com/sirupsen/logrus v1.9.3/go.mod h1:naHLuLoDiP4jHNo9R0sCBMtWGeIprob74mVsIT4qYEQ=
 github.com/smartystreets/assertions v0.0.0-20180927180507-b2de0cb4f26d/go.mod h1:OnSkiWE9lh6wB0YB77sQom3nweQdgAjqCqsofrRNTgc=

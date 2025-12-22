@@ -21,7 +21,7 @@ func Benchmark_IndexLookup(b *testing.B) {
 			Pos:       int64((i % 1000) * 1024),
 			Size:      1024,
 		}
-		val.TestingSetCTime(now)
+		val.SetCTime(now)
 		records[i] = KeyValue{
 			Key: Key(i),
 			Val: val,

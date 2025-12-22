@@ -3,7 +3,7 @@ package index
 import (
 	"errors"
 	"time"
-	
+
 	"github.com/miretskiy/blobcache/metadata"
 )
 
@@ -17,7 +17,7 @@ type Value struct {
 	Checksum uint64 // CRC32 checksum of the blob data; metadata.InvalidChecksum if not set.
 
 	// Segment metadata
-	ctime     time.Time // Creation time (unexported - use CTime() accessor or TestingSetCTime())
+	ctime     time.Time // Creation time (unexported - use CTime() accessor or SetCTime())
 	SegmentID int64     // Unique segment file identifier
 }
 
@@ -26,8 +26,8 @@ func (v Value) CTime() time.Time {
 	return v.ctime
 }
 
-// TestingSetCTime sets the creation time (for testing only)
-func (v *Value) TestingSetCTime(t time.Time) {
+// SetCTime sets the creation time.
+func (v *Value) SetCTime(t time.Time) {
 	v.ctime = t
 }
 

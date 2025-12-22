@@ -34,7 +34,7 @@ func TestSkipmapIndex_PutGet(t *testing.T) {
 
 	// Put a record
 	val := Value{Size: 1024}
-	val.TestingSetCTime(now)
+	val.SetCTime(now)
 	err := idx.PutBlob(key, val)
 	require.NoError(t, err)
 
@@ -65,7 +65,7 @@ func TestSkipmapIndex_Delete(t *testing.T) {
 	// Insert
 	now := time.Now()
 	val := Value{Size: 500}
-	val.TestingSetCTime(now)
+	val.SetCTime(now)
 	require.NoError(t, idx.PutBlob(key, val))
 
 	// Delete
@@ -87,9 +87,9 @@ func TestSkipmapIndex_PutBatch(t *testing.T) {
 	key2 := Key(321)
 
 	val1 := Value{SegmentID: 100, Pos: 0, Size: 100}
-	val1.TestingSetCTime(now)
+	val1.SetCTime(now)
 	val2 := Value{SegmentID: 100, Pos: 100, Size: 200}
-	val2.TestingSetCTime(now)
+	val2.SetCTime(now)
 
 	records := []KeyValue{
 		{Key: key1, Val: val1},
@@ -123,7 +123,7 @@ func TestSkipmapIndex_Scan(t *testing.T) {
 		val := Value{
 			Size: int64(100 * (i + 1)),
 		}
-		val.TestingSetCTime(now.Add(time.Duration(i) * time.Hour))
+		val.SetCTime(now.Add(time.Duration(i) * time.Hour))
 		err := idx.PutBlob(Key(i), val)
 		require.NoError(t, err)
 	}

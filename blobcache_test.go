@@ -288,7 +288,7 @@ func TestCache_ReactiveEviction(t *testing.T) {
 				Size:      1024, // 1KB each
 				Checksum:  0,
 			}
-			val.TestingSetCTime(baseTime.Add(time.Duration(i) * time.Second))
+			val.SetCTime(baseTime.Add(time.Duration(i) * time.Second))
 			batch[i] = index.KeyValue{
 				Key: Key(h),
 				Val: val,
@@ -352,7 +352,7 @@ func TestCache_ReactiveEviction(t *testing.T) {
 				Size:      1024, // 1KB each
 				Checksum:  0,
 			}
-			val.TestingSetCTime(baseTime.Add(time.Duration(i) * time.Second))
+			val.SetCTime(baseTime.Add(time.Duration(i) * time.Second))
 			oldBatch[i] = index.KeyValue{
 				Key: Key(h),
 				Val: val,
@@ -381,7 +381,7 @@ func TestCache_ReactiveEviction(t *testing.T) {
 				Size:      1024, // 1KB each
 				Checksum:  0,
 			}
-			val.TestingSetCTime(baseTime.Add(time.Duration(100+i) * time.Second))
+			val.SetCTime(baseTime.Add(time.Duration(100+i) * time.Second))
 			batch[i] = index.KeyValue{
 				Key: Key(h),
 				Val: val,

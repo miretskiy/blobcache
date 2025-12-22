@@ -12,6 +12,7 @@ require (
 )
 
 require (
+	github.com/HdrHistogram/hdrhistogram-go v1.2.0 // indirect
 	github.com/abcum/lcp v0.0.0-20201209214815-7a3f3840be81 // indirect
 	github.com/gofrs/flock v0.8.1 // indirect
 	github.com/hashicorp/go-immutable-radix/v2 v2.0.0 // indirect
@@ -35,7 +36,7 @@ require (
 	github.com/pierrec/lz4/v4 v4.1.22 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
-	github.com/rogpeppe/go-internal v1.9.0 // indirect
+	github.com/rogpeppe/go-internal v1.14.1 // indirect
 	github.com/zeebo/xxh3 v1.0.2 // indirect
 	github.com/zhangyunhao116/skipmap v0.10.1
 	golang.org/x/exp v0.0.0-20250128182459-e0ece0dbea4c // indirect

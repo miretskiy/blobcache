@@ -1,12 +1,13 @@
 use clap::Parser;
 use foyer::{HybridCache, HybridCacheBuilder, HybridCachePolicy};
 use foyer_storage::{BlockEngineBuilder, DeviceBuilder, FsDeviceBuilder, Throttle};
+use hdrhistogram::Histogram;
 use leaky_bucket::RateLimiter;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 #[derive(Parser, Debug)]
@@ -39,16 +40,24 @@ struct WorkerStats {
     num_reads: Arc<AtomicI64>,
     num_found: Arc<AtomicI64>,
     total_bytes_written: Arc<AtomicI64>,
+    hit_hist: Arc<Mutex<Histogram<u64>>>,
+    miss_hist: Arc<Mutex<Histogram<u64>>>,
 }
 
 impl WorkerStats {
     fn new() -> Self {
+        // Histograms: 1ns to 60 seconds, 3 significant digits
+        let hit_hist = Histogram::<u64>::new_with_bounds(1, 60_000_000_000, 3).unwrap();
+        let miss_hist = Histogram::<u64>::new_with_bounds(1, 60_000_000_000, 3).unwrap();
+
         Self {
             num_writes: Arc::new(AtomicI64::new(0)),
             completed_writes: Arc::new(AtomicI64::new(0)),
             num_reads: Arc::new(AtomicI64::new(0)),
             num_found: Arc::new(AtomicI64::new(0)),
             total_bytes_written: Arc::new(AtomicI64::new(0)),
+            hit_hist: Arc::new(Mutex::new(hit_hist)),
+            miss_hist: Arc::new(Mutex::new(miss_hist)),
         }
     }
 }
@@ -91,6 +100,8 @@ async fn run_worker(
         } else if op < 55 {
             // 45% reads from this worker's completed writes (hits)
             if !my_keys.is_empty() {
+                let read_start = Instant::now();
+
                 let idx = rng.gen_range(0..my_keys.len());
                 let key_id = my_keys[idx];
                 let key = format!("w-{}-key-{}", worker_id, key_id).into_bytes();
@@ -100,16 +111,26 @@ async fn run_worker(
                     // Read the value to match Go benchmark behavior
                     let _value = entry.value();
                     stats.num_found.fetch_add(1, Ordering::Relaxed);
+
+                    let latency_ns = read_start.elapsed().as_nanos() as u64;
+                    stats.hit_hist.lock().unwrap().record(latency_ns).ok();
                 }
             }
         } else {
             // 45% reads with miss prefix (bloom filter test)
+            let miss_start = Instant::now();
+
             let key_id = rng.gen_range(0..total_ops as i64);
             let key = format!("miss-{}", key_id).into_bytes();
 
+            stats.num_reads.fetch_add(1, Ordering::Relaxed);  // Count all reads!
             if let Ok(Some(_)) = cache.get(&key).await {
                 eprintln!("Expected missing, but found instead miss-{}", key_id);
+                stats.num_found.fetch_add(1, Ordering::Relaxed);  // False positive
             }
+
+            let latency_ns = miss_start.elapsed().as_nanos() as u64;
+            stats.miss_hist.lock().unwrap().record(latency_ns).ok();
         }
     }
 }
@@ -248,6 +269,37 @@ async fn main() -> anyhow::Result<()> {
     println!("Operations/sec: {:.0}", args.iterations as f64 / duration.as_secs_f64());
     println!("Worker time: {:.2}s", workers_done.as_secs_f64());
     println!("Flush time: {:.2}s", flush_time.as_secs_f64());
+
+    // Read latency percentiles
+    println!();
+    let hit_hist = stats.hit_hist.lock().unwrap();
+    if hit_hist.len() > 0 {
+        println!("Hit latencies (µs):");
+        println!("  avg: {:.2}", hit_hist.mean() / 1000.0);
+        println!("  p50: {:.2}", hit_hist.value_at_quantile(0.50) as f64 / 1000.0);
+        println!("  p90: {:.2}", hit_hist.value_at_quantile(0.90) as f64 / 1000.0);
+        println!("  p95: {:.2}", hit_hist.value_at_quantile(0.95) as f64 / 1000.0);
+        println!("  p99: {:.2}", hit_hist.value_at_quantile(0.99) as f64 / 1000.0);
+        println!("  max: {:.2}", hit_hist.max() as f64 / 1000.0);
+    }
+
+    let miss_hist = stats.miss_hist.lock().unwrap();
+    if miss_hist.len() > 0 {
+        println!("Miss latencies (ns):");
+        println!("  avg: {:.0}", miss_hist.mean());
+        println!("  p50: {}", miss_hist.value_at_quantile(0.50));
+        println!("  p90: {}", miss_hist.value_at_quantile(0.90));
+        println!("  p95: {}", miss_hist.value_at_quantile(0.95));
+        println!("  p99: {}", miss_hist.value_at_quantile(0.99));
+        println!("  max: {}", miss_hist.max());
+    }
+
+    let total_reads = stats.num_reads.load(Ordering::Relaxed);
+    let hits = stats.num_found.load(Ordering::Relaxed);
+    if total_reads > 0 {
+        let hit_rate = hits as f64 / total_reads as f64 * 100.0;
+        println!("Hit rate: {:.1}%", hit_rate);
+    }
 
     // Verify disk usage
     if let Ok(output) = std::process::Command::new("du")

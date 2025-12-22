@@ -9,10 +9,10 @@ import (
 func Benchmark_MemoryCopy(b *testing.B) {
 	src := make([]byte, 1024*1024) // 1MB
 	dst := make([]byte, 1024*1024)
-	
+
 	b.SetBytes(1024 * 1024)
 	b.ResetTimer()
-	
+
 	for i := 0; i < b.N; i++ {
 		copy(dst, src)
 	}
@@ -57,19 +57,19 @@ func Benchmark_WriteToTempFile(b *testing.B) {
 	if _, err := os.Stat("/instance_storage"); err == nil {
 		tmpDir = "/instance_storage"
 	}
-	
+
 	tmpFile, err := os.CreateTemp(tmpDir, "write-bench-*")
 	if err != nil {
 		b.Fatal(err)
 	}
 	defer os.Remove(tmpFile.Name())
 	defer tmpFile.Close()
-	
+
 	buf := make([]byte, 1024*1024) // 1MB
-	
+
 	b.SetBytes(1024 * 1024)
 	b.ResetTimer()
-	
+
 	for i := 0; i < b.N; i++ {
 		if _, err := tmpFile.Write(buf); err != nil {
 			b.Fatal(err)
@@ -84,10 +84,10 @@ func Benchmark_WriteToTempFileParallel(b *testing.B) {
 	if _, err := os.Stat("/instance_storage"); err == nil {
 		tmpDir = "/instance_storage"
 	}
-	
+
 	b.SetBytes(1024 * 1024)
 	b.ResetTimer()
-	
+
 	b.RunParallel(func(pb *testing.PB) {
 		tmpFile, err := os.CreateTemp(tmpDir, "write-bench-*")
 		if err != nil {
@@ -95,9 +95,9 @@ func Benchmark_WriteToTempFileParallel(b *testing.B) {
 		}
 		defer os.Remove(tmpFile.Name())
 		defer tmpFile.Close()
-		
+
 		buf := make([]byte, 1024*1024) // 1MB
-		
+
 		for pb.Next() {
 			if _, err := tmpFile.Write(buf); err != nil {
 				b.Fatal(err)

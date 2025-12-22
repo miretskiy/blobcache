@@ -37,7 +37,7 @@ func Benchmark_BloomRebuild(b *testing.B) {
 						Pos:       int64(i % 1000),
 						Size:      1024,
 					}
-					val.TestingSetCTime(now)
+					val.SetCTime(now)
 					entries[k] = index.KeyValue{
 						Key: index.Key(i),
 						Val: val,

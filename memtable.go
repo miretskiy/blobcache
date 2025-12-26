@@ -273,14 +273,10 @@ func (mt *MemTable) flushMemFile(mf *memFile, writer BlobWriter) error {
 		// Get position for index
 		pos := writer.Pos()
 
+		val := index.NewValueFrom(pos.Pos, int64(len(value)), checksum, pos.SegmentID)
 		records = append(records, index.KeyValue{
 			Key: Key(key),
-			Val: index.Value{
-				SegmentID: pos.SegmentID,
-				Pos:       pos.Pos,
-				Size:      int64(len(value)),
-				Checksum:  checksum,
-			},
+			Val: val,
 		})
 		return true
 	})

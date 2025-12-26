@@ -11,20 +11,15 @@ import (
 func Benchmark_IndexLookup(b *testing.B) {
 	const numKeys = 1 << 16
 
-	now := time.Now()
-
 	// Pre-create records
 	records := make([]KeyValue, numKeys)
 	for i := 0; i < numKeys; i++ {
-		val := Value{
-			SegmentID: 0,
-			Pos:       int64((i % 1000) * 1024),
-			Size:      1024,
-		}
-		val.SetCTime(now)
 		records[i] = KeyValue{
 			Key: Key(i),
-			Val: val,
+			Val: &Value{
+				Pos:  int64((i % 1000) * 1024),
+				Size: 1024,
+			},
 		}
 	}
 
@@ -42,9 +37,8 @@ func Benchmark_IndexLookup(b *testing.B) {
 	b.ReportMetric(populateTime.Seconds(), "populate-sec")
 	b.StartTimer()
 
-	var entry Value
 	for i := 0; i < b.N; i++ {
-		err := idx.Get(Key(i%numKeys), &entry)
+		entry, err := idx.Get(Key(i % numKeys))
 		if err != nil {
 			b.Fatalf("Get failed: %v", err)
 		}

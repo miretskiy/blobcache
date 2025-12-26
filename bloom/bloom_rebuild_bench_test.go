@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"testing"
-	"time"
 
 	"github.com/miretskiy/blobcache/index"
 	"github.com/miretskiy/blobcache/metadata"
@@ -30,17 +29,14 @@ func Benchmark_BloomRebuild(b *testing.B) {
 			// Populate index (not timed)
 			for i := 0; i < numKeys; i += keysPerSegment {
 				entries := make([]index.KeyValue, keysPerSegment)
-				now := time.Now()
 				for k := 0; k < keysPerSegment; k++ {
-					val := index.Value{
-						SegmentID: int64(i >> 10),
-						Pos:       int64(i % 1000),
-						Size:      1024,
-					}
-					val.SetCTime(now)
 					entries[k] = index.KeyValue{
 						Key: index.Key(i),
-						Val: val,
+						Val: &index.Value{
+							Pos:       int64(i % 1000),
+							Size:      1024,
+							SegmentID: int64(i >> 10),
+						},
 					}
 				}
 				if err := idx.PutBatch(entries); err != nil {

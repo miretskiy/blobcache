@@ -45,10 +45,13 @@ func (s *Storage) Close() error {
 
 // Get reads a blob from a segment file at the specified position
 func (r *Storage) Get(key Key) (io.Reader, bool) {
-	var record index.Value
-	if err := r.index.Get(key, &record); err != nil {
+	record, err := r.index.Get(key)
+	if err != nil {
 		return nil, false
 	}
+
+	// Mark as visited for Sieve eviction algorithm (lock-free)
+	record.MarkVisited(true)
 
 	file, err := r.getSegmentFile(record.SegmentID)
 	if err != nil {
@@ -98,6 +101,15 @@ func (s *Storage) getSegmentFile(segmentID int64) (*os.File, error) {
 	}
 
 	return file, nil
+}
+
+// HolePunchBlob deallocates space for a deleted blob within a segment file
+func (s *Storage) HolePunchBlob(segmentID int64, offset, size int64) error {
+	file, err := s.getSegmentFile(segmentID)
+	if err != nil {
+		return err
+	}
+	return PunchHole(file, offset, size)
 }
 
 // SegmentWriter writes multiple blobs into large segment files

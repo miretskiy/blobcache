@@ -122,7 +122,7 @@ func TestCache_DegradedMode_MemtableEviction(t *testing.T) {
 	require.NotNil(t, cache.BGError())
 
 	// Now frozen list should be at capacity (6 memtables)
-	// Next rotation should drop oldest frozen memtable
+	// next rotation should drop oldest frozen memtable
 
 	// Trigger more rotations (should drop oldest)
 	for i := 20; i < 30; i++ {

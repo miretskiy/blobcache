@@ -35,9 +35,30 @@ type Cache struct {
 	// Background error tracking
 	bgError atomic.Pointer[error] // First background error (nil = healthy)
 
+	// Segment fullness tracking for compaction
+	segmentStats struct {
+		sync.RWMutex
+		stats map[int64]*SegmentStats // SegmentID -> stats
+	}
+
 	// Background workers
 	stopCh chan struct{}
 	wg     sync.WaitGroup
+}
+
+// SegmentStats tracks segment fullness for compaction decisions
+type SegmentStats struct {
+	TotalBytes   int64
+	LiveBytes    int64
+	DeletedBytes int64
+}
+
+// FullnessPct returns the percentage of live data in the segment
+func (s *SegmentStats) FullnessPct() float64 {
+	if s.TotalBytes == 0 {
+		return 0
+	}
+	return float64(s.LiveBytes) / float64(s.TotalBytes)
 }
 
 // degradedMode interface allows memtable to check/set degraded state
@@ -102,6 +123,23 @@ func New(path string, opts ...Option) (*Cache, error) {
 	}
 	c.bloom.Store(filter)
 	c.approxSize.Store(totalSize)
+	c.segmentStats.stats = make(map[int64]*SegmentStats)
+
+	// Initialize segment stats from index
+	if err := idx.ForEachSegment(func(segment metadata.SegmentRecord) bool {
+		var segBytes int64
+		for _, rec := range segment.Records {
+			segBytes += rec.Size
+		}
+		c.segmentStats.stats[segment.SegmentID] = &SegmentStats{
+			TotalBytes: segBytes,
+			LiveBytes:  segBytes,
+		}
+		return true
+	}); err != nil {
+		return nil, fmt.Errorf("failed to initialize segment stats: %w", err)
+	}
+
 	c.memTable = c.newMemTable(c.config, c.storage)
 
 	return c, nil
@@ -179,6 +217,20 @@ func checkOrInitialize(cfg config) (*index.Index, error) {
 	return idx, nil
 }
 
+// updateSegmentStats updates stats for a segment after blob eviction
+func (c *Cache) updateSegmentStats(segmentID, deltaBytes int64) {
+	c.segmentStats.Lock()
+	defer c.segmentStats.Unlock()
+
+	stats, exists := c.segmentStats.stats[segmentID]
+	if !exists {
+		return // Segment not tracked (shouldn't happen)
+	}
+
+	stats.LiveBytes += deltaBytes    // deltaBytes is negative for eviction
+	stats.DeletedBytes -= deltaBytes // Increase deleted
+}
+
 // rebuildBloom scans all keys from index and builds new bloom filter
 func (c *Cache) rebuildBloom() error {
 	// Create new bloom filter
@@ -230,7 +282,7 @@ func (c *Cache) evictionWorker() {
 		select {
 		case <-ticker.C:
 			if c.MaxSize > 0 && !c.isDegraded() {
-				if err := c.runEviction(c.MaxSize); err != nil {
+				if err := c.runEvictionSieve(c.MaxSize); err != nil {
 					c.setDegraded(err)
 					return // Stop eviction permanently
 				}
@@ -241,8 +293,69 @@ func (c *Cache) evictionWorker() {
 	}
 }
 
-// runEviction evicts oldest entries if cache size exceeds limit
-func (c *Cache) runEviction(maxCacheSize int64) error {
+// runEvictionSieve evicts blobs using Sieve algorithm until under size limit
+func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
+	// Testing: inject eviction error
+	if c.testingInjectEvictErr != nil {
+		if err := c.testingInjectEvictErr(); err != nil {
+			return err
+		}
+	}
+
+	// Prevent concurrent evictions
+	if !c.evictionRunning.CompareAndSwap(false, true) {
+		return nil
+	}
+	defer c.evictionRunning.Store(false)
+
+	// Compute total size
+	var totalSize int64
+	c.index.ForEachBlob(func(kv index.KeyValue) bool {
+		totalSize += kv.Val.Size
+		return true
+	})
+
+	if totalSize <= maxCacheSize {
+		return nil // Under limit
+	}
+
+	toEvictBytes := totalSize - maxCacheSize
+	evictedBytes := int64(0)
+	evictedCount := 0
+
+	// Evict blobs one by one using Sieve
+	for evictedBytes < toEvictBytes {
+		key, victim, err := c.index.SieveScan()
+		if err != nil {
+			return err
+		}
+
+		// Update segment stats (track deleted space)
+		c.updateSegmentStats(victim.SegmentID, -victim.Size)
+
+		// Remove from index (also removes from FIFO queue and recycles Value)
+		c.index.DeleteBlob(key)
+
+		evictedBytes += victim.Size
+		evictedCount++
+	}
+
+	log.Info("eviction completed",
+		"evicted_blobs", evictedCount,
+		"evicted_mb", evictedBytes/(1024*1024))
+
+	// Rebuild bloom filter after eviction
+	if evictedCount > 0 {
+		if err := c.rebuildBloom(); err != nil {
+			return fmt.Errorf("failed to rebuild bloom after eviction: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// runEviction evicts oldest entries if cache size exceeds limit (DEPRECATED: use runEvictionSieve)
+func (c *Cache) runEviction_OLD(maxCacheSize int64) error {
 	// Testing: inject eviction error
 	if c.testingInjectEvictErr != nil {
 		if err := c.testingInjectEvictErr(); err != nil {
@@ -378,7 +491,7 @@ func (c *Cache) PutBatch(kvs []index.KeyValue) error {
 
 	// Trigger eviction if over limit (reactive)
 	if c.MaxSize > 0 && newSize > c.MaxSize && !c.isDegraded() {
-		if err := c.runEviction(c.MaxSize); err != nil {
+		if err := c.runEvictionSieve(c.MaxSize); err != nil {
 			c.setDegraded(err)
 			return err
 		}

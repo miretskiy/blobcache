@@ -102,17 +102,10 @@ func RecoverIndex(path string, opts ...Option) (*Cache, error) {
 			// Add valid segment records to recovery index
 			var kvs []index.KeyValue
 			for _, rec := range segment.Records {
-				kv := index.KeyValue{
+				kvs = append(kvs, index.KeyValue{
 					Key: index.Key(rec.Hash),
-					Val: index.Value{
-						Pos:       rec.Pos,
-						Size:      rec.Size,
-						Checksum:  rec.Checksum,
-						SegmentID: segment.SegmentID,
-					},
-				}
-				kv.Val.SetCTime(segment.CTime)
-				kvs = append(kvs, kv)
+					Val: index.NewValueFrom(rec.Pos, rec.Size, rec.Checksum, segment.SegmentID),
+				})
 			}
 
 			if err := recoveryIdx.PutBatch(kvs); err != nil {

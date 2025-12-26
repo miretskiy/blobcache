@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/miretskiy/blobcache/index"
 	"github.com/stretchr/testify/require"
@@ -236,7 +235,7 @@ func TestCache_Eviction(t *testing.T) {
 	require.Equal(t, int64(6<<10), totalSize)
 
 	// Run eviction
-	err = cache.runEviction(5 << 10)
+	err = cache.runEvictionSieve(5 << 10)
 	require.NoError(t, err)
 
 	// Check size after eviction (should be under limit)
@@ -274,35 +273,23 @@ func TestCache_ReactiveEviction(t *testing.T) {
 		require.NoError(t, err)
 		defer cache.Close()
 
-		baseTime := time.Now()
-
-		// Use PutBatch to add 6 entries with deterministic times
-		// key-0 has oldest time, key-5 has newest time
+		// Use PutBatch to add 6 entries
+		// key-0 to key-5, each in separate segment
 		batch := make([]index.KeyValue, 6)
 		for i := 0; i < 6; i++ {
 			key := []byte(fmt.Sprintf("key-%d", i))
 			h := cache.KeyHasher(key)
-			val := index.Value{
-				SegmentID: int64(i), // Each key gets its own segment
-				Pos:       0,
-				Size:      1024, // 1KB each
-				Checksum:  0,
-			}
-			val.SetCTime(baseTime.Add(time.Duration(i) * time.Second))
 			batch[i] = index.KeyValue{
 				Key: Key(h),
-				Val: val,
+				Val: &index.Value{Size: 1024, SegmentID: int64(i)},
 			}
 		}
 
 		err = cache.PutBatch(batch)
 		require.NoError(t, err)
 
-		// Verify reactive eviction occurred
-		mu.Lock()
-		numEvicted := len(evictedSegments)
-		mu.Unlock()
-		require.Greater(t, numEvicted, 0, "expected reactive eviction to occur after exceeding MaxSize")
+		// Note: With Sieve eviction, individual blobs are evicted (not full segments)
+		// so onSegmentEvicted callback won't fire. Verify eviction by checking final size.
 
 		// Verify final size is under or near limit
 		var totalSize int64
@@ -339,23 +326,14 @@ func TestCache_ReactiveEviction(t *testing.T) {
 		require.NoError(t, err)
 		defer cache.Close()
 
-		baseTime := time.Now()
-
-		// First, add 2KB of "old" data using PutBatch with old timestamps
+		// First, add 2KB of "old" data using PutBatch
 		oldBatch := make([]index.KeyValue, 2)
 		for i := 0; i < 2; i++ {
 			key := []byte(fmt.Sprintf("old-key-%d", i))
 			h := cache.KeyHasher(key)
-			val := index.Value{
-				SegmentID: int64(i),
-				Pos:       0,
-				Size:      1024, // 1KB each
-				Checksum:  0,
-			}
-			val.SetCTime(baseTime.Add(time.Duration(i) * time.Second))
 			oldBatch[i] = index.KeyValue{
 				Key: Key(h),
-				Val: val,
+				Val: &index.Value{Size: 1024, SegmentID: int64(i)},
 			}
 		}
 		err = cache.PutBatch(oldBatch)
@@ -375,27 +353,17 @@ func TestCache_ReactiveEviction(t *testing.T) {
 		for i := 0; i < 3; i++ {
 			key := []byte(fmt.Sprintf("batch-key-%d", i))
 			h := cache.KeyHasher(key)
-			val := index.Value{
-				SegmentID: int64(100 + i), // Different segment IDs
-				Pos:       0,
-				Size:      1024, // 1KB each
-				Checksum:  0,
-			}
-			val.SetCTime(baseTime.Add(time.Duration(100+i) * time.Second))
 			batch[i] = index.KeyValue{
 				Key: Key(h),
-				Val: val,
+				Val: &index.Value{Size: 1024, SegmentID: int64(100 + i)},
 			}
 		}
 
 		err = cache.PutBatch(batch)
 		require.NoError(t, err)
 
-		// Verify reactive eviction occurred during PutBatch
-		mu.Lock()
-		numEvicted := len(evictedSegments)
-		mu.Unlock()
-		require.Greater(t, numEvicted, 0, "expected reactive eviction during PutBatch when exceeding MaxSize")
+		// Note: With Sieve eviction, individual blobs are evicted (not full segments)
+		// Verify eviction by checking final size is under limit
 
 		// Verify final size is at or under limit
 		var finalSize int64

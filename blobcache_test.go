@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/miretskiy/blobcache/index"
 	"github.com/stretchr/testify/require"
@@ -273,6 +274,10 @@ func TestCache_ReactiveEviction(t *testing.T) {
 		require.NoError(t, err)
 		defer cache.Close()
 
+		// Start background worker for async eviction
+		_, err = cache.Start()
+		require.NoError(t, err)
+
 		// Use PutBatch to add 6 entries
 		// key-0 to key-5, each in separate segment
 		batch := make([]index.KeyValue, 6)
@@ -289,15 +294,15 @@ func TestCache_ReactiveEviction(t *testing.T) {
 		require.NoError(t, err)
 
 		// Note: With Sieve eviction, individual blobs are evicted (not full segments)
-		// so onSegmentEvicted callback won't fire. Verify eviction by checking final size.
-
-		// Verify final size is under or near limit
-		var totalSize int64
-		cache.index.ForEachBlob(func(kv index.KeyValue) bool {
-			totalSize += kv.Val.Size
-			return true
-		})
-		require.LessOrEqual(t, totalSize, int64(5<<10), "cache size should be at or under MaxSize after reactive eviction")
+		// Eviction runs async, wait for it to complete
+		require.Eventually(t, func() bool {
+			var totalSize int64
+			cache.index.ForEachBlob(func(kv index.KeyValue) bool {
+				totalSize += kv.Val.Size
+				return true
+			})
+			return totalSize <= int64(5<<10)
+		}, time.Second, 10*time.Millisecond, "cache size should decrease after eviction")
 
 		// Verify oldest key (key-0) was evicted
 		cache.memTable.TestingClearMemtable()
@@ -325,6 +330,10 @@ func TestCache_ReactiveEviction(t *testing.T) {
 		)
 		require.NoError(t, err)
 		defer cache.Close()
+
+		// Start background worker for async eviction
+		_, err = cache.Start()
+		require.NoError(t, err)
 
 		// First, add 2KB of "old" data using PutBatch
 		oldBatch := make([]index.KeyValue, 2)
@@ -363,15 +372,15 @@ func TestCache_ReactiveEviction(t *testing.T) {
 		require.NoError(t, err)
 
 		// Note: With Sieve eviction, individual blobs are evicted (not full segments)
-		// Verify eviction by checking final size is under limit
-
-		// Verify final size is at or under limit
-		var finalSize int64
-		cache.index.ForEachBlob(func(kv index.KeyValue) bool {
-			finalSize += kv.Val.Size
-			return true
-		})
-		require.LessOrEqual(t, finalSize, int64(3<<10), "cache size should be at or under MaxSize after PutBatch reactive eviction")
+		// Eviction runs async, wait for it to complete
+		require.Eventually(t, func() bool {
+			var finalSize int64
+			cache.index.ForEachBlob(func(kv index.KeyValue) bool {
+				finalSize += kv.Val.Size
+				return true
+			})
+			return finalSize <= int64(3<<10)
+		}, time.Second, 10*time.Millisecond, "cache size should decrease after eviction")
 
 		// Verify the old data was evicted (oldest should be gone)
 		cache.memTable.TestingClearMemtable()

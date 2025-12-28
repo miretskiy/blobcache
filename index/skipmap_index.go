@@ -131,6 +131,21 @@ func (idx *Index) Close() error {
 	return idx.segments.Close()
 }
 
+// GetSegmentRecord retrieves a specific segment record by ID
+func (idx *Index) GetSegmentRecord(segmentID int64) (*metadata.SegmentRecord, error) {
+	key := idx.getSegmentKey(segmentID)
+	v, err := idx.segments.Get(key)
+	if err != nil {
+		return nil, err
+	}
+	segment, err := metadata.DecodeSegmentRecord(v)
+	if err != nil {
+		return nil, err
+	}
+	segment.IndexKey = key
+	return &segment, nil
+}
+
 // ForEachSegment iterates over all segment records in the index
 func (idx *Index) ForEachSegment(fn ScanSegmentFn) error {
 	return idx.segments.ForEach(
@@ -200,8 +215,9 @@ func (idx *Index) putSegment(records []KeyValue) error {
 			return nil
 		}
 		data := metadata.AppendSegmentRecord(nil, seg)
+		key := idx.getSegmentKey(seg.SegmentID)
 		seg.Records = seg.Records[:0]
-		return txn.Put(idx.makeSegmentKey(), data)
+		return txn.Put(key, data)
 	}
 
 	for _, rec := range records {

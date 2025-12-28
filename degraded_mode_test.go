@@ -6,6 +6,7 @@ import (
 	"os"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -163,6 +164,10 @@ func TestCache_DegradedMode_EvictionError(t *testing.T) {
 	require.NoError(t, err)
 	defer cache.Close()
 
+	// Start background worker
+	_, err = cache.Start()
+	require.NoError(t, err)
+
 	value := make([]byte, 1024)
 
 	// Fill to trigger eviction
@@ -171,8 +176,11 @@ func TestCache_DegradedMode_EvictionError(t *testing.T) {
 	}
 	cache.Drain()
 
-	// Verify degraded from eviction error
-	require.NotNil(t, cache.BGError())
+	// Wait for async eviction to run and set degraded mode
+	require.Eventually(t, func() bool {
+		return cache.BGError() != nil
+	}, time.Second, 10*time.Millisecond, "should enter degraded mode from eviction error")
+
 	require.ErrorIs(t, cache.BGError(), errInjected)
 
 	// Cache still works

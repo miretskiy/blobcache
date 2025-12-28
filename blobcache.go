@@ -19,6 +19,13 @@ import (
 // Key is a cache key providing type safety (strong type, not alias)
 type Key = index.Key
 
+const (
+	// evictionHysteresis is the target fraction of MaxSize to evict to
+	// Evicting to 98% of limit (not 100%) avoids re-triggering on small additions
+	// Example: 1TB cache evicts to 980GB (20GB buffer)
+	evictionHysteresis = 0.98
+)
+
 // Cache is a high-performance blob storage with bloom filter optimization
 type Cache struct {
 	config
@@ -34,30 +41,10 @@ type Cache struct {
 	// Background error tracking
 	bgError atomic.Pointer[error] // First background error (nil = healthy)
 
-	// Segment fullness tracking for compaction
-	segmentStats struct {
-		sync.RWMutex
-		stats map[int64]*SegmentStats // SegmentID -> stats
-	}
-
 	// Background workers
-	stopCh chan struct{}
-	wg     sync.WaitGroup
-}
-
-// SegmentStats tracks segment fullness for compaction decisions
-type SegmentStats struct {
-	TotalBytes   int64
-	LiveBytes    int64
-	DeletedBytes int64
-}
-
-// FullnessPct returns the percentage of live data in the segment
-func (s *SegmentStats) FullnessPct() float64 {
-	if s.TotalBytes == 0 {
-		return 0
-	}
-	return float64(s.LiveBytes) / float64(s.TotalBytes)
+	evictionTrigger chan struct{} // Capacity 1: trigger eviction, blocks when eviction running
+	stopCh          chan struct{}
+	wg              sync.WaitGroup
 }
 
 // degradedMode interface allows memtable to check/set degraded state
@@ -118,35 +105,14 @@ func New(path string, opts ...Option) (*Cache, error) {
 	}
 
 	c := &Cache{
-		config:  cfg,
-		index:   idx,
-		storage: NewStorage(cfg, idx),
-		stopCh:  make(chan struct{}),
+		config:          cfg,
+		index:           idx,
+		storage:         NewStorage(cfg, idx),
+		evictionTrigger: make(chan struct{}, 1),
+		stopCh:          make(chan struct{}),
 	}
 	c.bloom.Store(filter)
 	c.approxSize.Store(totalSize)
-	c.segmentStats.stats = make(map[int64]*SegmentStats)
-
-	// Initialize segment stats from index (scan Deleted flags)
-	if err := idx.ForEachSegment(func(segment metadata.SegmentRecord) bool {
-		var totalBytes, liveBytes, deletedBytes int64
-		for _, rec := range segment.Records {
-			totalBytes += rec.Size
-			if rec.IsDeleted() {
-				deletedBytes += rec.Size
-			} else {
-				liveBytes += rec.Size
-			}
-		}
-		c.segmentStats.stats[segment.SegmentID] = &SegmentStats{
-			TotalBytes:   totalBytes,
-			LiveBytes:    liveBytes,
-			DeletedBytes: deletedBytes,
-		}
-		return true
-	}); err != nil {
-		return nil, fmt.Errorf("failed to initialize segment stats: %w", err)
-	}
 
 	c.memTable = c.newMemTable(c.config, c.storage)
 
@@ -225,20 +191,6 @@ func checkOrInitialize(cfg config) (*index.Index, error) {
 	return idx, nil
 }
 
-// updateSegmentStats updates stats for a segment after blob eviction
-func (c *Cache) updateSegmentStats(segmentID, deltaBytes int64) {
-	c.segmentStats.Lock()
-	defer c.segmentStats.Unlock()
-
-	stats, exists := c.segmentStats.stats[segmentID]
-	if !exists {
-		return // Segment not tracked (shouldn't happen)
-	}
-
-	stats.LiveBytes += deltaBytes    // deltaBytes is negative for eviction
-	stats.DeletedBytes -= deltaBytes // Increase deleted
-}
-
 // rebuildBloom scans all keys from index and builds new bloom filter
 func (c *Cache) rebuildBloom() error {
 	// Create new bloom filter
@@ -279,22 +231,34 @@ func (c *Cache) rebuildBloom() error {
 	return nil
 }
 
-// evictionWorker checks size and evicts old segments when over limit
+// evictionWorker handles eviction requests and periodic compaction
 func (c *Cache) evictionWorker() {
 	defer c.wg.Done()
 
-	ticker := time.NewTicker(60 * time.Second)
-	defer ticker.Stop()
+	// Compaction runs less frequently (every hour)
+	compactionTicker := time.NewTicker(60 * time.Minute)
+	defer compactionTicker.Stop()
 
 	for {
 		select {
-		case <-ticker.C:
+		case <-c.evictionTrigger:
+			// Eviction requested (triggered by PutBatch)
 			if c.MaxSize > 0 && !c.isDegraded() {
 				if err := c.runEvictionSieve(c.MaxSize); err != nil {
 					c.setDegraded(err)
-					return // Stop eviction permanently
+					return // Stop worker permanently
 				}
 			}
+
+		case <-compactionTicker.C:
+			// Periodic compaction of sparse segments
+			if !c.isDegraded() {
+				if err := c.maybeCompactSegments(); err != nil {
+					log.Warn("compaction failed", "error", err)
+					// Non-fatal: continue running
+				}
+			}
+
 		case <-c.stopCh:
 			return
 		}
@@ -327,7 +291,9 @@ func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
 		return nil // Under limit
 	}
 
-	toEvictBytes := totalSize - maxCacheSize
+	// Evict to evictionHysteresis * maxCacheSize to avoid re-triggering
+	target := int64(float64(maxCacheSize) * evictionHysteresis)
+	toEvictBytes := totalSize - target
 	evictedBytes := int64(0)
 	evictedCount := 0
 
@@ -339,6 +305,7 @@ func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
 		}
 
 		// Punch hole in segment file (reclaim space immediately)
+		// This also updates segment stats (totalBytes/deletedBytes in SegmentFile)
 		if err := c.storage.HolePunchBlob(victim.SegmentID, victim.Pos, victim.Size); err != nil {
 			log.Warn("hole punch failed",
 				"segment", victim.SegmentID,
@@ -347,9 +314,6 @@ func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
 				"error", err)
 			// Non-fatal: continue evicting, compaction will reclaim space eventually
 		}
-
-		// Update segment stats (track deleted space)
-		c.updateSegmentStats(victim.SegmentID, -victim.Size)
 
 		// Remove from index (also removes from FIFO queue and recycles Value)
 		c.index.DeleteBlob(key)
@@ -362,6 +326,9 @@ func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
 		"evicted_blobs", evictedCount,
 		"evicted_mb", evictedBytes/(1024*1024))
 
+	// Update approxSize to reflect evicted bytes
+	c.approxSize.Add(-evictedBytes)
+
 	// Rebuild bloom filter after eviction
 	if evictedCount > 0 {
 		if err := c.rebuildBloom(); err != nil {
@@ -369,6 +336,15 @@ func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
 		}
 	}
 
+	return nil
+}
+
+// maybeCompactSegments checks for sparse segments and compacts them
+func (c *Cache) maybeCompactSegments() error {
+	// TODO: Implement segment compaction
+	// 1. Scan segmentStats for segments with FullnessPct < 0.20
+	// 2. Compact 1-2 segments per cycle (rate limited)
+	// 3. Read live blobs, re-insert to memtable, delete old segment
 	return nil
 }
 
@@ -419,12 +395,10 @@ func (c *Cache) PutBatch(kvs []index.KeyValue) error {
 	}
 	newSize := c.approxSize.Add(addedBytes)
 
-	// Trigger eviction if over limit (reactive)
+	// Trigger eviction if over limit
+	// First write sends to channel (non-blocking), subsequent writes block until eviction completes
 	if c.MaxSize > 0 && newSize > c.MaxSize && !c.isDegraded() {
-		if err := c.runEvictionSieve(c.MaxSize); err != nil {
-			c.setDegraded(err)
-			return err
-		}
+		c.evictionTrigger <- struct{}{}
 	}
 	return nil
 }

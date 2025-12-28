@@ -92,30 +92,70 @@ func (s *Storage) getSegmentFile(segmentID int64) (SegmentFile, error) {
 		return nil, err
 	}
 
-	// Find footer position for sealed segment
 	stat, err := file.Stat()
 	if err != nil {
 		file.Close()
 		return nil, err
 	}
-	footerPos := stat.Size() - metadata.SegmentFooterSize
 
 	sf := &segmentFile{
 		file:      file,
 		segmentID: segmentID,
-		footerPos: footerPos,
 	}
-	sf.sealed.Store(true) // Existing file is sealed
+
+	// Validate footer if file is large enough
+	// Only set footerPos and sealed if footer is actually valid
+	if stat.Size() >= metadata.SegmentFooterSize {
+		potentialFooterPos := stat.Size() - metadata.SegmentFooterSize
+		footerBuf := make([]byte, metadata.SegmentFooterSize)
+		if _, err := file.ReadAt(footerBuf, potentialFooterPos); err == nil {
+			if _, err := metadata.DecodeSegmentFooter(footerBuf); err == nil {
+				// Valid footer found - finalized segment
+				sf.footerPos = potentialFooterPos
+				sf.sealed.Store(true)
+			}
+			// Invalid footer: partial segment, leave footerPos=0, sealed=false
+		}
+	}
+	// File smaller than footer or invalid footer: partial segment, sealed=false
+
+	// Initialize stats from Index (bitcask) - source of truth
+	// Works for both finalized and partial segments
+	if err := s.initializeStatsFromIndex(sf, segmentID); err != nil {
+		file.Close()
+		return nil, err
+	}
 
 	// Store in cache (LoadOrStore handles race)
 	actual, _ := s.cache.LoadOrStore(segmentID, sf)
 	if actual != sf {
-		// Another goroutine opened it first, close ours and use theirs
 		sf.Close()
 		return actual.(SegmentFile), nil
 	}
 
 	return sf, nil
+}
+
+// initializeStatsFromIndex initializes segment stats from Index (bitcask)
+// Bitcask is the source of truth - works for finalized and partial segments
+func (s *Storage) initializeStatsFromIndex(sf *segmentFile, segmentID int64) error {
+	segmentRecord, err := s.index.GetSegmentRecord(segmentID)
+	if err != nil {
+		return err
+	}
+
+	// Compute stats from segment record
+	var totalBytes, deletedBytes int64
+	for _, rec := range segmentRecord.Records {
+		totalBytes += rec.Size
+		if rec.IsDeleted() {
+			deletedBytes += rec.Size
+		}
+	}
+
+	sf.totalBytes.Store(totalBytes)
+	sf.deletedBytes.Store(deletedBytes)
+	return nil
 }
 
 // HolePunchBlob deallocates space for a deleted blob within a segment file

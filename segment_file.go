@@ -27,6 +27,10 @@ type segmentFile struct {
 	// For active segments: track records (deletion tracked via Deleted flag)
 	records []metadata.BlobRecord
 
+	// Segment statistics
+	totalBytes   atomic.Int64 // Total bytes (sum of all blob sizes, grows during writes)
+	deletedBytes atomic.Int64 // Bytes deleted via hole punching
+
 	// For sealed segments: track footer position for rewrites
 	footerPos int64
 	segmentID int64
@@ -76,6 +80,7 @@ func (s *segmentFile) punchHoleActive(offset, length int64) error {
 	for i := range s.records {
 		if s.records[i].Pos == offset && s.records[i].Size == length {
 			s.records[i].SetDeleted()
+			s.deletedBytes.Add(length)
 			break
 		}
 	}
@@ -109,11 +114,12 @@ func (s *segmentFile) punchHoleSealed(offset, length int64) error {
 		return fmt.Errorf("segment record validation failed: %w", err)
 	}
 
-	// Mark the blob as deleted (set Deleted flag)
+	// Mark the blob as deleted
 	found := false
 	for i := range segment.Records {
 		if segment.Records[i].Pos == offset && segment.Records[i].Size == length {
 			segment.Records[i].SetDeleted()
+			s.deletedBytes.Add(length)
 			found = true
 			break
 		}
@@ -138,6 +144,7 @@ func (s *segmentFile) addRecord(rec metadata.BlobRecord) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.records = append(s.records, rec)
+	s.totalBytes.Add(rec.Size)
 }
 
 // seal marks the segment as finalized and records footer position
@@ -154,4 +161,28 @@ func (s *segmentFile) getLiveRecords() []metadata.BlobRecord {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.records
+}
+
+// LiveBytes returns bytes of live (non-deleted) blobs
+func (s *segmentFile) LiveBytes() int64 {
+	return s.totalBytes.Load() - s.deletedBytes.Load()
+}
+
+// DeletedBytes returns bytes of deleted blobs
+func (s *segmentFile) DeletedBytes() int64 {
+	return s.deletedBytes.Load()
+}
+
+// TotalBytes returns total bytes (live + deleted)
+func (s *segmentFile) TotalBytes() int64 {
+	return s.totalBytes.Load()
+}
+
+// FullnessPct returns percentage of live data (0.0 to 1.0)
+func (s *segmentFile) FullnessPct() float64 {
+	total := s.TotalBytes()
+	if total == 0 {
+		return 1.0 // Empty segment is "fully live" (don't compact)
+	}
+	return float64(s.LiveBytes()) / float64(total)
 }

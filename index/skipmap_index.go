@@ -66,8 +66,12 @@ func NewIndex(basePath string) (*Index, error) {
 		}
 
 		// Create Values and link into FIFO queue in segment age order
+		// Skip deleted blobs (evicted blobs with Deleted flag set)
 		for _, rec := range segment.Records {
-			val := NewValueFrom(rec.Pos, rec.Size, rec.Checksum, segment.SegmentID)
+			if rec.IsDeleted() {
+				continue // Skip deleted blobs
+			}
+			val := NewValueFrom(rec.Pos, rec.Size, rec.Flags, segment.SegmentID)
 			blobs.Store(rec.Hash, val)
 			idx.insertIntoQueue(val)
 		}
@@ -231,10 +235,10 @@ func (idx *Index) putSegment(records []KeyValue) error {
 		}
 
 		seg.Records = append(seg.Records, metadata.BlobRecord{
-			Hash:     uint64(rec.Key),
-			Pos:      rec.Val.Pos,
-			Size:     rec.Val.Size,
-			Checksum: rec.Val.Checksum,
+			Hash:  uint64(rec.Key),
+			Pos:   rec.Val.Pos,
+			Size:  rec.Val.Size,
+			Flags: rec.Val.Checksum,
 		})
 	}
 

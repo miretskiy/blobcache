@@ -19,7 +19,7 @@ type Storage struct {
 	config
 	index *index.Index
 	seq   atomic.Int64
-	cache sync.Map // segmentID (int64) -> *os.File
+	cache sync.Map // segmentID (int64) -> SegmentFile
 }
 
 func NewStorage(cfg config, idx *index.Index) *Storage {
@@ -28,12 +28,12 @@ func NewStorage(cfg config, idx *index.Index) *Storage {
 	return &s
 }
 
-// Close closes all cached file handles
+// Close closes all cached segment files
 func (s *Storage) Close() error {
 	var errs []error
 	s.cache.Range(func(key, value any) bool {
-		if file, ok := value.(*os.File); ok {
-			if err := file.Close(); err != nil {
+		if closer, ok := value.(io.Closer); ok {
+			if err := closer.Close(); err != nil {
 				errs = append(errs, err)
 			}
 		}
@@ -53,13 +53,13 @@ func (r *Storage) Get(key Key) (io.Reader, bool) {
 	// Mark as visited for Sieve eviction algorithm (lock-free)
 	record.MarkVisited(true)
 
-	file, err := r.getSegmentFile(record.SegmentID)
+	sf, err := r.getSegmentFile(record.SegmentID)
 	if err != nil {
 		return nil, false
 	}
 
 	// Use SectionReader for lazy reading (reads only when caller reads)
-	reader := io.NewSectionReader(file, record.Pos, record.Size)
+	reader := io.NewSectionReader(sf, record.Pos, record.Size)
 
 	// Wrap with checksum verification if enabled
 	if r.Resilience.VerifyOnRead && r.Resilience.ChecksumHasher != nil &&
@@ -79,57 +79,73 @@ func getSegmentPath(basePath string, numShards int, segmentID int64) string {
 	)
 }
 
-// getSegmentFile returns cached file or opens it
-func (s *Storage) getSegmentFile(segmentID int64) (*os.File, error) {
+// getSegmentFile returns cached SegmentFile or opens it
+func (s *Storage) getSegmentFile(segmentID int64) (SegmentFile, error) {
 	// Check cache
 	if cached, ok := s.cache.Load(segmentID); ok {
-		return cached.(*os.File), nil
+		return cached.(SegmentFile), nil
 	}
 
 	segmentPath := getSegmentPath(s.Path, s.Shards, segmentID)
-	file, err := os.Open(segmentPath)
+	file, err := os.OpenFile(segmentPath, os.O_RDWR, 0644)
 	if err != nil {
 		return nil, err
 	}
 
-	// Store in cache (LoadOrStore handles race)
-	actual, _ := s.cache.LoadOrStore(segmentID, file)
-	if actual != file {
-		// Another goroutine opened it first, close ours and use theirs
+	// Find footer position for sealed segment
+	stat, err := file.Stat()
+	if err != nil {
 		file.Close()
-		return actual.(*os.File), nil
+		return nil, err
+	}
+	footerPos := stat.Size() - metadata.SegmentFooterSize
+
+	sf := &segmentFile{
+		file:      file,
+		segmentID: segmentID,
+		footerPos: footerPos,
+	}
+	sf.sealed.Store(true) // Existing file is sealed
+
+	// Store in cache (LoadOrStore handles race)
+	actual, _ := s.cache.LoadOrStore(segmentID, sf)
+	if actual != sf {
+		// Another goroutine opened it first, close ours and use theirs
+		sf.Close()
+		return actual.(SegmentFile), nil
 	}
 
-	return file, nil
+	return sf, nil
 }
 
 // HolePunchBlob deallocates space for a deleted blob within a segment file
 func (s *Storage) HolePunchBlob(segmentID int64, offset, size int64) error {
-	file, err := s.getSegmentFile(segmentID)
+	sf, err := s.getSegmentFile(segmentID)
 	if err != nil {
 		return err
 	}
-	return PunchHole(file, offset, size)
+	return sf.PunchHole(offset, size)
 }
 
 // SegmentWriter writes multiple blobs into large segment files
 type SegmentWriter struct {
 	config
+	storage       *Storage
 	getSequenceID func() int64
 
 	// Current segment state
-	currentFile  *os.File
-	currentID    int64
-	currentPos   int64
-	lastWritePos int64                 // Position of last Write() for Pos()
-	leftover     []byte                // For DirectIO alignment
-	records      []metadata.BlobRecord // Records for footer
+	currentSegment *segmentFile // SegmentFile for current segment
+	currentID      int64
+	currentPos     int64
+	lastWritePos   int64 // Position of last Write() for Pos()
+	leftover       []byte
 }
 
 // NewSegmentWriter creates a segment writer for a specific worker
 func (s *Storage) NewSegmentWriter() *SegmentWriter {
 	return &SegmentWriter{
 		config:        s.config,
+		storage:       s,
 		getSequenceID: func() int64 { return s.seq.Add(1) },
 	}
 }
@@ -137,7 +153,7 @@ func (s *Storage) NewSegmentWriter() *SegmentWriter {
 // openNewSegment opens a new segment file
 func (w *SegmentWriter) openNewSegment() error {
 	// Close current if open
-	if w.currentFile != nil {
+	if w.currentSegment != nil {
 		if err := w.closeCurrentSegment(); err != nil {
 			return err
 		}
@@ -149,11 +165,13 @@ func (w *SegmentWriter) openNewSegment() error {
 	// Get segment path from path manager
 	segmentPath := getSegmentPath(w.Path, w.Shards, w.currentID)
 
+	// Open with O_RDWR (not O_APPEND) to support both writing and hole punching
+	var file *os.File
 	var err error
 	if w.IO.DirectIO {
-		w.currentFile, err = directio.OpenFile(segmentPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		file, err = directio.OpenFile(segmentPath, os.O_CREATE|os.O_RDWR, 0o644)
 	} else {
-		w.currentFile, err = os.OpenFile(segmentPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		file, err = os.OpenFile(segmentPath, os.O_CREATE|os.O_RDWR, 0o644)
 	}
 
 	if err != nil {
@@ -162,7 +180,7 @@ func (w *SegmentWriter) openNewSegment() error {
 
 	// Pre-allocate segment size to reduce fragmentation
 	if w.SegmentSize > 0 {
-		if err := fallocate(w.currentFile, w.SegmentSize); err != nil {
+		if err := fallocate(file, w.SegmentSize); err != nil {
 			// Non-fatal - log but continue (fallback to growing file)
 			log.Warn("failed to pre-allocate segment space",
 				"size", w.SegmentSize,
@@ -170,29 +188,31 @@ func (w *SegmentWriter) openNewSegment() error {
 		}
 	}
 
+	// Create SegmentFile and register in Storage cache
+	sf := newSegmentFile(file, w.currentID)
+	w.storage.cache.Store(w.currentID, sf)
+	w.currentSegment = sf
+
 	w.currentPos = 0
 	w.leftover = nil
-	w.records = nil // Reset records for new segment
 	return nil
 }
 
 // closeCurrentSegment finalizes current segment
-func (w *SegmentWriter) closeCurrentSegment() (retErr error) {
-	if w.currentFile == nil {
+func (w *SegmentWriter) closeCurrentSegment() error {
+	if w.currentSegment == nil {
 		return nil
 	}
 
-	defer func() {
-		err := w.currentFile.Close()
-		w.currentFile = nil
-		retErr = errors.Join(retErr, err)
-	}()
+	// Get live records (filters out deleted blobs)
+	liveRecords := w.currentSegment.getLiveRecords()
 
-	// Write footer with all records for this segment
-	if len(w.records) > 0 {
+	// Write footer with live records only
+	if len(liveRecords) > 0 {
+		footerStartPos := w.currentPos
 		footerBytes := metadata.AppendSegmentRecordWithFooter(nil,
 			metadata.SegmentRecord{
-				Records:   w.records,
+				Records:   liveRecords,
 				SegmentID: w.currentID,
 				CTime:     time.Now(),
 				IndexKey:  nil,
@@ -207,34 +227,39 @@ func (w *SegmentWriter) closeCurrentSegment() (retErr error) {
 		if err != nil {
 			return fmt.Errorf("failed to write footer: %w", err)
 		}
+
+		// Seal segment with footer position
+		w.currentSegment.seal(footerStartPos)
 	}
 
 	if w.IO.FDataSync {
-		if err := fdatasync(w.currentFile); err != nil {
+		if err := fdatasync(w.currentSegment.file); err != nil {
 			return err
 		}
 	}
 
+	// Don't close file - it stays registered in Storage cache
+	w.currentSegment = nil
 	return nil
 }
 
 // Write writes a blob to current segment
 func (w *SegmentWriter) Write(key Key, value []byte, checksum uint64) error {
 	// Open new segment if needed or if this write would exceed segment size
-	if w.currentFile == nil || w.currentPos+int64(len(value)) > w.SegmentSize {
+	if w.currentSegment == nil || w.currentPos+int64(len(value)) > w.SegmentSize {
 		if err := w.openNewSegment(); err != nil {
 			return err
 		}
 	}
 
-	// Track record for footer
+	// Track record in segmentFile (for footer)
 	rec := metadata.BlobRecord{
-		Hash:     uint64(key),
-		Pos:      w.currentPos,
-		Size:     int64(len(value)),
-		Checksum: checksum,
+		Hash:  uint64(key),
+		Pos:   w.currentPos,
+		Size:  int64(len(value)),
+		Flags: checksum, // Low 32 bits = checksum, high 32 bits = flags
 	}
-	w.records = append(w.records, rec)
+	w.currentSegment.addRecord(rec)
 
 	if w.IO.DirectIO {
 		return w.writeDirectIO(value)
@@ -256,19 +281,18 @@ func (w *SegmentWriter) Close() error {
 }
 
 func (w *SegmentWriter) writeBufferred(value []byte) error {
-	// Buffered write
 	w.lastWritePos = w.currentPos
 
-	// Simple buffered write
-	n, err := w.currentFile.Write(value)
+	// Use WriteAt instead of Write (no O_APPEND)
+	n, err := w.currentSegment.WriteAt(value, w.currentPos)
 	if err != nil {
 		return err
 	}
 	w.currentPos += int64(n)
 
-	// Fdatasync after each write if enabled (not needed for DirectIO)
+	// Fdatasync after each write if enabled
 	if w.IO.FDataSync {
-		if err := fdatasync(w.currentFile); err != nil {
+		if err := fdatasync(w.currentSegment.file); err != nil {
 			return fmt.Errorf("failed to fdatasync after write: %w", err)
 		}
 	}
@@ -294,7 +318,7 @@ func (w *SegmentWriter) writeDirectIO(value []byte) error {
 		copy(buf, value)
 	}
 
-	n, err := w.currentFile.Write(buf)
+	n, err := w.currentSegment.WriteAt(buf, w.currentPos)
 	if err != nil {
 		return err
 	}

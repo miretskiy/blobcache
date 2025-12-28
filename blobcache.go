@@ -7,7 +7,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -103,12 +102,15 @@ func New(path string, opts ...Option) (*Cache, error) {
 	}
 
 	// Create new bloom filter and figure out how much data on disk from segment records.
+	// Skip deleted blobs when building bloom filter
 	var totalSize int64
 	filter := bloom.New(uint(cfg.BloomEstimatedKeys), cfg.BloomFPRate)
 	if err := idx.ForEachSegment(func(segment metadata.SegmentRecord) bool {
 		for _, rec := range segment.Records {
-			filter.Add(rec.Hash)
-			totalSize += rec.Size
+			if !rec.IsDeleted() {
+				filter.Add(rec.Hash)
+				totalSize += rec.Size
+			}
 		}
 		return true
 	}); err != nil {
@@ -125,15 +127,21 @@ func New(path string, opts ...Option) (*Cache, error) {
 	c.approxSize.Store(totalSize)
 	c.segmentStats.stats = make(map[int64]*SegmentStats)
 
-	// Initialize segment stats from index
+	// Initialize segment stats from index (scan Deleted flags)
 	if err := idx.ForEachSegment(func(segment metadata.SegmentRecord) bool {
-		var segBytes int64
+		var totalBytes, liveBytes, deletedBytes int64
 		for _, rec := range segment.Records {
-			segBytes += rec.Size
+			totalBytes += rec.Size
+			if rec.IsDeleted() {
+				deletedBytes += rec.Size
+			} else {
+				liveBytes += rec.Size
+			}
 		}
 		c.segmentStats.stats[segment.SegmentID] = &SegmentStats{
-			TotalBytes: segBytes,
-			LiveBytes:  segBytes,
+			TotalBytes:   totalBytes,
+			LiveBytes:    liveBytes,
+			DeletedBytes: deletedBytes,
 		}
 		return true
 	}); err != nil {
@@ -247,7 +255,9 @@ func (c *Cache) rebuildBloom() error {
 
 	if err := c.index.ForEachSegment(func(segment metadata.SegmentRecord) bool {
 		for _, rec := range segment.Records {
-			filter.Add(rec.Hash)
+			if !rec.IsDeleted() {
+				filter.Add(rec.Hash)
+			}
 		}
 		return true
 	}); err != nil {
@@ -268,8 +278,6 @@ func (c *Cache) rebuildBloom() error {
 
 	return nil
 }
-
-// Background workers
 
 // evictionWorker checks size and evicts old segments when over limit
 func (c *Cache) evictionWorker() {
@@ -330,6 +338,16 @@ func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
 			return err
 		}
 
+		// Punch hole in segment file (reclaim space immediately)
+		if err := c.storage.HolePunchBlob(victim.SegmentID, victim.Pos, victim.Size); err != nil {
+			log.Warn("hole punch failed",
+				"segment", victim.SegmentID,
+				"offset", victim.Pos,
+				"size", victim.Size,
+				"error", err)
+			// Non-fatal: continue evicting, compaction will reclaim space eventually
+		}
+
 		// Update segment stats (track deleted space)
 		c.updateSegmentStats(victim.SegmentID, -victim.Size)
 
@@ -345,94 +363,6 @@ func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
 		"evicted_mb", evictedBytes/(1024*1024))
 
 	// Rebuild bloom filter after eviction
-	if evictedCount > 0 {
-		if err := c.rebuildBloom(); err != nil {
-			return fmt.Errorf("failed to rebuild bloom after eviction: %w", err)
-		}
-	}
-
-	return nil
-}
-
-// runEviction evicts oldest entries if cache size exceeds limit (DEPRECATED: use runEvictionSieve)
-func (c *Cache) runEviction_OLD(maxCacheSize int64) error {
-	// Testing: inject eviction error
-	if c.testingInjectEvictErr != nil {
-		if err := c.testingInjectEvictErr(); err != nil {
-			return err
-		}
-	}
-
-	// Prevent concurrent evictions (multiple flush workers could trigger)
-	if !c.evictionRunning.CompareAndSwap(false, true) {
-		return nil // Another eviction already running
-	}
-	defer c.evictionRunning.Store(false)
-
-	// Compute total size by scanning segment recrods.
-	var totalSize int64
-	var segments []metadata.SegmentRecord
-	if err := c.index.ForEachSegment(func(segment metadata.SegmentRecord) bool {
-		for _, rec := range segment.Records {
-			totalSize += rec.Size
-		}
-		segments = append(segments, segment)
-		return true
-	}); err != nil {
-		return err
-	}
-
-	if totalSize <= maxCacheSize {
-		return nil // Under limit
-	}
-
-	// Calculate how much to remove (no hysteresis needed since we remove entire segments)
-	toEvictBytes := totalSize - maxCacheSize
-
-	// Sort by ctime (oldest first)
-	sort.Slice(segments, func(i, j int) bool {
-		return segments[i].CTime.Before(segments[j].CTime)
-	})
-
-	// Evict oldest until target reached
-	evictedBytes := int64(0)
-	evictedCount := 0
-
-	for _, segment := range segments {
-		if evictedBytes >= toEvictBytes {
-			break
-		}
-
-		// Delete segment file and update counters
-		for _, rec := range segment.Records {
-			evictedBytes += rec.Size
-		}
-		evictedCount += len(segment.Records)
-
-		// Try to delete segment file (best effort)
-		p := getSegmentPath(c.Path, c.Shards, segment.SegmentID)
-		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
-			log.Warn("failed to remove segment file",
-				"path", p,
-				"error", err)
-			// Continue - index consistency more important than disk cleanup
-		}
-
-		// Index delete MUST succeed - critical for consistency
-		if err := c.index.DeleteSegment(segment); err != nil {
-			return fmt.Errorf("index delete failed: %w", err)
-		}
-
-		if c.onSegmentEvicted != nil {
-			c.onSegmentEvicted(segment.SegmentID)
-		}
-	}
-
-	log.Info("eviction completed",
-		"evicted_blobs", evictedCount,
-		"evicted_mb", evictedBytes/(1024*1024))
-
-	// Rebuild bloom filter after eviction to remove stale entries
 	if evictedCount > 0 {
 		if err := c.rebuildBloom(); err != nil {
 			return fmt.Errorf("failed to rebuild bloom after eviction: %w", err)

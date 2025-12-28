@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
-	"math"
 	"time"
 )
 
@@ -16,15 +15,40 @@ const (
 	SegmentRecordHeaderSize = 16 // SegmentID(8) + CTime(8)
 	SegmentFooterSize       = 20 // Len(8) + Checksum(4) + Magic(8)
 
-	InvalidChecksum = uint64(math.MaxUint32) + 1
+	// Checksum field flags (high 32 bits)
+	InvalidChecksumFlag = uint64(1) << 32 // Bit 32: no checksum available
+	DeletedFlag         = uint64(1) << 33 // Bit 33: blob deleted (hole punched)
+
+	// Helper for backward compatibility
+	InvalidChecksum = InvalidChecksumFlag
 )
 
 // BlobRecord is one entry in the SegmentRecord
 type BlobRecord struct {
-	Hash     uint64 // xxhash of key (for bloom rebuild)
-	Pos      int64  // Offset within segment
-	Size     int64  // Blob size
-	Checksum uint64 // CRC32 checksum; InvalidChecksum if not set.
+	Hash  uint64 // xxhash of key (for bloom rebuild)
+	Pos   int64  // Offset within segment
+	Size  int64  // Blob size
+	Flags uint64 // Low 32 bits: CRC32 checksum, High 32 bits: flags (InvalidChecksumFlag, DeletedFlag)
+}
+
+// IsDeleted returns true if the blob has been evicted (hole punched)
+func (b *BlobRecord) IsDeleted() bool {
+	return (b.Flags & DeletedFlag) != 0
+}
+
+// SetDeleted marks the blob as deleted
+func (b *BlobRecord) SetDeleted() {
+	b.Flags |= DeletedFlag
+}
+
+// Checksum returns the CRC32 checksum value (low 32 bits, without flags)
+func (b *BlobRecord) Checksum() uint32 {
+	return uint32(b.Flags & 0xFFFFFFFF)
+}
+
+// HasChecksum returns true if a checksum is available
+func (b *BlobRecord) HasChecksum() bool {
+	return (b.Flags & InvalidChecksumFlag) == 0
 }
 
 // SegmentRecord contains all metadata for a segment
@@ -43,27 +67,27 @@ type SegmentFooter struct {
 	Checksum uint32 // CRC32 checksum of SegmentRecord data
 }
 
-// AppendBlobRecord appends a blob record to buffer (28 bytes)
+// AppendBlobRecord appends a blob record to buffer (32 bytes)
 // Follows stdlib pattern like binary.LittleEndian.AppendUint64
 func AppendBlobRecord(buf []byte, rec BlobRecord) []byte {
 	buf = binary.LittleEndian.AppendUint64(buf, rec.Hash)
 	buf = binary.LittleEndian.AppendUint64(buf, uint64(rec.Pos))
 	buf = binary.LittleEndian.AppendUint64(buf, uint64(rec.Size))
-	buf = binary.LittleEndian.AppendUint64(buf, rec.Checksum)
+	buf = binary.LittleEndian.AppendUint64(buf, rec.Flags)
 	return buf
 }
 
-// DecodeBlobRecord decodes a blob record from buffer (28 bytes)
+// DecodeBlobRecord decodes a blob record from buffer (32 bytes)
 func DecodeBlobRecord(buf []byte) (BlobRecord, error) {
 	if len(buf) < EncodedBlobRecordSize {
 		return BlobRecord{}, fmt.Errorf("buffer too small for blob record (need %d bytes, got %d)",
 			EncodedBlobRecordSize, len(buf))
 	}
 	return BlobRecord{
-		Hash:     binary.LittleEndian.Uint64(buf[0:8]),
-		Pos:      int64(binary.LittleEndian.Uint64(buf[8:16])),
-		Size:     int64(binary.LittleEndian.Uint64(buf[16:24])),
-		Checksum: binary.LittleEndian.Uint64(buf[24:32]),
+		Hash:  binary.LittleEndian.Uint64(buf[0:8]),
+		Pos:   int64(binary.LittleEndian.Uint64(buf[8:16])),
+		Size:  int64(binary.LittleEndian.Uint64(buf[16:24])),
+		Flags: binary.LittleEndian.Uint64(buf[24:32]),
 	}, nil
 }
 

@@ -100,11 +100,15 @@ func RecoverIndex(path string, opts ...Option) (*Cache, error) {
 			}
 
 			// Add valid segment records to recovery index
+			// Skip deleted blobs (marked with Deleted flag)
 			var kvs []index.KeyValue
 			for _, rec := range segment.Records {
+				if rec.IsDeleted() {
+					continue // Skip deleted blobs
+				}
 				kvs = append(kvs, index.KeyValue{
 					Key: index.Key(rec.Hash),
-					Val: index.NewValueFrom(rec.Pos, rec.Size, rec.Checksum, segment.SegmentID),
+					Val: index.NewValueFrom(rec.Pos, rec.Size, rec.Flags, segment.SegmentID),
 				})
 			}
 

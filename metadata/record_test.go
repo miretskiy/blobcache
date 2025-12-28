@@ -38,9 +38,9 @@ func TestFooter_EncodeAndDecode(t *testing.T) {
 	ctime := time.Unix(1234567890, 0)
 	sr := SegmentRecord{
 		Records: []BlobRecord{
-			{Hash: 0x1234567890ABCDEF, Pos: 0, Size: 1024, Checksum: 0xAABBCCDD},
-			{Hash: 0xFEDCBA0987654321, Pos: 1024, Size: 2048, Checksum: 0x11223344},
-			{Hash: 0xABCDEF0123456789, Pos: 3072, Size: 512, Checksum: 0x99887766},
+			{Hash: 0x1234567890ABCDEF, Pos: 0, Size: 1024, Flags: 0xAABBCCDD},
+			{Hash: 0xFEDCBA0987654321, Pos: 1024, Size: 2048, Flags: 0x11223344},
+			{Hash: 0xABCDEF0123456789, Pos: 3072, Size: 512, Flags: 0x99887766},
 		},
 		SegmentID: 1,
 		CTime:     ctime,
@@ -88,10 +88,10 @@ func TestFooter_ManyRecords(t *testing.T) {
 	records := make([]BlobRecord, 1000)
 	for i := 0; i < 1000; i++ {
 		records[i] = BlobRecord{
-			Hash:     uint64(i) << 32,
-			Pos:      int64(i * 1000),
-			Size:     int64(i * 100),
-			Checksum: uint64(i),
+			Hash:  uint64(i) << 32,
+			Pos:   int64(i * 1000),
+			Size:  int64(i * 100),
+			Flags: uint64(i),
 		}
 	}
 
@@ -117,7 +117,7 @@ func TestFooter_ManyRecords(t *testing.T) {
 
 func TestFooter_InvalidMagic_Footer(t *testing.T) {
 	sr := SegmentRecord{
-		Records:   []BlobRecord{{Hash: 123, Pos: 0, Size: 456, Checksum: 789}},
+		Records:   []BlobRecord{{Hash: 123, Pos: 0, Size: 456, Flags: 789}},
 		SegmentID: 0,
 		CTime:     time.Now(),
 	}
@@ -135,7 +135,7 @@ func TestFooter_InvalidMagic_Footer(t *testing.T) {
 
 func TestFooter_InvalidLength(t *testing.T) {
 	sr := SegmentRecord{
-		Records:   []BlobRecord{{Hash: 123, Pos: 0, Size: 456, Checksum: 789}},
+		Records:   []BlobRecord{{Hash: 123, Pos: 0, Size: 456, Flags: 789}},
 		SegmentID: 0,
 		CTime:     time.Now(),
 	}
@@ -154,7 +154,7 @@ func TestFooter_InvalidLength(t *testing.T) {
 
 func TestFooter_ChecksumMismatch(t *testing.T) {
 	sr := SegmentRecord{
-		Records:   []BlobRecord{{Hash: 123, Pos: 0, Size: 456, Checksum: 789}},
+		Records:   []BlobRecord{{Hash: 123, Pos: 0, Size: 456, Flags: 789}},
 		SegmentID: 0,
 		CTime:     time.Now(),
 	}
@@ -173,8 +173,8 @@ func TestFooter_ChecksumMismatch(t *testing.T) {
 func TestFooter_CorruptRecordData(t *testing.T) {
 	sr := SegmentRecord{
 		Records: []BlobRecord{
-			{Hash: 0x1111111111111111, Pos: 0, Size: 100, Checksum: 0xAAAAAAAA},
-			{Hash: 0x2222222222222222, Pos: 100, Size: 200, Checksum: 0xBBBBBBBB},
+			{Hash: 0x1111111111111111, Pos: 0, Size: 100, Flags: 0xAAAAAAAA},
+			{Hash: 0x2222222222222222, Pos: 100, Size: 200, Flags: 0xBBBBBBBB},
 		},
 		SegmentID: 1,
 		CTime:     time.Now(),
@@ -202,9 +202,9 @@ func TestFooter_RoundTrip_LargeValues(t *testing.T) {
 	// Test with large hash/size values
 	sr := SegmentRecord{
 		Records: []BlobRecord{
-			{Hash: 0xFFFFFFFFFFFFFFFF, Pos: 0, Size: 0x7FFFFFFFFFFFFFFF, Checksum: 0xFFFFFFFF},
-			{Hash: 0x0000000000000000, Pos: 1000, Size: 0x0000000000000000, Checksum: 0x00000000},
-			{Hash: 0x7FFFFFFFFFFFFFFF, Pos: 2000, Size: 0x7FFFFFFFFFFFFFFF, Checksum: 0x80000000},
+			{Hash: 0xFFFFFFFFFFFFFFFF, Pos: 0, Size: 0x7FFFFFFFFFFFFFFF, Flags: 0xFFFFFFFF},
+			{Hash: 0x0000000000000000, Pos: 1000, Size: 0x0000000000000000, Flags: 0x00000000},
+			{Hash: 0x7FFFFFFFFFFFFFFF, Pos: 2000, Size: 0x7FFFFFFFFFFFFFFF, Flags: 0x80000000},
 		},
 		SegmentID: 1,
 		CTime:     time.Unix(2147483647, 0), // Max 32-bit timestamp
@@ -229,10 +229,10 @@ func TestFooter_RoundTrip_LargeValues(t *testing.T) {
 
 func TestBlobRecord_Encode(t *testing.T) {
 	rec := BlobRecord{
-		Hash:     0x1122334455667788,
-		Pos:      1024,
-		Size:     2048,
-		Checksum: 0xAABBCCDD,
+		Hash:  0x1122334455667788,
+		Pos:   1024,
+		Size:  2048,
+		Flags: 0xAABBCCDD,
 	}
 
 	buf := AppendBlobRecord(nil, rec)
@@ -252,9 +252,9 @@ func TestBlobRecord_TooSmall(t *testing.T) {
 
 func TestBlobRecord_RoundTrip(t *testing.T) {
 	records := []BlobRecord{
-		{Hash: 1, Pos: 0, Size: 100, Checksum: 0x11111111},
-		{Hash: 2, Pos: 100, Size: 200, Checksum: 0x22222222},
-		{Hash: 3, Pos: 300, Size: 300, Checksum: 0x33333333},
+		{Hash: 1, Pos: 0, Size: 100, Flags: 0x11111111},
+		{Hash: 2, Pos: 100, Size: 200, Flags: 0x22222222},
+		{Hash: 3, Pos: 300, Size: 300, Flags: 0x33333333},
 	}
 
 	// Encode all
@@ -277,9 +277,9 @@ func TestBlobRecord_RoundTrip(t *testing.T) {
 func TestSegmentRecord_RoundTrip(t *testing.T) {
 	sr := SegmentRecord{
 		Records: []BlobRecord{
-			{Hash: 0x1111111111111111, Pos: 0, Size: 1000, Checksum: 0xAAAAAAAA},
-			{Hash: 0x2222222222222222, Pos: 1000, Size: 2000, Checksum: 0xBBBBBBBB},
-			{Hash: 0x3333333333333333, Pos: 3000, Size: 3000, Checksum: 0xCCCCCCCC},
+			{Hash: 0x1111111111111111, Pos: 0, Size: 1000, Flags: 0xAAAAAAAA},
+			{Hash: 0x2222222222222222, Pos: 1000, Size: 2000, Flags: 0xBBBBBBBB},
+			{Hash: 0x3333333333333333, Pos: 3000, Size: 3000, Flags: 0xCCCCCCCC},
 		},
 		SegmentID: 1,
 		CTime:     time.Unix(1234567890, 0),
@@ -340,7 +340,7 @@ func TestSegmentRecord_InvalidRecordCount(t *testing.T) {
 
 func TestSegmentFooter_DecodeValid(t *testing.T) {
 	sr := SegmentRecord{
-		Records:   []BlobRecord{{Hash: 123, Pos: 0, Size: 456, Checksum: 789}},
+		Records:   []BlobRecord{{Hash: 123, Pos: 0, Size: 456, Flags: 789}},
 		SegmentID: 1,
 		CTime:     time.Unix(1234567890, 0),
 	}
@@ -384,7 +384,7 @@ func TestFooter_CTimePreservation(t *testing.T) {
 	for _, ctime := range testCases {
 		sr := SegmentRecord{
 			Records: []BlobRecord{
-				{Hash: 123, Pos: 0, Size: 100, Checksum: 456},
+				{Hash: 123, Pos: 0, Size: 100, Flags: 456},
 			},
 			SegmentID: 1,
 			CTime:     ctime,

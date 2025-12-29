@@ -12,7 +12,6 @@ import (
 
 	"github.com/miretskiy/blobcache/index"
 	"github.com/miretskiy/blobcache/metadata"
-	"github.com/ncw/directio"
 )
 
 type Storage struct {
@@ -97,34 +96,22 @@ func (s *Storage) getSegmentFile(segmentID int64) (SegmentFile, error) {
 		file.Close()
 		return nil, err
 	}
+	fileSize := stat.Size()
 
-	sf := &segmentFile{
-		file:      file,
-		segmentID: segmentID,
-	}
-
-	// Validate footer if file is large enough
-	// Only set footerPos and sealed if footer is actually valid
-	if stat.Size() >= metadata.SegmentFooterSize {
-		potentialFooterPos := stat.Size() - metadata.SegmentFooterSize
-		footerBuf := make([]byte, metadata.SegmentFooterSize)
-		if _, err := file.ReadAt(footerBuf, potentialFooterPos); err == nil {
-			if _, err := metadata.DecodeSegmentFooter(footerBuf); err == nil {
-				// Valid footer found - finalized segment
-				sf.footerPos = potentialFooterPos
-				sf.sealed.Store(true)
-			}
-			// Invalid footer: partial segment, leave footerPos=0, sealed=false
+	// Try to read segment record from footer (finalized segment)
+	meta, recordEndPos, err := metadata.ReadSegmentFooterFromFile(file, fileSize, segmentID)
+	if err != nil {
+		// No valid footer - partial segment, read from bitcask
+		metaPtr, err := s.index.GetSegmentRecord(segmentID)
+		if err != nil {
+			file.Close()
+			return nil, fmt.Errorf("segment not in Index: %w", err)
 		}
+		meta = *metaPtr
+		recordEndPos = fileSize // Footer will be written at EOF on first hole punch
 	}
-	// File smaller than footer or invalid footer: partial segment, sealed=false
 
-	// Initialize stats from Index (bitcask) - source of truth
-	// Works for both finalized and partial segments
-	if err := s.initializeStatsFromIndex(sf, segmentID); err != nil {
-		file.Close()
-		return nil, err
-	}
+	sf := newSegmentFile(file, recordEndPos, meta)
 
 	// Store in cache (LoadOrStore handles race)
 	actual, _ := s.cache.LoadOrStore(segmentID, sf)
@@ -136,29 +123,7 @@ func (s *Storage) getSegmentFile(segmentID int64) (SegmentFile, error) {
 	return sf, nil
 }
 
-// initializeStatsFromIndex initializes segment stats from Index (bitcask)
-// Bitcask is the source of truth - works for finalized and partial segments
-func (s *Storage) initializeStatsFromIndex(sf *segmentFile, segmentID int64) error {
-	segmentRecord, err := s.index.GetSegmentRecord(segmentID)
-	if err != nil {
-		return err
-	}
-
-	// Compute stats from segment record
-	var totalBytes, deletedBytes int64
-	for _, rec := range segmentRecord.Records {
-		totalBytes += rec.Size
-		if rec.IsDeleted() {
-			deletedBytes += rec.Size
-		}
-	}
-
-	sf.totalBytes.Store(totalBytes)
-	sf.deletedBytes.Store(deletedBytes)
-	return nil
-}
-
-// HolePunchBlob deallocates space for a deleted blob within a segment file
+// tryReadFooterFromFile attempts to read and validate segment record from file footer
 func (s *Storage) HolePunchBlob(segmentID int64, offset, size int64) error {
 	sf, err := s.getSegmentFile(segmentID)
 	if err != nil {
@@ -206,13 +171,7 @@ func (w *SegmentWriter) openNewSegment() error {
 	segmentPath := getSegmentPath(w.Path, w.Shards, w.currentID)
 
 	// Open with O_RDWR (not O_APPEND) to support both writing and hole punching
-	var file *os.File
-	var err error
-	if w.IO.DirectIO {
-		file, err = directio.OpenFile(segmentPath, os.O_CREATE|os.O_RDWR, 0o644)
-	} else {
-		file, err = os.OpenFile(segmentPath, os.O_CREATE|os.O_RDWR, 0o644)
-	}
+	file, err := os.OpenFile(segmentPath, os.O_CREATE|os.O_RDWR, 0o644)
 
 	if err != nil {
 		return err
@@ -229,7 +188,11 @@ func (w *SegmentWriter) openNewSegment() error {
 	}
 
 	// Create SegmentFile and register in Storage cache
-	sf := newSegmentFile(file, w.currentID)
+	// New segment: footerPos=0 (not written yet), empty meta
+	sf := newSegmentFile(file, 0, metadata.SegmentRecord{
+		SegmentID: w.currentID,
+		CTime:     time.Now(),
+	})
 	w.storage.cache.Store(w.currentID, sf)
 	w.currentSegment = sf
 
@@ -244,10 +207,7 @@ func (w *SegmentWriter) closeCurrentSegment() error {
 		return nil
 	}
 
-	// Get live records (filters out deleted blobs)
 	liveRecords := w.currentSegment.getLiveRecords()
-
-	// Write footer with live records only
 	if len(liveRecords) > 0 {
 		footerStartPos := w.currentPos
 		footerBytes := metadata.AppendSegmentRecordWithFooter(nil,
@@ -258,13 +218,7 @@ func (w *SegmentWriter) closeCurrentSegment() error {
 				IndexKey:  nil,
 			})
 
-		var err error
-		if w.IO.DirectIO {
-			err = w.writeDirectIO(footerBytes)
-		} else {
-			err = w.writeBufferred(footerBytes)
-		}
-		if err != nil {
+		if err := w.writeBufferred(footerBytes); err != nil {
 			return fmt.Errorf("failed to write footer: %w", err)
 		}
 
@@ -301,9 +255,6 @@ func (w *SegmentWriter) Write(key Key, value []byte, checksum uint64) error {
 	}
 	w.currentSegment.addRecord(rec)
 
-	if w.IO.DirectIO {
-		return w.writeDirectIO(value)
-	}
 	return w.writeBufferred(value)
 }
 
@@ -336,33 +287,5 @@ func (w *SegmentWriter) writeBufferred(value []byte) error {
 			return fmt.Errorf("failed to fdatasync after write: %w", err)
 		}
 	}
-	return nil
-}
-
-func (w *SegmentWriter) writeDirectIO(value []byte) error {
-	// Each blob is padded individually (no cross-blob leftover)
-	// This wastes space but keeps blob addressing simple
-	w.lastWritePos = w.currentPos
-
-	// Pad value to block size
-	const mask = directio.BlockSize - 1
-	paddedSize := (len(value) + mask) &^ mask
-
-	var buf []byte
-	if len(value) == paddedSize && isAligned(value) {
-		// Already padded and aligned (fast path)
-		buf = value
-	} else {
-		// Allocate aligned+padded buffer
-		buf = directio.AlignedBlock(paddedSize)
-		copy(buf, value)
-	}
-
-	n, err := w.currentSegment.WriteAt(buf, w.currentPos)
-	if err != nil {
-		return err
-	}
-	w.currentPos += int64(n)
-	// DirectIO doesn't need fdatasync (bypasses OS cache, writes directly to disk)
 	return nil
 }

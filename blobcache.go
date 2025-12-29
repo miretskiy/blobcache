@@ -88,7 +88,7 @@ func New(path string, opts ...Option) (*Cache, error) {
 		return nil, fmt.Errorf("initialization failed: %w", err)
 	}
 
-	// Create new bloom filter and figure out how much data on disk from segment records.
+	// Create new bloom filter and figure out how much data on disk from segment meta.
 	// Skip deleted blobs when building bloom filter
 	var totalSize int64
 	filter := bloom.New(uint(cfg.BloomEstimatedKeys), cfg.BloomFPRate)

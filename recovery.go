@@ -99,7 +99,7 @@ func RecoverIndex(path string, opts ...Option) (*Cache, error) {
 				continue
 			}
 
-			// Add valid segment records to recovery index
+			// Add valid segment meta to recovery index
 			// Skip deleted blobs (marked with Deleted flag)
 			var kvs []index.KeyValue
 			for _, rec := range segment.Records {
@@ -197,70 +197,13 @@ func readSegmentFooter(path string, segmentID int64) (metadata.SegmentRecord, er
 	}
 	defer file.Close()
 
-	// Get file size
 	stat, err := file.Stat()
 	if err != nil {
 		return metadata.SegmentRecord{}, err
 	}
-	fileSize := stat.Size()
 
-	// File must be at least large enough for a footer
-	if fileSize < metadata.SegmentFooterSize {
-		return metadata.SegmentRecord{}, fmt.Errorf("file too small for footer: %d bytes", fileSize)
-	}
-
-	// Read footer from end of file
-	footerBuf := make([]byte, metadata.SegmentFooterSize)
-	footerPos := fileSize - metadata.SegmentFooterSize
-	if _, err := file.ReadAt(footerBuf, footerPos); err != nil {
-		return metadata.SegmentRecord{}, fmt.Errorf("failed to read footer: %w", err)
-	}
-
-	// Parse and validate footer
-	footer, err := metadata.DecodeSegmentFooter(footerBuf)
-	if err != nil {
-		return metadata.SegmentRecord{}, fmt.Errorf("invalid footer: %w", err)
-	}
-
-	// Validate segment record length
-	if footer.Len <= 0 || footer.Len > fileSize-metadata.SegmentFooterSize {
-		return metadata.SegmentRecord{}, fmt.Errorf("invalid segment record length: %d", footer.Len)
-	}
-
-	// Read segment record
-	segmentRecordPos := footerPos - footer.Len
-	if segmentRecordPos < 0 {
-		return metadata.SegmentRecord{}, fmt.Errorf("segment record position negative: %d", segmentRecordPos)
-	}
-
-	segmentRecordBuf := make([]byte, footer.Len)
-	if _, err := file.ReadAt(segmentRecordBuf, segmentRecordPos); err != nil {
-		return metadata.SegmentRecord{}, fmt.Errorf("failed to read segment record: %w", err)
-	}
-
-	// Decode and validate segment record with checksum
-	segment, err := metadata.DecodeSegmentRecordWithChecksum(segmentRecordBuf, footer.Checksum)
-	if err != nil {
-		return metadata.SegmentRecord{}, fmt.Errorf("segment record validation failed: %w", err)
-	}
-
-	// Validate segment ID matches filename
-	if segment.SegmentID != segmentID {
-		return metadata.SegmentRecord{}, fmt.Errorf("segment ID mismatch: file=%d, record=%d", segmentID, segment.SegmentID)
-	}
-
-	// Validate all blob records reference positions within the segment
-	dataEnd := segmentRecordPos
-	for _, rec := range segment.Records {
-		if rec.Pos < 0 || rec.Pos >= dataEnd {
-			return metadata.SegmentRecord{}, fmt.Errorf("blob at invalid position: %d (segment data ends at %d)", rec.Pos, dataEnd)
-		}
-		if rec.Size <= 0 || rec.Pos+rec.Size > dataEnd {
-			return metadata.SegmentRecord{}, fmt.Errorf("blob extends beyond segment: pos=%d size=%d end=%d", rec.Pos, rec.Size, dataEnd)
-		}
-	}
-
-	return segment, nil
+	segment, _, err := metadata.ReadSegmentFooterFromFile(file, stat.Size(), segmentID)
+	return segment, err
 }
 
 // extractSegmentID extracts the segment ID from a filename like "123456.seg"

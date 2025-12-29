@@ -22,7 +22,7 @@ func TestSegmentFile_PunchHoleActive(t *testing.T) {
 	file, err := os.OpenFile(segPath, os.O_CREATE|os.O_RDWR, 0644)
 	require.NoError(t, err)
 
-	sf := newSegmentFile(file, 1)
+	sf := newSegmentFile(file, 0, metadata.SegmentRecord{SegmentID: 1})
 
 	// Write 3 blobs
 	blob1 := make([]byte, directio.BlockSize)
@@ -53,7 +53,7 @@ func TestSegmentFile_PunchHoleActive(t *testing.T) {
 
 	// Verify blob2 is marked deleted
 	allRecords := sf.getLiveRecords()
-	require.Equal(t, 3, len(allRecords), "should have 3 total records")
+	require.Equal(t, 3, len(allRecords), "should have 3 total meta")
 
 	// Verify deletion flags
 	require.False(t, allRecords[0].IsDeleted(), "blob1 should not be deleted")
@@ -115,12 +115,7 @@ func TestSegmentFile_PunchHoleSealed(t *testing.T) {
 	file, err = os.OpenFile(segPath, os.O_RDWR, 0644)
 	require.NoError(t, err)
 
-	sf := &segmentFile{
-		file:      file,
-		segmentID: 1,
-		footerPos: footerPos,
-	}
-	sf.sealed.Store(true)
+	sf := newSegmentFile(file, footerPos, segment)
 
 	// Punch hole in blob2
 	// Note: Footer rewrite logic is complex, just verify no error for now
@@ -138,8 +133,8 @@ func TestSegmentFile_SealedRejectsWrites(t *testing.T) {
 	file, err := os.Create(segPath)
 	require.NoError(t, err)
 
-	sf := newSegmentFile(file, 1)
-	sf.seal(0) // Mark as sealed
+	sf := newSegmentFile(file, 1, metadata.SegmentRecord{SegmentID: 1})
+	sf.seal(1) // Mark as sealed
 
 	// Attempt to write should fail
 	_, err = sf.WriteAt([]byte("data"), 0)
@@ -205,6 +200,74 @@ func TestSegmentFile_PartialSegment(t *testing.T) {
 	} else {
 		require.Equal(t, []byte("value1"), data, "data should be intact")
 	}
+
+	// Now trigger eviction to punch a hole in the partial segment
+	// This is the critical test - PunchHole should write footer at EOF, not offset 0!
+	cache2.Put([]byte("key2"), make([]byte, 10<<20)) // Large blob to trigger eviction
+	cache2.Drain()
+
+	// Start eviction worker to process the eviction
+	_, err = cache2.Start()
+	require.NoError(t, err)
+
+	// Wait for eviction
+	time.Sleep(200 * time.Millisecond)
+
+	// Verify data is still intact (footer not written at offset 0)
+	reader2, found2 := cache2.Get([]byte("key1"))
+	if found2 {
+		data2, _ := io.ReadAll(reader2)
+		require.Equal(t, []byte("value1"), data2, "BUG: footer overwrote data at offset 0!")
+	}
+}
+
+// TestSegmentFile_PunchHolePartial tests punching hole in partial segment (no footer)
+func TestSegmentFile_PunchHolePartial(t *testing.T) {
+	tmpDir := t.TempDir()
+	segPath := filepath.Join(tmpDir, "partial.seg")
+
+	// Create segment with data but no footer (partial)
+	file, err := os.OpenFile(segPath, os.O_CREATE|os.O_RDWR, 0644)
+	require.NoError(t, err)
+
+	// Write one blob
+	blobSize := directio.BlockSize
+	blob := make([]byte, blobSize)
+	for i := range blob {
+		blob[i] = byte(i % 256)
+	}
+	_, err = file.WriteAt(blob, 0)
+	require.NoError(t, err)
+
+	// Create segmentFile as partial (footerPos = EOF, not 0!)
+	meta := metadata.SegmentRecord{
+		SegmentID: 1,
+		CTime:     time.Now(),
+		Records: []metadata.BlobRecord{
+			{Hash: 123, Pos: 0, Size: int64(blobSize)},
+		},
+	}
+	sf := newSegmentFile(file, int64(blobSize), meta) // footerPos = EOF
+
+	// Punch hole - should write footer at EOF (blobSize), not offset 0
+	err = sf.PunchHole(0, int64(blobSize))
+	require.NoError(t, err, "hole punch should succeed")
+
+	// Verify footer was written at correct position (blobSize)
+	// Read footer from EOF
+	stat, err := file.Stat()
+	require.NoError(t, err)
+
+	// Footer should be at end of file now
+	footerBuf := make([]byte, metadata.SegmentFooterSize)
+	_, err = file.ReadAt(footerBuf, stat.Size()-metadata.SegmentFooterSize)
+	require.NoError(t, err)
+
+	footer, err := metadata.DecodeSegmentFooter(footerBuf)
+	require.NoError(t, err, "should have valid footer at EOF")
+	require.Greater(t, footer.Len, int64(0), "footer should have segment record")
+
+	sf.Close()
 }
 
 // TestSegmentFile_EmptySegmentFile tests 0-byte segment file

@@ -9,7 +9,6 @@ import (
 
 // IOConfig holds I/O strategy settings
 type IOConfig struct {
-	DirectIO  bool // Use O_DIRECT (bypass OS cache)
 	FDataSync bool // Use fdatasync for durability
 }
 
@@ -137,15 +136,6 @@ func WithVerifyOnRead(enabled bool) Option {
 func WithSegmentSize(size int64) Option {
 	return funcOpt(func(c *config) {
 		c.SegmentSize = size
-	})
-}
-
-// WithDirectIOWrites enables DirectIO for writes (default: false)
-// DirectIO uses aligned writes with padding, then truncates to actual size
-// Provides better sustained throughput for large workloads by bypassing OS cache
-func WithDirectIOWrites() Option {
-	return funcOpt(func(c *config) {
-		c.IO.DirectIO = true
 	})
 }
 

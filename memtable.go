@@ -233,7 +233,7 @@ func (mt *MemTable) flushWorker() {
 }
 
 func (mt *MemTable) flushMemFile(mf *memFile, writer BlobWriter) error {
-	// Phase 1: Write all blob files and collect records for index
+	// Phase 1: Write all blob files and collect meta for index
 	var records []index.KeyValue
 	var writeErr error
 

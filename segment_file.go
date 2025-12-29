@@ -24,8 +24,8 @@ type segmentFile struct {
 	mu     sync.Mutex
 	sealed atomic.Bool // True after footer written
 
-	// For active segments: track records (deletion tracked via Deleted flag)
-	records []metadata.BlobRecord
+	// For active segments: track meta (deletion tracked via Deleted flag)
+	meta metadata.SegmentRecord
 
 	// Segment statistics
 	totalBytes   atomic.Int64 // Total bytes (sum of all blob sizes, grows during writes)
@@ -33,15 +33,32 @@ type segmentFile struct {
 
 	// For sealed segments: track footer position for rewrites
 	footerPos int64
-	segmentID int64
 }
 
-// newSegmentFile creates a SegmentFile from an os.File
-func newSegmentFile(f *os.File, segmentID int64) *segmentFile {
-	return &segmentFile{
+// newSegmentFile creates a SegmentFile with explicit parameters
+// footerPos: offset where footer is/will be written (0 for new/partial, >0 for finalized)
+// meta: segment record (from footer or bitcask)
+func newSegmentFile(f *os.File, footerPos int64, meta metadata.SegmentRecord) *segmentFile {
+	sf := &segmentFile{
 		file:      f,
-		segmentID: segmentID,
+		footerPos: footerPos,
+		meta:      meta,
 	}
+
+	// Initialize stats from meta
+	var totalBytes, deletedBytes int64
+	for _, rec := range meta.Records {
+		totalBytes += rec.Size
+		if rec.IsDeleted() {
+			deletedBytes += rec.Size
+		}
+	}
+	sf.totalBytes.Store(totalBytes)
+	sf.deletedBytes.Store(deletedBytes)
+
+	sf.sealed.Store(footerPos > 0)
+
+	return sf
 }
 
 // ReadAt implements io.ReaderAt
@@ -67,58 +84,11 @@ func (s *segmentFile) PunchHole(offset, length int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.sealed.Load() {
-		return s.punchHoleSealed(offset, length)
-	}
-	return s.punchHoleActive(offset, length)
-}
-
-// punchHoleActive marks a blob as deleted in active segment
-// Sets Deleted flag which persists to footer
-func (s *segmentFile) punchHoleActive(offset, length int64) error {
-	// Find and mark record as deleted
-	for i := range s.records {
-		if s.records[i].Pos == offset && s.records[i].Size == length {
-			s.records[i].SetDeleted()
-			s.deletedBytes.Add(length)
-			break
-		}
-	}
-
-	// Punch the hole in the file
-	return PunchHole(s.file, offset, length)
-}
-
-// punchHoleSealed marks blob as deleted and rewrites footer
-func (s *segmentFile) punchHoleSealed(offset, length int64) error {
-	// Read current footer
-	footerBuf := make([]byte, metadata.SegmentFooterSize)
-	if _, err := s.file.ReadAt(footerBuf, s.footerPos); err != nil {
-		return fmt.Errorf("failed to read footer: %w", err)
-	}
-
-	footer, err := metadata.DecodeSegmentFooter(footerBuf)
-	if err != nil {
-		return fmt.Errorf("invalid footer: %w", err)
-	}
-
-	// Read segment record
-	segmentRecordBuf := make([]byte, footer.Len)
-	segmentRecordPos := s.footerPos - footer.Len
-	if _, err := s.file.ReadAt(segmentRecordBuf, segmentRecordPos); err != nil {
-		return fmt.Errorf("failed to read segment record: %w", err)
-	}
-
-	segment, err := metadata.DecodeSegmentRecordWithChecksum(segmentRecordBuf, footer.Checksum)
-	if err != nil {
-		return fmt.Errorf("segment record validation failed: %w", err)
-	}
-
-	// Mark the blob as deleted
+	// Find and mark blob as deleted
 	found := false
-	for i := range segment.Records {
-		if segment.Records[i].Pos == offset && segment.Records[i].Size == length {
-			segment.Records[i].SetDeleted()
+	for i := range s.meta.Records {
+		if s.meta.Records[i].Pos == offset && s.meta.Records[i].Size == length {
+			s.meta.Records[i].SetDeleted()
 			s.deletedBytes.Add(length)
 			found = true
 			break
@@ -126,13 +96,15 @@ func (s *segmentFile) punchHoleSealed(offset, length int64) error {
 	}
 
 	if !found {
-		return fmt.Errorf("blob not found in footer at offset=%d size=%d", offset, length)
+		return fmt.Errorf("blob not found at offset=%d size=%d", offset, length)
 	}
 
-	// Rewrite footer with updated record (includes Deleted flag)
-	newFooterBytes := metadata.AppendSegmentRecordWithFooter(nil, segment)
-	if _, err := s.file.WriteAt(newFooterBytes, segmentRecordPos); err != nil {
-		return fmt.Errorf("failed to rewrite footer: %w", err)
+	// Write footer if sealed (active segments write footer on close)
+	if s.sealed.Load() {
+		footerBytes := metadata.AppendSegmentRecordWithFooter(nil, s.meta)
+		if _, err := s.file.WriteAt(footerBytes, s.footerPos); err != nil {
+			return fmt.Errorf("failed to write footer: %w", err)
+		}
 	}
 
 	// Punch the hole in the file
@@ -143,11 +115,11 @@ func (s *segmentFile) punchHoleSealed(offset, length int64) error {
 func (s *segmentFile) addRecord(rec metadata.BlobRecord) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.records = append(s.records, rec)
+	s.meta.Records = append(s.meta.Records, rec)
 	s.totalBytes.Add(rec.Size)
 }
 
-// seal marks the segment as finalized and records footer position
+// seal marks the segment as finalized and meta footer position
 func (s *segmentFile) seal(footerPos int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -155,12 +127,12 @@ func (s *segmentFile) seal(footerPos int64) {
 	s.sealed.Store(true)
 }
 
-// getLiveRecords returns all records (including deleted ones with Deleted flag set)
+// getLiveRecords returns all meta (including deleted ones with Deleted flag set)
 // Deleted blobs are included in footer with flag - allows recovery and stats rebuild
 func (s *segmentFile) getLiveRecords() []metadata.BlobRecord {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.records
+	return s.meta.Records
 }
 
 // LiveBytes returns bytes of live (non-deleted) blobs

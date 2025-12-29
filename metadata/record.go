@@ -188,3 +188,71 @@ func DecodeSegmentRecordWithChecksum(buf []byte, expectedChecksum uint32) (Segme
 
 	return DecodeSegmentRecord(buf)
 }
+
+// ReadSegmentFooterFromFile reads and validates segment footer and record from file
+// Returns (record, recordEndPos, nil) on success, where recordEndPos is the offset
+// where blob records end and segment metadata begins.
+// This is the write position for AppendSegmentRecordWithFooter when updating footer.
+//
+// File structure: [Blob data...][SegmentRecord][Footer]
+//
+//	^recordEndPos
+//
+// Validates: footer magic, checksum, segment ID, blob positions
+func ReadSegmentFooterFromFile(file interface {
+	ReadAt([]byte, int64) (int, error)
+}, fileSize int64, segmentID int64) (SegmentRecord, int64, error) {
+	if fileSize < SegmentFooterSize {
+		return SegmentRecord{}, 0, fmt.Errorf("file too small for footer: %d bytes", fileSize)
+	}
+
+	// Read footer
+	footerBuf := make([]byte, SegmentFooterSize)
+	footerPos := fileSize - SegmentFooterSize
+	if _, err := file.ReadAt(footerBuf, footerPos); err != nil {
+		return SegmentRecord{}, 0, fmt.Errorf("failed to read footer: %w", err)
+	}
+
+	footer, err := DecodeSegmentFooter(footerBuf)
+	if err != nil {
+		return SegmentRecord{}, 0, fmt.Errorf("invalid footer: %w", err)
+	}
+
+	// Validate segment record length
+	if footer.Len <= 0 || footer.Len > footerPos {
+		return SegmentRecord{}, 0, fmt.Errorf("invalid segment record length: %d", footer.Len)
+	}
+
+	// Read segment record
+	recordEndPos := footerPos - footer.Len
+	if recordEndPos < 0 {
+		return SegmentRecord{}, 0, fmt.Errorf("record end position negative: %d", recordEndPos)
+	}
+
+	segmentRecordBuf := make([]byte, footer.Len)
+	if _, err := file.ReadAt(segmentRecordBuf, recordEndPos); err != nil {
+		return SegmentRecord{}, 0, fmt.Errorf("failed to read segment record: %w", err)
+	}
+
+	segment, err := DecodeSegmentRecordWithChecksum(segmentRecordBuf, footer.Checksum)
+	if err != nil {
+		return SegmentRecord{}, 0, fmt.Errorf("segment record validation failed: %w", err)
+	}
+
+	// Validate segment ID
+	if segment.SegmentID != segmentID {
+		return SegmentRecord{}, 0, fmt.Errorf("segment ID mismatch: expected=%d, actual=%d", segmentID, segment.SegmentID)
+	}
+
+	// Validate blob positions
+	for _, rec := range segment.Records {
+		if rec.Pos < 0 || rec.Pos >= recordEndPos {
+			return SegmentRecord{}, 0, fmt.Errorf("blob at invalid position: %d (records end at %d)", rec.Pos, recordEndPos)
+		}
+		if rec.Size <= 0 || rec.Pos+rec.Size > recordEndPos {
+			return SegmentRecord{}, 0, fmt.Errorf("blob extends beyond records: pos=%d size=%d end=%d", rec.Pos, rec.Size, recordEndPos)
+		}
+	}
+
+	return segment, recordEndPos, nil
+}

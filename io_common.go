@@ -4,6 +4,15 @@ import "github.com/ncw/directio"
 
 const mask = directio.BlockSize - 1
 
+type FadviseHint int
+
+const (
+	FadvSequential FadviseHint = iota
+	FadvDontNeed
+)
+
+type Offset_t int64
+
 // alignForHolePunch aligns offset and length to filesystem block boundaries
 // Returns (alignedOffset, alignedLength, canPunch)
 // canPunch is false if there are no complete blocks to punch

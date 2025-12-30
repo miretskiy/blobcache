@@ -9,7 +9,9 @@ import (
 
 // IOConfig holds I/O strategy settings
 type IOConfig struct {
-	FDataSync bool // Use fdatasync for durability
+	FDataSync          bool // Use fdatasync for durability
+	Fadvise            bool // Use fadvise to provide data access hints to the kernel.
+	PageCacheRetention int  // How many memtables to keep resident in the OS page cache
 }
 
 // ResilienceConfig holds data integrity settings
@@ -199,6 +201,24 @@ func WithFlushConcurrency(n int) Option {
 	})
 }
 
+// WithFadvise allows enabling/disabling kernel page cache hints (default: true).
+func WithFadvise(enabled bool) Option {
+	return funcOpt(func(c *config) {
+		c.IO.Fadvise = enabled
+	})
+}
+
+// WithPageCacheRetention sets how many memtables to keep resident in the OS
+// page cache before advising the kernel to drop the memory (default: 3).
+func WithPageCacheRetention(n int) Option {
+	return funcOpt(func(c *config) {
+		if n < 0 {
+			n = 0
+		}
+		c.IO.PageCacheRetention = n
+	})
+}
+
 // defaultConfig returns sensible defaults (path set by caller)
 func defaultConfig(path string) config {
 	return config{
@@ -212,5 +232,6 @@ func defaultConfig(path string) config {
 		FlushConcurrency:   6,                 // same as MaxInflightBatches
 		BloomFPRate:        0.01,              // 1% FP rate
 		BloomEstimatedKeys: 1_000_000,         // 1M keys → ~1.2 MB bloom
+		IO:                 defaultIOConfig,
 	}
 }

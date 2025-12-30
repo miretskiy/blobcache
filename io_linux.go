@@ -12,6 +12,12 @@ import (
 	"github.com/ncw/directio"
 )
 
+var defaultIOConfig = IOConfig{
+	FDataSync:          false,
+	Fadvise:            true,
+	PageCacheRetention: 3,
+}
+
 // fdatasync syncs file data to disk without syncing metadata
 // Uses fdatasync(2) on Linux for better performance than fsync
 func fdatasync(f *os.File) error {
@@ -46,4 +52,23 @@ func PunchHole(f *os.File, offset, length int64) error {
 
 	// Fallocate(fd, mode, offset, length)
 	return unix.Fallocate(int(f.Fd()), mode, alignedOffset, alignedLength)
+}
+
+// Fadvise maps the internal FadviseHint to Linux-specific posix_fadvise constants.
+func Fadvise(fd uintptr, offset Offset_t, length int64, hint FadviseHint) error {
+	var linuxHint int
+	switch hint {
+	case FadvSequential:
+		linuxHint = syscall.POSIX_FADV_SEQUENTIAL
+	case FadvDontNeed:
+		// On Linux, we use DONTNEED.
+		// If you want to be extra aggressive, you can also call NOREUSE,
+		// but DONTNEED is the standard for releasing Page Cache.
+		linuxHint = syscall.POSIX_FADV_DONTNEED
+	default:
+		return nil
+	}
+
+	// Signature: fd, offset, length, advice
+	return syscall.PosixFadvise(int(fd), offset, length, linuxHint)
 }

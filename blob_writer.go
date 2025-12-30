@@ -21,4 +21,7 @@ type BlobWriter interface {
 	// Pos returns the current write position (for index tracking)
 	// Called after Write() to get position for the last written blob
 	Pos() WritePosition
+
+	// Fd returns segment file descriptor.
+	Fd() uintptr
 }

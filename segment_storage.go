@@ -43,8 +43,8 @@ func (s *Storage) Close() error {
 }
 
 // Get reads a blob from a segment file at the specified position
-func (r *Storage) Get(key Key) (io.Reader, bool) {
-	record, err := r.index.Get(key)
+func (s *Storage) Get(key Key) (io.Reader, bool) {
+	record, err := s.index.Get(key)
 	if err != nil {
 		return nil, false
 	}
@@ -52,18 +52,25 @@ func (r *Storage) Get(key Key) (io.Reader, bool) {
 	// Mark as visited for Sieve eviction algorithm (lock-free)
 	record.MarkVisited(true)
 
-	sf, err := r.getSegmentFile(record.SegmentID)
+	sf, err := s.getSegmentFile(record.SegmentID)
 	if err != nil {
 		return nil, false
+	}
+
+	// 2. Give the kernel a "head start"
+	if s.IO.Fadvise {
+		// FadvSequential tells the kernel: "We are going to read
+		// this whole range, so start prefetching it now."
+		_ = Fadvise(sf.file.Fd(), Offset_t(record.Pos), record.Size, FadvSequential)
 	}
 
 	// Use SectionReader for lazy reading (reads only when caller reads)
 	reader := io.NewSectionReader(sf, record.Pos, record.Size)
 
 	// Wrap with checksum verification if enabled
-	if r.Resilience.VerifyOnRead && r.Resilience.ChecksumHasher != nil &&
+	if s.Resilience.VerifyOnRead && s.Resilience.ChecksumHasher != nil &&
 		record.Checksum != metadata.InvalidChecksum {
-		return newChecksumVerifyingReader(reader, r.Resilience.ChecksumHasher, uint32(record.Checksum)), true
+		return newChecksumVerifyingReader(reader, s.Resilience.ChecksumHasher, uint32(record.Checksum)), true
 	}
 
 	return reader, true
@@ -79,10 +86,10 @@ func getSegmentPath(basePath string, numShards int, segmentID int64) string {
 }
 
 // getSegmentFile returns cached SegmentFile or opens it
-func (s *Storage) getSegmentFile(segmentID int64) (SegmentFile, error) {
+func (s *Storage) getSegmentFile(segmentID int64) (*segmentFile, error) {
 	// Check cache
 	if cached, ok := s.cache.Load(segmentID); ok {
-		return cached.(SegmentFile), nil
+		return cached.(*segmentFile), nil
 	}
 
 	segmentPath := getSegmentPath(s.Path, s.Shards, segmentID)
@@ -117,7 +124,7 @@ func (s *Storage) getSegmentFile(segmentID int64) (SegmentFile, error) {
 	actual, _ := s.cache.LoadOrStore(segmentID, sf)
 	if actual != sf {
 		sf.Close()
-		return actual.(SegmentFile), nil
+		return actual.(*segmentFile), nil
 	}
 
 	return sf, nil
@@ -232,6 +239,10 @@ func (w *SegmentWriter) closeCurrentSegment() error {
 		}
 	}
 
+	if w.IO.Fadvise {
+		_ = Fadvise(w.currentSegment.file.Fd(), 0, 0, FadvDontNeed)
+	}
+
 	// Don't close file - it stays registered in Storage cache
 	w.currentSegment = nil
 	return nil
@@ -264,6 +275,10 @@ func (w *SegmentWriter) Pos() WritePosition {
 		SegmentID: w.currentID,
 		Pos:       w.lastWritePos,
 	}
+}
+
+func (w *SegmentWriter) Fd() uintptr {
+	return w.currentSegment.file.Fd()
 }
 
 // Close finalizes and closes the current segment

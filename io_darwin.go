@@ -10,6 +10,12 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+var defaultIOConfig = IOConfig{
+	FDataSync:          false,
+	Fadvise:            false,
+	PageCacheRetention: 0,
+}
+
 // fdatasync syncs file data to disk
 // Darwin doesn't have fdatasync, so we use F_FULLFSYNC which ensures
 // data reaches physical disk (not just drive cache)
@@ -85,7 +91,7 @@ func PunchHole(f *os.File, offset, length int64) error {
 	}
 
 	_, _, errno := syscall.Syscall(
-		unix.SYS_FCNTL,
+		syscall.SYS_FCNTL,
 		f.Fd(),
 		uintptr(unix.F_PUNCHHOLE),
 		uintptr(unsafe.Pointer(&ph)),
@@ -95,4 +101,27 @@ func PunchHole(f *os.File, offset, length int64) error {
 		return errno
 	}
 	return nil
+}
+
+// Fadvise on darwin is less flexible than linux in that it's a global, file descriptor
+// based operation.  But we keep the same signature as linux (ignoring offset and the length).
+func Fadvise(fd uintptr, offset Offset_t, length int64, hint FadviseHint) error {
+	switch hint {
+	case FadvDontNeed:
+		// F_NOCACHE: 1 turns off, 0 turns on
+		_, _, errno := syscall.Syscall(syscall.SYS_FCNTL, fd, uintptr(syscall.F_NOCACHE), 1)
+		if errno != 0 {
+			return errno
+		}
+		return nil
+	case FadvSequential:
+		// F_RDAHEAD turns on/off the read-ahead engine.
+		_, _, errno := syscall.Syscall(syscall.SYS_FCNTL, fd, uintptr(syscall.F_RDAHEAD), 1)
+		if errno != 0 {
+			return errno
+		}
+		return nil
+	default:
+		return nil // Unsupported hints are ignored on Darwin
+	}
 }

@@ -233,6 +233,14 @@ func (mt *MemTable) flushWorker() {
 }
 
 func (mt *MemTable) flushMemFile(mf *memFile, writer BlobWriter) error {
+	if mt.IO.Fadvise && mt.IO.PageCacheRetention > 0 {
+		pos := writer.Pos()
+		endPos := max(0, pos.Pos-mt.WriteBufferSize*int64(mt.IO.PageCacheRetention))
+		if endPos > 0 {
+			_ = Fadvise(writer.Fd(), 0, endPos, FadvDontNeed)
+		}
+	}
+
 	// Phase 1: Write all blob files and collect meta for index
 	var records []index.KeyValue
 	var writeErr error

@@ -6,14 +6,12 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/miretskiy/blobcache/bloom"
 	"github.com/miretskiy/blobcache/index"
 	"github.com/miretskiy/blobcache/metadata"
 )
 
 // RecoverIndex scans all segment files and rebuilds the index from scratch.
-// It removes corrupt segment files or segments without complete/valid footers.
-// This should be called instead of New() when recovery is needed.
+// It bypasses Cache-level orchestration (eviction/bloom) to ensure a clean rebuild.
 func RecoverIndex(path string, opts ...Option) (*Cache, error) {
 	cfg := defaultConfig(path)
 	for _, opt := range opts {
@@ -22,58 +20,35 @@ func RecoverIndex(path string, opts ...Option) (*Cache, error) {
 
 	log.Info("starting index recovery", "path", path)
 
-	// Ensure directory structure exists
 	segmentsDir := filepath.Join(path, "segments")
-	if _, err := os.Stat(segmentsDir); os.IsNotExist(err) {
-		return nil, fmt.Errorf("segments directory does not exist: %s", segmentsDir)
-	}
-
-	// Create temporary recovery directory that will contain the index
-	// Note: index.NewIndex() creates a "db" subdirectory inside the path we provide
-	// So we create a temporary parent directory, and the index will be at tempPath/db
-	tempParentPath := path + "_recovery"
 	dbPath := filepath.Join(path, "db")
+	tempParentPath := path + "_recovery"
 	tempDBPath := filepath.Join(tempParentPath, "db")
 
-	// Clean up any leftover recovery directory
-	if err := os.RemoveAll(tempParentPath); err != nil && !os.IsNotExist(err) {
-		return nil, fmt.Errorf("failed to clean recovery directory: %w", err)
-	}
+	// 1. Prepare Workspace
+	_ = os.RemoveAll(tempParentPath)
 	if err := os.MkdirAll(tempParentPath, 0o755); err != nil {
 		return nil, fmt.Errorf("failed to create recovery directory: %w", err)
 	}
 
-	// Create temporary index for recovery
-	// This will create tempParentPath/db internally
+	// Create a raw Index. We talk to this directly, bypassing c.PutBatch().
 	recoveryIdx, err := index.NewIndex(tempParentPath)
 	if err != nil {
-		os.RemoveAll(tempParentPath)
 		return nil, fmt.Errorf("failed to create recovery index: %w", err)
 	}
 
-	// Scan and rebuild index from segment files
 	corruptCount := 0
 	validCount := 0
-	totalBlobs := 0
 
-	// Scan all shard directories
+	// 2. Scan Shards & Segments
 	numShards := max(1, cfg.Shards)
 	for shard := 0; shard < numShards; shard++ {
 		shardDir := filepath.Join(segmentsDir, fmt.Sprintf("%04d", shard))
-
-		// Check if shard directory exists
 		if _, err := os.Stat(shardDir); os.IsNotExist(err) {
-			continue // Skip non-existent shards
+			continue
 		}
 
-		// Scan all segment files in this shard
-		entries, err := os.ReadDir(shardDir)
-		if err != nil {
-			recoveryIdx.Close()
-			os.RemoveAll(tempParentPath)
-			return nil, fmt.Errorf("failed to read shard directory %s: %w", shardDir, err)
-		}
-
+		entries, _ := os.ReadDir(shardDir)
 		for _, entry := range entries {
 			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".seg") {
 				continue
@@ -82,96 +57,38 @@ func RecoverIndex(path string, opts ...Option) (*Cache, error) {
 			segmentPath := filepath.Join(shardDir, entry.Name())
 			segmentID := extractSegmentID(entry.Name())
 
-			// Try to read and validate segment footer
 			segment, err := readSegmentFooter(segmentPath, segmentID)
 			if err != nil {
-				log.Warn("corrupt or incomplete segment file, removing",
-					"path", segmentPath,
-					"error", err)
-
-				// Remove corrupt segment file
-				if removeErr := os.Remove(segmentPath); removeErr != nil {
-					log.Error("failed to remove corrupt segment",
-						"path", segmentPath,
-						"error", removeErr)
-				}
+				log.Warn("corrupt segment file, removing", "path", segmentPath, "error", err)
+				_ = os.Remove(segmentPath)
 				corruptCount++
 				continue
 			}
 
-			// Add valid segment meta to recovery index
-			// Skip deleted blobs (marked with Deleted flag)
-			var kvs []index.KeyValue
-			for _, rec := range segment.Records {
-				if rec.IsDeleted() {
-					continue // Skip deleted blobs
-				}
-				kvs = append(kvs, index.KeyValue{
-					Key: index.Key(rec.Hash),
-					Val: index.NewValueFrom(rec.Pos, rec.Size, rec.Flags, segment.SegmentID),
-				})
-			}
-
-			if err := recoveryIdx.PutBatch(kvs); err != nil {
+			// USE THE LOWER LEVEL PRIMITIVE:
+			// IngestBatch directly updates the Skipmap/Sieve metadata.
+			if err := recoveryIdx.IngestBatch(segment.SegmentID, segment.Records); err != nil {
 				recoveryIdx.Close()
-				os.RemoveAll(tempParentPath)
-				return nil, fmt.Errorf("failed to add segment %d to recovery index: %w", segment.SegmentID, err)
+				return nil, fmt.Errorf("recovery ingestion failed for seg %d: %w", segment.SegmentID, err)
 			}
-
 			validCount++
-			totalBlobs += len(kvs)
 		}
 	}
 
-	// Close recovery index before renaming
-	if err := recoveryIdx.Close(); err != nil {
-		os.RemoveAll(tempParentPath)
-		return nil, fmt.Errorf("failed to close recovery index: %w", err)
-	}
+	recoveryIdx.Close()
 
-	log.Info("segment scan completed",
-		"valid_segments", validCount,
-		"corrupt_segments", corruptCount,
-		"total_blobs", totalBlobs)
-
-	// Replace old index with recovery index
-	// The recovery index is at tempParentPath/db
-	// We want to move it to path/db
-
-	// 1. Remove old index
-	if err := os.RemoveAll(dbPath); err != nil && !os.IsNotExist(err) {
-		os.RemoveAll(tempParentPath)
-		return nil, fmt.Errorf("failed to remove old index: %w", err)
-	}
-
-	// 2. Rename recovery index (tempParentPath/db -> path/db)
+	// 3. Swap Index Folders
+	_ = os.RemoveAll(dbPath)
 	if err := os.Rename(tempDBPath, dbPath); err != nil {
-		os.RemoveAll(tempParentPath)
-		return nil, fmt.Errorf("failed to rename recovery index: %w", err)
+		return nil, fmt.Errorf("failed to swap recovery index: %w", err)
 	}
+	_ = os.RemoveAll(tempParentPath)
 
-	// 3. Clean up temporary parent directory
-	os.RemoveAll(tempParentPath)
-
-	// Now open the recovered index normally
+	// 4. Final Assembly
+	// Re-open the index at the proper path
 	idx, err := index.NewIndex(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open recovered index: %w", err)
-	}
-
-	log.Info("index recovery completed, building bloom filter")
-
-	// Create bloom filter and populate from recovered index
-	var totalSize int64
-	filter := bloom.New(uint(cfg.BloomEstimatedKeys), cfg.BloomFPRate)
-	if err := idx.ForEachSegment(func(segment metadata.SegmentRecord) bool {
-		for _, rec := range segment.Records {
-			filter.Add(rec.Hash)
-			totalSize += rec.Size
-		}
-		return true
-	}); err != nil {
-		return nil, fmt.Errorf("failed to build bloom filter: %w", err)
 	}
 
 	c := &Cache{
@@ -180,11 +97,23 @@ func RecoverIndex(path string, opts ...Option) (*Cache, error) {
 		storage: NewStorage(cfg, idx),
 		stopCh:  make(chan struct{}),
 	}
-	c.bloom.Store(filter)
-	c.approxSize.Store(totalSize)
-	c.memTable = c.newMemTable(c.config, c.storage)
+	c.memTable = NewMemTable(c.config, c, c)
 
-	log.Info("recovery completed successfully")
+	// Build Bloom Filter synchronously
+	log.Info("rebuilding bloom filter from recovered segments...")
+	if err := c.rebuildBloom(); err != nil {
+		return nil, fmt.Errorf("failed to build bloom filter: %w", err)
+	}
+
+	// Set starting size by scanning the index truth
+	var totalSize int64
+	c.index.ForEachBlob(func(e index.Entry) bool {
+		totalSize += e.Size
+		return true
+	})
+	c.approxSize.Store(totalSize)
+
+	log.Info("recovery complete", "valid", validCount, "corrupt", corruptCount, "total_mb", totalSize/(1024*1024))
 	return c, nil
 }
 
@@ -206,7 +135,7 @@ func readSegmentFooter(path string, segmentID int64) (metadata.SegmentRecord, er
 	return segment, err
 }
 
-// extractSegmentID extracts the segment ID from a filename like "123456.seg"
+// extractSegmentID extracts the segment SegmentID from a filename like "123456.seg"
 func extractSegmentID(filename string) int64 {
 	var id int64
 	// Parse filename: "123456.seg" -> 123456

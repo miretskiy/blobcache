@@ -9,9 +9,8 @@ import (
 
 // IOConfig holds I/O strategy settings
 type IOConfig struct {
-	FDataSync          bool // Use fdatasync for durability
-	Fadvise            bool // Use fadvise to provide data access hints to the kernel.
-	PageCacheRetention int  // How many memtables to keep resident in the OS page cache
+	FDataSync bool // Use fdatasync for durability
+	Fadvise   bool // Use fadvise to provide data access hints to the kernel.
 }
 
 // ResilienceConfig holds data integrity settings
@@ -24,18 +23,19 @@ type KeyHasherFn func(b []byte) uint64
 
 // config holds internal configuration
 type config struct {
-	Path               string
-	MaxSize            int64
-	KeyHasher          KeyHasherFn
-	Shards             int   // Number of shard directories (default: 0 = no sharding)
-	WriteBufferSize    int64 // Memtable batch size in bytes (like RocksDB write_buffer_size)
-	SegmentSize        int64 // Target segment file size (0 = flush on every write, for testing)
-	MaxInflightBatches int   // Max batches queued (like RocksDB max_write_buffer_number)
-	FlushConcurrency   int   // How many flush workers to have; default: MaxInflightBatches
-	BloomFPRate        float64
-	BloomEstimatedKeys int
-	IO                 IOConfig
-	Resilience         ResilienceConfig
+	Path                string
+	MaxSize             int64
+	KeyHasher           KeyHasherFn
+	Shards              int   // Number of shard directories (default: 0 = no sharding)
+	WriteBufferSize     int64 // Memtable batch size in bytes (like RocksDB write_buffer_size)
+	LargeWriteThreshold int64 // Writes exceeding this threshold are handed off to the flusher directly.
+	SegmentSize         int64 // Target segment file size (0 = flush on every write, for testing)
+	MaxInflightBatches  int   // Max batches queued (like RocksDB max_write_buffer_number)
+	FlushConcurrency    int   // How many flush workers to have; default: MaxInflightBatches
+	BloomFPRate         float64
+	BloomEstimatedKeys  int
+	IO                  IOConfig
+	Resilience          ResilienceConfig
 
 	// Testing hooks
 	onSegmentEvicted      func(segmentID int64)
@@ -141,6 +141,14 @@ func WithSegmentSize(size int64) Option {
 	})
 }
 
+// WithLargeWriteThreshold sets the threshold when the writes exceeding this
+// value are sent directly to the flusher, bypassing normal memtable.
+func WithLargeWriteThreshold(size int64) Option {
+	return funcOpt(func(c *config) {
+		c.LargeWriteThreshold = size
+	})
+}
+
 // WithKeyHasher configures this cache to use specified key hasher
 // Default: xxhash
 func WithKeyHasher(hasher KeyHasherFn) Option {
@@ -208,30 +216,20 @@ func WithFadvise(enabled bool) Option {
 	})
 }
 
-// WithPageCacheRetention sets how many memtables to keep resident in the OS
-// page cache before advising the kernel to drop the memory (default: 3).
-func WithPageCacheRetention(n int) Option {
-	return funcOpt(func(c *config) {
-		if n < 0 {
-			n = 0
-		}
-		c.IO.PageCacheRetention = n
-	})
-}
-
 // defaultConfig returns sensible defaults (path set by caller)
 func defaultConfig(path string) config {
 	return config{
-		Path:               path,
-		MaxSize:            0, // TODO: Auto-detect 80% of disk capacity
-		KeyHasher:          func(b []byte) uint64 { return xxhash.Sum64(b) },
-		Shards:             0,
-		WriteBufferSize:    100 * 1024 * 1024, // 100MB (production ~1GB)
-		SegmentSize:        32 << 20,          // 32MB
-		MaxInflightBatches: 6,                 // Max batches queued
-		FlushConcurrency:   6,                 // same as MaxInflightBatches
-		BloomFPRate:        0.01,              // 1% FP rate
-		BloomEstimatedKeys: 1_000_000,         // 1M keys → ~1.2 MB bloom
-		IO:                 defaultIOConfig,
+		Path:                path,
+		MaxSize:             0, // TODO: Auto-detect 80% of disk capacity
+		KeyHasher:           func(b []byte) uint64 { return xxhash.Sum64(b) },
+		Shards:              0,
+		WriteBufferSize:     128 << 20, // 100MB (production ~1GB)
+		LargeWriteThreshold: 4 << 20,
+		SegmentSize:         2 << 30,   // 64MB
+		MaxInflightBatches:  6,         // Max batches queued
+		FlushConcurrency:    6,         // same as MaxInflightBatches
+		BloomFPRate:         0.01,      // 1% FP rate
+		BloomEstimatedKeys:  1_000_000, // 1M keys → ~1.2 MB bloom
+		IO:                  defaultIOConfig,
 	}
 }

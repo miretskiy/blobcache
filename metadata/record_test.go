@@ -15,17 +15,26 @@ func decodeFooterSection(segmentData []byte) (SegmentRecord, error) {
 		return SegmentRecord{}, fmt.Errorf("data too small")
 	}
 
-	footer, err := DecodeSegmentFooter(segmentData[len(segmentData)-SegmentFooterSize:])
+	// 1. Footer is always at the absolute end
+	footerBuf := segmentData[len(segmentData)-SegmentFooterSize:]
+	footer, err := DecodeSegmentFooter(footerBuf)
 	if err != nil {
 		return SegmentRecord{}, err
 	}
 
-	if footer.Len < 0 || footer.Len > int64(len(segmentData)-SegmentFooterSize) {
-		return SegmentRecord{}, fmt.Errorf("invalid segment record length: %d", footer.Len)
+	// 2. Calculate where the Aligned Metadata Block starts
+	// We must use the same rounding logic used during encoding
+	physicalSize := roundToPage(footer.Len + int64(SegmentFooterSize))
+
+	// metadataBlockStart is the beginning of the 4KB-aligned section
+	metadataBlockStart := len(segmentData) - int(physicalSize)
+	if metadataBlockStart < 0 {
+		// This happens if the length in the footer is impossibly large
+		return SegmentRecord{}, fmt.Errorf("invalid segment record length: metadata block out of bounds")
 	}
 
-	segmentRecordStart := len(segmentData) - SegmentFooterSize - int(footer.Len)
-	segmentRecordData := segmentData[segmentRecordStart : len(segmentData)-SegmentFooterSize]
+	// 3. The Record Data is at the START of that physical block
+	segmentRecordData := segmentData[metadataBlockStart : metadataBlockStart+int(footer.Len)]
 
 	return DecodeSegmentRecordWithChecksum(segmentRecordData, footer.Checksum)
 }

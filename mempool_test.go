@@ -1,126 +1,199 @@
 package blobcache
 
 import (
-	"bytes"
-	"encoding/json"
-	"errors"
+	"fmt"
+	"io"
+	"runtime"
 	"sync"
 	"testing"
+	"time"
+
+	"golang.org/x/sys/unix"
 )
 
-func TestMmapBuffer_Write(t *testing.T) {
-	// Setup a small pool for testing
-	pool := NewMmapPool(1, 64)
-	buf := pool.Acquire()
-	defer pool.Release(buf)
+// TestMmapPool_FrozenHandover validates the state machine:
+// Buffers should NOT return to the pool until they are both Unpinned AND Frozen.
+// This is critical for the MemTable rotation logic.
+func TestMmapPool_FrozenHandover(t *testing.T) {
+	pool := NewMmapPool(1, 1024, 0)
+	buf := pool.Acquire() // refCount = 1, isFrozen = false
 
-	t.Run("Atomic Write Success", func(t *testing.T) {
-		data := []byte("nitro-speed")
-		n, err := buf.Write(data)
-		if err != nil {
-			t.Fatalf("expected no error, got %v", err)
-		}
-		if n != len(data) {
-			t.Errorf("expected %d bytes written, got %d", len(data), n)
-		}
-		if !bytes.Equal(buf.Bytes(), data) {
-			t.Errorf("buffer content mismatch")
-		}
-	})
+	// 1. Simulate owner finishing work, but NOT freezing yet.
+	// This happens when a write completes but the MemTable isn't full.
+	buf.Unpin() // refCount = 0
 
-	t.Run("Atomic Write Failure (All-or-Nothing)", func(t *testing.T) {
-		buf.Reset()
-		largeData := make([]byte, 100) // Larger than 64 byte Cap
-		n, err := buf.Write(largeData)
+	select {
+	case <-pool.buffers:
+		t.Fatal("Buffer returned to pool before being marked as Frozen!")
+	default:
+		// Success: refCount is 0, but it's waiting for the "Freeze" signal.
+	}
 
-		if !errors.Is(err, ErrBufferFull) {
-			t.Errorf("expected ErrBufferFull, got %v", err)
-		}
-		if n != 0 {
-			t.Errorf("expected 0 bytes written on failure, got %d", n)
-		}
-		if buf.Len() != 0 {
-			t.Errorf("buffer offset should not have advanced")
-		}
-	})
+	// 2. Simulate MemTable rotation (The Freeze signal).
+	// In production, isFrozen is set to true before the final flusher Unpins.
+	buf.isFrozen.Store(true)
+
+	// We need to trigger the logic that checks (refCount == 0 && isFrozen).
+	// Since refCount is already 0, we simulate a final activity or just
+	// call the internal reset logic.
+	buf.refCount.Store(1)
+	buf.Unpin() // This call should now trigger resetAndRelease()
+
+	select {
+	case <-pool.buffers:
+		// Success: now it's back in the pool for reuse.
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("Buffer failed to return to pool after being Frozen and Unpinned")
+	}
 }
 
-func TestMmapBuffer_InterfaceCompliance(t *testing.T) {
-	pool := NewMmapPool(1, 128)
-	buf := pool.Acquire()
-	defer pool.Release(buf)
+// TestMmapPool_AcquireAligned validates the "Dual Path" (Pooled vs Unpooled).
+// This ensures the SegmentWriter can handle standard footers and massive ones.
+func TestMmapPool_AcquireAligned(t *testing.T) {
+	capacity := 1
+	standardSize := int64(1024)
+	pool := NewMmapPool(capacity, standardSize, 0)
 
-	t.Run("JSON Encoder Integration", func(t *testing.T) {
-		type Stats struct {
-			ID    int    `json:"id"`
-			Label string `json:"label"`
-		}
-		item := Stats{ID: 42, Label: "graviton3"}
+	// 1. Test Pooled Path: Fits within standard poolSize.
+	buf1 := pool.AcquireAligned(512)
+	if buf1.pool != pool || int64(len(buf1.raw)) < standardSize {
+		t.Error("Should have acquired from pool for small request")
+	}
+	buf1.isFrozen.Store(true)
+	buf1.Unpin()
 
-		// MmapBuffer satisfies io.Writer
-		encoder := json.NewEncoder(buf)
-		if err := encoder.Encode(item); err != nil {
-			t.Fatalf("failed to encode into mmap buffer: %v", err)
-		}
-
-		// Verify result
-		expected := `{"id":42,"label":"graviton3"}` + "\n"
-		if string(buf.Bytes()) != expected {
-			t.Errorf("expected %q, got %q", expected, string(buf.Bytes()))
-		}
-	})
+	// 2. Test Pathological Path: Request exceeds standard poolSize.
+	giantSize := int64(1024 * 1024)
+	buf2 := pool.AcquireAligned(giantSize)
+	if buf2.pool != nil {
+		t.Error("Large request should have returned unpooled buffer (nil pool)")
+	}
+	if int64(len(buf2.raw)) < giantSize {
+		t.Errorf("Expected at least %d bytes, got %d", giantSize, len(buf2.raw))
+	}
+	// Unpooled buffers are unmapped via GC/Cleanup or manual Munmap.
+	buf2.Unpin()
 }
 
-func TestMmapPool_Backpressure(t *testing.T) {
-	capacity := 2
-	pool := NewMmapPool(capacity, 64)
+// TestMmapBuffer_ReaderRefCounting validates that concurrent readers
+// properly hold the "pin" even if the primary owner is done.
+func TestMmapBuffer_ReaderRefCounting(t *testing.T) {
+	pool := NewMmapPool(1, 1024, 0)
+	buf := pool.Acquire()
+	buf.isFrozen.Store(true)
 
-	// Exhaust the pool
-	b1 := pool.Acquire()
-	b2 := pool.Acquire()
+	// Create two concurrent readers.
+	r1 := buf.NewSectionReader(0, 10)
+	r2 := buf.NewSectionReader(10, 10) // refCount is now 3 (1 Owner + 2 Readers)
 
-	var wg sync.WaitGroup
-	wg.Add(1)
+	// Primary owner (MemTable) finishes and unpins.
+	buf.Unpin() // refCount = 2
 
-	blocked := true
-	go func() {
-		defer wg.Done()
-		// This should block until b1 or b2 is released
-		b3 := pool.Acquire()
-		blocked = false
-		pool.Release(b3)
+	select {
+	case <-pool.buffers:
+		t.Fatal("Buffer returned to pool while readers were still active")
+	default:
+		// Correct.
+	}
+
+	// Close first reader.
+	r1.Close() // refCount = 1
+	select {
+	case <-pool.buffers:
+		t.Fatal("Buffer returned to pool while one reader was still active")
+	default:
+	}
+
+	// Close final reader.
+	r2.Close() // refCount = 0 -> Release()
+	select {
+	case <-pool.buffers:
+		// Success: Finally returned.
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("Buffer stuck; failed to return after all readers closed")
+	}
+}
+
+// TestMmapPool_SafetyNet validates the Go 1.24+ runtime.AddCleanup fallback.
+// This ensures that even "leaked" handles eventually return memory to the pool.
+func TestMmapPool_SafetyNet(t *testing.T) {
+	pool := NewMmapPool(1, 1024, 0)
+	buf := pool.Acquire()
+	buf.isFrozen.Store(true)
+
+	// Create a reader in a scope and let it "leak" (not calling Close).
+	func() {
+		_ = buf.NewSectionReader(0, 5)
 	}()
 
-	// If the pool isn't blocking, 'blocked' would flip to false immediately.
-	// We check after a small sleep.
-	if !blocked {
-		t.Error("pool did not block when exhausted")
+	buf.Unpin() // refCount remains 1 due to the leaked reader.
+
+	select {
+	case <-pool.buffers:
+		t.Fatal("Buffer returned to pool before GC reaped the leaked handle")
+	default:
 	}
 
-	pool.Release(b1)
-	wg.Wait()
-
-	if blocked {
-		t.Error("Acquire was still blocked after Release")
+	// Trigger GC to fire AddCleanup for the MmapHandle.
+	for i := 0; i < 3; i++ {
+		runtime.GC()
+		time.Sleep(50 * time.Millisecond)
 	}
 
-	pool.Release(b2)
+	select {
+	case <-pool.buffers:
+		// Success: Safety net reclaimed the leaked handle.
+	case <-time.After(1 * time.Second):
+		t.Fatal("Safety net failed to reclaim leaked handle after GC")
+	}
 }
 
-func TestMmapBuffer_Reset(t *testing.T) {
-	pool := NewMmapPool(1, 64)
-	buf := pool.Acquire()
+// TestMmapPool_Stress validates concurrent atomic access and data integrity.
+func TestMmapPool_Stress(t *testing.T) {
+	const (
+		concurrency = 32
+		iters       = 500
+		size        = 4096
+	)
+	pool := NewMmapPool(10, size, 0)
+	var wg sync.WaitGroup
 
-	buf.Write([]byte("data"))
-	if buf.Len() != 4 {
-		t.Errorf("expected len 4, got %d", buf.Len())
-	}
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for j := 0; j < iters; j++ {
+				b := pool.Acquire()
+				b.isFrozen.Store(true)
 
-	buf.Reset()
-	if buf.Len() != 0 {
-		t.Error("Reset did not zero the offset")
+				payload := []byte(fmt.Sprintf("worker-%d-iter-%d", workerID, j))
+				_, _ = b.Append(payload)
+
+				r := b.NewSectionReader(0, int64(len(payload)))
+				data, _ := io.ReadAll(r)
+
+				if string(data) != string(payload) {
+					t.Errorf("Data corruption: expected %s, got %s", payload, data)
+				}
+
+				_ = r.Close()
+				b.Unpin()
+			}
+		}(i)
 	}
-	if len(buf.Bytes()) != 0 {
-		t.Error("Bytes() should return empty slice after reset")
+	wg.Wait()
+}
+
+func TestMmap_AllocatePreWarm(t *testing.T) {
+	size := 8192
+	buf := allocate(int64(size))
+
+	// Verify pre-warming: all bytes should be zeroed out.
+	for i, b := range buf.raw {
+		if b != 0 {
+			t.Fatalf("Byte at index %d was not zeroed during allocation", i)
+		}
 	}
+	// Manual cleanup for this one-off allocation.
+	_ = unix.Munmap(buf.raw)
 }

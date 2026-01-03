@@ -1,6 +1,7 @@
 package bloom
 
 import (
+	"math/rand/v2"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -28,32 +29,63 @@ func TestBloom_AddTest(t *testing.T) {
 }
 
 func TestBloom_FalsePositiveRate(t *testing.T) {
-	n := uint64(10000)
-	fpRate := 0.01
+	const (
+		n      = 20000 // Sample size
+		fpRate = 0.01
+	)
 
 	filter := New(uint(n), fpRate)
 
-	// Put n keys
-	for i := uint64(0); i < n; i++ {
-		filter.Add(i)
+	// In rand/v2, if you want a local, seeded generator for reproducibility:
+	// PCG is the new high-performance, statistically robust generator.
+	// We'll use two fixed seeds to ensure the test is deterministic.
+	pcg := rand.NewPCG(42, 100)
+	rng := rand.New(pcg)
+
+	addedKeys := make([]uint64, n)
+	exists := make(map[uint64]struct{}, n)
+
+	for i := 0; i < n; i++ {
+		h := rng.Uint64()
+		addedKeys[i] = h
+		exists[h] = struct{}{}
+		filter.Add(h)
 	}
 
-	// Test n non-existent keys
+	// 1. Verify No False Negatives
+	for _, h := range addedKeys {
+		if !filter.Test(h) {
+			t.Fatalf("CRITICAL: False Negative detected at key %d", h)
+		}
+	}
+
+	// 2. Measure False Positive Rate
 	falsePositives := 0
-	for i := uint64(0); i < n; i++ {
-		if filter.Test(i + n) {
+	checkSize := 100000
+
+	for i := 0; i < checkSize; i++ {
+		h := rng.Uint64()
+
+		// Ensure this random key wasn't actually in our 'added' set
+		if _, ok := exists[h]; ok {
+			continue
+		}
+
+		if filter.Test(h) {
 			falsePositives++
 		}
 	}
 
-	actualFPRate := float64(falsePositives) / float64(n)
+	actualFPRate := float64(falsePositives) / float64(checkSize)
 
-	// Should be close to target (within 50% tolerance)
-	if actualFPRate < fpRate*0.5 || actualFPRate > fpRate*1.5 {
-		t.Errorf("FP rate = %.4f, want ~%.4f (±50%%)", actualFPRate, fpRate)
+	// Tolerance: 20% margin is standard for Bloom statistical tests
+	upperBound := fpRate * 1.2
+	if actualFPRate > upperBound {
+		t.Errorf("FP rate too high: Got %.4f, want <= %.4f", actualFPRate, upperBound)
 	}
 
-	t.Logf("False positive rate: %.4f (target: %.4f)", actualFPRate, fpRate)
+	t.Logf("Stats: n=%d, samples=%d, FPs=%d, Actual Rate=%.4f (Target=%.4f)",
+		n, checkSize, falsePositives, actualFPRate, fpRate)
 }
 
 func TestBloom_Deterministic(t *testing.T) {

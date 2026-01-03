@@ -18,8 +18,7 @@ func TestApproxSize_UpdatedAfterEviction(t *testing.T) {
 	defer cache.Close()
 
 	// Start eviction worker
-	_, err = cache.Start()
-	require.NoError(t, err)
+	cache.Start()
 
 	// Add 6KB using Put (goes through memtable, creates real segments)
 	initialSize := cache.approxSize.Load()
@@ -53,8 +52,7 @@ func TestApproxSize_NoRepeatEviction(t *testing.T) {
 	require.NoError(t, err)
 	defer cache.Close()
 
-	_, err = cache.Start()
-	require.NoError(t, err)
+	cache.Start()
 
 	// Add 6KB (triggers eviction, should evict to ~5KB)
 	for i := 0; i < 6; i++ {

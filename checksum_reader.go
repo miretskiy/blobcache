@@ -25,28 +25,24 @@ func newChecksumVerifyingReader(r io.Reader, hasher Hasher, expected uint32) io.
 	}
 }
 
-// Read implements io.Reader, computing checksum incrementally
-// Returns checksum mismatch error on the Read() that hits EOF
 func (c *checksumVerifyingReader) Read(p []byte) (n int, err error) {
-	// If we already hit a checksum error, keep returning it
 	if c.err != nil {
 		return 0, c.err
 	}
 
-	// Read from underlying reader
 	n, err = c.r.Read(p)
 
-	// Update hash with data read
 	if n > 0 {
-		c.hash.Write(p[:n])
+		// Standard hash.Hash implementations (crc32, etc) never return an error on Write.
+		_, _ = c.hash.Write(p[:n])
 	}
 
-	// Check if we hit EOF
 	if err == io.EOF {
-		// Verify checksum
 		computed := c.hash.Sum32()
 		if computed != c.expected {
-			c.err = fmt.Errorf("checksum mismatch: expected %d, got %d", c.expected, computed)
+			// Suggestion: Use hex (%08x) for checksums. It makes comparing
+			// logs with hex-dumped data much easier for humans.
+			c.err = fmt.Errorf("checksum mismatch: expected %08x, got %08x", c.expected, computed)
 			return n, c.err
 		}
 	}

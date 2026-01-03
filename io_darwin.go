@@ -11,9 +11,8 @@ import (
 )
 
 var defaultIOConfig = IOConfig{
-	FDataSync:          false,
-	Fadvise:            false,
-	PageCacheRetention: 0,
+	FDataSync: false,
+	Fadvise:   false,
 }
 
 // fdatasync syncs file data to disk
@@ -27,7 +26,8 @@ func fdatasync(f *os.File) error {
 	return nil
 }
 
-// isAligned always returns true on macOS since AlignSize is 0
+// isAligned always returns true on Darwin as F_NOCACHE does not
+// enforce the same strict memory-alignment rules as Linux O_DIRECT.
 func isAligned(block []byte) bool {
 	return true
 }
@@ -124,4 +124,21 @@ func Fadvise(fd uintptr, offset Offset_t, length int64, hint FadviseHint) error 
 	default:
 		return nil // Unsupported hints are ignored on Darwin
 	}
+}
+
+// OpenWriter opens specified file for writing; emulates O_DIRECT via F_NOCACHE
+func OpenWriter(path string) (*os.File, error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return nil, err
+	}
+	// Darwin's equivalent to O_DIRECT (bypassing the Page Cache)
+	if _, err := unix.FcntlInt(f.Fd(), unix.F_NOCACHE, 1); err != nil {
+		// Attempt to close to avoid FD leak.
+		// We don't wrap the Close error into the return because the
+		// fcntl failure is the reason this operation failed.
+		_ = f.Close()
+		return nil, err
+	}
+	return f, nil
 }

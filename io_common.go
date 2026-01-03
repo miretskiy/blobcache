@@ -1,6 +1,13 @@
 package blobcache
 
-import "github.com/ncw/directio"
+import (
+	"errors"
+	"io"
+	"net"
+	"syscall"
+
+	"github.com/ncw/directio"
+)
 
 const mask = directio.BlockSize - 1
 
@@ -30,4 +37,45 @@ func alignForHolePunch(offset, length int64) (int64, int64, bool) {
 	length &^= mask
 
 	return alignedOffset, length, true
+}
+
+// IsTransientIOError returns true if the error is likely temporary and
+// the operation might succeed if retried. This is used to distinguish
+// between "data is gone" and "the system is busy."
+func IsTransientIOError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// 1. Check for specific transient syscall errors
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		switch errno {
+		case syscall.EINTR, // Interrupted system call
+			syscall.EAGAIN, // Try again
+			syscall.EBUSY,  // Device or resource busy
+			syscall.EMFILE, // Too many open files (process limit)
+			syscall.ENFILE, // Too many open files (system limit)
+			syscall.ENOMEM: // Out of memory
+			return true
+		}
+	}
+
+	// 2. Check for network timeouts (if using network-attached storage)
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		if netErr.Timeout() || netErr.Temporary() {
+			return true
+		}
+	}
+
+	// 3. Context cancellation or deadline exceeded
+	// These are technically transient because the next request might have a fresh context.
+	if errors.Is(err, io.ErrClosedPipe) || errors.Is(err, io.ErrUnexpectedEOF) {
+		// Note: ErrUnexpectedEOF is tricky; usually it means the file is corrupted/truncated.
+		// We usually treat it as PERMANENT for a specific blob, but transient for the system.
+		return false
+	}
+
+	return false
 }

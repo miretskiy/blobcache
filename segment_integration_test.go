@@ -14,7 +14,7 @@ func TestCache_SegmentMode(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	// Create cache with segments and Bitcask index
-	cache, err := New(tmpDir, WithSegmentSize(10<<29))
+	cache, err := New(tmpDir, WithSegmentSize(16<<20))
 	require.NoError(t, err)
 	defer cache.Close()
 
@@ -27,7 +27,6 @@ func TestCache_SegmentMode(t *testing.T) {
 		}
 		cache.Put(key, value)
 	}
-
 	cache.Drain()
 
 	// Read them back and verify
@@ -35,13 +34,18 @@ func TestCache_SegmentMode(t *testing.T) {
 		key := []byte(fmt.Sprintf("key-%d", i))
 		value, found := readAll(t, cache, key)
 		require.True(t, found, "key-%d should be found", i)
+
+		// 1. Check size once
 		require.Equal(t, 1024*1024, len(value), "key-%d size mismatch", i)
 
-		// Verify data integrity
-		for j := 0; j < len(value); j++ {
-			expected := byte((i + j) % 256)
-			require.Equal(t, expected, value[j], "key-%d byte %d mismatch", i, j)
+		// 2. Build the expected buffer once per key
+		expected := make([]byte, 1024*1024)
+		for j := range expected {
+			expected[j] = byte((i + j) % 256)
 		}
+
+		// 3. ONE assertion for the whole 1MB slice (Super fast)
+		require.Equal(t, expected, value, "key-%d data mismatch", i)
 	}
 }
 

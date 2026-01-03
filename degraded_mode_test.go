@@ -40,7 +40,7 @@ func TestCache_DegradedMode_FlushWriteError(t *testing.T) {
 	cache.Drain()
 
 	// Verify degraded mode
-	require.NotNil(t, cache.BGError())
+	require.NotNil(t, cache.BGError(), cache.BGError())
 	require.ErrorIs(t, cache.BGError(), errInjected)
 
 	// Subsequent Puts should still work (memory-only)
@@ -109,7 +109,7 @@ func TestCache_DegradedMode_MemtableEviction(t *testing.T) {
 
 	value := make([]byte, 512) // 512 bytes
 
-	// Fill and rotate 6 memtables (to fill frozen list - default MaxInflightBatches=6)
+	// Fill and rotate 6 memtables (to fill files list - default MaxInflightBatches=6)
 	for i := 0; i < 12; i++ {
 		cache.Put([]byte(fmt.Sprintf("key-%d", i)), value)
 		if (i+1)%2 == 0 {
@@ -122,8 +122,8 @@ func TestCache_DegradedMode_MemtableEviction(t *testing.T) {
 	cache.Drain()
 	require.NotNil(t, cache.BGError())
 
-	// Now frozen list should be at capacity (6 memtables)
-	// next rotation should drop oldest frozen memtable
+	// Now files list should be at capacity (6 memtables)
+	// next rotation should drop oldest files memtable
 
 	// Trigger more rotations (should drop oldest)
 	for i := 20; i < 30; i++ {
@@ -136,9 +136,9 @@ func TestCache_DegradedMode_MemtableEviction(t *testing.T) {
 	// Keys from early memtables should be gone (dropped due to FIFO eviction)
 	cache.memTable.TestingClearMemtable()
 	_, found := cache.Get([]byte("key-0"))
-	require.False(t, found, "key-0 should be evicted (oldest frozen memtable dropped)")
+	require.False(t, found, "key-0 should be evicted (oldest files memtable dropped)")
 
-	// Recent keys should still be in frozen memtables
+	// Recent keys should still be in files memtables
 	data, found := readAll(t, cache, []byte("new-key-25"))
 	require.True(t, found)
 	require.Equal(t, value, data)
@@ -165,8 +165,7 @@ func TestCache_DegradedMode_EvictionError(t *testing.T) {
 	defer cache.Close()
 
 	// Start background worker
-	_, err = cache.Start()
-	require.NoError(t, err)
+	cache.Start()
 
 	value := make([]byte, 1024)
 

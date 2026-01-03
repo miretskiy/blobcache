@@ -8,14 +8,11 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/unix"
-
-	"github.com/ncw/directio"
 )
 
 var defaultIOConfig = IOConfig{
-	FDataSync:          false,
-	Fadvise:            true,
-	PageCacheRetention: 3,
+	FDataSync: false,
+	Fadvise:   true,
 }
 
 // fdatasync syncs file data to disk without syncing metadata
@@ -24,13 +21,13 @@ func fdatasync(f *os.File) error {
 	return syscall.Fdatasync(int(f.Fd()))
 }
 
-// isAligned checks if block is aligned in memory for DirectIO
+// isAligned checks if the memory address of the slice is on a 4KB boundary.
 func isAligned(block []byte) bool {
 	if len(block) == 0 {
 		return true
 	}
-	alignment := int(uintptr(unsafe.Pointer(&block[0])) & uintptr(directio.AlignSize-1))
-	return alignment == 0
+	// 4095 is the mask for 4096-byte alignment.
+	return uintptr(unsafe.Pointer(&block[0]))&4095 == 0
 }
 
 // fallocate pre-allocates disk space for a file
@@ -71,4 +68,12 @@ func Fadvise(fd uintptr, offset Offset_t, length int64, hint FadviseHint) error 
 
 	// Signature: fd, offset, length, advice
 	return syscall.PosixFadvise(int(fd), offset, length, linuxHint)
+}
+
+// OpenWriter opens specified file for writing with O_DIRECT.
+func OpenWriter(path string) (*os.File, error) {
+	// We use unix.O_DIRECT for hardware-aligned zero-copy.
+	// We also use O_WRONLY because the writer handle is append-only.
+	// We do NOT use O_APPEND because we use WriteAt for precise positioning.
+	return os.OpenFile(path, os.O_CREATE|os.O_WRONLY|unix.O_DIRECT, 0644)
 }

@@ -10,58 +10,57 @@ import (
 )
 
 // Benchmark_BloomRebuild measures time to rebuild bloom filter from index
-// Run with: go test -bench=Benchmark_BloomRebuild -benchtime=10x
 func Benchmark_BloomRebuild(b *testing.B) {
-	sizes := []int{128 << 10, 1 << 20, 1 << 22}
-	const keysPerSegment = 1024
+	// 128k, 1M, 4M keys
+	sizes := []int{128 << 10, 1 << 20, 4 << 20}
 
 	for _, numKeys := range sizes {
-		b.Run(fmt.Sprintf("%dK", numKeys>>10), func(b *testing.B) {
-			b.StopTimer()
-
-			// Setup: Create index with N keys (not timed)
-			tmpDir, _ := os.MkdirTemp("", "bloom-rebuild-bench-*")
+		b.Run(fmt.Sprintf("%dK-Keys", numKeys>>10), func(b *testing.B) {
+			// Setup: Create index
+			tmpDir, _ := os.MkdirTemp("", "bloom-rebuild-*")
 			defer os.RemoveAll(tmpDir)
 
 			idx, _ := index.NewIndex(tmpDir)
 			defer idx.Close()
 
-			// Populate index (not timed)
-			for i := 0; i < numKeys; i += keysPerSegment {
-				entries := make([]index.KeyValue, keysPerSegment)
-				for k := 0; k < keysPerSegment; k++ {
-					entries[k] = index.KeyValue{
-						Key: index.Key(i),
-						Val: &index.Value{
-							Pos:       int64(i % 1000),
-							Size:      1024,
-							SegmentID: int64(i >> 10),
-						},
+			// Populate with "Mixed" hashes to simulate real entropy
+			const batchSize = 1024
+			for i := 0; i < numKeys; i += batchSize {
+				entries := make([]metadata.BlobRecord, batchSize)
+				for k := 0; k < batchSize; k++ {
+					id := uint64(i + k)
+					// Use a simple Knuth mixer to prevent "Silly Hash" linearity
+					mixedHash := id * 0x9e3779b97f4a7c15
+
+					entries[k] = metadata.BlobRecord{
+						Hash: mixedHash,
+						Pos:  int64(id % 1000),
+						Size: 1024,
 					}
 				}
-				if err := idx.PutBatch(entries); err != nil {
-					b.Fatal(err)
-				}
-				// fmt.Fprintf(os.Stderr, "Populated %d\n", i+keysPerSegment)
+				_ = idx.IngestBatch(int64(i/batchSize), entries)
 			}
-			b.StartTimer()
 
-			// Benchmark: Rebuild bloom filter
+			// Pre-calculate filter specs
+			estimatedKeys := uint(numKeys)
+			fpRate := 0.01
+
+			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				filter := New(uint(4<<20), 0.01)
+				// We allocate inside the loop to simulate a real "rebuild from scratch"
+				filter := New(estimatedKeys, fpRate)
 
-				if err := idx.ForEachSegment(func(segment metadata.SegmentRecord) bool {
-					for _, rec := range segment.Records {
-						filter.Add(rec.Hash)
-					}
+				// REBUILD PATH: Use the Skipmap Range.
+				// It's all in RAM and pointer-stable, so it's the fastest way
+				// to populate the filter.
+				idx.ForEachBlob(func(v index.Entry) bool {
+					filter.AddHash(v.Hash) // Use AddHash to skip internal mixer if already mixed
 					return true
-				}); err != nil {
-					b.Fatal(err)
-				}
+				})
 
-				// Verify it works
-				if !filter.Test(0) {
-					b.Fatal("bloom filter broken")
+				// Tiny sanity check (not enough to skew bench)
+				if !filter.Test(uint64(0) * 0x9e3779b97f4a7c15) {
+					b.Fatal("Bloom lookup failed")
 				}
 			}
 		})

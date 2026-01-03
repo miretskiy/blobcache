@@ -3,118 +3,195 @@ package blobcache
 import (
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
+	"golang.org/x/sys/unix"
+
+	"github.com/miretskiy/blobcache/metadata"
 	"github.com/stretchr/testify/require"
 )
 
-func TestSegmentWriter_Buffered(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "segment-test-*")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpDir)
-
-	// Create segments directory
-	segDir := filepath.Join(tmpDir, "segments/0000")
-	require.NoError(t, os.MkdirAll(segDir, 0o755))
-	cfg := defaultConfig(tmpDir)
-	cfg.SegmentSize = 10 * 1024
-	s := NewStorage(cfg, nil)
-	defer s.Close()
-
-	// Create segment writer with 10KB segments
-	writer := s.NewSegmentWriter()
-	defer writer.Close()
-
-	// Write multiple small values to same segment
-	value1 := make([]byte, 1000)
-	err = writer.Write(0, value1, 0)
-	require.NoError(t, err)
-	pos1 := writer.Pos()
-	require.NotEqual(t, 0, pos1.SegmentID) // Timestamp-based segment ID
-	require.Equal(t, int64(0), pos1.Pos)
-
-	value2 := make([]byte, 2000)
-	err = writer.Write(1, value2, 0)
-	require.NoError(t, err)
-	pos2 := writer.Pos()
-	require.Equal(t, pos1.SegmentID, pos2.SegmentID) // Same segment
-	require.Equal(t, int64(1000), pos2.Pos)          // After first value
-
-	// Write large value to trigger rotation
-	value3 := make([]byte, 15000) // Exceeds 10KB segment size
-	err = writer.Write(2, value3, 0)
-	require.NoError(t, err)
-	pos3 := writer.Pos()
-	require.NotEqual(t, pos1.SegmentID, pos3.SegmentID) // New segment
-	require.Equal(t, int64(0), pos3.Pos)                // Start of new segment
+// TrackedPool wraps the production MmapPool for deterministic cleanup.
+type TrackedPool struct {
+	*MmapPool
+	mu           sync.Mutex
+	extraRegions [][]byte
 }
 
-func TestSegmentWriter_DirectIO(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "segment-directio-test-*")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpDir)
-
-	// Create segments directory
-	segDir := filepath.Join(tmpDir, "segments/0000")
-	require.NoError(t, os.MkdirAll(segDir, 0o755))
-	cfg := defaultConfig(tmpDir)
-	cfg.SegmentSize = 1 << 20
-
-	// Create segment writer with DirectIO
-	s := NewStorage(cfg, nil)
-	defer s.Close()
-	writer := s.NewSegmentWriter()
-	defer writer.Close()
-
-	// Write value (tests leftover handling)
-	value := make([]byte, 5000) // Unaligned size
-	for i := range value {
-		value[i] = byte(i % 256)
+func NewTrackedPool(capacity int, slabSize int64) *TrackedPool {
+	return &TrackedPool{
+		MmapPool: NewMmapPool(capacity, slabSize, 0),
 	}
-
-	err = writer.Write(0, value, 0)
-	require.NoError(t, err)
-
-	pos := writer.Pos()
-	require.Equal(t, int64(0), pos.Pos)
-
-	// Close should flush leftover and truncate
-	err = writer.Close()
-	require.NoError(t, err)
-
-	// TODO: Verify file size is exactly 5000 bytes (not padded)
 }
 
-func TestSegmentWriter_MultipleSegments(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "segment-multi-test-*")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpDir)
+func (tp *TrackedPool) AcquireAligned(size int64) *MmapBuffer {
+	buf := tp.MmapPool.AcquireAligned(size)
+	if buf.pool == nil {
+		tp.mu.Lock()
+		tp.extraRegions = append(tp.extraRegions, buf.raw)
+		tp.mu.Unlock()
+	}
+	return buf
+}
 
-	// Create segments directory
-	segDir := filepath.Join(tmpDir, "segments/0000")
-	require.NoError(t, os.MkdirAll(segDir, 0o755))
+func (tp *TrackedPool) Teardown() {
+	tp.mu.Lock()
+	defer tp.mu.Unlock()
+	for _, r := range tp.extraRegions {
+		_ = unix.Munmap(r)
+	}
+	tp.extraRegions = nil
+	for {
+		select {
+		case buf := <-tp.buffers:
+			_ = unix.Munmap(buf.raw)
+		default:
+			return
+		}
+	}
+}
 
-	// Small segment size to trigger multiple segments
-	cfg := defaultConfig(tmpDir)
-	cfg.SegmentSize = 5000
+// MockBatcher implements: PutBatch(segID int64, records []metadata.BlobRecord) error
+type MockBatcher struct {
+	mu      sync.Mutex
+	Batches map[int64][]metadata.BlobRecord
+	Count   int
+}
 
-	s := NewStorage(cfg, nil)
-	defer s.Close()
-	writer := s.NewSegmentWriter()
-	defer writer.Close()
+func (m *MockBatcher) PutBatch(segID int64, records []metadata.BlobRecord) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.Batches == nil {
+		m.Batches = make(map[int64][]metadata.BlobRecord)
+	}
+	m.Batches[segID] = append(m.Batches[segID], records...)
+	m.Count += len(records)
+	return nil
+}
 
-	segments := make(map[int64]bool)
+// MockHealthReporter tracks desyncs or disk failures.
+type MockHealthReporter struct {
+	mu           sync.Mutex
+	ReportedErr  error
+	DegradedFlag bool
+}
 
-	// Write 5 values, should span multiple segments
-	for i := 0; i < 5; i++ {
-		value := make([]byte, 2000)
-		err := writer.Write(Key(i), value, 0)
+func (m *MockHealthReporter) ReportError(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ReportedErr = err
+	m.DegradedFlag = true
+}
+
+func (m *MockHealthReporter) IsDegraded() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.DegradedFlag
+}
+
+// Helpers
+func testRoundToPage(size int64) int64 {
+	const pageSize = 4096
+	return (size + pageSize - 1) & ^(pageSize - 1)
+}
+
+func TestSegmentWriter_FullCycle(t *testing.T) {
+	tmpDir := t.TempDir()
+	const slabSize = 1024 * 1024
+	const segSize = 4 * 1024 * 1024
+	const segID = int64(777)
+
+	pool := NewTrackedPool(4, slabSize)
+	defer pool.Teardown()
+
+	path := filepath.Join(tmpDir, "777.seg")
+
+	t.Run("AlignedPhysicalWrites", func(t *testing.T) {
+		sw, err := NewSegmentWriter(segID, path, segSize, pool)
 		require.NoError(t, err)
 
-		pos := writer.Pos()
-		segments[pos.SegmentID] = true
+		// Slab 1
+		slab1 := pool.Acquire()
+		data1 := []byte("direct-io-block-1")
+		_, _ = slab1.Append(data1)
+		// metadata.BlobRecord uses uint64 for Hash
+		recs1 := []metadata.BlobRecord{{Hash: 101, Pos: 0, Size: int64(len(data1))}}
+		require.NoError(t, sw.WriteSlab(slab1.AlignedBytes(), recs1))
+		slab1.Unpin()
+
+		// Slab 2
+		slab2 := pool.Acquire()
+		data2 := []byte("direct-io-block-2")
+		_, _ = slab2.Append(data2)
+		recs2 := []metadata.BlobRecord{{Hash: 202, Pos: 0, Size: int64(len(data2))}}
+		require.NoError(t, sw.WriteSlab(slab2.AlignedBytes(), recs2))
+		slab2.Unpin()
+
+		require.NoError(t, sw.Close())
+
+		// Verify Footer Recovery
+		f, err := os.Open(path)
+		require.NoError(t, err)
+		defer f.Close()
+
+		info, _ := f.Stat()
+		footer, _, err := metadata.ReadSegmentFooterFromFile(f, info.Size(), segID)
+		require.NoError(t, err)
+
+		// Verify Pos rounding (critical for Direct I/O reads)
+		expectedOffset := testRoundToPage(int64(len(data1)))
+		require.Equal(t, expectedOffset, footer.Records[1].Pos)
+	})
+}
+
+func TestMemTable_Integration_Rotation(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := config{
+		Path:               tmpDir,
+		WriteBufferSize:    512 * 1024,
+		SegmentSize:        1024 * 1024,
+		MaxInflightBatches: 4,
+		FlushConcurrency:   2,
+		Shards:             1,
 	}
 
-	// Should have created multiple segments
-	require.Greater(t, len(segments), 1, "Should have created multiple segments")
+	mb := &MockBatcher{}
+	mh := &MockHealthReporter{}
+
+	mt := NewMemTable(cfg, mb, mh)
+	defer mt.Close()
+
+	// Ingest 2MB to force rotation of 1MB segments
+	blobCount := 20
+	blobSize := 100 * 1024
+	data := make([]byte, blobSize)
+	for i := 0; i < blobSize; i++ {
+		data[i] = byte(i % 256)
+	}
+
+	for i := 0; i < blobCount; i++ {
+		key := Key(i)
+		mt.Put(key, data)
+	}
+
+	mt.Drain()
+
+	// 1. Verify all records hit the Batcher
+	require.Equal(t, blobCount, mb.Count)
+
+	// 2. Verify rotation occurred
+	require.GreaterOrEqual(t, len(mb.Batches), 2, "Should have flushed multiple segments")
+
+	// 3. Verify physical files
+	segCount := 0
+	// Try this to see where they actually went:
+	err := filepath.Walk(tmpDir, func(path string, info os.FileInfo, err error) error {
+		if !info.IsDir() && filepath.Ext(path) == ".seg" {
+			segCount++
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, segCount, 2)
 }

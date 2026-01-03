@@ -2,47 +2,45 @@ package blobcache
 
 import (
 	"fmt"
+	"io"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/miretskiy/blobcache/index"
 	"github.com/miretskiy/blobcache/metadata"
 	"github.com/zhangyunhao116/skipmap"
 )
 
-// memEntry holds value and optional user-provided checksum
-type memEntry struct {
-	value       []byte
-	checksum    uint32 // User-provided checksum
-	hasChecksum bool   // True if checksum was explicitly provided by user
-}
-
 // memFile represents a single memtable with skipmap and size tracking
 type memFile struct {
-	data *skipmap.Uint64Map[*memEntry]
-	size atomic.Int64
+	buf     *MmapBuffer
+	nextIdx atomic.Int64 // entries index reservation
+	entries []metadata.BlobRecord
+	data    *skipmap.Uint64Map[int] // key -> offset in entries
+	done    chan struct{}           // Closed when flush completes
 }
 
 // MemTable provides async write buffering with in-memory read support
 // Uses atomic memFile pointer for lock-free writes
 type MemTable struct {
 	config
-	batcher
-	degradedMode // Callback to check/set degraded state
-	newWriter    func() BlobWriter
+	Batcher
+	ErrorRporter // Callback to check/set degraded state
 
-	// Active memfile - currently accepting writes (lock-free)
-	active atomic.Pointer[memFile]
+	// SegmentID sequence number.
+	segmentID atomic.Int64
 
-	// Frozen coordination
-	frozen struct {
+	// Set of memFiles currently being written or flushed.
+	files struct {
 		sync.RWMutex
-		inflight []*memFile
+		active   *memFile
+		flushing []*memFile
 		cond     *sync.Cond
 	}
 
-	seq atomic.Int64
+	seq        atomic.Int64
+	slabPool   *MmapPool
+	footerPool *MmapPool
 
 	// Background flush workers
 	flushCh chan *memFile
@@ -52,35 +50,46 @@ type MemTable struct {
 	writeBufferSize int64
 }
 
-// newMemTable creates a memtable with skipmap-based storage
-func (c *Cache) newMemTable(cfg config, storage *Storage) *MemTable {
+// NewMemTable creates a memtable with skipmap-based storage
+func NewMemTable(cfg config, b Batcher, reporter ErrorRporter) *MemTable {
 	mt := &MemTable{
-		config:       cfg,
-		batcher:      c,
-		degradedMode: c, // Cache implements degradedMode interface
-		flushCh:      make(chan *memFile, c.MaxInflightBatches),
-		stopCh:       make(chan struct{}),
-		newWriter: func() BlobWriter {
-			return storage.NewSegmentWriter()
-		},
-		writeBufferSize: c.WriteBufferSize,
+		config:          cfg,
+		Batcher:         b,
+		ErrorRporter:    reporter,
+		slabPool:        NewMmapPool(cfg.MaxInflightBatches, cfg.WriteBufferSize, cfg.LargeWriteThreshold),
+		footerPool:      NewMmapPool(cfg.MaxInflightBatches, 256<<10, 0),
+		flushCh:         make(chan *memFile, cfg.MaxInflightBatches),
+		stopCh:          make(chan struct{}),
+		writeBufferSize: cfg.WriteBufferSize,
 	}
-	mt.frozen.cond = sync.NewCond(&mt.frozen)
-	mt.seq.Store(time.Now().UnixNano())
+	mt.segmentID.Store(time.Now().UnixNano())
 
 	// Initialize active memfile
-	mf := &memFile{
-		data: skipmap.NewUint64[*memEntry](),
-	}
-	mt.active.Store(mf)
+	mt.files.cond = sync.NewCond(&mt.files)
+	mt.files.active = mt.newMemFile()
 
 	// Start I/O workers for flushing memfiles
-	mt.wg.Add(c.FlushConcurrency)
-	for i := 0; i < c.FlushConcurrency; i++ {
+	mt.wg.Add(cfg.FlushConcurrency)
+	for i := 0; i < cfg.FlushConcurrency; i++ {
 		go mt.flushWorker()
 	}
 
 	return mt
+}
+
+func (mt *MemTable) newMemFile() *memFile {
+	// We assume a "minimum respectable blob size" for a 1GB table.
+	// If we assume 8KB blobs, that's 128k entries.
+	// RAM cost: 3MB.
+	// Clamp it to 4K entries on the low end and 1M on the high end.
+	capacity := min(1<<20, max(4096, mt.writeBufferSize/8192))
+
+	return &memFile{
+		buf:     mt.slabPool.Acquire(),
+		entries: make([]metadata.BlobRecord, capacity),
+		data:    skipmap.NewUint64[int](),
+		done:    make(chan struct{}),
+	}
 }
 
 // Put stores key-value in memtable (checksum will be computed during flush)
@@ -95,76 +104,163 @@ func (mt *MemTable) PutChecksummed(key Key, value []byte, checksum uint32) {
 	mt.putWithChecksum(key, value, &checksum)
 }
 
+func makeEntry(
+	key Key, offset int64, val []byte, hasher Hasher, checksum *uint32,
+) metadata.BlobRecord {
+	entry := metadata.BlobRecord{
+		Hash:  uint64(key),
+		Pos:   offset,
+		Size:  int64(len(val)),
+		Flags: metadata.InvalidChecksum,
+	}
+	if checksum != nil {
+		// User provided explicit checksum
+		entry.Flags = uint64(*checksum)
+	} else if hasher != nil {
+		h := hasher()
+		h.Write(val)
+		entry.Flags = uint64(h.Sum32())
+	}
+	return entry
+}
+
 // putWithChecksum is the internal implementation for Put and PutChecksummed
 // checksum may be nil (will be computed during flush if ChecksumHasher configured)
 func (mt *MemTable) putWithChecksum(key Key, value []byte, checksum *uint32) {
-retry:
-	mf := mt.active.Load()
+	if int64(len(value)) > mt.LargeWriteThreshold {
+		mt.putLargeWithChecksum(key, value, checksum)
+		return
+	}
 
-	entry := &memEntry{
-		value: value,
-	}
-	if checksum != nil {
-		entry.checksum = *checksum
-		entry.hasChecksum = true
-	}
-	mf.data.Store(uint64(key), entry)
-	newSize := mf.size.Add(int64(len(value)))
-	if newSize >= mt.writeBufferSize {
-		mt.frozen.Lock()
-		if mt.active.Load() != mf {
-			mt.frozen.Unlock()
-			goto retry
+	// RETRY LOOP: Ensures the blob is never lost.
+	// If the active slab is full (Metadata or Data), we rotate and try the new one.
+	for {
+		active, written, shouldRotate := mt.putActive(key, value, checksum)
+
+		if written {
+			if shouldRotate {
+				mt.rotateActive(active)
+			}
+			return
 		}
 
-		mt.doRotateUnderLock(mf)
-		mt.frozen.Unlock()
+		// Slab was full. Initiate rotation and try again on the fresh slab.
+		mt.rotateActive(active)
 	}
 }
 
-// doRotateUnderLock rotates the given memfile out
-// CALLER MUST HOLD mt.frozen.Lock()
-func (mt *MemTable) doRotateUnderLock(mf *memFile) {
-	// Normal mode: wait for space before rotating
-	if !mt.isDegraded() {
-		for len(mt.frozen.inflight) >= mt.MaxInflightBatches {
-			mt.frozen.cond.Wait()
+func (mt *MemTable) rotateActive(active *memFile) {
+	mt.files.Lock()
+	defer mt.files.Unlock()
 
-			// After wait, check if another thread already rotated this mf
-			if mt.active.Load() != mf {
-				return // Already rotated by another thread
-			}
-		}
+	if mt.files.active != active {
+		// Somebody else won the race and rotated
+		return
 	}
 
-	// Add current memfile to frozen list (preserves most recent data)
-	mt.frozen.inflight = append(mt.frozen.inflight, mf)
+	// Swap to new active & flush
+	mt.files.active = mt.newMemFile()
+	mt.flushUnderLock(active)
+}
 
-	// Degraded mode: drop oldest if over capacity (AFTER adding current)
-	if mt.isDegraded() && len(mt.frozen.inflight) > mt.MaxInflightBatches {
-		oldest := mt.frozen.inflight[0]
-		mt.frozen.inflight = mt.frozen.inflight[1:]
+// putActive adds data to the active file, and returns active file and a boolean
+// indicating if active should be rotated due to size.
+// and returns that active file along with an indicator if active still has capacity.
+func (mt *MemTable) putActive(
+	key Key, value []byte, checksum *uint32,
+) (
+	_ *memFile, dataWritten bool, shouldRotate bool,
+) {
+	mt.files.RLock()
+	defer mt.files.RUnlock()
+
+	active := mt.files.active
+
+	// 1. Reserve Metadata Index (Atomic)
+	idx := active.nextIdx.Add(1) - 1
+
+	// 2. Metadata Overflow Guard
+	// If we run out of slots, we signal rotation immediately.
+	if idx >= int64(len(active.entries)) {
+		return active, false, true
+	}
+
+	// 3. Reserve Data Space (Atomic)
+	offset, err := active.buf.Append(value)
+	if err != nil {
+		mt.ReportError(fmt.Errorf("memtable append failed: %w", err))
+		return active, false, false
+	}
+
+	// 4. Populate Entry (Private to this thread)
+	// No one can see this yet because it isn't in the skipmap.
+	active.entries[idx] = makeEntry(key, offset, value, mt.Resilience.ChecksumHasher, checksum)
+
+	// 5. PUBLISH to SkipMap (Lock-Free)
+	// Now Get() can find the index and safely read the entry.
+	active.data.Store(key, int(idx))
+
+	// 6. Check for Rotation
+	// Rotate if we hit the data limit OR if we are nearly out of metadata slots.
+	shouldRotate = (offset+int64(len(value)) >= mt.writeBufferSize) ||
+		(idx >= int64(len(active.entries)-1))
+
+	return active, true, shouldRotate
+}
+
+func (mt *MemTable) putLargeWithChecksum(key Key, value []byte, checksum *uint32) {
+	blob := &memFile{
+		buf: mt.slabPool.AcquireUnpooled(int64(len(value))),
+		// Pre-size to 1 and fill it immediately
+		entries: make([]metadata.BlobRecord, 1),
+		data:    skipmap.NewUint64[int](),
+		done:    make(chan struct{}),
+	}
+
+	offset, _ := blob.buf.Append(value)
+	blob.entries[0] = makeEntry(key, offset, value, mt.Resilience.ChecksumHasher, checksum)
+	blob.nextIdx.Store(1) // Mark 1 entry as valid
+	blob.data.Store(uint64(key), 0)
+
+	mt.files.Lock()
+	defer mt.files.Unlock()
+	mt.flushUnderLock(blob)
+}
+
+// flushUnderLock rotates the given memfile out
+// CALLER MUST HOLD mt.files.Lock()
+func (mt *MemTable) flushUnderLock(mf *memFile) {
+	// 1. Mark as Frozen: No more writes will ever happen to this buffer.
+	mf.buf.isFrozen.Store(true)
+
+	// 2. Add current memfile to files list (preserves most recent data)
+	mt.files.flushing = append(mt.files.flushing, mf)
+
+	// We do NOT Unpin here. The MemTable is "handing off" its
+	// original pin to the background flusher.
+
+	// Normal mode: wait for space before rotating
+	for !mt.IsDegraded() && len(mt.files.flushing) >= mt.MaxInflightBatches {
+		mt.files.cond.Wait()
+	}
+
+	// Degraded mode: drop the oldest if over capacity (AFTER adding current)
+	if mt.IsDegraded() && len(mt.files.flushing) > mt.MaxInflightBatches {
+		oldest := mt.files.flushing[0]
+		mt.files.flushing = mt.files.flushing[1:]
+		oldest.buf.Unpin()
 
 		log.Warn("degraded mode: dropped oldest unflushed memtable",
-			"size_bytes", oldest.size.Load())
+			"size_bytes", oldest.buf.Len())
 
 		// Note: Bloom filter not updated - will accumulate false positives
 		// for dropped keys. Acceptable in degraded mode (causes extra disk lookups)
-
-		mt.frozen.cond.Broadcast()
-	}
-
-	// Swap to new active
-	newMf := &memFile{
-		data: skipmap.NewUint64[*memEntry](),
-	}
-	if old := mt.active.Swap(newMf); old != mf {
-		panic(fmt.Errorf("active map changed under lock: expected %p found %p", mf, old))
+		mt.files.cond.Broadcast()
 	}
 
 	// Degraded mode: don't send to workers (they've stopped)
-	// Memfile stays in frozen.inflight, will be dropped on next rotation if over capacity
-	if mt.isDegraded() {
+	// Memfile stays in files.flushing, will be dropped on next rotation if over capacity
+	if mt.IsDegraded() {
 		return
 	}
 
@@ -174,57 +270,81 @@ func (mt *MemTable) doRotateUnderLock(mf *memFile) {
 		// Sent successfully
 	default:
 		// Channel full - recheck if degraded or panic
-		if !mt.isDegraded() {
-			panic("doRotateUnderLock: flushCh full despite backpressure")
+		if !mt.IsDegraded() {
+			panic("flushUnderLock: flushCh full despite backpressure")
 		}
-		// If degraded, workers just stopped - memfile stays in frozen.inflight
+		// If degraded, workers just stopped - memfile stays in files.flushing
 	}
 }
 
-// Get retrieves value from active or frozen memfiles
-func (mt *MemTable) Get(key Key) ([]byte, bool) {
-	mf := mt.active.Load()
-	if entry, ok := mf.data.Load(uint64(key)); ok {
-		return entry.value, true
+// Get retrieves value from active or files memfiles
+func (mt *MemTable) Get(key Key) (io.ReadCloser, bool) {
+	mt.files.RLock()
+	defer mt.files.RUnlock()
+
+	// Check Active
+	if mf := mt.files.active; mf != nil {
+		if pos, ok := mf.data.Load(uint64(key)); ok {
+			// SAFETY: Even though entries is size 128k, 'pos' is guaranteed
+			// to be < nextIdx and fully initialized because of the skipmap Store.
+			entry := mf.entries[pos]
+			return mf.buf.NewSectionReader(entry.Pos, entry.Size), true
+		}
 	}
 
-	mt.frozen.RLock()
-	defer mt.frozen.RUnlock()
-
-	for i := len(mt.frozen.inflight) - 1; i >= 0; i-- {
-		if entry, ok := mt.frozen.inflight[i].data.Load(uint64(key)); ok {
-			return entry.value, true
+	// Check Flushing (Newest to Oldest)
+	for i := len(mt.files.flushing) - 1; i >= 0; i-- {
+		mf := mt.files.flushing[i]
+		if pos, ok := mf.data.Load(uint64(key)); ok {
+			entry := mf.entries[pos]
+			return mf.buf.NewSectionReader(entry.Pos, entry.Size), true
 		}
 	}
 
 	return nil, false
 }
 
-// flushWorker processes frozen memfiles
+func (mt *MemTable) openSegment() (*SegmentWriter, error) {
+	segmentID := mt.segmentID.Add(1)
+	segmentPath := getSegmentPath(mt.Path, mt.Shards, segmentID)
+	return NewSegmentWriter(segmentID, segmentPath, mt.SegmentSize, mt.footerPool)
+}
+
+// flushWorker processes files memfiles
 func (mt *MemTable) flushWorker() {
 	defer mt.wg.Done()
 
 	// Create per-worker blob writer (shared across flushes for efficiency)
 	// Segment files are much larger than memfiles (GBs vs MBs)
-	writer := mt.newWriter()
+	writer, err := mt.openSegment()
+	if err != nil {
+		mt.ReportError(err)
+		return
+	}
+
 	defer func() {
-		// Close errors logged but don't trigger degraded mode
-		// Footer write failure is acceptable - reads will treat I/O errors as cache miss
-		if err := writer.Close(); err != nil {
-			log.Error("failed to close segment writer", "error", err)
+		if closeErr := writer.Close(); closeErr != nil {
+			mt.ReportError(fmt.Errorf("writer close failed: %w", closeErr))
 		}
 	}()
 
 	for {
 		select {
-		case mf := <-mt.flushCh:
-			if err := mt.flushMemFile(mf, writer); err != nil {
-				mt.setDegraded(err) // Enter degraded mode (one-way door)
-				mt.removeFrozen(mf)
-				return // Stop worker permanently
+		case mf, ok := <-mt.flushCh:
+			if !ok {
+				return
 			}
-			mt.removeFrozen(mf)
 
+			// Execute the flush logic
+			nextWriter, flushErr := mt.processFlush(mf, writer)
+
+			if flushErr != nil {
+				mt.ReportError(flushErr)
+				// We do NOT return. We keep the loop running so we can
+				// pull the next mf from flushCh and trigger its close(mf.done).
+			}
+
+			writer = nextWriter
 		case <-mt.stopCh:
 			// Stop immediately - caller must call Drain() before Close() if needed
 			return
@@ -232,96 +352,93 @@ func (mt *MemTable) flushWorker() {
 	}
 }
 
-func (mt *MemTable) flushMemFile(mf *memFile, writer BlobWriter) error {
-	if mt.IO.Fadvise && mt.IO.PageCacheRetention > 0 {
-		pos := writer.Pos()
-		endPos := max(0, pos.Pos-mt.WriteBufferSize*int64(mt.IO.PageCacheRetention))
-		if endPos > 0 {
-			_ = Fadvise(writer.Fd(), 0, endPos, FadvDontNeed)
-		}
+func (mt *MemTable) processFlush(
+	mf *memFile, writer *SegmentWriter,
+) (newWriter *SegmentWriter, fatal error) {
+	// 1. Guaranteed signal and RAM cleanup
+	defer func() {
+		mt.removeFrozen(mf)
+		mf.buf.Unpin()
+		close(mf.done)
+	}()
+
+	// 2. Short-circuit if we are already in trouble
+	if mt.IsDegraded() {
+		return writer, nil
 	}
 
-	// Phase 1: Write all blob files and collect meta for index
-	var records []index.KeyValue
-	var writeErr error
-
-	mf.data.Range(func(key uint64, entry *memEntry) bool {
-		value := entry.value
-		if len(value) == 0 {
-			return true
-		}
-
-		// Compute or use provided checksum
-		checksum := metadata.InvalidChecksum
-
-		if entry.hasChecksum {
-			// User provided explicit checksum
-			checksum = uint64(entry.checksum)
-		} else if mt.Resilience.ChecksumHasher != nil {
-			// Compute checksum using hash
-			h := mt.Resilience.ChecksumHasher()
-			h.Write(value)
-			checksum = uint64(h.Sum32())
-		}
-
-		// Testing: inject write error
-		if mt.testingInjectWriteErr != nil {
-			if err := mt.testingInjectWriteErr(); err != nil {
-				writeErr = err
-				return false
-			}
-		}
-
-		// Write blob via writer interface (pass checksum for footer)
-		if err := writer.Write(Key(key), value, checksum); err != nil {
-			writeErr = err
-			return false // Stop iteration on first error
-		}
-
-		// Get position for index
-		pos := writer.Pos()
-
-		val := index.NewValueFrom(pos.Pos, int64(len(value)), checksum, pos.SegmentID)
-		records = append(records, index.KeyValue{
-			Key: Key(key),
-			Val: val,
-		})
-		return true
-	})
-
-	// Return blob write error
-	if writeErr != nil {
-		return fmt.Errorf("blob write failed: %w", writeErr)
+	// 3. Physical Write
+	if err := mt.flushMemFile(mf, writer); err != nil {
+		return writer, err
 	}
 
-	// Phase 2: Batch update index (critical - must succeed)
-	if len(records) == 0 {
-		return nil
+	// 4. Segment Rotation Logic
+	if writer.CurrentPos() >= mt.SegmentSize {
+		if err := writer.Close(); err != nil {
+			return nil, fmt.Errorf("close segment failed: %w", err)
+		}
+		// Open next segment
+		next, err := mt.openSegment()
+		if err != nil {
+			return nil, err
+		}
+		return next, nil
 	}
 
-	// Testing: inject index error
-	if mt.testingInjectIndexErr != nil {
-		if err := mt.testingInjectIndexErr(); err != nil {
+	return writer, nil
+}
+
+func (mt *MemTable) flushMemFile(mf *memFile, writer *SegmentWriter) error {
+	if mt.testingInjectWriteErr != nil {
+		if err := mt.testingInjectWriteErr(); err != nil {
+			mt.ReportError(err)
 			return err
 		}
 	}
 
-	if err := mt.PutBatch(records); err != nil {
+	// 1. Determine how many entries were actually written
+	count := mf.nextIdx.Load()
+	if count > int64(len(mf.entries)) {
+		count = int64(len(mf.entries))
+	}
+
+	// Slice the pre-allocated records to the actual count.
+	// These currently have POS = relative offset in slab.
+	records := mf.entries[:count]
+
+	// 2. Physical Write to NVMe (O_DIRECT)
+	// IMPORTANT: writer.WriteSlab transforms records[i].Pos from RELATIVE to ABSOLUTE.
+	if err := writer.WriteSlab(mf.buf.AlignedBytes(), records); err != nil {
+		return fmt.Errorf("physical write failed: %w", err)
+	}
+
+	// Test fails here because this block is likely missing!
+	if mt.testingInjectIndexErr != nil {
+		if err := mt.testingInjectIndexErr(); err != nil {
+			mt.ReportError(err)
+			return err
+		}
+	}
+
+	// 3. Update the Persistent Index (LSM-tree or SkipList)
+	// This call makes the data visible to Get() requests globally.
+	if err := mt.PutBatch(writer.id, records); err != nil {
 		return fmt.Errorf("index update failed: %w", err)
 	}
 
 	return nil
 }
 
-// removeFrozen removes memfile from frozen list after flush
+// removeFrozen removes memfile from files list after flush
 func (mt *MemTable) removeFrozen(target *memFile) {
-	mt.frozen.Lock()
-	defer mt.frozen.Unlock()
+	mt.files.Lock()
+	defer mt.files.Unlock()
 
-	for i, mf := range mt.frozen.inflight {
+	for i, mf := range mt.files.flushing {
 		if mf == target {
-			mt.frozen.inflight = append(mt.frozen.inflight[:i], mt.frozen.inflight[i+1:]...)
-			mt.frozen.cond.Broadcast()
+			// removeNode from slice while preserving order (standard Go idiom)
+			mt.files.flushing = append(mt.files.flushing[:i], mt.files.flushing[i+1:]...)
+			mt.files.cond.Broadcast()
 			return
 		}
 	}
@@ -330,44 +447,40 @@ func (mt *MemTable) removeFrozen(target *memFile) {
 // Drain waits for all memfiles to be flushed
 // In degraded mode, this is a no-op (workers stopped, nothing to drain)
 func (mt *MemTable) Drain() {
-	// If degraded, workers stopped - nothing to drain
-	if mt.isDegraded() {
+	if mt.IsDegraded() {
 		return
 	}
 
-	mt.frozen.Lock()
-	defer mt.frozen.Unlock()
+	var signals []chan struct{}
+	var toFlush *memFile
 
-	// Send active directly if it has data (no need to rotate/create new active)
-	mf := mt.active.Load()
-	if mf.size.Load() > 0 {
-		// Wait for space in inflight
-		for len(mt.frozen.inflight) >= mt.MaxInflightBatches {
-			mt.frozen.cond.Wait()
-		}
+	// 1. Snapshot and Rotate under Lock
+	mt.files.Lock()
 
-		// Add to frozen
-		mt.frozen.inflight = append(mt.frozen.inflight, mf)
-
-		// Create empty active (drain context, no more writes expected)
-		emptyMf := &memFile{data: skipmap.NewUint64[*memEntry]()}
-		mt.active.Store(emptyMf)
-
-		// Send to flush
-		mt.flushCh <- mf
+	// Check if active needs to be moved to the pipeline
+	if mt.files.active.buf.Len() > 0 {
+		toFlush = mt.files.active
+		mt.files.flushing = append(mt.files.flushing, toFlush)
+		mt.files.active = mt.newMemFile() // Replace with fresh empty
 	}
 
-	// Wait for all inflight to be processed
-	// Also check for degraded mode (workers may have stopped)
-	for len(mt.frozen.inflight) > 0 && !mt.isDegraded() {
-		mt.frozen.cond.Wait()
+	// Capture all signals currently in the pipeline
+	for _, f := range mt.files.flushing {
+		signals = append(signals, f.done)
+	}
+	mt.files.Unlock()
+
+	// 2. Perform Send outside of lock
+	if toFlush != nil {
+		// This ensures we don't hold the mutex if the worker queue is full
+		mt.flushCh <- toFlush
 	}
 
-	// If became degraded while draining, clear remaining frozen memfiles
-	if mt.isDegraded() && len(mt.frozen.inflight) > 0 {
-		log.Warn("degraded mode during drain: dropping remaining frozen memtables",
-			"count", len(mt.frozen.inflight))
-		mt.frozen.inflight = nil
+	// 3. The Universal Barrier
+	// Even if toFlush was nil, we still wait for any previously
+	// started flushes to complete.
+	for _, sig := range signals {
+		<-sig
 	}
 }
 
@@ -384,11 +497,9 @@ func (mt *MemTable) Close() {
 // TestingClearMemtable clears active memfile
 // ONLY for use in tests - this breaks the normal memtable contract
 func (mt *MemTable) TestingClearMemtable() {
-	// Create new empty memfile
-	newMf := &memFile{
-		data: skipmap.NewUint64[*memEntry](),
-	}
-	mt.active.Store(newMf)
+	mt.files.Lock()
+	defer mt.files.Unlock()
+	mt.files.active = mt.newMemFile()
 
 	// Drain flush channel
 	for {

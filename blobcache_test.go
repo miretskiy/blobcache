@@ -4,10 +4,8 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
-	"sync"
+	"runtime"
 	"testing"
-	"time"
 
 	"github.com/miretskiy/blobcache/index"
 	"github.com/stretchr/testify/require"
@@ -23,7 +21,6 @@ func readAll(t *testing.T, cache *Cache, key []byte) ([]byte, bool) {
 	data, err := io.ReadAll(reader)
 	require.NoError(t, err)
 
-	// Close if it's a Closer
 	if closer, ok := reader.(io.Closer); ok {
 		closer.Close()
 	}
@@ -31,87 +28,8 @@ func readAll(t *testing.T, cache *Cache, key []byte) ([]byte, bool) {
 	return data, true
 }
 
-func TestNew_CreatesDirectories(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "blobcache-test-*")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpDir)
-
-	cache, err := New(tmpDir)
-	require.NoError(t, err)
-	defer cache.Close()
-
-	// Verify key directories created
-	require.DirExists(t, filepath.Join(tmpDir, "db"))
-
-	// Verify marker
-	require.FileExists(t, filepath.Join(tmpDir, ".initialized"))
-}
-
-func TestNew_Idempotent(t *testing.T) {
-	tmpDir, _ := os.MkdirTemp("", "blobcache-test-*")
-	defer os.RemoveAll(tmpDir)
-
-	cache1, err := New(tmpDir)
-	require.NoError(t, err, "First New should succeed")
-	cache1.Close()
-
-	cache2, err := New(tmpDir)
-	require.NoError(t, err, "Second New should succeed (idempotent)")
-	cache2.Close()
-}
-
-func TestCache_StartClose(t *testing.T) {
-	tmpDir, _ := os.MkdirTemp("", "blobcache-test-*")
-	defer os.RemoveAll(tmpDir)
-
-	cache, err := New(tmpDir)
-	require.NoError(t, err)
-
-	closer, err := cache.Start()
-	require.NoError(t, err)
-
-	// Close gracefully
-	err = closer()
-	require.NoError(t, err)
-
-	// Close again should be safe
-	err = cache.Close()
-	require.NoError(t, err)
-}
-
-func TestCache_CloseWithoutStart(t *testing.T) {
-	tmpDir, _ := os.MkdirTemp("", "blobcache-test-*")
-	defer os.RemoveAll(tmpDir)
-
-	cache, err := New(tmpDir)
-	require.NoError(t, err)
-
-	// Close without Start should be safe
-	err = cache.Close()
-	require.NoError(t, err)
-}
-
-func TestCache_CustomOptions(t *testing.T) {
-	tmpDir, _ := os.MkdirTemp("", "blobcache-test-*")
-	defer os.RemoveAll(tmpDir)
-
-	cache, err := New(tmpDir,
-		WithShards(128),
-		WithBloomFPRate(0.001),
-		// IncludeChecksums disabled by default
-	)
-	require.NoError(t, err)
-	defer cache.Close()
-
-	require.Equal(t, 128, cache.Shards)
-	require.Equal(t, 0.001, cache.BloomFPRate)
-	require.Nil(t, cache.Resilience.ChecksumHasher, "checksums should be disabled by default")
-}
-
-func TestCache_PutGet(t *testing.T) {
-	tmpDir, _ := os.MkdirTemp("", "blobcache-test-*")
-	defer os.RemoveAll(tmpDir)
-
+func TestCache_PutGet_Basic(t *testing.T) {
+	tmpDir := t.TempDir()
 	cache, err := New(tmpDir)
 	require.NoError(t, err)
 	defer cache.Close()
@@ -119,272 +37,176 @@ func TestCache_PutGet(t *testing.T) {
 	key := []byte("test-key")
 	value := []byte("test-value")
 
-	// Put
+	// Standard Put
 	cache.Put(key, value)
 
-	// Drain memtable to ensure write completes
+	// Flush memtable to disk to test the full IO path (Index + Storage)
 	cache.Drain()
 
-	// Get
 	retrieved, found := readAll(t, cache, key)
 	require.True(t, found)
 	require.Equal(t, value, retrieved)
 }
 
-func TestCache_GetNotFound(t *testing.T) {
-	tmpDir, _ := os.MkdirTemp("", "blobcache-test-*")
-	defer os.RemoveAll(tmpDir)
-
+func TestCache_SelfHealing_OnCorruption(t *testing.T) {
+	tmpDir := t.TempDir()
 	cache, err := New(tmpDir)
 	require.NoError(t, err)
 	defer cache.Close()
 
-	// Get non-existent key
-	_, found := cache.Get([]byte("nonexistent"))
+	key := []byte("healing-key")
+	value := []byte("precious-data")
+	h := cache.KeyHasher(key)
+
+	cache.Put(key, value)
+	cache.Drain()
+
+	// 1. Manually corrupt the storage by deleting the segment file
+	entry, ok := cache.index.Get(h)
+	require.True(t, ok)
+
+	// Use shard-aware path helper
+	segmentPath := getSegmentPath(tmpDir, cache.Shards, entry.SegmentID)
+	err = os.Remove(segmentPath)
+	require.NoError(t, err)
+
+	// 2. Attempt Get.
+	// The Index has the entry, but Storage will return a failure.
+	// This triggers self-healing (DeleteBlobs) inside Cache.Get.
+	_, found := cache.Get(key)
+	require.False(t, found, "Get should return false after storage failure")
+
+	// 3. Verify Self-Healing: The entry should have been purged from the index
+	_, inIndex := cache.index.Get(h)
+	require.False(t, inIndex, "Index should have been purged via self-healing")
+}
+
+func TestCache_BloomGhostTracking(t *testing.T) {
+	tmpDir := t.TempDir()
+	cache, err := New(tmpDir)
+	require.NoError(t, err)
+	defer cache.Close()
+
+	// 1. Manually inject a key into the Bloom filter that isn't in the index
+	key := []byte("ghost-key")
+	h := cache.KeyHasher(key)
+	cache.bloom.Load().AddHash(h)
+
+	// 2. Perform Get. Bloom says YES, Index says NO.
+	_, found := cache.Get(key)
 	require.False(t, found)
+
+	// 3. Verify ghost hit was tracked
+	require.Equal(t, uint64(1), cache.bloom.ghosts.Load(), "Ghost hit should be recorded")
+	require.Equal(t, uint64(1), cache.bloom.hits.Load(), "Hit should also be recorded")
+}
+
+func TestCache_Eviction_Headroom(t *testing.T) {
+	tmpDir := t.TempDir()
+	// Small cache: 10KB. 5% hysteresis means target is 9.5KB.
+	cache, err := New(tmpDir, WithMaxSize(10*1024), WithLargeWriteThreshold(0))
+	require.NoError(t, err)
+	defer cache.Close()
+
+	// Put 12 blobs of 1KB each
+	for i := 0; i < 12; i++ {
+		key := []byte(fmt.Sprintf("key-%d", i))
+		cache.Put(key, make([]byte, 1024))
+	}
+	cache.Drain()
+
+	// Trigger eviction manually for the test
+	err = cache.runEvictionSieve(10 * 1024)
+	require.NoError(t, err)
+
+	// Verify we are under the 95% threshold (9.5KB)
+	// That means we should have at most 9 blobs left.
+	count := 0
+	cache.index.ForEachBlob(func(e index.Entry) bool {
+		count++
+		return true
+	})
+	require.LessOrEqual(t, count, 9, "Should have evicted down to hysteresis target")
+
+	// Check that deletions counter was updated
+	require.Greater(t, cache.bloom.deletions.Load(), int64(0))
+}
+
+func TestCache_HolePunching_Physical(t *testing.T) {
+	// Only run on systems likely to support hole punching (Linux)
+	// On macOS, PunchHole is often a no-op or returns EOPNOTSUPP
+	if runtime.GOOS == "darwin" {
+		t.Skip("Skipping physical reclamation test on Darwin: fcntl F_PUNCHHOLE behavior differs")
+	}
+
+	tmpDir := t.TempDir()
+	cache, err := New(tmpDir)
+	require.NoError(t, err)
+	defer cache.Close()
+
+	// Write a large blob (> 4KB block size)
+	val := make([]byte, 8192)
+	key := []byte("big-blob")
+	cache.Put(key, val)
+	cache.Drain()
+
+	// Get entry info
+	h := cache.KeyHasher(key)
+	entry, ok := cache.index.Get(h)
+	require.True(t, ok)
+
+	segmentPath := getSegmentPath(tmpDir, cache.Shards, entry.SegmentID)
+	fiBefore, err := os.Stat(segmentPath)
+	require.NoError(t, err)
+
+	// 1. Mark as deleted in Index (Durable + RAM)
+	err = cache.index.DeleteBlobs(entry)
+	require.NoError(t, err)
+
+	// 2. Physically reclaim space via Storage
+	err = cache.storage.HolePunchBlob(entry.SegmentID, entry.Pos, entry.Size)
+	require.NoError(t, err)
+
+	fiAfter, err := os.Stat(segmentPath)
+	require.NoError(t, err)
+
+	// Logical size should remain constant (FALLOC_FL_KEEP_SIZE)
+	require.Equal(t, fiBefore.Size(), fiAfter.Size(), "Logical size must stay constant")
+}
+
+func TestCache_Restart_Persistence(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Phase 1: Write and Close
+	cache1, err := New(tmpDir)
+	require.NoError(t, err)
+	cache1.Put([]byte("k1"), []byte("v1"))
+	cache1.Drain()
+	cache1.Close()
+
+	// Phase 2: Open and Verify
+	cache2, err := New(tmpDir)
+	require.NoError(t, err)
+	defer cache2.Close()
+
+	val, found := readAll(t, cache2, []byte("k1"))
+	require.True(t, found)
+	require.Equal(t, []byte("v1"), val)
 }
 
 // Benchmarks
 
-func BenchmarkCache_Put(b *testing.B) {
-	tmpDir, _ := os.MkdirTemp("", "blobcache-bench-*")
-	defer os.RemoveAll(tmpDir)
-
+func BenchmarkCache_Get_WithBloom(b *testing.B) {
+	tmpDir := b.TempDir()
 	cache, _ := New(tmpDir)
 	defer cache.Close()
 
-	value := make([]byte, 1024*1024) // 1MB
-
-	b.ResetTimer()
-	b.SetBytes(int64(len(value)))
-	for i := 0; i < b.N; i++ {
-		key := []byte(fmt.Sprintf("key-%d", i))
-		cache.Put(key, value)
-	}
-}
-
-func BenchmarkCache_GetHit(b *testing.B) {
-	tmpDir, _ := os.MkdirTemp("", "blobcache-bench-*")
-	defer os.RemoveAll(tmpDir)
-
-	cache, _ := New(tmpDir)
-	defer cache.Close()
-	value := make([]byte, 1024*1024) // 1MB
-
-	// Pre-populate
-	for i := 0; i < 1000; i++ {
-		key := []byte(fmt.Sprintf("key-%d", i))
-		cache.Put(key, value)
-	}
-
-	b.ResetTimer()
-	b.SetBytes(int64(len(value)))
-	for i := 0; i < b.N; i++ {
-		key := []byte(fmt.Sprintf("key-%d", i%1000))
-		cache.Get(key)
-	}
-}
-
-func BenchmarkCache_GetMiss(b *testing.B) {
-	tmpDir, _ := os.MkdirTemp("", "blobcache-bench-*")
-	defer os.RemoveAll(tmpDir)
-
-	cache, _ := New(tmpDir)
-	defer cache.Close()
-	value := make([]byte, 1024*1024) // 1MB
-
-	// Pre-populate with different keys
-	for i := 0; i < 1000; i++ {
-		key := []byte(fmt.Sprintf("existing-%d", i))
-		cache.Put(key, value)
-	}
-
-	b.ResetTimer()
-	b.SetBytes(int64(len(value)))
-	for i := 0; i < b.N; i++ {
-		key := []byte(fmt.Sprintf("missing-%d", i))
-		cache.Get(key)
-	}
-}
-
-func TestCache_Eviction(t *testing.T) {
-	tmpDir, _ := os.MkdirTemp("", "blobcache-test-*")
-	defer os.RemoveAll(tmpDir)
-
-	// Create cache without size limit initially (to test eviction manually)
-	cache, err := New(tmpDir, WithTestingFlushOnPut())
-	require.NoError(t, err)
-	defer cache.Close()
-
-	value := make([]byte, 1024)
-
-	// Fill cache with 6 entries (6MB)
-	for i := 0; i < 6; i++ {
-		key := []byte(fmt.Sprintf("key-%d", i))
-		cache.Put(key, value)
-	}
-
-	// Drain to ensure all writes complete
+	key := []byte("bench-key")
+	cache.Put(key, make([]byte, 1024))
 	cache.Drain()
 
-	// Check size before eviction
-	var totalSize int64
-	cache.index.ForEachBlob(func(kv index.KeyValue) bool {
-		totalSize += kv.Val.Size
-		return true
-	})
-	require.Equal(t, int64(6<<10), totalSize)
-
-	// Run eviction
-	err = cache.runEvictionSieve(5 << 10)
-	require.NoError(t, err)
-
-	// Check size after eviction (should be under limit)
-	totalSize = 0
-	cache.index.ForEachBlob(func(kv index.KeyValue) bool {
-		totalSize += kv.Val.Size
-		return true
-	})
-	// Should evict enough to get under 5KB limit
-	require.Less(t, totalSize, int64(6<<10))
-
-	// Clear memtable so evicted keys are truly not found
-	cache.memTable.TestingClearMemtable()
-}
-
-func TestCache_ReactiveEviction(t *testing.T) {
-	t.Run("OnPutExceedingMaxSize", func(t *testing.T) {
-		tmpDir, _ := os.MkdirTemp("", "blobcache-test-*")
-		defer os.RemoveAll(tmpDir)
-
-		// Track evicted segments (thread-safe)
-		var mu sync.Mutex
-		var evictedSegments []int64
-		evictionCallback := func(segmentID int64) {
-			mu.Lock()
-			evictedSegments = append(evictedSegments, segmentID)
-			mu.Unlock()
-		}
-
-		// Create cache with 5KB limit
-		cache, err := New(tmpDir,
-			WithMaxSize(5<<10), // 5KB
-			WithTestingOnSegmentEvicted(evictionCallback),
-		)
-		require.NoError(t, err)
-		defer cache.Close()
-
-		// Start background worker for async eviction
-		_, err = cache.Start()
-		require.NoError(t, err)
-
-		// Use PutBatch to add 6 entries
-		// key-0 to key-5, each in separate segment
-		batch := make([]index.KeyValue, 6)
-		for i := 0; i < 6; i++ {
-			key := []byte(fmt.Sprintf("key-%d", i))
-			h := cache.KeyHasher(key)
-			batch[i] = index.KeyValue{
-				Key: Key(h),
-				Val: &index.Value{Size: 1024, SegmentID: int64(i)},
-			}
-		}
-
-		err = cache.PutBatch(batch)
-		require.NoError(t, err)
-
-		// Note: With Sieve eviction, individual blobs are evicted (not full segments)
-		// Eviction runs async, wait for it to complete
-		require.Eventually(t, func() bool {
-			var totalSize int64
-			cache.index.ForEachBlob(func(kv index.KeyValue) bool {
-				totalSize += kv.Val.Size
-				return true
-			})
-			return totalSize <= int64(5<<10)
-		}, time.Second, 10*time.Millisecond, "cache size should decrease after eviction")
-
-		// Verify oldest key (key-0) was evicted
-		cache.memTable.TestingClearMemtable()
-		_, found := cache.Get([]byte("key-0"))
-		require.False(t, found, "oldest key (key-0) should have been evicted")
-	})
-
-	t.Run("OnPutBatchExceedingMaxSize", func(t *testing.T) {
-		tmpDir, _ := os.MkdirTemp("", "blobcache-test-*")
-		defer os.RemoveAll(tmpDir)
-
-		// Track evicted segments (thread-safe)
-		var mu sync.Mutex
-		var evictedSegments []int64
-		evictionCallback := func(segmentID int64) {
-			mu.Lock()
-			evictedSegments = append(evictedSegments, segmentID)
-			mu.Unlock()
-		}
-
-		// Create cache with 3KB limit
-		cache, err := New(tmpDir,
-			WithMaxSize(3<<10), // 3KB
-			WithTestingOnSegmentEvicted(evictionCallback),
-		)
-		require.NoError(t, err)
-		defer cache.Close()
-
-		// Start background worker for async eviction
-		_, err = cache.Start()
-		require.NoError(t, err)
-
-		// First, add 2KB of "old" data using PutBatch
-		oldBatch := make([]index.KeyValue, 2)
-		for i := 0; i < 2; i++ {
-			key := []byte(fmt.Sprintf("old-key-%d", i))
-			h := cache.KeyHasher(key)
-			oldBatch[i] = index.KeyValue{
-				Key: Key(h),
-				Val: &index.Value{Size: 1024, SegmentID: int64(i)},
-			}
-		}
-		err = cache.PutBatch(oldBatch)
-		require.NoError(t, err)
-
-		// Verify we have 2KB on disk
-		var initialSize int64
-		cache.index.ForEachBlob(func(kv index.KeyValue) bool {
-			initialSize += kv.Val.Size
-			return true
-		})
-		require.Equal(t, int64(2<<10), initialSize, "should have 2KB before batch")
-
-		// Now use PutBatch to add 3KB more with newer timestamps (total would be 5KB, exceeding 3KB limit)
-		// This should trigger reactive eviction during PutBatch
-		batch := make([]index.KeyValue, 3)
-		for i := 0; i < 3; i++ {
-			key := []byte(fmt.Sprintf("batch-key-%d", i))
-			h := cache.KeyHasher(key)
-			batch[i] = index.KeyValue{
-				Key: Key(h),
-				Val: &index.Value{Size: 1024, SegmentID: int64(100 + i)},
-			}
-		}
-
-		err = cache.PutBatch(batch)
-		require.NoError(t, err)
-
-		// Note: With Sieve eviction, individual blobs are evicted (not full segments)
-		// Eviction runs async, wait for it to complete
-		require.Eventually(t, func() bool {
-			var finalSize int64
-			cache.index.ForEachBlob(func(kv index.KeyValue) bool {
-				finalSize += kv.Val.Size
-				return true
-			})
-			return finalSize <= int64(3<<10)
-		}, time.Second, 10*time.Millisecond, "cache size should decrease after eviction")
-
-		// Verify the old data was evicted (oldest should be gone)
-		cache.memTable.TestingClearMemtable()
-		_, found := cache.Get([]byte("old-key-0"))
-		require.False(t, found, "oldest key (old-key-0) should have been evicted")
-	})
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = cache.Get(key)
+	}
 }

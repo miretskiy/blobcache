@@ -3,11 +3,13 @@ module github.com/miretskiy/blobcache
 go 1.25.0
 
 require (
+	github.com/DataDog/zstd v1.5.7
 	github.com/HdrHistogram/hdrhistogram-go v1.2.0
 	github.com/cespare/xxhash/v2 v2.3.0
+	github.com/klauspost/compress v1.18.2
 	github.com/ncw/directio v1.0.5
+	github.com/pierrec/lz4/v4 v4.1.23
 	github.com/stretchr/testify v1.11.1
-	github.com/zhangyunhao116/skipset v0.13.0
 	go.mills.io/bitcask/v2 v2.1.5
 )
 

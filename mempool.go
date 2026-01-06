@@ -2,77 +2,71 @@ package blobcache
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"io"
 	"runtime"
 	"sync"
 	"sync/atomic"
-
+	
 	"golang.org/x/sys/unix"
 )
-
-var ErrBufferFull = errors.New("mmap slabPool: buffer capacity exceeded")
 
 // --- MmapBuffer: The Physical Slab ---
 
 type MmapBuffer struct {
-	raw      []byte
-	off      atomic.Int64
+	raw      []byte       // Private to enforce WriteAt usage
+	off      atomic.Int64 // Sentinel: -1 means "Active", >= 0 means "Sealed"
 	refCount atomic.Int64
-	isFrozen atomic.Bool
-	pool     *MmapPool // Set only for pooled buffers
+	pool     *MmapPool
 }
 
-// Append adds p to this buffer, returning the offset where p was written.
-func (b *MmapBuffer) Append(p []byte) (_ int64, err error) {
-	n := int64(len(p))
-
-	for {
-		currentOff := b.off.Load()
-		newOff := currentOff + n
-
-		// 1. Check bounds
-		if newOff > int64(len(b.raw)) {
-			return 0, ErrBufferFull
-		}
-
-		// 2. Atomic Reservation (CAS loop)
-		if b.off.CompareAndSwap(currentOff, newOff) {
-			// 3. We successfully reserved currentOff to newOff.
-			// No other writer can touch this range.
-			copy(b.raw[currentOff:newOff], p)
-			return currentOff, nil
-		}
-		// If CAS fails, someone else reserved space; loop and try again.
-	}
+// WriteAt performs a copy into the buffer.
+// It relies on Go's native sub-slicing bounds checks to panic if
+// the range [off : off+len(p)] is invalid.
+func (b *MmapBuffer) WriteAt(p []byte, off int64) {
+	copy(b.raw[off:off+int64(len(p))], p)
 }
 
-func (b *MmapBuffer) AlignedBytes() []byte {
-	// Because we allocated (size + 4096), this math
-	// will NEVER result in a slice that exceeds len(b.raw).
-	return b.raw[:roundToPage(b.off.Load())]
-}
-
+// Bytes returns the full physical slice. Useful for internal serialization.
 func (b *MmapBuffer) Bytes() []byte {
-	return b.raw[:b.off.Load()]
+	return b.raw
 }
 
-func (b *MmapBuffer) Available() int { return int(int64(len(b.raw)) - b.off.Load()) }
-func (b *MmapBuffer) Len() int       { return int(b.off.Load()) }
-func (b *MmapBuffer) Cap() int       { return len(b.raw) }
+// AlignedBytes returns the slice rounded to the nearest 4KB page for O_DIRECT.
+// This is used by SegmentWriter to ensure hardware-aligned writes.
+func (b *MmapBuffer) AlignedBytes() []byte {
+	off := b.off.Load()
+	if off < 0 {
+		return nil
+	}
+	return b.raw[:roundToPage(off)]
+}
+
+// Seal finalizes the buffer size and marks the slab as ready for pool return.
+// Once sealed (off >= 0), it can be reclaimed when the refCount hits zero.
+func (b *MmapBuffer) Seal(finalOffset int64) {
+	b.off.Store(finalOffset)
+}
+
+func (b *MmapBuffer) Len() int {
+	off := b.off.Load()
+	if off < 0 {
+		return 0
+	}
+	return int(off)
+}
+
+func (b *MmapBuffer) Cap() int { return len(b.raw) }
 
 func (b *MmapBuffer) Reset() {
-	b.off.Store(0)
+	b.off.Store(-1) // Set back to Active sentinel
 }
 
-// Unpin decrements the refcount. If 0, and a slabPool is present, it returns to slabPool.
+// Unpin decrements the refcount. If the slab is Sealed (off >= 0) and unreferenced,
+// it returns to the pool.
 func (b *MmapBuffer) Unpin() {
-	// Decrement and check if we are the last ones out
 	if b.refCount.Add(-1) == 0 {
-		// isFrozen should be set to true when the MemTable
-		// rotates this buffer into the 'flushing' state.
-		if b.isFrozen.Load() {
+		if b.off.Load() >= 0 {
 			b.resetAndRelease()
 		}
 	}
@@ -80,37 +74,27 @@ func (b *MmapBuffer) Unpin() {
 
 func (b *MmapBuffer) resetAndRelease() {
 	b.Reset()
-	b.isFrozen.Store(false) // Reset for next slabPool user
 	if b.pool != nil {
 		b.pool.Release(b)
 	}
 }
 
 // NewSectionReader creates a ReadCloser for a range of the buffer.
+// It increments the refCount to ensure the buffer is pinned while in use.
 func (b *MmapBuffer) NewSectionReader(offset, size int64) io.ReadCloser {
-	// 1. Physical Bounds Check
-	// Protect against potential index out of bounds on the raw slice
 	if offset < 0 || size < 0 || offset+size > int64(len(b.raw)) {
 		return &MmapHandle{Reader: bytes.NewReader(nil)}
 	}
-
-	// 2. Increment RefCount BEFORE exposing the handle
 	b.refCount.Add(1)
-
 	h := &MmapHandle{
 		Reader: bytes.NewReader(b.raw[offset : offset+size]),
 		buffer: b,
 	}
-
-	// 3. Register Cleanup
-	// We pass 'b' (the buffer) to the closure so it doesn't
-	// have to reach back into the potentially-not-fully-initialized 'h'
 	h.cleanup = runtime.AddCleanup(h, func(buf *MmapBuffer) { buf.Unpin() }, b)
-
 	return h
 }
 
-// --- MmapHandle: The User View ---
+// --- MmapHandle, Helpers, and MmapPool ---
 
 type MmapHandle struct {
 	*bytes.Reader
@@ -123,15 +107,12 @@ func (h *MmapHandle) Close() error {
 	h.once.Do(func() {
 		// Stop the GC cleanup from running since we are doing it manually
 		h.cleanup.Stop()
-
 		if h.buffer != nil {
 			h.buffer.Unpin()
 		}
 	})
 	return nil
 }
-
-// --- Internal Helper: allocate ---
 
 func roundToPage(size int64) int64 {
 	const pageSize = 4096
@@ -145,23 +126,19 @@ func allocate(size int64) *MmapBuffer {
 		unix.PROT_READ|unix.PROT_WRITE,
 		unix.MAP_ANON|unix.MAP_PRIVATE)
 	if err != nil {
-		panic(fmt.Sprintf("mmap-slabPool: failed to allocate %d bytes: %v", size, err))
+		panic(fmt.Sprintf("mmap-pool: failed to allocate %d bytes: %v", size, err))
 	}
-
+	
 	// PRE-WARM: Force physical RAM commitment.
 	for i := 0; i < len(data); i += 4096 {
 		data[i] = 0
 	}
-
+	
 	buf := &MmapBuffer{raw: data}
-	runtime.AddCleanup(buf, func(d []byte) {
-		_ = unix.Munmap(d)
-	}, data)
-
+	buf.Reset()
+	runtime.AddCleanup(buf, func(d []byte) { _ = unix.Munmap(d) }, data)
 	return buf
 }
-
-// --- MmapPool: The Manager ---
 
 type MmapPool struct {
 	buffers  chan *MmapBuffer
@@ -183,15 +160,8 @@ func NewMmapPool(capacity int, bufferSize int64, headroom int64) *MmapPool {
 }
 
 func (p *MmapPool) Acquire() *MmapBuffer {
-	var buf *MmapBuffer
-	select {
-	case buf = <-p.buffers:
-		buf.Reset()
-	default:
-		// Pool exhausted: allocate a new standard slab and tag it.
-		buf = allocate(p.poolSize)
-		buf.pool = p
-	}
+	buf := <-p.buffers
+	buf.Reset()
 	buf.refCount.Store(1)
 	return buf
 }
@@ -204,7 +174,7 @@ func (p *MmapPool) AcquireAligned(size int64) *MmapBuffer {
 		// Happy Path: fits in our pre-mapped slabPool slabs
 		return p.Acquire()
 	}
-
+	
 	// Pathological Path: requires a larger one-off mmap
 	return p.AcquireUnpooled(size)
 }
@@ -220,7 +190,7 @@ func (p *MmapPool) Release(buf *MmapBuffer) {
 	if buf.pool == nil {
 		return
 	}
-
+	
 	buf.Reset()
 	select {
 	case p.buffers <- buf:
@@ -229,7 +199,7 @@ func (p *MmapPool) Release(buf *MmapBuffer) {
 		// Pool is full. This was likely an "overflow" buffer
 		// created during high load. Evict and free RAM.
 		_ = unix.Madvise(buf.raw, unix.MADV_DONTNEED)
-
+		
 		// IMPORTANT: Sever the connection so that future Unpin()
 		// calls on this specific slab don't hit the slabPool again.
 		buf.pool = nil

@@ -9,7 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
+	
 	"github.com/miretskiy/blobcache/bloom"
 	"github.com/miretskiy/blobcache/index"
 	"github.com/miretskiy/blobcache/metadata"
@@ -36,14 +36,14 @@ type Cache struct {
 		running     atomic.Bool
 	}
 	memTable *MemTable
-
-	// Size tracking for reactive eviction
+	
+	// LogicalSize tracking for reactive eviction
 	approxSize      atomic.Int64 // Approximate total size (updated during flush/eviction)
 	evictionRunning atomic.Bool  // Prevents concurrent evictions
-
+	
 	// Background error tracking
 	bgError atomic.Pointer[error] // First background error (nil = healthy)
-
+	
 	// Background workers
 	evictionTrigger chan struct{} // Capacity 1: trigger eviction, blocks when eviction running
 	stopCh          chan struct{}
@@ -84,13 +84,13 @@ func New(path string, opts ...Option) (*Cache, error) {
 	for _, opt := range opts {
 		opt.apply(&cfg)
 	}
-
+	
 	// Ensure directory structure exists and validate configuration
 	idx, err := checkOrInitialize(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("initialization failed: %w", err)
 	}
-
+	
 	// Create new bloom filter and figure out how much data on disk from segment meta.
 	// Skip deleted blobs when building bloom filter
 	var totalSize int64
@@ -99,14 +99,14 @@ func New(path string, opts ...Option) (*Cache, error) {
 		for _, rec := range segment.Records {
 			if !rec.IsDeleted() {
 				filter.Add(rec.Hash)
-				totalSize += rec.Size
+				totalSize += rec.LogicalSize
 			}
 		}
 		return true
 	}); err != nil {
 		return nil, err
 	}
-
+	
 	c := &Cache{
 		config:          cfg,
 		index:           idx,
@@ -116,9 +116,9 @@ func New(path string, opts ...Option) (*Cache, error) {
 	}
 	c.bloom.Store(filter)
 	c.approxSize.Store(totalSize)
-
+	
 	c.memTable = NewMemTable(c.config, c, c)
-
+	
 	return c, nil
 }
 
@@ -140,11 +140,11 @@ func (c *Cache) Close() error {
 	default:
 		close(c.stopCh)
 	}
-
+	
 	// Close memtable (does NOT drain)
 	c.memTable.Close()
 	c.wg.Wait()
-
+	
 	// Collect all close errors
 	return errors.Join(
 		c.storage.Close(),
@@ -162,13 +162,13 @@ func (c *Cache) Drain() {
 // Uses empty .initialized marker file for fast idempotency check
 func checkOrInitialize(cfg config) (*index.Index, error) {
 	markerPath := filepath.Join(cfg.Path, ".initialized")
-
+	
 	// Check if already initialized
 	if _, err := os.Stat(markerPath); err == nil {
 		// Already initialized
 		return index.NewIndex(cfg.Path)
 	}
-
+	
 	// Not initialized - create directory structure
 	// Create shard directories for blobs
 	for i := 0; i < max(1, cfg.Shards); i++ {
@@ -177,7 +177,7 @@ func checkOrInitialize(cfg config) (*index.Index, error) {
 			return nil, fmt.Errorf("failed to create %04d: %w", i, err)
 		}
 	}
-
+	
 	idx, err := index.NewIndex(cfg.Path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open index: %w", err)
@@ -186,24 +186,24 @@ func checkOrInitialize(cfg config) (*index.Index, error) {
 	if err := os.WriteFile(markerPath, []byte{}, 0o644); err != nil {
 		return nil, fmt.Errorf("failed to write marker: %w", err)
 	}
-
+	
 	return idx, nil
 }
 
 func (c *Cache) rebuildBloom() error {
 	// 1. Create the new filter skeleton
 	newFilter := bloom.New(uint(c.BloomEstimatedKeys), c.BloomFPRate)
-
+	
 	// 2. Start recording on the OLD filter if it exists
 	var stopRecording func()
 	var consumeRecording func(bloom.HashConsumer)
-
+	
 	if oldFilter := c.bloom.Load(); oldFilter != nil {
 		// We use a large buffer to ensure we don't block the hot path
 		// during the index scan.
 		stopRecording, consumeRecording = oldFilter.RecordAdditions()
 	}
-
+	
 	// 3. Scan the index and populate the NEW filter
 	// This is the long-running part.
 	err := c.index.ForEachSegment(func(segment metadata.SegmentRecord) bool {
@@ -220,30 +220,30 @@ func (c *Cache) rebuildBloom() error {
 		}
 		return err
 	}
-
+	
 	// 4. ATOMIC SWAP: The handover moment.
 	// From this line forward, c.Put() calls hit the newFilter.
 	oldFilter := c.bloom.Swap(newFilter)
-
+	
 	// 4. THE DRAIN: Catch the "In-Flight" additions
 	if oldFilter != nil && stopRecording != nil {
 		// Stop recording first: This closes the channel.
 		stopRecording()
-
+		
 		// Replay the final batch captured during the scan into the NEW filter.
 		consumeRecording(newFilter.AddHash)
 	}
-
+	
 	return nil
 }
 
 // evictionWorker handles eviction requests and periodic compaction
 func (c *Cache) evictionWorker() {
 	defer c.wg.Done()
-
+	
 	compactionTicker := time.NewTicker(10 * time.Minute)
 	defer compactionTicker.Stop()
-
+	
 	for {
 		select {
 		case <-c.evictionTrigger:
@@ -254,7 +254,7 @@ func (c *Cache) evictionWorker() {
 					return // Stop worker permanently
 				}
 			}
-
+		
 		case <-compactionTicker.C:
 			// Periodic compaction of sparse segments
 			if !c.IsDegraded() {
@@ -263,7 +263,7 @@ func (c *Cache) evictionWorker() {
 					// Non-fatal: continue running
 				}
 			}
-
+		
 		case <-c.stopCh:
 			return
 		}
@@ -281,20 +281,20 @@ func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
 		return nil
 	}
 	defer c.evictionRunning.Store(false)
-
+	
 	currentSize := c.approxSize.Load()
 	if currentSize <= maxCacheSize {
 		return nil
 	}
-
+	
 	target := int64(float64(maxCacheSize) * evictionHysteresis)
 	toEvictBytes := currentSize - target
-
+	
 	var (
 		victims      []index.Entry
 		evictedBytes int64
 	)
-
+	
 	// 1. SELECTION PHASE: High-speed RAM eviction.
 	// Index.Evict() now unlinks from FIFO, removes from skipmap,
 	// and recycles the node, returning only the Entry copy.
@@ -304,13 +304,13 @@ func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
 			break // No more victims available
 		}
 		victims = append(victims, victim)
-		evictedBytes += victim.Size
+		evictedBytes += victim.LogicalSize
 	}
-
+	
 	if len(victims) == 0 {
 		return nil
 	}
-
+	
 	// 2. COMMIT PHASE: Sync metadata to Disk (Bitcask).
 	// One transaction per segment for the entire batch.
 	if err := c.index.DeleteBlobs(victims...); err != nil {
@@ -318,28 +318,28 @@ func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
 		// RAM is already updated, but durable index isn't.
 		return fmt.Errorf("eviction durability sync failed: %w", err)
 	}
-
+	
 	// 3. RECLAMATION PHASE: Physical Disk Space.
 	// Performed AFTER metadata is durable.
 	for _, v := range victims {
-		_ = c.storage.HolePunchBlob(v.SegmentID, v.Pos, v.Size)
+		_ = c.storage.HolePunchBlob(v.SegmentID, v.Pos, v.LogicalSize)
 	}
-
+	
 	// 4. METRICS & MAINTENANCE
 	c.approxSize.Add(-evictedBytes)
 	evictedCount := len(victims)
-
+	
 	log.Info("eviction completed",
 		"evicted_count", evictedCount,
 		"evicted_mb", evictedBytes/(1024*1024),
 		"remaining_mb", c.approxSize.Load()/(1024*1024))
-
+	
 	c.bloom.deletions.Add(int64(evictedCount))
-
+	
 	if err := c.maybeTriggerBloomRebuild(); err != nil {
 		log.Error("bloom rebuild failed", "error", err)
 	}
-
+	
 	return nil
 }
 
@@ -349,9 +349,9 @@ func (c *Cache) maybeTriggerBloomRebuild() error {
 	if last != nil && time.Since(*last) < 5*time.Minute {
 		return nil
 	}
-
+	
 	shouldRebuild := false
-
+	
 	// 2. Proactive: Cumulative Staleness check
 	// If the number of deletions reaches a threshold (e.g. 10% of total capacity), rebuild.
 	staleCount := c.bloom.deletions.Load()
@@ -359,7 +359,7 @@ func (c *Cache) maybeTriggerBloomRebuild() error {
 	if staleCount > threshold {
 		shouldRebuild = true
 	}
-
+	
 	// 3. Reactive: Observed FPR check (if we haven't hit volume threshold yet)
 	if !shouldRebuild {
 		hits := c.bloom.hits.Load()
@@ -371,7 +371,7 @@ func (c *Cache) maybeTriggerBloomRebuild() error {
 			}
 		}
 	}
-
+	
 	if shouldRebuild {
 		return c.rebuildBloom()
 	}
@@ -387,34 +387,19 @@ func (c *Cache) maybeCompactSegments() error {
 	return nil
 }
 
-// Put stores a key-value pair (makes copies for safety)
-func (c *Cache) Put(key []byte, value []byte) {
-	valueCopy := make([]byte, len(value))
-	copy(valueCopy, value)
-	c.UnsafePut(key, valueCopy)
-}
-
 // UnsafePut stores key-value without copying
 // Caller must ensure key and value are not modified after this call
-func (c *Cache) UnsafePut(key []byte, value []byte) {
+func (c *Cache) Put(key []byte, value []byte) {
 	h := c.KeyHasher(key)
-	c.memTable.Put(Key(h), value)
+	c.memTable.Put(h, value)
 	c.bloom.Load().Add(h)
-}
-
-// PutChecksummed stores key-value with an explicit checksum (makes copies for safety)
-// The checksum will be validated if WithVerifyOnRead is enabled
-func (c *Cache) PutChecksummed(key []byte, value []byte, checksum uint32) {
-	valueCopy := make([]byte, len(value))
-	copy(valueCopy, value)
-	c.UnsafePutChecksummed(key, valueCopy, checksum)
 }
 
 // UnsafePutChecksummed stores key-value with checksum without copying
 // Caller must ensure key and value are not modified after this call
-func (c *Cache) UnsafePutChecksummed(key []byte, value []byte, checksum uint32) {
+func (c *Cache) PutChecksummed(key []byte, value []byte, checksum uint32) {
 	h := c.KeyHasher(key)
-	c.memTable.PutChecksummed(Key(h), value, checksum)
+	c.memTable.PutChecksummed(h, value, checksum)
 	c.bloom.Load().Add(h)
 }
 
@@ -426,14 +411,14 @@ func (c *Cache) PutBatch(segID int64, records []metadata.BlobRecord) error {
 	if err := c.index.IngestBatch(segID, records); err != nil {
 		return err
 	}
-
+	
 	// Phase 3: Update size tracking and trigger reactive eviction if needed
 	var addedBytes int64
 	for _, rec := range records {
-		addedBytes += rec.Size
+		addedBytes += rec.LogicalSize
 	}
 	newSize := c.approxSize.Add(addedBytes)
-
+	
 	// Trigger eviction if over limit
 	// First write sends to channel (non-blocking), subsequent writes block until eviction completes
 	if c.MaxSize > 0 && newSize > c.MaxSize && !c.IsDegraded() {
@@ -458,15 +443,15 @@ func (c *Cache) Get(key []byte) (io.Reader, bool) {
 	if !c.bloom.Load().Test(h) {
 		return nil, false
 	}
-
+	
 	// If we are here, the Bloom filter said "Yes"
 	c.bloom.hits.Add(1)
-
+	
 	// 2. Check memtable (recent writes)
 	if value, found := c.memTable.Get(Key(h)); found {
 		return value, true
 	}
-
+	
 	// 3. RAM Index Check (The Truth)
 	// index.Get(h) marks the entry as 'visited' for the Sieve algorithm internally.
 	entry, ok := c.index.Get(h)
@@ -475,7 +460,7 @@ func (c *Cache) Get(key []byte) (io.Reader, bool) {
 		c.bloom.ghosts.Add(1)
 		return nil, false
 	}
-
+	
 	// 3. Read from disk using BlobReader
 	// Reader handles index lookup and checksum verification internally
 	reader, err := c.storage.ReadBlob(entry)
@@ -486,15 +471,15 @@ func (c *Cache) Get(key []byte) (io.Reader, bool) {
 			log.Error("transient storage error (skipping)", "hash", h, "error", err)
 			return nil, false
 		}
-
+		
 		// DATA ISSUE: The error is permanent (e.g., os.ErrNotExist).
 		// The index is desynced from the disk. Self-heal by removing the stale entry.
 		log.Warn("permanent storage failure: removing stale index entry",
 			"hash", h, "error", err)
-
+		
 		err := c.index.DeleteBlobs(entry)
 		if err == nil {
-			c.approxSize.Add(-entry.Size)
+			c.approxSize.Add(-entry.LogicalSize)
 			// Update Bloom metrics: This key is now a "Ghost" in the current filter
 			// and its removal counts toward the staleness/rebuild threshold.
 			c.bloom.ghosts.Add(1)
@@ -502,7 +487,7 @@ func (c *Cache) Get(key []byte) (io.Reader, bool) {
 		} else {
 			log.Warn("index update failure: removing stale index entry", "hash", h, "error", err)
 		}
-
+		
 		return nil, false
 	}
 	return reader, true

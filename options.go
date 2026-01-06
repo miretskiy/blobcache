@@ -3,7 +3,7 @@ package blobcache
 import (
 	"hash"
 	"hash/crc32"
-
+	
 	"github.com/cespare/xxhash/v2"
 )
 
@@ -36,9 +36,8 @@ type config struct {
 	BloomEstimatedKeys  int
 	IO                  IOConfig
 	Resilience          ResilienceConfig
-
+	
 	// Testing hooks
-	onSegmentEvicted      func(segmentID int64)
 	testingInjectWriteErr func() error // Called before writer.Write() in flush
 	testingInjectIndexErr func() error // Called before index.PutBatch() in flush
 	testingInjectEvictErr func() error // Called in runEviction()
@@ -162,13 +161,6 @@ func WithKeyHasher(hasher KeyHasherFn) Option {
 func WithTestingFlushOnPut() Option {
 	return funcOpt(func(c *config) {
 		c.SegmentSize = 0
-	})
-}
-
-// WithTestingOnSegmentEvicted sets a callback invoked when segments are evicted
-func WithTestingOnSegmentEvicted(fn func(segmentID int64)) Option {
-	return funcOpt(func(c *config) {
-		c.onSegmentEvicted = fn
 	})
 }
 

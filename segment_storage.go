@@ -7,7 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-
+	
 	"github.com/miretskiy/blobcache/index"
 )
 
@@ -44,23 +44,23 @@ func (s *Storage) ReadBlob(e index.Entry) (io.Reader, error) {
 	if err != nil {
 		return nil, fmt.Errorf("storage: segment %d not found: %w", e.SegmentID, err)
 	}
-
+	
 	// 1. Kernel Hinting (Hybrid I/O)
 	// Since reads are buffered, we tell the kernel exactly what we are about to read.
 	if s.IO.Fadvise {
-		_ = Fadvise(sf.file.Fd(), Offset_t(e.Pos), e.Size, FadvSequential)
+		_ = Fadvise(sf.file.Fd(), Offset_t(e.Pos), e.LogicalSize, FadvSequential)
 	}
-
+	
 	// 2. Base Reader
 	// SectionReader provides a view into the segment file without moving the file pointer.
-	var reader io.Reader = io.NewSectionReader(sf, e.Pos, e.Size)
-
+	var reader io.Reader = io.NewSectionReader(sf, e.Pos, e.LogicalSize)
+	
 	// 3. Optional Integrity Layer
 	// We wrap the reader so the checksum is verified as the user consumes the data.
 	if s.Resilience.VerifyOnRead && e.HasChecksum() {
 		reader = newChecksumVerifyingReader(reader, s.Resilience.ChecksumHasher, e.Checksum())
 	}
-
+	
 	return reader, nil
 }
 
@@ -79,29 +79,29 @@ func (s *Storage) getSegmentFile(segmentID int64) (*segmentFile, error) {
 	if cached, ok := s.cache.Load(segmentID); ok {
 		return cached.(*segmentFile), nil
 	}
-
+	
 	// 2. Open the file
 	path := getSegmentPath(s.Path, s.Shards, segmentID)
 	f, err := os.OpenFile(path, os.O_RDWR, 0644)
 	if err != nil {
 		return nil, err
 	}
-
+	
 	// 3. Verify the Index knows this segment exists
 	if _, ok := s.index.GetSegmentRecord(segmentID); !ok {
 		_ = f.Close()
 		return nil, fmt.Errorf("storage: segment %d unknown to index", segmentID)
 	}
-
+	
 	sf := &segmentFile{file: f, segID: segmentID}
-
+	
 	// 4. Cache the handle
 	actual, loaded := s.cache.LoadOrStore(segmentID, sf)
 	if loaded {
 		_ = sf.Close()
 		return actual.(*segmentFile), nil
 	}
-
+	
 	return sf, nil
 }
 

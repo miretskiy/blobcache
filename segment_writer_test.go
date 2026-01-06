@@ -5,9 +5,9 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
-
+	
 	"golang.org/x/sys/unix"
-
+	
 	"github.com/miretskiy/blobcache/metadata"
 	"github.com/stretchr/testify/require"
 )
@@ -27,9 +27,10 @@ func NewTrackedPool(capacity int, slabSize int64) *TrackedPool {
 
 func (tp *TrackedPool) AcquireAligned(size int64) *MmapBuffer {
 	buf := tp.MmapPool.AcquireAligned(size)
+	// If buf.pool is nil, it's a one-off unpooled allocation that needs tracking.
 	if buf.pool == nil {
 		tp.mu.Lock()
-		tp.extraRegions = append(tp.extraRegions, buf.raw)
+		tp.extraRegions = append(tp.extraRegions, buf.Bytes())
 		tp.mu.Unlock()
 	}
 	return buf
@@ -38,18 +39,11 @@ func (tp *TrackedPool) AcquireAligned(size int64) *MmapBuffer {
 func (tp *TrackedPool) Teardown() {
 	tp.mu.Lock()
 	defer tp.mu.Unlock()
+	// Clean up unpooled regions.
 	for _, r := range tp.extraRegions {
 		_ = unix.Munmap(r)
 	}
 	tp.extraRegions = nil
-	for {
-		select {
-		case buf := <-tp.buffers:
-			_ = unix.Munmap(buf.raw)
-		default:
-			return
-		}
-	}
 }
 
 // MockBatcher implements: PutBatch(segID int64, records []metadata.BlobRecord) error
@@ -65,6 +59,7 @@ func (m *MockBatcher) PutBatch(segID int64, records []metadata.BlobRecord) error
 	if m.Batches == nil {
 		m.Batches = make(map[int64][]metadata.BlobRecord)
 	}
+	// Copy slice to simulate persistent storage.
 	m.Batches[segID] = append(m.Batches[segID], records...)
 	m.Count += len(records)
 	return nil
@@ -101,45 +96,58 @@ func TestSegmentWriter_FullCycle(t *testing.T) {
 	const slabSize = 1024 * 1024
 	const segSize = 4 * 1024 * 1024
 	const segID = int64(777)
-
+	
 	pool := NewTrackedPool(4, slabSize)
 	defer pool.Teardown()
-
+	
 	path := filepath.Join(tmpDir, "777.seg")
-
+	
 	t.Run("AlignedPhysicalWrites", func(t *testing.T) {
 		sw, err := NewSegmentWriter(segID, path, segSize, pool)
 		require.NoError(t, err)
-
+		
 		// Slab 1
 		slab1 := pool.Acquire()
 		data1 := []byte("direct-io-block-1")
-		_, _ = slab1.Append(data1)
-		// metadata.BlobRecord uses uint64 for Hash
-		recs1 := []metadata.BlobRecord{{Hash: 101, Pos: 0, Size: int64(len(data1))}}
+		// Use WriteAt instead of Append.
+		slab1.WriteAt(data1, 0)
+		slab1.Seal(int64(len(data1))) // Mark as ready for O_DIRECT.
+		
+		recs1 := []metadata.BlobRecord{{
+			Hash:        101,
+			Pos:         0,
+			LogicalSize: int64(len(data1)), // Renamed field.
+		}}
 		require.NoError(t, sw.WriteSlab(slab1.AlignedBytes(), recs1))
 		slab1.Unpin()
-
+		
 		// Slab 2
 		slab2 := pool.Acquire()
 		data2 := []byte("direct-io-block-2")
-		_, _ = slab2.Append(data2)
-		recs2 := []metadata.BlobRecord{{Hash: 202, Pos: 0, Size: int64(len(data2))}}
+		slab2.WriteAt(data2, 0)
+		slab2.Seal(int64(len(data2)))
+		
+		recs2 := []metadata.BlobRecord{{
+			Hash:        202,
+			Pos:         0,
+			LogicalSize: int64(len(data2)),
+		}}
 		require.NoError(t, sw.WriteSlab(slab2.AlignedBytes(), recs2))
 		slab2.Unpin()
-
+		
 		require.NoError(t, sw.Close())
-
+		
 		// Verify Footer Recovery
 		f, err := os.Open(path)
 		require.NoError(t, err)
 		defer f.Close()
-
+		
 		info, _ := f.Stat()
 		footer, _, err := metadata.ReadSegmentFooterFromFile(f, info.Size(), segID)
 		require.NoError(t, err)
-
+		
 		// Verify Pos rounding (critical for Direct I/O reads)
+		// Slab 2 should be positioned at the next 4KB boundary.
 		expectedOffset := testRoundToPage(int64(len(data1)))
 		require.Equal(t, expectedOffset, footer.Records[1].Pos)
 	})
@@ -155,38 +163,40 @@ func TestMemTable_Integration_Rotation(t *testing.T) {
 		FlushConcurrency:   2,
 		Shards:             1,
 	}
-
+	
 	mb := &MockBatcher{}
 	mh := &MockHealthReporter{}
-
+	
 	mt := NewMemTable(cfg, mb, mh)
 	defer mt.Close()
-
-	// Ingest 2MB to force rotation of 1MB segments
+	
+	// Ingest blobs to force rotation across multiple 1MB segments.
 	blobCount := 20
 	blobSize := 100 * 1024
 	data := make([]byte, blobSize)
 	for i := 0; i < blobSize; i++ {
 		data[i] = byte(i % 256)
 	}
-
+	
 	for i := 0; i < blobCount; i++ {
 		key := Key(i)
 		mt.Put(key, data)
 	}
-
+	
 	mt.Drain()
-
-	// 1. Verify all records hit the Batcher
+	
+	// 1. Verify all records hit the Batcher.
 	require.Equal(t, blobCount, mb.Count)
-
-	// 2. Verify rotation occurred
+	
+	// 2. Verify rotation occurred.
 	require.GreaterOrEqual(t, len(mb.Batches), 2, "Should have flushed multiple segments")
-
-	// 3. Verify physical files
+	
+	// 3. Verify physical files exist on disk.
 	segCount := 0
-	// Try this to see where they actually went:
 	err := filepath.Walk(tmpDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
 		if !info.IsDir() && filepath.Ext(path) == ".seg" {
 			segCount++
 		}

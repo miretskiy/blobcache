@@ -26,43 +26,44 @@ func Benchmark_Mixed(b *testing.B) {
 	}
 	os.RemoveAll(tmpDir)
 	defer os.RemoveAll(tmpDir)
-
+	
 	cache, err := New(tmpDir,
 		WithMaxSize(512<<30),       // 512GB cache capacity
-		WithWriteBufferSize(1<<30), // 1GB memtables (optimal batching)
+		WithWriteBufferSize(1<<27), // 128MB
 		WithSegmentSize(2<<30),     // 2GB segments
-		WithMaxInflightBatches(8),  // 8GB total buffer
-		WithFlushConcurrency(4),    // 4 workers (optimal for this workload)
+		WithMaxInflightBatches(8),
+		WithFlushConcurrency(6), // 4 workers (optimal for this workload)
 	)
 	if err != nil {
 		b.Fatal(err)
 	}
 	cache.Start()
-	defer cache.Close()
-
+	defer func() {
+		cache.Close()
+	}()
+	
 	var numReads, numFound atomic.Int64
 	var numWrites, completedWrites atomic.Int64 // Pre-allocates key IDs
 	var workerID atomic.Int64
 	start := time.Now()
-
+	
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		workerID := workerID.Add(1)
 		rng := rand.New(rand.NewSource(42 + workerID))
 		myKeys := make([]int64, 0, 1024) // Track this worker's completed writes
-
+		value := make([]byte, 1024*1024) // 1MB per worker
+		for i := 0; i < len(value); i += 128 * 1024 {
+			value[i] = byte(rng.Intn(255))
+		}
+		
 		for pb.Next() {
 			op := rng.Intn(100)
 			if op < 10 {
 				// 10% writes
-				value := make([]byte, 1024*1024) // 1MB per worker
-				for i := 0; i < len(value); i += 128 * 1024 {
-					value[i] = byte(rng.Intn(255))
-				}
-
 				keyID := numWrites.Add(1) - 1
 				key := []byte(fmt.Sprintf("w-%d-key-%d", workerID, keyID))
-				cache.UnsafePut(key, value)
+				cache.Put(key, value)
 				myKeys = append(myKeys, keyID)
 				completedWrites.Add(1)
 			} else if op < 55 {
@@ -75,8 +76,7 @@ func Benchmark_Mixed(b *testing.B) {
 					reader, found := cache.Get(key)
 					numReads.Add(1)
 					if found {
-						var buf [1024 * 1024]byte
-						_, _ = io.ReadFull(reader, buf[:])
+						_, _ = io.ReadFull(reader, value)
 						numFound.Add(1)
 					} else {
 						b.Logf("Failed to find %s", key)
@@ -93,11 +93,11 @@ func Benchmark_Mixed(b *testing.B) {
 			}
 		}
 	})
-
+	
 	cache.Drain() // include drain time to flush the rest of the data.
 	duration := time.Since(start)
 	b.StopTimer()
-
+	
 	writeThroughput := float64(numWrites.Load()) / duration.Seconds() / 1024 // GB/s
 	b.ReportMetric(writeThroughput, "write-GB/s")
 }

@@ -239,12 +239,36 @@ BlobCache utilizes `O_DIRECT`. This introduces the **Direct I/O Paradox**: By ch
 The "lie" is moved to the **MemTable**. Ingestion completes at RAM speeds, while the background Flush Worker handles the blocking Direct I/O call without affecting application latency.
 
 
+---
 
 ---
 
-## 7. Unified Bloom Filter
+---
 
-### 7.1 Unified vs. Distributed Rejection
+---
+
+## 7. Compression Strategy: Distributed In-Thread Compression
+
+### 7.1 Distributed Ingestion & The "1/8th" Heuristic
+BlobCache utilizes a distributed compression model where data transformation is performed by the calling goroutine during the `Put()` operation. By offloading this burden to the ingestion threads, the system prevents background flush workers from becoming a CPU bottleneck, ensuring NVMe write saturation even under high load. This effectively increases MemTable density, as compressed payloads allow each 128MB physical slab to host a significantly larger volume of logical data before requiring a flush to disk.
+
+To prevent wasting cycles on incompressible data, the system employs a **"1/8th Early Abort"** heuristic inspired by ZFS. The compression algorithm is provided a destination buffer exactly 12.5% smaller than the source; if the buffer is filled before the blob is fully processed, the operation is aborted and the blob is stored raw. This "savings rule" ensures CPU time is only invested in data yielding meaningful footprint reductions while signaling that the data may already be compressed or contain high entropy.
+
+### 7.2 Preservation of Physical Reclamation
+The decision to compress individual blobs rather than larger logical chunks is critical to the efficacy of the **Sieve eviction policy** and **physical hole-punching**. Because each blob remains an independent unit of compression, the system can utilize `FALLOC_FL_PUNCH_HOLE` at the granularity of a single object's 4KB-aligned blocks the moment it is evicted from the cache.
+
+Alternative "chunked" designs were rejected because they introduce **reclamation friction**: physical space cannot be recovered until every blob within a compressed block has been evicted, effectively forcing expensive compaction cycles to recover fragmented space. Path A ensures the logical unit of eviction always matches the physical unit of reclamation.
+
+### 7.3 Dual-Size Metadata & Zero-Allocation Reads
+To maximize retrieval efficiency, the Skipmap and Segment Footer track both the **Logical (Uncompressed)** and **Physical (Stored)** sizes. This dual-size tracking enables a **Zero-Allocation** retrieval path: by knowing the logical size upfront, the system can pre-allocate a destination buffer of the exact required size, eliminating the CPU and GC overhead of dynamic buffer growth during a `Get()` request.
+
+Furthermore, these metrics provide high-fidelity, real-time observability into compression ratios across the 1TB NVMe tier. This metadata allows the Retrieval Accelerator to execute a single `pread()` for the exact physical byte range, eliminating "Read Amplification" where a small request would otherwise force the disk to pull in a much larger compressed chunk.
+
+---
+
+## 8. Unified Bloom Filter
+
+### 8.1 Unified vs. Distributed Rejection
 Traditional LSM-trees check a separate filter for every file ($O(N)$). BlobCache uses one **Unified Bloom Filter** ($O(1)$). A miss costs $\approx 1ns$ regardless of cache size.
 
 ```text
@@ -257,7 +281,7 @@ KEY: "blob_77"
 +--[ Hash 3 ]--+    +-----------------------------------+
 ```
 
-### 7.2 False Positive Decay
+### 8.2 False Positive Decay
 Standard Bloom filters cannot handle deletions. As Sieve evicts blobs, the filter decays with "ghost" entries.
 1. **Proactive Tracking:** Rebuilds when ghosts exceed 10%.
 2. **Reactive Monitoring:** Rebuilds if Observed FPR spikes.
@@ -265,7 +289,7 @@ Standard Bloom filters cannot handle deletions. As Sieve evicts blobs, the filte
 
 ---
 
-## 8. Resilience: Degraded Mode
+## 9. Resilience: Degraded Mode
 When a background I/O error occurs (e.g., `Disk Full`), BlobCache enters **Degraded Mode** to maintain availability:
 
 1.  **Worker Halt:** Background flushers stop permanently to prevent inconsistent index states.
@@ -274,9 +298,9 @@ When a background I/O error occurs (e.g., `Disk Full`), BlobCache enters **Degra
 
 ---
 
-## 9. Eviction & Space Reclamation
+## 10. Eviction & Space Reclamation
 
-### 9.1 The Three-Phase Eviction Lifecycle
+### 10.1 The Three-Phase Eviction Lifecycle
 1. **Selection (Sieve):** Victims are unlinked from the Skipmap (Logical Deletion).
 2. **Commit:** Deletion is persisted to the Bitcask log (Durability).
 3. **Reclamation (Hole Punching):** `fallocate(FALLOC_FL_PUNCH_HOLE)` reclaims physical SSD blocks without rewriting immutable segments.
@@ -296,7 +320,7 @@ SEGMENT FILE STRUCTURE (Physical View)
     | B1 | B2 |  HOLE (B3-B5)  | B6 | B7 | B8 |
 ```
 
-### 9.2 Sparse Segment Compaction
+### 10.2 Sparse Segment Compaction
 Hole punching creates "Swiss Cheese" segments—files that remain physically large on disk but contain mostly empty space.
 * **The Compaction Ticker:** A background task periodically calculates the "Fullness Percentage" ($LiveBytes / TotalPhysicalSize$).
 * **Migration:** Segments falling below a threshold (e.g., 20%) are marked for compaction. Remaining live blobs are read and re-inserted into the `MemTable` as new `Put()` operations.

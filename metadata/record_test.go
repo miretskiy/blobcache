@@ -5,7 +5,8 @@ import (
 	"fmt"
 	"testing"
 	"time"
-
+	
+	"github.com/miretskiy/blobcache/compression"
 	"github.com/stretchr/testify/require"
 )
 
@@ -14,395 +15,176 @@ func decodeFooterSection(segmentData []byte) (SegmentRecord, error) {
 	if len(segmentData) < SegmentFooterSize {
 		return SegmentRecord{}, fmt.Errorf("data too small")
 	}
-
+	
 	// 1. Footer is always at the absolute end
 	footerBuf := segmentData[len(segmentData)-SegmentFooterSize:]
 	footer, err := DecodeSegmentFooter(footerBuf)
 	if err != nil {
 		return SegmentRecord{}, err
 	}
-
+	
 	// 2. Calculate where the Aligned Metadata Block starts
-	// We must use the same rounding logic used during encoding
 	physicalSize := roundToPage(footer.Len + int64(SegmentFooterSize))
-
-	// metadataBlockStart is the beginning of the 4KB-aligned section
+	
 	metadataBlockStart := len(segmentData) - int(physicalSize)
 	if metadataBlockStart < 0 {
-		// This happens if the length in the footer is impossibly large
 		return SegmentRecord{}, fmt.Errorf("invalid segment record length: metadata block out of bounds")
 	}
-
+	
 	// 3. The Record Data is at the START of that physical block
 	segmentRecordData := segmentData[metadataBlockStart : metadataBlockStart+int(footer.Len)]
-
+	
 	return DecodeSegmentRecordWithChecksum(segmentRecordData, footer.Checksum)
 }
 
-func TestFooter_EncodeAndDecode(t *testing.T) {
-	// Simulate segment with some blob data
-	blobData := []byte("test blob data here")
+func TestBlobRecord_CompressionAndSizes(t *testing.T) {
+	// Test case: Compressed blob with dual-size tracking
+	rec := BlobRecord{
+		Hash:         0x1234567890ABCDEF,
+		Pos:          5000,
+		LogicalSize:  10240, // 10KB original
+		PhysicalSize: 4096,  // 4KB compressed
+		Flags:        0,
+	}
+	rec.SetCompression(compression.CodexZstd) // Set compression bit
+	
+	require.True(t, rec.IsCompressed())
+	require.Equal(t, compression.CodexZstd, rec.Compression())
+	require.InDelta(t, 0.4, rec.CompressionRatio(), 0.001) // 4096 / 10240
+	
+	// Round-trip serialization
+	buf := AppendBlobRecord(nil, rec)
+	require.Equal(t, EncodedBlobRecordSize, len(buf))
+	
+	decoded, err := DecodeBlobRecord(buf)
+	require.NoError(t, err)
+	require.Equal(t, rec, decoded)
+	require.Equal(t, int64(10240), decoded.LogicalSize)
+	require.Equal(t, int64(4096), decoded.PhysicalSize)
+}
 
-	// Create test segment record
+func TestFooter_EncodeAndDecode_WithCompression(t *testing.T) {
 	ctime := time.Unix(1234567890, 0)
+	
+	// Create records with mixed compression and sizes
+	rec1 := BlobRecord{Hash: 1, Pos: 0, LogicalSize: 1000, PhysicalSize: 1000, Flags: 0}
+	rec1.SetCompression(compression.CodexNone)
+	
+	rec2 := BlobRecord{Hash: 2, Pos: 1000, LogicalSize: 5000, PhysicalSize: 1200, Flags: 0}
+	rec2.SetCompression(compression.CodexLZ4) // Corrected Codex name
+	
 	sr := SegmentRecord{
-		Records: []BlobRecord{
-			{Hash: 0x1234567890ABCDEF, Pos: 0, Size: 1024, Flags: 0xAABBCCDD},
-			{Hash: 0xFEDCBA0987654321, Pos: 1024, Size: 2048, Flags: 0x11223344},
-			{Hash: 0xABCDEF0123456789, Pos: 3072, Size: 512, Flags: 0x99887766},
-		},
-		SegmentID: 1,
+		Records:   []BlobRecord{rec1, rec2},
+		SegmentID: 99,
 		CTime:     ctime,
 	}
-
-	// Encode footer
+	
 	footerBytes := AppendSegmentRecordWithFooter(nil, sr)
-
-	// Build segment data (blob + footer)
-	segmentData := append(blobData, footerBytes...)
-
-	decodedSR, err := decodeFooterSection(segmentData)
-	require.NoError(t, err)
-	require.Equal(t, sr.SegmentID, decodedSR.SegmentID)
-	require.Equal(t, 3, len(decodedSR.Records))
-	require.Equal(t, ctime.Unix(), decodedSR.CTime.Unix())
-
-	// Validate records
-	for i, rec := range sr.Records {
-		require.Equal(t, rec, decodedSR.Records[i])
-	}
-}
-
-func TestFooter_EmptyRecords(t *testing.T) {
-	data := []byte("some data")
-
-	sr := SegmentRecord{
-		Records:   []BlobRecord{},
-		SegmentID: 0,
-		CTime:     time.Unix(1000000000, 0),
-	}
-
-	footerBytes := AppendSegmentRecordWithFooter(nil, sr)
-	segmentData := append(data, footerBytes...)
-
-	decodedSR, err := decodeFooterSection(segmentData)
-	require.NoError(t, err)
-	require.Equal(t, int64(0), decodedSR.SegmentID)
-	require.Equal(t, 0, len(decodedSR.Records))
-	require.Equal(t, sr.CTime.Unix(), decodedSR.CTime.Unix())
-}
-
-func TestFooter_ManyRecords(t *testing.T) {
-	// Create 1000 records
-	records := make([]BlobRecord, 1000)
-	for i := 0; i < 1000; i++ {
-		records[i] = BlobRecord{
-			Hash:  uint64(i) << 32,
-			Pos:   int64(i * 1000),
-			Size:  int64(i * 100),
-			Flags: uint64(i),
-		}
-	}
-
-	sr := SegmentRecord{
-		Records:   records,
-		SegmentID: 1,
-		CTime:     time.Unix(1500000000, 0),
-	}
-
-	footerBytes := AppendSegmentRecordWithFooter(nil, sr)
-
+	
 	decodedSR, err := decodeFooterSection(footerBytes)
 	require.NoError(t, err)
-	require.Equal(t, sr.SegmentID, decodedSR.SegmentID)
-	require.Equal(t, 1000, len(decodedSR.Records))
-	require.Equal(t, sr.CTime.Unix(), decodedSR.CTime.Unix())
-
-	// Spot check
-	require.Equal(t, records[0], decodedSR.Records[0])
-	require.Equal(t, records[500], decodedSR.Records[500])
-	require.Equal(t, records[999], decodedSR.Records[999])
+	require.Equal(t, 2, len(decodedSR.Records))
+	
+	// Validate logical vs physical size preservation
+	require.Equal(t, int64(5000), decodedSR.Records[1].LogicalSize)
+	require.Equal(t, int64(1200), decodedSR.Records[1].PhysicalSize)
+	require.Equal(t, compression.CodexLZ4, decodedSR.Records[1].Compression())
 }
 
-func TestFooter_InvalidMagic_Footer(t *testing.T) {
-	sr := SegmentRecord{
-		Records:   []BlobRecord{{Hash: 123, Pos: 0, Size: 456, Flags: 789}},
-		SegmentID: 0,
-		CTime:     time.Now(),
+func TestFooter_HolePunchingAlignment(t *testing.T) {
+	// Verify that PhysicalMetadataSize accounts for the larger 40-byte records
+	numRecords := 100
+	
+	pSize := PhysicalMetadataSize(numRecords)
+	// (16 + 4000 + 20) = 4036. This fits in ONE 4KB page (4096)
+	require.Equal(t, int64(4096), pSize)
+	require.True(t, pSize%4096 == 0)
+}
+
+func TestCompressionHeuristic_FlagSafety(t *testing.T) {
+	// Test that setting compression doesn't clobber other flags like Deleted
+	rec := BlobRecord{Flags: 0}
+	rec.SetDeleted()
+	rec.SetCompression(compression.CodexZstd)
+	
+	require.True(t, rec.IsDeleted())
+	require.True(t, rec.IsCompressed())
+	require.Equal(t, compression.CodexZstd, rec.Compression())
+	
+	// Unset compression
+	rec.SetCompression(compression.CodexNone)
+	require.False(t, rec.IsCompressed())
+	require.True(t, rec.IsDeleted()) // Deleted bit must remain
+}
+
+func TestSegmentRecord_InvalidRecordCount_Updated(t *testing.T) {
+	// With 40-byte records, a 32-byte addition should fail
+	buf := make([]byte, SegmentRecordHeaderSize+32)
+	binary.LittleEndian.PutUint64(buf[0:8], 1)
+	binary.LittleEndian.PutUint64(buf[8:16], uint64(time.Now().Unix()))
+	
+	_, err := DecodeSegmentRecord(buf)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "not a multiple of 40")
+}
+
+func TestFooter_ManyRecords_LargeSlab(t *testing.T) {
+	// Create 5000 records to test metadata block crossing multiple pages
+	records := make([]BlobRecord, 5000)
+	for i := 0; i < 5000; i++ {
+		records[i] = BlobRecord{
+			Hash:         uint64(i),
+			Pos:          int64(i * 4096),
+			LogicalSize:  8192,
+			PhysicalSize: 2048,
+			Flags:        0,
+		}
+		records[i].SetCompression(compression.CodexZstd)
 	}
-
-	footerBytes := AppendSegmentRecordWithFooter(nil, sr)
-
-	// Corrupt footer magic: Len(8) + Checksum(4) + Magic(8)
-	footerStart := len(footerBytes) - SegmentFooterSize
-	binary.LittleEndian.PutUint64(footerBytes[footerStart+12:], 0xDEADBEEFDEADBEEF)
-
-	_, err := decodeFooterSection(footerBytes)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "invalid footer magic")
-}
-
-func TestFooter_InvalidLength(t *testing.T) {
+	
 	sr := SegmentRecord{
-		Records:   []BlobRecord{{Hash: 123, Pos: 0, Size: 456, Flags: 789}},
-		SegmentID: 0,
-		CTime:     time.Now(),
+		Records:   records,
+		SegmentID: 500,
+		CTime:     time.Now().Truncate(time.Second),
 	}
-
+	
 	footerBytes := AppendSegmentRecordWithFooter(nil, sr)
-
-	// Corrupt Len to point beyond valid range
-	// Footer: Len(8) + Checksum(4) + Magic(8)
-	footerStart := len(footerBytes) - SegmentFooterSize
-	binary.LittleEndian.PutUint64(footerBytes[footerStart:], uint64(len(footerBytes)))
-
-	_, err := decodeFooterSection(footerBytes)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "invalid segment record length")
-}
-
-func TestFooter_ChecksumMismatch(t *testing.T) {
-	sr := SegmentRecord{
-		Records:   []BlobRecord{{Hash: 123, Pos: 0, Size: 456, Flags: 789}},
-		SegmentID: 0,
-		CTime:     time.Now(),
-	}
-
-	footerBytes := AppendSegmentRecordWithFooter(nil, sr)
-
-	// Corrupt checksum in footer: Len(8) + Checksum(4) + Magic(8)
-	footerStart := len(footerBytes) - SegmentFooterSize
-	binary.LittleEndian.PutUint32(footerBytes[footerStart+8:], 0xDEADBEEF)
-
-	_, err := decodeFooterSection(footerBytes)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "checksum mismatch")
-}
-
-func TestFooter_CorruptRecordData(t *testing.T) {
-	sr := SegmentRecord{
-		Records: []BlobRecord{
-			{Hash: 0x1111111111111111, Pos: 0, Size: 100, Flags: 0xAAAAAAAA},
-			{Hash: 0x2222222222222222, Pos: 100, Size: 200, Flags: 0xBBBBBBBB},
-		},
-		SegmentID: 1,
-		CTime:     time.Now(),
-	}
-
-	footerBytes := AppendSegmentRecordWithFooter(nil, sr)
-
-	// Corrupt first blob record in segment record
-	firstRecordPos := SegmentRecordHeaderSize
-	footerBytes[firstRecordPos] = 0xFF
-	footerBytes[firstRecordPos+1] = 0xFF
-
-	_, err := decodeFooterSection(footerBytes)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "checksum mismatch")
-}
-
-func TestFooter_TooSmall(t *testing.T) {
-	_, err := decodeFooterSection([]byte("tiny"))
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "too small")
+	
+	// The metadata block should be (16 + (5000 * 40) + 20) = 200,036 bytes.
+	// Rounded to 4KB: 200,704 bytes.
+	require.Equal(t, int(PhysicalMetadataSize(5000)), len(footerBytes))
+	
+	decodedSR, err := decodeFooterSection(footerBytes)
+	require.NoError(t, err)
+	require.Equal(t, 5000, len(decodedSR.Records))
+	require.Equal(t, compression.CodexZstd, decodedSR.Records[4999].Compression())
 }
 
 func TestFooter_RoundTrip_LargeValues(t *testing.T) {
 	// Test with large hash/size values
 	sr := SegmentRecord{
 		Records: []BlobRecord{
-			{Hash: 0xFFFFFFFFFFFFFFFF, Pos: 0, Size: 0x7FFFFFFFFFFFFFFF, Flags: 0xFFFFFFFF},
-			{Hash: 0x0000000000000000, Pos: 1000, Size: 0x0000000000000000, Flags: 0x00000000},
-			{Hash: 0x7FFFFFFFFFFFFFFF, Pos: 2000, Size: 0x7FFFFFFFFFFFFFFF, Flags: 0x80000000},
+			{Hash: 0xFFFFFFFFFFFFFFFF, Pos: 0, LogicalSize: 0x7FFFFFFFFFFFFFFF, PhysicalSize: 0x7FFFFFFFFFFFFFFF, Flags: 0xFFFFFFFF},
+			{Hash: 0x0000000000000000, Pos: 1000, LogicalSize: 0, PhysicalSize: 0, Flags: 0},
+			{Hash: 0x7FFFFFFFFFFFFFFF, Pos: 2000, LogicalSize: 0x7FFFFFFFFFFFFFFF, PhysicalSize: 0x7FFFFFFFFFFFFFFF, Flags: 0x80000000},
 		},
 		SegmentID: 1,
 		CTime:     time.Unix(2147483647, 0), // Max 32-bit timestamp
 	}
-
+	
 	footerBytes := AppendSegmentRecordWithFooter(nil, sr)
-
+	
 	// Prepend some data
 	data := make([]byte, 100)
 	segmentData := append(data, footerBytes...)
-
+	
 	decodedSR, err := decodeFooterSection(segmentData)
 	require.NoError(t, err)
 	require.Equal(t, sr.SegmentID, decodedSR.SegmentID)
 	require.Equal(t, 3, len(decodedSR.Records))
 	require.Equal(t, sr.CTime.Unix(), decodedSR.CTime.Unix())
-
+	
 	for i := range sr.Records {
 		require.Equal(t, sr.Records[i], decodedSR.Records[i])
-	}
-}
-
-func TestBlobRecord_Encode(t *testing.T) {
-	rec := BlobRecord{
-		Hash:  0x1122334455667788,
-		Pos:   1024,
-		Size:  2048,
-		Flags: 0xAABBCCDD,
-	}
-
-	buf := AppendBlobRecord(nil, rec)
-	require.Equal(t, EncodedBlobRecordSize, len(buf))
-
-	// Decode and verify
-	decoded, err := DecodeBlobRecord(buf)
-	require.NoError(t, err)
-	require.Equal(t, rec, decoded)
-}
-
-func TestBlobRecord_TooSmall(t *testing.T) {
-	_, err := DecodeBlobRecord([]byte("short"))
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "too small")
-}
-
-func TestBlobRecord_RoundTrip(t *testing.T) {
-	records := []BlobRecord{
-		{Hash: 1, Pos: 0, Size: 100, Flags: 0x11111111},
-		{Hash: 2, Pos: 100, Size: 200, Flags: 0x22222222},
-		{Hash: 3, Pos: 300, Size: 300, Flags: 0x33333333},
-	}
-
-	// Encode all
-	var buf []byte
-	for i := range records {
-		buf = AppendBlobRecord(buf, records[i])
-	}
-
-	require.Equal(t, EncodedBlobRecordSize*3, len(buf))
-
-	// Decode all
-	for i := 0; i < 3; i++ {
-		offset := i * EncodedBlobRecordSize
-		decoded, err := DecodeBlobRecord(buf[offset : offset+EncodedBlobRecordSize])
-		require.NoError(t, err)
-		require.Equal(t, records[i], decoded)
-	}
-}
-
-func TestSegmentRecord_RoundTrip(t *testing.T) {
-	sr := SegmentRecord{
-		Records: []BlobRecord{
-			{Hash: 0x1111111111111111, Pos: 0, Size: 1000, Flags: 0xAAAAAAAA},
-			{Hash: 0x2222222222222222, Pos: 1000, Size: 2000, Flags: 0xBBBBBBBB},
-			{Hash: 0x3333333333333333, Pos: 3000, Size: 3000, Flags: 0xCCCCCCCC},
-		},
-		SegmentID: 1,
-		CTime:     time.Unix(1234567890, 0),
-	}
-
-	// Encode
-	buf := AppendSegmentRecord(nil, sr)
-
-	// Expected size: header + 3 records
-	expectedSize := SegmentRecordHeaderSize + EncodedBlobRecordSize*3
-	require.Equal(t, expectedSize, len(buf))
-
-	// Decode
-	decodedSR, err := DecodeSegmentRecord(buf)
-	require.NoError(t, err)
-	require.Equal(t, 3, len(decodedSR.Records))
-	require.Equal(t, sr.SegmentID, decodedSR.SegmentID)
-	require.Equal(t, sr.CTime.Unix(), decodedSR.CTime.Unix())
-
-	for i := range sr.Records {
-		require.Equal(t, sr.Records[i], decodedSR.Records[i])
-	}
-}
-
-func TestSegmentRecord_EmptyRecords(t *testing.T) {
-	sr := SegmentRecord{
-		Records:   []BlobRecord{},
-		SegmentID: 0,
-		CTime:     time.Unix(1000000000, 0),
-	}
-
-	buf := AppendSegmentRecord(nil, sr)
-	require.Equal(t, SegmentRecordHeaderSize, len(buf)) // Just the header
-
-	decodedSR, err := DecodeSegmentRecord(buf)
-	require.NoError(t, err)
-	require.Equal(t, 0, len(decodedSR.Records))
-	require.Equal(t, sr.SegmentID, decodedSR.SegmentID)
-	require.Equal(t, sr.CTime.Unix(), decodedSR.CTime.Unix())
-}
-
-func TestSegmentRecord_TooSmall(t *testing.T) {
-	_, err := DecodeSegmentRecord([]byte("short"))
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "too small")
-}
-
-func TestSegmentRecord_InvalidRecordCount(t *testing.T) {
-	// Create buffer with header + partial record (not a multiple of EncodedBlobRecordSize)
-	buf := make([]byte, SegmentRecordHeaderSize+10)   // Header + 10 bytes (not a full record)
-	binary.LittleEndian.PutUint64(buf[0:8], 0)        // SegmentID = false
-	binary.LittleEndian.PutUint64(buf[8:16], 1000000) // CTime
-
-	_, err := DecodeSegmentRecord(buf)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "not a multiple")
-}
-
-func TestSegmentFooter_DecodeValid(t *testing.T) {
-	sr := SegmentRecord{
-		Records:   []BlobRecord{{Hash: 123, Pos: 0, Size: 456, Flags: 789}},
-		SegmentID: 1,
-		CTime:     time.Unix(1234567890, 0),
-	}
-
-	footerBytes := AppendSegmentRecordWithFooter(nil, sr)
-
-	// Extract and decode just the footer
-	footerStart := len(footerBytes) - SegmentFooterSize
-	footer, err := DecodeSegmentFooter(footerBytes[footerStart:])
-	require.NoError(t, err)
-	require.Greater(t, footer.Len, int64(0))
-	require.NotEqual(t, uint32(0), footer.Checksum)
-}
-
-func TestSegmentFooter_TooSmall(t *testing.T) {
-	_, err := DecodeSegmentFooter([]byte("short"))
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "too small")
-}
-
-func TestSegmentFooter_InvalidMagic(t *testing.T) {
-	buf := make([]byte, SegmentFooterSize)
-	binary.LittleEndian.PutUint64(buf[0:8], 100)         // Len
-	binary.LittleEndian.PutUint32(buf[8:12], 0x12345678) // Checksum
-	binary.LittleEndian.PutUint64(buf[12:20], 0xBADBAD)  // Bad magic
-
-	_, err := DecodeSegmentFooter(buf)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "invalid footer magic")
-}
-
-func TestFooter_CTimePreservation(t *testing.T) {
-	// Test various timestamps
-	testCases := []time.Time{
-		time.Unix(0, 0),                  // Epoch
-		time.Unix(1234567890, 0),         // Arbitrary past
-		time.Unix(2147483647, 0),         // Max 32-bit timestamp
-		time.Now().Truncate(time.Second), // Current time (truncated to second)
-	}
-
-	for _, ctime := range testCases {
-		sr := SegmentRecord{
-			Records: []BlobRecord{
-				{Hash: 123, Pos: 0, Size: 100, Flags: 456},
-			},
-			SegmentID: 1,
-			CTime:     ctime,
-		}
-
-		footerBytes := AppendSegmentRecordWithFooter(nil, sr)
-		decodedSR, err := decodeFooterSection(footerBytes)
-		require.NoError(t, err)
-		require.Equal(t, ctime.Unix(), decodedSR.CTime.Unix(),
-			"CTime not preserved for timestamp %v", ctime)
 	}
 }

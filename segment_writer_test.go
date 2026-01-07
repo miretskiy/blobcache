@@ -5,9 +5,9 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
-	
+
 	"golang.org/x/sys/unix"
-	
+
 	"github.com/miretskiy/blobcache/metadata"
 	"github.com/stretchr/testify/require"
 )
@@ -96,23 +96,23 @@ func TestSegmentWriter_FullCycle(t *testing.T) {
 	const slabSize = 1024 * 1024
 	const segSize = 4 * 1024 * 1024
 	const segID = int64(777)
-	
+
 	pool := NewTrackedPool(4, slabSize)
 	defer pool.Teardown()
-	
+
 	path := filepath.Join(tmpDir, "777.seg")
-	
+
 	t.Run("AlignedPhysicalWrites", func(t *testing.T) {
 		sw, err := NewSegmentWriter(segID, path, segSize, pool)
 		require.NoError(t, err)
-		
+
 		// Slab 1
 		slab1 := pool.Acquire()
 		data1 := []byte("direct-io-block-1")
 		// Use WriteAt instead of Append.
 		slab1.WriteAt(data1, 0)
 		slab1.Seal(int64(len(data1))) // Mark as ready for O_DIRECT.
-		
+
 		recs1 := []metadata.BlobRecord{{
 			Hash:        101,
 			Pos:         0,
@@ -120,13 +120,13 @@ func TestSegmentWriter_FullCycle(t *testing.T) {
 		}}
 		require.NoError(t, sw.WriteSlab(slab1.AlignedBytes(), recs1))
 		slab1.Unpin()
-		
+
 		// Slab 2
 		slab2 := pool.Acquire()
 		data2 := []byte("direct-io-block-2")
 		slab2.WriteAt(data2, 0)
 		slab2.Seal(int64(len(data2)))
-		
+
 		recs2 := []metadata.BlobRecord{{
 			Hash:        202,
 			Pos:         0,
@@ -134,18 +134,18 @@ func TestSegmentWriter_FullCycle(t *testing.T) {
 		}}
 		require.NoError(t, sw.WriteSlab(slab2.AlignedBytes(), recs2))
 		slab2.Unpin()
-		
+
 		require.NoError(t, sw.Close())
-		
+
 		// Verify Footer Recovery
 		f, err := os.Open(path)
 		require.NoError(t, err)
 		defer f.Close()
-		
+
 		info, _ := f.Stat()
 		footer, _, err := metadata.ReadSegmentFooterFromFile(f, info.Size(), segID)
 		require.NoError(t, err)
-		
+
 		// Verify Pos rounding (critical for Direct I/O reads)
 		// Slab 2 should be positioned at the next 4KB boundary.
 		expectedOffset := testRoundToPage(int64(len(data1)))
@@ -163,13 +163,13 @@ func TestMemTable_Integration_Rotation(t *testing.T) {
 		FlushConcurrency:   2,
 		Shards:             1,
 	}
-	
+
 	mb := &MockBatcher{}
 	mh := &MockHealthReporter{}
-	
+
 	mt := NewMemTable(cfg, mb, mh)
 	defer mt.Close()
-	
+
 	// Ingest blobs to force rotation across multiple 1MB segments.
 	blobCount := 20
 	blobSize := 100 * 1024
@@ -177,21 +177,40 @@ func TestMemTable_Integration_Rotation(t *testing.T) {
 	for i := 0; i < blobSize; i++ {
 		data[i] = byte(i % 256)
 	}
-	
+
 	for i := 0; i < blobCount; i++ {
 		key := Key(i)
 		mt.Put(key, data)
+		if i == 0 {
+			// After first put, check if it's in memtable
+			if _, found := mt.Get(key, nil); !found {
+				t.Fatalf("First Put failed: key %d not found in memtable", i)
+			}
+			t.Logf("First key successfully written to memtable")
+		}
 	}
-	
+
 	mt.Drain()
-	
+
+	// Check if any errors were reported during flush
+	if mh.DegradedFlag {
+		t.Fatalf("MemTable entered degraded mode: %v", mh.ReportedErr)
+	}
+
+	// Debug: Check what actually happened
+	t.Logf("Batcher received %d blobs (expected %d)", mb.Count, blobCount)
+	t.Logf("Batcher has %d segment batches", len(mb.Batches))
+	for segID, recs := range mb.Batches {
+		t.Logf("  Segment %d: %d records", segID, len(recs))
+	}
+
 	// 1. Verify all records hit the Batcher.
 	require.Equal(t, blobCount, mb.Count)
-	
+
 	// 2. Verify rotation occurred.
 	require.GreaterOrEqual(t, len(mb.Batches), 2, "Should have flushed multiple segments")
-	
-	// 3. Verify physical files exist on disk.
+
+	// 3. Verify physical mu exist on disk.
 	segCount := 0
 	err := filepath.Walk(tmpDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {

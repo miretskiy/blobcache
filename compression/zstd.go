@@ -2,7 +2,7 @@ package compression
 
 import (
 	"errors"
-	
+
 	"github.com/DataDog/zstd"
 )
 
@@ -23,7 +23,7 @@ func compressZstd(dst, src []byte, level Level) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	
+
 	// If the library returned a different slice, it allocated a new one
 	// because the provided dst was too small.
 	if len(res) > 0 && &res[0] != &dst[0] {

@@ -7,15 +7,15 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
-	
+
 	"golang.org/x/sys/unix"
 )
 
 // --- MmapBuffer: The Physical Slab ---
 
 type MmapBuffer struct {
-	raw      []byte       // Private to enforce WriteAt usage
-	off      atomic.Int64 // Sentinel: -1 means "Active", >= 0 means "Sealed"
+	raw      []byte
+	wPos     atomic.Int64
 	refCount atomic.Int64
 	pool     *MmapPool
 }
@@ -35,7 +35,7 @@ func (b *MmapBuffer) Bytes() []byte {
 // AlignedBytes returns the slice rounded to the nearest 4KB page for O_DIRECT.
 // This is used by SegmentWriter to ensure hardware-aligned writes.
 func (b *MmapBuffer) AlignedBytes() []byte {
-	off := b.off.Load()
+	off := b.wPos.Load()
 	if off < 0 {
 		return nil
 	}
@@ -43,13 +43,13 @@ func (b *MmapBuffer) AlignedBytes() []byte {
 }
 
 // Seal finalizes the buffer size and marks the slab as ready for pool return.
-// Once sealed (off >= 0), it can be reclaimed when the refCount hits zero.
+// Once sealed (wPos >= 0), it can be reclaimed when the refCount hits zero.
 func (b *MmapBuffer) Seal(finalOffset int64) {
-	b.off.Store(finalOffset)
+	b.wPos.Store(finalOffset)
 }
 
 func (b *MmapBuffer) Len() int {
-	off := b.off.Load()
+	off := b.wPos.Load()
 	if off < 0 {
 		return 0
 	}
@@ -59,14 +59,14 @@ func (b *MmapBuffer) Len() int {
 func (b *MmapBuffer) Cap() int { return len(b.raw) }
 
 func (b *MmapBuffer) Reset() {
-	b.off.Store(-1) // Set back to Active sentinel
+	b.wPos.Store(-1) // Set back to Active sentinel
 }
 
-// Unpin decrements the refcount. If the slab is Sealed (off >= 0) and unreferenced,
+// Unpin decrements the refcount. If the slab is Sealed and unreferenced,
 // it returns to the pool.
 func (b *MmapBuffer) Unpin() {
 	if b.refCount.Add(-1) == 0 {
-		if b.off.Load() >= 0 {
+		if b.wPos.Load() >= 0 {
 			b.resetAndRelease()
 		}
 	}
@@ -128,12 +128,12 @@ func allocate(size int64) *MmapBuffer {
 	if err != nil {
 		panic(fmt.Sprintf("mmap-pool: failed to allocate %d bytes: %v", size, err))
 	}
-	
+
 	// PRE-WARM: Force physical RAM commitment.
 	for i := 0; i < len(data); i += 4096 {
 		data[i] = 0
 	}
-	
+
 	buf := &MmapBuffer{raw: data}
 	buf.Reset()
 	runtime.AddCleanup(buf, func(d []byte) { _ = unix.Munmap(d) }, data)
@@ -174,7 +174,7 @@ func (p *MmapPool) AcquireAligned(size int64) *MmapBuffer {
 		// Happy Path: fits in our pre-mapped slabPool slabs
 		return p.Acquire()
 	}
-	
+
 	// Pathological Path: requires a larger one-off mmap
 	return p.AcquireUnpooled(size)
 }
@@ -190,7 +190,7 @@ func (p *MmapPool) Release(buf *MmapBuffer) {
 	if buf.pool == nil {
 		return
 	}
-	
+
 	buf.Reset()
 	select {
 	case p.buffers <- buf:
@@ -199,7 +199,7 @@ func (p *MmapPool) Release(buf *MmapBuffer) {
 		// Pool is full. This was likely an "overflow" buffer
 		// created during high load. Evict and free RAM.
 		_ = unix.Madvise(buf.raw, unix.MADV_DONTNEED)
-		
+
 		// IMPORTANT: Sever the connection so that future Unpin()
 		// calls on this specific slab don't hit the slabPool again.
 		buf.pool = nil

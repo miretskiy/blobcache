@@ -63,10 +63,8 @@ func IsTransientIOError(err error) bool {
 
 	// 2. Check for network timeouts (if using network-attached storage)
 	var netErr net.Error
-	if errors.As(err, &netErr) {
-		if netErr.Timeout() || netErr.Temporary() {
-			return true
-		}
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
 	}
 
 	// 3. Context cancellation or deadline exceeded

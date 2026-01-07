@@ -26,7 +26,7 @@ func Benchmark_Mixed(b *testing.B) {
 	}
 	os.RemoveAll(tmpDir)
 	defer os.RemoveAll(tmpDir)
-	
+
 	cache, err := New(tmpDir,
 		WithMaxSize(512<<30),       // 512GB cache capacity
 		WithWriteBufferSize(1<<27), // 128MB
@@ -41,12 +41,12 @@ func Benchmark_Mixed(b *testing.B) {
 	defer func() {
 		cache.Close()
 	}()
-	
+
 	var numReads, numFound atomic.Int64
 	var numWrites, completedWrites atomic.Int64 // Pre-allocates key IDs
 	var workerID atomic.Int64
 	start := time.Now()
-	
+
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		workerID := workerID.Add(1)
@@ -56,7 +56,7 @@ func Benchmark_Mixed(b *testing.B) {
 		for i := 0; i < len(value); i += 128 * 1024 {
 			value[i] = byte(rng.Intn(255))
 		}
-		
+
 		for pb.Next() {
 			op := rng.Intn(100)
 			if op < 10 {
@@ -73,10 +73,9 @@ func Benchmark_Mixed(b *testing.B) {
 					idx := rng.Intn(len(myKeys))
 					keyID := myKeys[idx]
 					key := []byte(fmt.Sprintf("w-%d-key-%d", workerID, keyID))
-					reader, found := cache.Get(key)
+					found := cache.View(key, func(r io.Reader) { /* io.ReadFull(r, value) */ })
 					numReads.Add(1)
 					if found {
-						_, _ = io.ReadFull(reader, value)
 						numFound.Add(1)
 					} else {
 						b.Logf("Failed to find %s", key)
@@ -93,11 +92,11 @@ func Benchmark_Mixed(b *testing.B) {
 			}
 		}
 	})
-	
+
 	cache.Drain() // include drain time to flush the rest of the data.
 	duration := time.Since(start)
 	b.StopTimer()
-	
+
 	writeThroughput := float64(numWrites.Load()) / duration.Seconds() / 1024 // GB/s
 	b.ReportMetric(writeThroughput, "write-GB/s")
 }

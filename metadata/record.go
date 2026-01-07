@@ -5,27 +5,27 @@ import (
 	"fmt"
 	"hash/crc32"
 	"time"
-	
+
 	"github.com/miretskiy/blobcache/compression"
 )
 
 const (
 	segmentMagic = 0xB10BCA4EB10BCA4E
-	
+
 	// EncodedBlobRecordSize is now 40 bytes:
 	// Hash(8) + Pos(8) + LogicalSize(8) + PhysicalSize(8) + Flags(8)
 	EncodedBlobRecordSize   = 40
 	SegmentRecordHeaderSize = 16
 	SegmentFooterSize       = 20
-	
+
 	// Checksum and Status Flags (Middle bits)
 	InvalidChecksumFlag uint64 = 1 << 32
 	DeletedFlag         uint64 = 1 << 33
-	
+
 	// Compression Schema (Top 4 bits: 60-63)
 	compressionShift = 60
 	compressionMask  = uint64(0xF) << compressionShift
-	
+
 	// InvalidChecksum is a sentinel value for a checksum that's not set.
 	InvalidChecksum = InvalidChecksumFlag
 )
@@ -130,11 +130,11 @@ func DecodeBlobRecord(buf []byte) (BlobRecord, error) {
 func AppendSegmentRecord(buf []byte, sr SegmentRecord) []byte {
 	buf = binary.LittleEndian.AppendUint64(buf, uint64(sr.SegmentID))
 	buf = binary.LittleEndian.AppendUint64(buf, uint64(sr.CTime.Unix()))
-	
+
 	for i := range sr.Records {
 		buf = AppendBlobRecord(buf, sr.Records[i])
 	}
-	
+
 	return buf
 }
 
@@ -143,16 +143,16 @@ func DecodeSegmentRecord(buf []byte) (SegmentRecord, error) {
 	if len(buf) < SegmentRecordHeaderSize {
 		return SegmentRecord{}, fmt.Errorf("buffer too small for segment record header")
 	}
-	
+
 	segmentID := int64(binary.LittleEndian.Uint64(buf[0:8]))
 	ctime := int64(binary.LittleEndian.Uint64(buf[8:16]))
-	
+
 	recordsSize := len(buf) - SegmentRecordHeaderSize
 	if recordsSize%EncodedBlobRecordSize != 0 {
 		return SegmentRecord{}, fmt.Errorf("invalid buffer size: not a multiple of %d", EncodedBlobRecordSize)
 	}
 	numRecords := recordsSize / EncodedBlobRecordSize
-	
+
 	records := make([]BlobRecord, numRecords)
 	offset := SegmentRecordHeaderSize
 	for i := 0; i < int(numRecords); i++ {
@@ -163,7 +163,7 @@ func DecodeSegmentRecord(buf []byte) (SegmentRecord, error) {
 		records[i] = rec
 		offset += EncodedBlobRecordSize
 	}
-	
+
 	return SegmentRecord{
 		Records:   records,
 		SegmentID: segmentID,
@@ -176,15 +176,15 @@ func DecodeSegmentFooter(buf []byte) (SegmentFooter, error) {
 	if len(buf) < SegmentFooterSize {
 		return SegmentFooter{}, fmt.Errorf("buffer too small for footer")
 	}
-	
+
 	segmentLen := int64(binary.LittleEndian.Uint64(buf[0:8]))
 	checksum := binary.LittleEndian.Uint32(buf[8:12])
 	magic := binary.LittleEndian.Uint64(buf[12:20])
-	
+
 	if magic != segmentMagic {
 		return SegmentFooter{}, fmt.Errorf("invalid footer magic: %x", magic)
 	}
-	
+
 	return SegmentFooter{
 		Len:      segmentLen,
 		Checksum: checksum,
@@ -197,7 +197,7 @@ func AppendSegmentRecordWithFooter(buf []byte, sr SegmentRecord) []byte {
 	recordDataSize := SegmentRecordHeaderSize + (len(sr.Records) * EncodedBlobRecordSize)
 	logicalSize := int64(recordDataSize + SegmentFooterSize)
 	physicalSize := roundToPage(logicalSize)
-	
+
 	// 1. Prepare the buffer.
 	if int64(cap(buf)) < physicalSize {
 		buf = make([]byte, physicalSize)
@@ -207,19 +207,19 @@ func AppendSegmentRecordWithFooter(buf []byte, sr SegmentRecord) []byte {
 			buf[i] = 0
 		}
 	}
-	
+
 	// 2. Serialize Record at the VERY START of the physical block.
 	_ = AppendSegmentRecord(buf[:0], sr)
-	
+
 	// 3. Compute Checksum of the record data ONLY.
 	checksum := crc32.ChecksumIEEE(buf[:recordDataSize])
-	
+
 	// 4. Place Footer at the VERY END of the physical block.
 	footerOffset := physicalSize - int64(SegmentFooterSize)
 	binary.LittleEndian.PutUint64(buf[footerOffset:footerOffset+8], uint64(recordDataSize))
 	binary.LittleEndian.PutUint32(buf[footerOffset+8:footerOffset+12], checksum)
 	binary.LittleEndian.PutUint64(buf[footerOffset+12:footerOffset+20], uint64(segmentMagic))
-	
+
 	return buf
 }
 
@@ -229,56 +229,56 @@ func DecodeSegmentRecordWithChecksum(buf []byte, expectedChecksum uint32) (Segme
 	if computedChecksum != expectedChecksum {
 		return SegmentRecord{}, fmt.Errorf("checksum mismatch: %x != %x", computedChecksum, expectedChecksum)
 	}
-	
+
 	return DecodeSegmentRecord(buf)
 }
 
 // ReadSegmentFooterFromFile reads and validates segment footer and record from file
 func ReadSegmentFooterFromFile(
-		file interface {
-	ReadAt([]byte, int64) (int, error)
-}, fileSize int64, segmentID int64,
+	file interface {
+		ReadAt([]byte, int64) (int, error)
+	}, fileSize int64, segmentID int64,
 ) (SegmentRecord, int64, error) {
 	if fileSize < int64(SegmentFooterSize) {
 		return SegmentRecord{}, 0, fmt.Errorf("file too small for footer")
 	}
-	
+
 	// 1. Read footer from the end
 	footerBuf := make([]byte, SegmentFooterSize)
 	footerPos := fileSize - int64(SegmentFooterSize)
 	if _, err := file.ReadAt(footerBuf, footerPos); err != nil {
 		return SegmentRecord{}, 0, fmt.Errorf("failed to read footer: %w", err)
 	}
-	
+
 	footer, err := DecodeSegmentFooter(footerBuf)
 	if err != nil {
 		return SegmentRecord{}, 0, fmt.Errorf("invalid footer: %w", err)
 	}
-	
+
 	// 2. Calculate the start of the entire Aligned Metadata Block
 	physicalSize := roundToPage(footer.Len + int64(SegmentFooterSize))
 	metadataBlockStart := fileSize - physicalSize
-	
+
 	if metadataBlockStart < 0 {
 		return SegmentRecord{}, 0, fmt.Errorf("invalid metadata block geometry")
 	}
-	
+
 	// 3. Read segment record from the START of the physical block
 	segmentRecordBuf := make([]byte, footer.Len)
 	if _, err := file.ReadAt(segmentRecordBuf, metadataBlockStart); err != nil {
 		return SegmentRecord{}, 0, fmt.Errorf("failed to read segment record: %w", err)
 	}
-	
+
 	// 4. Validate and Decode
 	segment, err := DecodeSegmentRecordWithChecksum(segmentRecordBuf, footer.Checksum)
 	if err != nil {
 		return SegmentRecord{}, 0, fmt.Errorf("segment record validation failed: %w", err)
 	}
-	
+
 	if segmentID != -1 && segment.SegmentID != segmentID {
 		return SegmentRecord{}, 0, fmt.Errorf("segment SegmentID mismatch: exp=%d, got=%d", segmentID, segment.SegmentID)
 	}
-	
+
 	return segment, metadataBlockStart, nil
 }
 
@@ -290,7 +290,7 @@ func roundToPage(size int64) int64 {
 // PhysicalMetadataSize returns the exact physical bytes (4KB aligned)
 func PhysicalMetadataSize(numRecords int) int64 {
 	logicalSize := int64(SegmentRecordHeaderSize +
-			(numRecords * EncodedBlobRecordSize) +
-			SegmentFooterSize)
+		(numRecords * EncodedBlobRecordSize) +
+		SegmentFooterSize)
 	return roundToPage(logicalSize)
 }

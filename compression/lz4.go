@@ -22,7 +22,7 @@ func compressLZ4(dst, src []byte, level Level) ([]byte, error) {
 	if level == CompressionBest {
 		c.Level = lzLevel(level)
 	}
-	
+
 	// CompressBlock naturally errors or returns 0 if dst is too small.
 	n, err := c.CompressBlock(src, dst)
 	if err != nil || n == 0 {

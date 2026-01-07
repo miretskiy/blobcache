@@ -11,7 +11,7 @@ func compressS2(dst, src []byte, level Level) ([]byte, error) {
 	} else {
 		res = s2.Encode(dst, src)
 	}
-	
+
 	// S2 uses append logic; if it grows beyond dst capacity, it reallocates.
 	if len(res) > 0 && &res[0] != &dst[0] {
 		return nil, ErrBufferTooSmall

@@ -359,3 +359,24 @@ func TestRecordAdditions_StopPreventsRecording(t *testing.T) {
 	require.True(t, newFilter.Test(123))
 	require.False(t, newFilter.Test(321))
 }
+
+func TestFilterBasic(t *testing.T) {
+	f := New(100, 0.01)
+
+	// Add some hashes
+	testHashes := []uint64{12345, 67890, 111222333}
+	for _, h := range testHashes {
+		f.AddHash(h)
+	}
+
+	// Test all should return true
+	for _, h := range testHashes {
+		if !f.Test(h) {
+			t.Errorf("Test(%d) returned false after AddHash", h)
+		}
+	}
+
+	// Test a hash we didn't add - might return true (false positive) or false
+	notAdded := uint64(999999)
+	f.Test(notAdded) // Result doesn't matter for this test
+}

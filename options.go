@@ -3,7 +3,7 @@ package blobcache
 import (
 	"hash"
 	"hash/crc32"
-	
+
 	"github.com/cespare/xxhash/v2"
 )
 
@@ -36,7 +36,7 @@ type config struct {
 	BloomEstimatedKeys  int
 	IO                  IOConfig
 	Resilience          ResilienceConfig
-	
+
 	// Testing hooks
 	testingInjectWriteErr func() error // Called before writer.Write() in flush
 	testingInjectIndexErr func() error // Called before index.PutBatch() in flush
@@ -132,7 +132,7 @@ func WithVerifyOnRead(enabled bool) Option {
 }
 
 // WithSegmentSize sets target segment file size (default: 32MB)
-// Multiple blobs are written to large segment files up to this size
+// Multiple blobs are written to large segment mu up to this size
 // Set to 0 to flush on every write (testing mode - creates one segment per blob)
 func WithSegmentSize(size int64) Option {
 	return funcOpt(func(c *config) {
@@ -156,7 +156,7 @@ func WithKeyHasher(hasher KeyHasherFn) Option {
 	})
 }
 
-// WithTestingFlushOnPut configures this cache to create separate files
+// WithTestingFlushOnPut configures this cache to create separate mu
 // for each key.
 func WithTestingFlushOnPut() Option {
 	return funcOpt(func(c *config) {

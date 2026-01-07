@@ -2,7 +2,6 @@ package blobcache
 
 import (
 	"bytes"
-	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -56,15 +55,9 @@ func TestRecovery_CorruptIndex(t *testing.T) {
 
 	// Verify all data is still accessible
 	for key, expectedValue := range testData {
-		reader, found := recovered.Get([]byte(key))
+		actualValue, found := recovered.Get([]byte(key))
 		if !found {
 			t.Errorf("key %q not found after recovery", key)
-			continue
-		}
-
-		actualValue, err := io.ReadAll(reader)
-		if err != nil {
-			t.Errorf("failed to read value for key %q: %v", key, err)
 			continue
 		}
 

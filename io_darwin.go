@@ -70,24 +70,27 @@ func fallocate(f *os.File, size int64) error {
 
 // fpunchhole_t matches the C struct used by fcntl(F_PUNCHHOLE)
 type fpunchhole_t struct {
-	FP_flags  uint32
-	FP_offset int64
-	FP_length int64
+	FP_flags    uint32
+	FP_reserved uint32 // Padding for 8-byte alignment
+	FP_offset   int64
+	FP_length   int64
 }
 
 // PunchHole deallocates a range within a file (creates sparse file)
 // Uses F_PUNCHHOLE to reclaim space on macOS (requires APFS)
 // Aligns to filesystem block boundaries to avoid punching adjacent blobs.
-func PunchHole(f *os.File, offset, length int64) error {
+// Returns the actual number of bytes reclaimed (after alignment)
+func PunchHole(f *os.File, offset, length int64) (int64, error) {
 	alignedOffset, alignedLength, canPunch := alignForHolePunch(offset, length)
 	if !canPunch {
-		return nil
+		return 0, nil
 	}
 
 	ph := fpunchhole_t{
-		FP_flags:  0, // Must be 0
-		FP_offset: alignedOffset,
-		FP_length: alignedLength,
+		FP_flags:    0, // Must be 0
+		FP_reserved: 0, // Must be 0
+		FP_offset:   alignedOffset,
+		FP_length:   alignedLength,
 	}
 
 	_, _, errno := syscall.Syscall(
@@ -98,9 +101,9 @@ func PunchHole(f *os.File, offset, length int64) error {
 	)
 
 	if errno != 0 {
-		return errno
+		return 0, errno
 	}
-	return nil
+	return alignedLength, nil
 }
 
 // Fadvise on darwin is less flexible than linux in that it's a global, file descriptor

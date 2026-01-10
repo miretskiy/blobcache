@@ -157,8 +157,9 @@ func TestCache_HolePunching_Physical(t *testing.T) {
 	require.NoError(t, err)
 
 	// 2. Physically reclaim space via Storage
-	err = cache.storage.HolePunchBlob(entry.SegmentID, entry.Pos, entry.LogicalSize)
+	reclaimed, err := cache.storage.HolePunchBlob(entry.SegmentID, entry.Pos, entry.LogicalSize)
 	require.NoError(t, err)
+	t.Logf("Hole punch reclaimed %d bytes (requested %d)", reclaimed, entry.LogicalSize)
 
 	fiAfter, err := os.Stat(segmentPath)
 	require.NoError(t, err)

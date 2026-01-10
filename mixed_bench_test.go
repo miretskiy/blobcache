@@ -73,7 +73,7 @@ func Benchmark_Mixed(b *testing.B) {
 					idx := rng.Intn(len(myKeys))
 					keyID := myKeys[idx]
 					key := []byte(fmt.Sprintf("w-%d-key-%d", workerID, keyID))
-					found := cache.View(key, func(r io.Reader) { /* io.ReadFull(r, value) */ })
+					found := cache.View(key, func(r io.Reader) { io.ReadFull(r, value) })
 					numReads.Add(1)
 					if found {
 						numFound.Add(1)

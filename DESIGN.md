@@ -187,6 +187,46 @@ v                                         |
 +---------------------------------------------------------+
 ```
 
+#### 5.1.1 The Resident Segment Cache: Extending the Memfile Lifecycle
+The `MmapPool` defines the physical boundary of the system's "Hot" zone. In this architecture, we decouple the pool depth from the flush concurrency to create a **Resident Segment Cache**. This allows the system to retain 128MB segments in RAM long after they have been persisted to the NVMe tier, specifically targeting the high-frequency "Read-After-Write" access pattern.
+
+A `memFile` now transitions through a four-stage lifecycle:
+* **Active:** The segment is open for concurrent `Put` operations via lock-free CAS reservations.
+* **Flushing:** The segment is frozen and immutable; a background worker is streaming its contents to disk using `O_DIRECT`.
+* **Cached:** The flush is complete, but the `MmapBuffer` remains resident in the pool and searchable via the Skipmap.
+* **Reclaimed:** When the `MmapPool` faces allocation pressure for a new `Active` segment, the oldest or coldest `Cached` segment is unmapped and its slot is recycled.
+
+```text
+[ MMAP POOL ]
+      |
+      | 1. Acquire (Pool Pop)
+      v
++-----------------------+
+|  STAGE 1: ACTIVE      | --(PUTs)--> [ Write Path: Lock-Free CAS ]
+|  (Mutable RAM)        |
++-----------------------+
+      |
+      | 2. Frozen (Handover)
+      v
++-----------------------+
+|  STAGE 2: FLUSHING    | --(O_DIRECT)--> [ NVMe Segment File ]
+|  (Immutable RAM)      |
++-----------------------+
+      |
+      | 3. Persisted (L1 Promotion)
+      v
++-----------------------+
+|  STAGE 3: CACHED      | --(GETs)--> [ Zero-Copy Skipmap Hit ]
+|  (Resident Purgatory) |
++-----------------------+
+      |
+      | 4. Pressure (Pool Push)
+      v
+[ RECLAIMED / RELEASED ]
+```
+
+This "Purgatory" state provides a multi-gigabyte L1 cache managed as 128MB units, avoiding the overhead of managing millions of individual 64KB block entries in the index. Serving a hit from a `Cached` segment involves a simple pointer offset within the `mmap` arena, resulting in the absolute theoretical minimum of CPU cycles and zero memory copies.
+
 ### 5.2 Short-Circuiting "Pathological" Blobs
 Large blobs (e.g., 20MB in a 64MB memtable) disrupt slab efficiency.
 1. **Direct Allocation:** Performs a one-off `AcquireUnpooled()` mmap.
@@ -325,3 +365,58 @@ Hole punching creates "Swiss Cheese" segments—files that remain physically lar
 * **The Compaction Ticker:** A background task periodically calculates the "Fullness Percentage" ($LiveBytes / TotalPhysicalSize$).
 * **Migration:** Segments falling below a threshold (e.g., 20%) are marked for compaction. Remaining live blobs are read and re-inserted into the `MemTable` as new `Put()` operations.
 * **Recycling:** Once live blobs are safely persisted in new, dense segments, the old sparse segment is physically deleted. This ensures long-term disk efficiency and maximizes NVMe storage utilization.
+
+---
+
+## 11. The Read-Path Spectrum: Page Cache vs. Direct I/O
+
+The optimization of the read path is a spectrum of strategies determined by the workload's access patterns. By default, BlobCache utilizes **Buffered I/O**, relying on the operating system’s decades of optimization.
+
+### 11.1 The Default: Buffered I/O and the Kernel Page Cache
+By default, any read that misses the Resident Segment Cache is satisfied via standard `pread`.
+* **Mechanism:** The kernel intercepts the request and checks its own Page Cache (Unified Buffer Cache). If the data is missing, the kernel fetches it from NVMe, stores it in its own pages, and copies it into the application buffer.
+* **Workload Implication:** This is the most efficient path for workloads with high temporal or spatial locality, as the kernel provides sophisticated read-ahead and prefetching "for free".
+* **The "Double Tax" & Tail Latency:** Under heavy memory pressure, the kernel’s background page reclamation (kswapd) can introduce unpredictable stalls. Furthermore, data exists in both Kernel RAM and application RAM, reducing total caching capacity.
+
+### 11.2 `WithDirectIORead`: Bypassing the Page Cache
+Enabling `WithDirectIORead` uses `O_DIRECT` to bypass the kernel's Page Cache entirely.
+* **High-Entropy Efficiency:** This is optimal for "Write-Once, Read-Once" workloads where data is unlikely to be requested again. It prevents the kernel from polluting its cache with one-time-use data that would otherwise evict critical system metadata.
+* **Predictability:** Read latencies remain bound strictly to the hardware’s physical performance, avoiding the "stutter" of kernel-driven eviction.
+
+
+### 11.3 `WithCacheAfterRead`: The Promotion Buffer
+The `WithCacheAfterRead` option provides a mechanism to promote cold data into the user-space "Hot" zone without wasting memory.
+* **The Circular Promotion Arena:** To avoid the fragmentation of 128MB slabs, promoted blobs are written into a dedicated `MmapBuffer` managed as a circular arena.
+* **Granular Packing:** Unlike the "Sealed" write segments, this promotion buffer allows for granular packing of disparate blobs from different disk segments into a single contiguous memory region.
+* **Indexing:** Once a blob is "promoted" into this RAM arena, the Skipmap is updated to point to these memory coordinates. This allows the system to serve future hits with zero-copy speed without needing a complex, sharded block-caching subsystem.
+
+```text
+[ USER GET(Key) ]
+               |
+               v
+     +-------------------+       HIT        +--------------------+
+     | Resident L1 Check | ---------------> | Return App Pointer |
+     +-------------------+                  +--------------------+
+               |
+               | MISS
+               v
+     +-------------------+                  +-------------------------+
+     | Option: DirectIO? | ---- NO -------> |   KERNEL PAGE CACHE     |
+     +-------------------+ (Default Path)   | (Buffered I/O + Copy)   |
+               |                            +-------------------------+
+               | YES (O_DIRECT)                          |
+               v                                         | UBC Miss
+     +-------------------+                  +-------------------------+
+     |   NVMe STORAGE    | <----------------|    PHYSICAL NVMe I/O    |
+     +-------------------+                  +-------------------------+
+               |
+               | Data Returned
+               v
+     +-----------------------+       YES      +-----------------------+
+     | Option: CacheOnRead?  | -------------> | CIRCULAR PROMO ARENA  |
+     +-----------------------+                +-----------------------+
+               |                  
+               | NO
+               v
+       [ Return to User ]
+```

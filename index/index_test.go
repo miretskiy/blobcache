@@ -59,7 +59,7 @@ func TestIndex_PersistenceRecovery(t *testing.T) {
 	require.NoError(t, err)
 
 	hash := uint64(888)
-	err = idx.IngestBatch(42, []metadata.BlobRecord{{Hash: hash, LogicalSize: 99}})
+	err = idx.IngestBatch(42, []metadata.BlobRecord{{Hash: hash, Pos: 0, LogicalSize: 99}})
 	require.NoError(t, err)
 	idx.Close()
 
@@ -78,8 +78,8 @@ func TestIndex_SegmentDeletion(t *testing.T) {
 	defer cleanup()
 
 	// Fill two segments
-	require.NoError(t, idx.IngestBatch(1, []metadata.BlobRecord{{Hash: 10, LogicalSize: 100}}))
-	require.NoError(t, idx.IngestBatch(2, []metadata.BlobRecord{{Hash: 20, LogicalSize: 100}}))
+	require.NoError(t, idx.IngestBatch(1, []metadata.BlobRecord{{Hash: 10, Pos: 0, LogicalSize: 100}}))
+	require.NoError(t, idx.IngestBatch(2, []metadata.BlobRecord{{Hash: 20, Pos: 100, LogicalSize: 100}}))
 
 	// Delete segment 1
 	err := idx.DeleteSegment(1)
@@ -99,8 +99,8 @@ func TestIndex_EvictionOrchestration(t *testing.T) {
 
 	// Insert two blobs
 	idx.IngestBatch(1, []metadata.BlobRecord{
-		{Hash: 1, LogicalSize: 10},
-		{Hash: 2, LogicalSize: 10},
+		{Hash: 1, Pos: 0, LogicalSize: 10},
+		{Hash: 2, Pos: 10, LogicalSize: 10},
 	})
 
 	// Mark 1 as visited (Hot)
@@ -129,11 +129,14 @@ func TestIndex_Concurrency(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			batch := make([]metadata.BlobRecord, itemsPerWorker)
+			pos := int64(0)
 			for i := 0; i < itemsPerWorker; i++ {
 				batch[i] = metadata.BlobRecord{
 					Hash:        uint64(id*itemsPerWorker + i),
+					Pos:         pos,
 					LogicalSize: 100,
 				}
+				pos += 100
 			}
 			idx.IngestBatch(int64(id), batch)
 		}(w)

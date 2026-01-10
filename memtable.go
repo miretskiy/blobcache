@@ -26,7 +26,23 @@ type memFile struct {
 	// Whichever thread decrements pendingWrites to 0 while retire is true closes writesDone.
 	pendingWrites atomic.Int64
 	retired       atomic.Bool
-	writesDone    chan struct{}
+	writesDone    signal
+}
+
+type signal struct {
+	sync.Once
+	ch chan struct{}
+}
+
+func (s *signal) Close() {
+	s.Do(func() {
+		close(s.ch)
+	})
+}
+
+type snapshot struct {
+	// files is ordered: oldest -> newest.
+	files []*memFile
 }
 
 // MemTable provides async write buffering with in-memory read support
@@ -45,7 +61,7 @@ type MemTable struct {
 		// However, exclusive lock is minimized to update internal state
 		// (rotate active for example) and for some bookkeeping tasks.
 		// The actual Write (in memory) is done w/out lock.
-		sync.RWMutex
+		sync.Mutex
 
 		// active is the currently active memFile.
 		// However, it may be temporarily unavailable (nil).  If that's the case,
@@ -57,8 +73,12 @@ type MemTable struct {
 		flushing []*memFile
 	}
 
-	slabPool   *MmapPool
-	footerPool *MmapPool
+	// Read state snapshot.
+	readState atomic.Pointer[snapshot]
+
+	slabPool    *MmapPool
+	footerPool  *MmapPool
+	entriesPool sync.Pool // amortize []blobrecord.Entry allocations.
 
 	// Background flush workers
 	flushCh chan *memFile
@@ -76,10 +96,17 @@ func NewMemTable(cfg config, b Batcher, reporter ErrorRporter) *MemTable {
 		Batcher:      b,
 		ErrorRporter: reporter,
 		// Pool size accounts for flushing slots + the active writer.
-		slabPool: NewMmapPool(
-			cfg.MaxInflightBatches+1, cfg.WriteBufferSize, cfg.LargeWriteThreshold,
-		),
-		footerPool:      NewMmapPool(cfg.MaxInflightBatches+1, 256<<10, 0),
+		slabPool: NewMmapPool("slab", cfg.WriteBufferSize, cfg.LargeWriteThreshold,
+			cfg.MaxInflightBatches+1),
+		footerPool: NewMmapPool("footer", 256<<10, 0, cfg.MaxInflightBatches+1),
+		entriesPool: sync.Pool{
+			New: func() any {
+				// Only allocate the backing array once
+				capacity := min(1<<20, max(4096, cfg.WriteBufferSize/8192))
+				s := make([]metadata.BlobRecord, capacity)
+				return &s
+			},
+		},
 		flushCh:         make(chan *memFile, cfg.MaxInflightBatches),
 		stopCh:          stopCh,
 		writeBufferSize: cfg.WriteBufferSize,
@@ -87,8 +114,11 @@ func NewMemTable(cfg config, b Batcher, reporter ErrorRporter) *MemTable {
 	mt.segmentID.Store(time.Now().UnixNano())
 
 	// Initialize active memfile
+	mt.mu.Lock()
 	mt.mu.activeReady = sync.NewCond(&mt.mu)
-	mt.mu.active = mt.newMemFile(true)
+	mt.mu.active = mt.newMemFile(0 /* pooled */)
+	mt.publishSnapshot()
+	mt.mu.Unlock()
 
 	// Start I/O workers for flushing memfiles
 	mt.wg.Add(cfg.FlushConcurrency)
@@ -99,24 +129,28 @@ func NewMemTable(cfg config, b Batcher, reporter ErrorRporter) *MemTable {
 	return mt
 }
 
-func (mt *MemTable) newMemFile(pooled bool) *memFile {
-	acquire := mt.slabPool.Acquire
-	if !pooled {
-		acquire = func() *MmapBuffer {
-			return mt.slabPool.AcquireUnpooled(mt.WriteBufferSize)
+func (mt *MemTable) newMemFile(size int) *memFile {
+	buf := func() *MmapBuffer {
+		if size == 0 {
+			return mt.slabPool.Acquire()
+		} else {
+			return mt.slabPool.AcquireUnpooled(int64(size))
 		}
-	}
+	}()
 
-	// Heuristic for metadata slot capacity based on average blob size.
-	capacity := min(1<<20, max(4096, mt.writeBufferSize/8192))
+	pEntries := mt.entriesPool.Get().(*[]metadata.BlobRecord)
+	buf.AddOnRelease(func() {
+		mt.entriesPool.Put(pEntries)
+	})
 
-	return &memFile{
-		buf:        acquire(),
-		entries:    make([]metadata.BlobRecord, capacity),
-		data:       skipmap.NewUint64[int](),
-		flushDone:  make(chan struct{}),
-		writesDone: make(chan struct{}),
+	mf := memFile{
+		buf:       buf,
+		entries:   (*pEntries)[:cap(*pEntries)],
+		data:      skipmap.NewUint64[int](),
+		flushDone: make(chan struct{}),
 	}
+	mf.writesDone.ch = make(chan struct{})
+	return &mf
 }
 
 // Put stores key-value in memtable
@@ -157,21 +191,14 @@ func (mt *MemTable) View(key Key, fn func(data []byte)) bool {
 
 // ZeroCopyView returns a raw pointer to memory. Expert use only.
 // The caller must not stash the returned byte value, and the release function
-// must be called expediently.  Otherwise, the memtable may stall.
+// must be called expediently. Otherwise, the memtable may stall.
 func (mt *MemTable) ZeroCopyView(key Key) ([]byte, Releaser, bool) {
-	mt.mu.RLock()
-	defer mt.mu.RUnlock()
+	s := mt.readState.Load()
 
-	// 1. Search Active
-	if mf := mt.mu.active; mf != nil {
-		if data, ok := mt.lookupAndPin(mf, key); ok {
-			return data, mf.buf.Unpin, true
-		}
-	}
+	// Iterate newest->oldest
+	for i := len(s.files) - 1; i >= 0; i-- {
+		mf := s.files[i]
 
-	// 2. Search Flushing (Newest to Oldest)
-	for i := len(mt.mu.flushing) - 1; i >= 0; i-- {
-		mf := mt.mu.flushing[i]
 		if data, ok := mt.lookupAndPin(mf, key); ok {
 			return data, mf.buf.Unpin, true
 		}
@@ -181,8 +208,8 @@ func (mt *MemTable) ZeroCopyView(key Key) ([]byte, Releaser, bool) {
 }
 
 func (mt *MemTable) lookupAndPin(mf *memFile, key Key) ([]byte, bool) {
+	// Skipmap Load is lock-free and thread-safe.
 	if pos, ok := mf.data.Load(uint64(key)); ok {
-		// PIN FIRST: Secure the memory before releasing the RLock.
 		mf.buf.refCount.Add(1)
 		entry := mf.entries[pos]
 		return mf.buf.raw[entry.Pos : entry.Pos+entry.LogicalSize], true
@@ -220,15 +247,7 @@ func (mt *MemTable) putWithChecksum(key Key, value []byte, checksum *uint32) {
 }
 
 func (mt *MemTable) putLargeWithChecksum(key Key, value []byte, checksum *uint32) {
-	blob := &memFile{
-		buf: mt.slabPool.AcquireUnpooled(int64(len(value))),
-		// Pre-size to 1 and fill it immediately
-		entries:    make([]metadata.BlobRecord, 1),
-		data:       skipmap.NewUint64[int](),
-		flushDone:  make(chan struct{}),
-		writesDone: make(chan struct{}),
-	}
-
+	blob := mt.newMemFile(len(value))
 	blob.buf.WriteAt(value, 0)
 	blob.entries[0] = makeEntry(key, 0, value, mt.Resilience.ChecksumHasher, checksum)
 	blob.nextEntry = 1
@@ -237,6 +256,7 @@ func (mt *MemTable) putLargeWithChecksum(key Key, value []byte, checksum *uint32
 
 	mt.mu.Lock()
 	shouldSend := mt.prepareFlushUnderLock(blob)
+	mt.publishSnapshot() // Make the blob visible to readers
 	mt.mu.Unlock()
 	if shouldSend {
 		mt.sendToFlusher(blob)
@@ -262,25 +282,21 @@ func (mt *MemTable) putActive(key Key, value []byte, checksum *uint32) {
 		active.retired.Store(true)
 		shouldSend := mt.prepareFlushUnderLock(active)
 
-		waitCh := active.writesDone
-
+		waitCh := active.writesDone.ch
 		// DOUBLE CHECK: If writes hit 0 before we set retired or during this block,
 		// we must close the channel ourselves.
 		if active.pendingWrites.Load() == 0 {
-			select {
-			case <-waitCh:
-			default:
-				close(waitCh)
-			}
+			active.writesDone.Close()
 		}
 		mt.mu.Unlock()
 
 		// Allocate new slab
-		newMF := mt.newMemFile(true)
+		newMF := mt.newMemFile(0 /* pooled */)
 
 		mt.mu.Lock()
 		mt.mu.active = newMF
 		mt.mu.activeReady.Broadcast()
+		mt.publishSnapshot()
 		mt.mu.Unlock()
 
 		// THE BLOCKING POINT: Now safe because the "Last Man Out" check is foolproof.
@@ -296,7 +312,6 @@ func (mt *MemTable) putActive(key Key, value []byte, checksum *uint32) {
 		// IMPORTANT: Do NOT manually store 1 in pendingWrites before this.
 		mt.putActive(key, value, checksum)
 		return
-
 	} else {
 		// 2. SUCCESS PATH: Atomic Reservation
 		active.pendingWrites.Add(1)
@@ -315,11 +330,7 @@ func (mt *MemTable) putActive(key Key, value []byte, checksum *uint32) {
 	// We decrement first, then check if we are the closer.
 	if active.pendingWrites.Add(-1) == 0 {
 		if active.retired.Load() {
-			select {
-			case <-active.writesDone:
-			default:
-				close(active.writesDone)
-			}
+			active.writesDone.Close()
 		}
 	}
 }
@@ -334,13 +345,14 @@ func (mt *MemTable) prepareFlushUnderLock(mf *memFile) bool {
 	// It will remain nil until memory can be acquired to create new active.
 	mt.mu.flushing = append(mt.mu.flushing, mf)
 	if mt.IsDegraded() {
-		// 1. Manage Capacity in Degraded Mode
-		// If we are over the limit, drop the oldest data to bound memory
+		// Manage Capacity in Degraded Mode
 		if len(mt.mu.flushing) > mt.MaxInflightBatches {
 			oldest := mt.mu.flushing[0]
 			mt.mu.flushing = mt.mu.flushing[1:]
-			oldest.buf.Unpin() // Return memory to pool (if hard pool) or munmap
+			oldest.buf.Unpin()
 		}
+		// Always publish after modifying flushing list so readers see new data
+		mt.publishSnapshot()
 		return false
 	}
 	return true
@@ -446,8 +458,9 @@ func (mt *MemTable) flushMemFile(mf *memFile, writer *SegmentWriter) error {
 	records := mf.entries[:mf.nextEntry]
 
 	// Physical Write to NVMe (O_DIRECT)
-	// IMPORTANT: writer.WriteSlab transforms records[i].Pos from RELATIVE to ABSOLUTE.
-	if err := writer.WriteSlab(mf.buf.AlignedBytes(), records); err != nil {
+	// WriteSlab returns records with Pos transformed from RELATIVE to ABSOLUTE
+	absoluteRecords, err := writer.WriteSlab(mf.buf.AlignedBytes(), records)
+	if err != nil {
 		return fmt.Errorf("physical write failed: %w", err)
 	}
 
@@ -458,8 +471,8 @@ func (mt *MemTable) flushMemFile(mf *memFile, writer *SegmentWriter) error {
 		}
 	}
 
-	// Update the Persistent Index
-	if err := mt.PutBatch(writer.id, records); err != nil {
+	// Update the Persistent Index with ABSOLUTE positions
+	if err := mt.PutBatch(writer.id, absoluteRecords); err != nil {
 		return fmt.Errorf("index update failed: %w", err)
 	}
 
@@ -471,11 +484,20 @@ func (mt *MemTable) removeFrozen(target *memFile) {
 	mt.mu.Lock()
 	defer mt.mu.Unlock()
 
+	found := false
 	for i, mf := range mt.mu.flushing {
 		if mf == target {
 			mt.mu.flushing = append(mt.mu.flushing[:i], mt.mu.flushing[i+1:]...)
-			return
+			found = true
+			break
 		}
+	}
+
+	if found {
+		// Update the lock-free snapshot for readers.
+		// Since we are still under mt.mu.Lock(), and mf.buf.Unpin()
+		// hasn't been called by the caller yet, this is 100% safe.
+		mt.publishSnapshot()
 	}
 }
 
@@ -491,7 +513,7 @@ func (mt *MemTable) Drain() {
 	shouldFlush := active != nil && active.wPos > 0 && mt.prepareFlushUnderLock(active)
 	if active != nil {
 		if active.pendingWrites.Load() > 0 {
-			waitCh = active.writesDone
+			waitCh = active.writesDone.ch
 		}
 		active.retired.Store(true)
 		mt.mu.active = nil
@@ -522,10 +544,11 @@ func (mt *MemTable) Drain() {
 		}
 	}
 
-	newActive := mt.newMemFile(true)
+	newActive := mt.newMemFile(0 /* pooled */)
 	mt.mu.Lock()
 	mt.mu.active = newActive
 	mt.mu.activeReady.Broadcast()
+	mt.publishSnapshot() // Make new active visible to readers
 	mt.mu.Unlock()
 }
 
@@ -537,4 +560,34 @@ func (mt *MemTable) Close() {
 		close(mt.stopCh)
 	}
 	mt.wg.Wait()
+}
+
+// mu.Lock must be held
+func (mt *MemTable) publishSnapshot() {
+	// 1. Prepare the new snapshot
+	count := len(mt.mu.flushing)
+	if mt.mu.active != nil {
+		count++
+	}
+	files := make([]*memFile, 0, count)
+	files = append(files, mt.mu.flushing...)
+	if mt.mu.active != nil {
+		files = append(files, mt.mu.active)
+	}
+	newSnap := &snapshot{files: files}
+
+	// 2. PIN everything in the new snapshot
+	for _, mf := range newSnap.files {
+		mf.buf.refCount.Add(1)
+	}
+
+	// 3. SWAP out the old snapshot
+	oldSnap := mt.readState.Swap(newSnap)
+
+	// 4. UNPIN everything from the old snapshot
+	if oldSnap != nil {
+		for _, mf := range oldSnap.files {
+			mf.buf.Unpin()
+		}
+	}
 }

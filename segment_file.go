@@ -13,8 +13,8 @@ func (s *segmentFile) ReadAt(p []byte, off int64) (int, error) {
 	return s.file.ReadAt(p, off)
 }
 
-func (s *segmentFile) PunchHole(offset, length int64) error {
-	// Calls the OS-specific implementation (fallocate on Linux)
+func (s *segmentFile) PunchHole(offset, length int64) (int64, error) {
+	// Calls the OS-specific implementation (fallocate on Linux, F_PUNCHHOLE on Darwin)
 	return PunchHole(s.file, offset, length)
 }
 

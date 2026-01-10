@@ -380,3 +380,20 @@ func TestFilterBasic(t *testing.T) {
 	notAdded := uint64(999999)
 	f.Test(notAdded) // Result doesn't matter for this test
 }
+
+func TestAtomicPointerNil(t *testing.T) {
+	type snapshot struct{ val int }
+	var ptr atomic.Pointer[snapshot]
+
+	s := ptr.Load()
+	if s == nil {
+		t.Log("Load returned nil before Store")
+	}
+
+	ptr.Store(&snapshot{val: 42})
+	s = ptr.Load()
+	if s == nil {
+		t.Fatal("Load returned nil after Store")
+	}
+	t.Logf("Loaded value: %d", s.val)
+}

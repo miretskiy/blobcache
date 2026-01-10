@@ -7,17 +7,19 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
-
+	"time"
+	
 	"golang.org/x/sys/unix"
 )
 
 // --- MmapBuffer: The Physical Slab ---
 
 type MmapBuffer struct {
-	raw      []byte
-	wPos     atomic.Int64
-	refCount atomic.Int64
-	pool     *MmapPool
+	raw       []byte
+	wPos      atomic.Int64
+	refCount  atomic.Int64
+	pool      *MmapPool
+	onRelease []func()
 }
 
 // WriteAt performs a copy into the buffer.
@@ -62,14 +64,24 @@ func (b *MmapBuffer) Reset() {
 	b.wPos.Store(-1) // Set back to Active sentinel
 }
 
-// Unpin decrements the refcount. If the slab is Sealed and unreferenced,
-// it returns to the pool.
 func (b *MmapBuffer) Unpin() {
 	if b.refCount.Add(-1) == 0 {
-		if b.wPos.Load() >= 0 {
-			b.resetAndRelease()
+		// 1. Execute all registered cleanup hooks
+		for _, fn := range b.onRelease {
+			fn()
 		}
+		
+		// 2. Clear hooks so they don't leak or double-run next time
+		b.onRelease = b.onRelease[:0]
+		
+		// 3. Reset buffer state and return to pool
+		b.resetAndRelease()
 	}
+}
+
+// AddOnRelease registers a callback to be run when the slab is recycled.
+func (b *MmapBuffer) AddOnRelease(fn func()) {
+	b.onRelease = append(b.onRelease, fn)
 }
 
 func (b *MmapBuffer) resetAndRelease() {
@@ -128,12 +140,12 @@ func allocate(size int64) *MmapBuffer {
 	if err != nil {
 		panic(fmt.Sprintf("mmap-pool: failed to allocate %d bytes: %v", size, err))
 	}
-
+	
 	// PRE-WARM: Force physical RAM commitment.
 	for i := 0; i < len(data); i += 4096 {
 		data[i] = 0
 	}
-
+	
 	buf := &MmapBuffer{raw: data}
 	buf.Reset()
 	runtime.AddCleanup(buf, func(d []byte) { _ = unix.Munmap(d) }, data)
@@ -141,14 +153,17 @@ func allocate(size int64) *MmapBuffer {
 }
 
 type MmapPool struct {
-	buffers  chan *MmapBuffer
-	poolSize int64
+	buffers     chan *MmapBuffer
+	poolSize    int64
+	outstanding atomic.Int64
+	name        string
 }
 
-func NewMmapPool(capacity int, bufferSize int64, headroom int64) *MmapPool {
+func NewMmapPool(name string, bufferSize int64, headroom int64, capacity int) *MmapPool {
 	p := &MmapPool{
 		buffers:  make(chan *MmapBuffer, capacity),
 		poolSize: bufferSize + headroom,
+		name:     name,
 	}
 	for i := 0; i < capacity; i++ {
 		buf := allocate(bufferSize + headroom)
@@ -160,7 +175,17 @@ func NewMmapPool(capacity int, bufferSize int64, headroom int64) *MmapPool {
 }
 
 func (p *MmapPool) Acquire() *MmapBuffer {
-	buf := <-p.buffers
+	// buf := <-p.buffers
+	var buf *MmapBuffer
+	for buf == nil {
+		select {
+		case buf = <-p.buffers:
+			p.outstanding.Add(1)
+		case <-time.After(10 * time.Second):
+			log.Error(" timeout acquiring buffers",
+				"pool", p.name, "outstanding", p.outstanding.Load())
+		}
+	}
 	buf.Reset()
 	buf.refCount.Store(1)
 	return buf
@@ -174,7 +199,7 @@ func (p *MmapPool) AcquireAligned(size int64) *MmapBuffer {
 		// Happy Path: fits in our pre-mapped slabPool slabs
 		return p.Acquire()
 	}
-
+	
 	// Pathological Path: requires a larger one-off mmap
 	return p.AcquireUnpooled(size)
 }
@@ -190,16 +215,18 @@ func (p *MmapPool) Release(buf *MmapBuffer) {
 	if buf.pool == nil {
 		return
 	}
-
+	
 	buf.Reset()
 	select {
 	case p.buffers <- buf:
 		// Hot return: RAM is preserved.
+		p.outstanding.Add(-1)
 	default:
+		log.Error("the pool buffer is full")
 		// Pool is full. This was likely an "overflow" buffer
 		// created during high load. Evict and free RAM.
 		_ = unix.Madvise(buf.raw, unix.MADV_DONTNEED)
-
+		
 		// IMPORTANT: Sever the connection so that future Unpin()
 		// calls on this specific slab don't hit the slabPool again.
 		buf.pool = nil

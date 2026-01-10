@@ -106,10 +106,10 @@ func (s *Storage) getSegmentFile(segmentID int64) (*segmentFile, error) {
 }
 
 // tryReadFooterFromFile attempts to read and validate segment record from file footer
-func (s *Storage) HolePunchBlob(segmentID int64, offset, size int64) error {
+func (s *Storage) HolePunchBlob(segmentID int64, offset, size int64) (int64, error) {
 	sf, err := s.getSegmentFile(segmentID)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	return sf.PunchHole(offset, size)
 }

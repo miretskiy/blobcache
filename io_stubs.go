@@ -30,6 +30,7 @@ func fallocate(f *os.File, size int64) error {
 
 // PunchHole is a no-op on unsupported platforms
 // Space will not be reclaimed until segment compaction occurs
-func PunchHole(f *os.File, offset, length int64) error {
-	return nil // No hole punching support
+// Returns 0 bytes reclaimed
+func PunchHole(f *os.File, offset, length int64) (int64, error) {
+	return 0, nil // No hole punching support
 }

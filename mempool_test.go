@@ -11,48 +11,10 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// TestMmapPool_SealHandover validates the state machine:
-// Buffers should NOT return to the pool until they are both Unpinned AND Sealed.
-// This uses the int64 sentinel (-1 = active, >= 0 = sealed).
-func TestMmapPool_SealHandover(t *testing.T) {
-	pool := NewMmapPool(1, 1024, 0)
-	buf := pool.Acquire() // refCount = 1, wPos = -1 (Active)
-
-	// 1. Simulate owner finishing work, but NOT sealing yet.
-	// This happens during active writes before a MemTable rotation.
-	buf.Unpin() // refCount = 0
-
-	select {
-	case <-pool.buffers:
-		t.Fatal("Buffer returned to pool before being Sealed (wPos was still -1)!")
-	default:
-		// Success: refCount is 0, but it's waiting for the "Seal" signal.
-	}
-
-	// 2. Simulate MemTable rotation (The Seal signal).
-	// Calling Seal(finalOffset) sets wPos >= 0, marking it ready for release.
-	buf.Seal(100) // wPos = 100
-
-	// Trigger the logic that checks (refCount == 0 && wPos >= 0).
-	// We increment/decrement to trigger the Unpin logic.
-	buf.refCount.Store(1)
-	buf.Unpin() // This call should now trigger resetAndRelease()
-
-	select {
-	case <-pool.buffers:
-		// Success: now it's back in the pool for reuse.
-		if buf.wPos.Load() != -1 {
-			t.Errorf("Expected offset to be reset to -1, got %d", buf.wPos.Load())
-		}
-	case <-time.After(100 * time.Millisecond):
-		t.Fatal("Buffer failed to return to pool after being Sealed and Unpinned")
-	}
-}
-
 // TestMmapPool_AcquireUnpooled validates that AcquireUnpooled creates
 // one-off allocations that do not return to a pool.
 func TestMmapPool_AcquireUnpooled(t *testing.T) {
-	pool := NewMmapPool(1, 1024, 0)
+	pool := NewMmapPool("", 1024, 0, 1)
 
 	giantSize := int64(1024 * 1024)
 	buf := pool.AcquireUnpooled(giantSize)
@@ -71,7 +33,7 @@ func TestMmapPool_AcquireUnpooled(t *testing.T) {
 // TestMmapBuffer_ReaderRefCounting validates that concurrent readers
 // properly hold the "pin" even after the MemTable is done with the slab.
 func TestMmapBuffer_ReaderRefCounting(t *testing.T) {
-	pool := NewMmapPool(1, 1024, 0)
+	pool := NewMmapPool("", 1024, 0, 1)
 	buf := pool.Acquire()
 	buf.Seal(1024) // Mark as ready for release once readers finish
 
@@ -109,7 +71,7 @@ func TestMmapBuffer_ReaderRefCounting(t *testing.T) {
 
 // TestMmapPool_SafetyNet validates the Go 1.24+ runtime.AddCleanup fallback.
 func TestMmapPool_SafetyNet(t *testing.T) {
-	pool := NewMmapPool(1, 1024, 0)
+	pool := NewMmapPool("", 1024, 0, 1)
 	buf := pool.Acquire()
 	buf.Seal(100)
 
@@ -148,7 +110,7 @@ func TestMmapBuffer_WriteAt_Stress(t *testing.T) {
 		iters       = 100
 		entrySize   = 64
 	)
-	pool := NewMmapPool(1, concurrency*iters*entrySize, 0)
+	pool := NewMmapPool("", concurrency*iters*entrySize, 0, 1)
 	buf := pool.Acquire()
 
 	var wg sync.WaitGroup

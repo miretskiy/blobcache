@@ -88,6 +88,11 @@ func (idx *Index) GetSegmentRecord(segmentID int64) (metadata.SegmentRecord, boo
 }
 
 func (idx *Index) IngestBatch(segID int64, batch []metadata.BlobRecord) error {
+	// Validate: records must be contiguous and non-overlapping
+	if err := validateNonOverlapping(batch); err != nil {
+		return fmt.Errorf("segment %d validation failed: %w", segID, err)
+	}
+
 	if err := idx.segments.writeBatch(segID, batch); err != nil {
 		return err
 	}
@@ -96,6 +101,27 @@ func (idx *Index) IngestBatch(segID int64, batch []metadata.BlobRecord) error {
 		entry := Entry{rec, segID}
 		idx.blobs.Store(rec.Hash, idx.evictor.Add(entry))
 	}
+	return nil
+}
+
+// validateNonOverlapping ensures blob positions are monotonically increasing
+// and don't overlap. Assumes records are in write order (O(n) check).
+func validateNonOverlapping(records []metadata.BlobRecord) error {
+	if len(records) <= 1 {
+		return nil
+	}
+
+	for i := 0; i < len(records)-1; i++ {
+		curr := records[i]
+		next := records[i+1]
+		currEnd := curr.Pos + curr.LogicalSize
+
+		if currEnd > next.Pos {
+			return fmt.Errorf("overlap: blob[%d] pos=%d size=%d ends at %d, blob[%d] starts at %d",
+				i, curr.Pos, curr.LogicalSize, currEnd, i+1, next.Pos)
+		}
+	}
+
 	return nil
 }
 

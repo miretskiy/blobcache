@@ -61,19 +61,20 @@ func NewSegmentWriter(
 // WriteSlab appends a memory-aligned slab of data to the segment.
 // 'data' MUST be 4KB-aligned (via MmapBuffer.AlignedBytes()) or the write
 // will fail with EINVAL on Linux systems.
-func (sw *SegmentWriter) WriteSlab(data []byte, records []metadata.BlobRecord) error {
+// Returns the records with Pos transformed from relative to absolute positions.
+func (sw *SegmentWriter) WriteSlab(data []byte, records []metadata.BlobRecord) ([]metadata.BlobRecord, error) {
 	if len(data) == 0 {
-		return nil
+		return records, nil
 	}
 
 	// If some previous operation left us unaligned, we must fail fast.
 	if sw.currentPos%4096 != 0 {
-		return fmt.Errorf("segment offset %d is not 4KB-aligned; O_DIRECT write will fail", sw.currentPos)
+		return nil, fmt.Errorf("segment offset %d is not 4KB-aligned; O_DIRECT write will fail", sw.currentPos)
 	}
 
 	// Safety check for alignment (abstracted helper)
 	if !isAligned(data) {
-		return fmt.Errorf("buffer address %p is not hardware-aligned", &data[0])
+		return nil, fmt.Errorf("buffer address %p is not hardware-aligned", &data[0])
 	}
 
 	// 1. Capture the start of this block in the file
@@ -81,18 +82,21 @@ func (sw *SegmentWriter) WriteSlab(data []byte, records []metadata.BlobRecord) e
 
 	// 2. Write the bytes to disk at the absolute offset
 	if _, err := sw.file.WriteAt(data, slabStart); err != nil {
-		return err
+		return nil, err
 	}
 
 	// 3. Advance the global file pointer by the size of the data written
-	// If data is 1MB, we move forward 1,048,576 bytes.
 	sw.currentPos += int64(len(data))
 
-	// 4. Append these modified records to the segment's internal list, re-positioned to
-	// physical offset.
-	sw.records = append(sw.records, localToPhysicalOffsets(records, slabStart)...)
+	// 4. Transform to absolute positions (create copy, don't mutate input)
+	absoluteRecords := make([]metadata.BlobRecord, len(records))
+	for i := range records {
+		absoluteRecords[i] = records[i]
+		absoluteRecords[i].Pos += slabStart
+	}
+	sw.records = append(sw.records, absoluteRecords...)
 
-	return nil
+	return absoluteRecords, nil
 }
 
 // Close finalizes and "seals" the segment. It appends the immutable
@@ -148,13 +152,3 @@ func (sw *SegmentWriter) Fd() uintptr {
 	return sw.file.Fd()
 }
 
-// localToPhysicalOffsets creates a copy of the records and transforms
-// their relative slab positions into absolute file positions.
-func localToPhysicalOffsets(records []metadata.BlobRecord, slabStart int64) []metadata.BlobRecord {
-	physical := make([]metadata.BlobRecord, len(records))
-	for i := range records {
-		physical[i] = records[i]
-		physical[i].Pos += slabStart
-	}
-	return physical
-}

@@ -20,7 +20,7 @@ type Key = uint64
 
 const (
 	// evictionHysteresis is the target fraction of MaxSize to evict to.
-	evictionHysteresis = 0.95
+	evictionHysteresis = 0.93
 )
 
 // Cache is a high-performance blob storage with bloom filter optimization
@@ -273,6 +273,8 @@ func (c *Cache) evictionWorker() {
 
 // runEvictionSieve evicts blobs using Sieve algorithm until under size limit
 func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
+	evictionStart := time.Now()
+
 	if c.testingInjectEvictErr != nil {
 		if err := c.testingInjectEvictErr(); err != nil {
 			return err
@@ -292,8 +294,9 @@ func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
 	toEvictBytes := currentSize - target
 
 	var (
-		victims      []index.Entry
-		evictedBytes int64
+		victims             []index.Entry
+		evictedBytes        int64
+		physicallyReclaimed int64
 	)
 
 	// 1. SELECTION PHASE: High-speed RAM eviction.
@@ -323,7 +326,8 @@ func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
 	// 3. RECLAMATION PHASE: Physical Disk Space.
 	// Performed AFTER metadata is durable.
 	for _, v := range victims {
-		_ = c.storage.HolePunchBlob(v.SegmentID, v.Pos, v.LogicalSize)
+		reclaimed, _ := c.storage.HolePunchBlob(v.SegmentID, v.Pos, v.LogicalSize)
+		physicallyReclaimed += reclaimed
 	}
 
 	// 4. METRICS & MAINTENANCE
@@ -331,8 +335,11 @@ func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
 	evictedCount := len(victims)
 
 	log.Info("eviction completed",
+		"duration", time.Since(evictionStart),
 		"evicted_count", evictedCount,
 		"evicted_mb", evictedBytes/(1024*1024),
+		"reclaimed_mb", physicallyReclaimed/(1024*1024),
+		"reclaim_pct", 100*float64(physicallyReclaimed)/float64(evictedBytes),
 		"remaining_mb", c.approxSize.Load()/(1024*1024))
 
 	c.bloom.deletions.Add(int64(evictedCount))

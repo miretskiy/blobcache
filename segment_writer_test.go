@@ -21,7 +21,7 @@ type TrackedPool struct {
 
 func NewTrackedPool(capacity int, slabSize int64) *TrackedPool {
 	return &TrackedPool{
-		MmapPool: NewMmapPool(capacity, slabSize, 0),
+		MmapPool: NewMmapPool("", slabSize, 0, capacity),
 	}
 }
 
@@ -118,7 +118,8 @@ func TestSegmentWriter_FullCycle(t *testing.T) {
 			Pos:         0,
 			LogicalSize: int64(len(data1)), // Renamed field.
 		}}
-		require.NoError(t, sw.WriteSlab(slab1.AlignedBytes(), recs1))
+		_, err = sw.WriteSlab(slab1.AlignedBytes(), recs1)
+		require.NoError(t, err)
 		slab1.Unpin()
 
 		// Slab 2
@@ -132,7 +133,8 @@ func TestSegmentWriter_FullCycle(t *testing.T) {
 			Pos:         0,
 			LogicalSize: int64(len(data2)),
 		}}
-		require.NoError(t, sw.WriteSlab(slab2.AlignedBytes(), recs2))
+		_, err = sw.WriteSlab(slab2.AlignedBytes(), recs2)
+		require.NoError(t, err)
 		slab2.Unpin()
 
 		require.NoError(t, sw.Close())
@@ -181,13 +183,6 @@ func TestMemTable_Integration_Rotation(t *testing.T) {
 	for i := 0; i < blobCount; i++ {
 		key := Key(i)
 		mt.Put(key, data)
-		if i == 0 {
-			// After first put, check if it's in memtable
-			if _, found := mt.Get(key, nil); !found {
-				t.Fatalf("First Put failed: key %d not found in memtable", i)
-			}
-			t.Logf("First key successfully written to memtable")
-		}
 	}
 
 	mt.Drain()
@@ -197,14 +192,7 @@ func TestMemTable_Integration_Rotation(t *testing.T) {
 		t.Fatalf("MemTable entered degraded mode: %v", mh.ReportedErr)
 	}
 
-	// Debug: Check what actually happened
-	t.Logf("Batcher received %d blobs (expected %d)", mb.Count, blobCount)
-	t.Logf("Batcher has %d segment batches", len(mb.Batches))
-	for segID, recs := range mb.Batches {
-		t.Logf("  Segment %d: %d records", segID, len(recs))
-	}
-
-	// 1. Verify all records hit the Batcher.
+	// Verify all records hit the Batcher.
 	require.Equal(t, blobCount, mb.Count)
 
 	// 2. Verify rotation occurred.

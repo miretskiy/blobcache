@@ -39,16 +39,21 @@ func fallocate(f *os.File, size int64) error {
 // PunchHole deallocates a range within a file (creates sparse file)
 // Uses FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE to reclaim space
 // Aligns to filesystem block boundaries to avoid punching adjacent blobs
-func PunchHole(f *os.File, offset, length int64) error {
+// Returns the actual number of bytes reclaimed (after alignment)
+func PunchHole(f *os.File, offset, length int64) (int64, error) {
 	alignedOffset, alignedLength, canPunch := alignForHolePunch(offset, length)
 	if !canPunch {
-		return nil
+		return 0, nil
 	}
 	// Mode must be the bitwise OR of PUNCH_HOLE and KEEP_SIZE
 	mode := uint32(unix.FALLOC_FL_PUNCH_HOLE | unix.FALLOC_FL_KEEP_SIZE)
 
 	// Fallocate(fd, mode, offset, length)
-	return unix.Fallocate(int(f.Fd()), mode, alignedOffset, alignedLength)
+	err := unix.Fallocate(int(f.Fd()), mode, alignedOffset, alignedLength)
+	if err != nil {
+		return 0, err
+	}
+	return alignedLength, nil
 }
 
 // Fadvise maps the internal FadviseHint to Linux-specific posix_fadvise constants.

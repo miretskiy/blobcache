@@ -5,7 +5,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
+	
 	"github.com/miretskiy/blobcache/metadata"
 	"github.com/zhangyunhao116/skipmap"
 )
@@ -18,7 +18,7 @@ type memFile struct {
 	entries   []metadata.BlobRecord
 	data      *skipmap.Uint64Map[int] // key -> offset in entries
 	flushDone chan struct{}           // Closed when flush completes
-
+	
 	// Atomic state to synchronize memFile rotation.
 	// the "rotator" -- Go routine that decides it's time to rotate
 	// wil set memtable active pointer to nil (under lock), and mark memfile retired.
@@ -26,12 +26,18 @@ type memFile struct {
 	// Whichever thread decrements pendingWrites to 0 while retire is true closes writesDone.
 	pendingWrites atomic.Int64
 	retired       atomic.Bool
-	writesDone    signal
+	writesDone    *signal
 }
 
 type signal struct {
 	sync.Once
 	ch chan struct{}
+}
+
+func newSignal() *signal {
+	return &signal{
+		ch: make(chan struct{}),
+	}
 }
 
 func (s *signal) Close() {
@@ -51,40 +57,41 @@ type MemTable struct {
 	config
 	Batcher
 	ErrorRporter // Callback to check/set degraded state
-
+	
 	// SegmentID sequence number.
 	segmentID atomic.Int64
-
-	// Set of memFiles currently being written or flushed.
+	
+	// Mutex protected state.
 	mu struct {
 		// Mutex protects access to active and flushing slices;
 		// However, exclusive lock is minimized to update internal state
 		// (rotate active for example) and for some bookkeeping tasks.
-		// The actual Write (in memory) is done w/out lock.
+		// The actual Write (in memory), or active rotation is done w/out lock.
 		sync.Mutex
-
+		
 		// active is the currently active memFile.
 		// However, it may be temporarily unavailable (nil).  If that's the case,
 		// caller must wait on activeReady until active is available.
-		active      *memFile
-		activeReady *sync.Cond
-
-		// set of currently flushing memfiles.
+		active *memFile
+		// Non-nil if the checker needs to wait for active to be ready.
+		activeReady chan struct{}
+		
+		// Set of currently flushing memfiles.
 		flushing []*memFile
 	}
-
+	
 	// Read state snapshot.
 	readState atomic.Pointer[snapshot]
-
+	
 	slabPool    *MmapPool
 	footerPool  *MmapPool
 	entriesPool sync.Pool // amortize []blobrecord.Entry allocations.
-
+	
 	// Background flush workers
 	flushCh chan *memFile
 	stopCh  chan struct{}
 	wg      sync.WaitGroup
-
+	
 	writeBufferSize int64
 }
 
@@ -112,20 +119,19 @@ func NewMemTable(cfg config, b Batcher, reporter ErrorRporter) *MemTable {
 		writeBufferSize: cfg.WriteBufferSize,
 	}
 	mt.segmentID.Store(time.Now().UnixNano())
-
+	
 	// Initialize active memfile
 	mt.mu.Lock()
-	mt.mu.activeReady = sync.NewCond(&mt.mu)
 	mt.mu.active = mt.newMemFile(0 /* pooled */)
 	mt.publishSnapshot()
 	mt.mu.Unlock()
-
+	
 	// Start I/O workers for flushing memfiles
 	mt.wg.Add(cfg.FlushConcurrency)
 	for i := 0; i < cfg.FlushConcurrency; i++ {
 		go mt.flushWorker()
 	}
-
+	
 	return mt
 }
 
@@ -137,19 +143,19 @@ func (mt *MemTable) newMemFile(size int) *memFile {
 			return mt.slabPool.AcquireUnpooled(int64(size))
 		}
 	}()
-
+	
 	pEntries := mt.entriesPool.Get().(*[]metadata.BlobRecord)
 	buf.AddOnRelease(func() {
 		mt.entriesPool.Put(pEntries)
 	})
-
+	
 	mf := memFile{
-		buf:       buf,
-		entries:   (*pEntries)[:cap(*pEntries)],
-		data:      skipmap.NewUint64[int](),
-		flushDone: make(chan struct{}),
+		buf:        buf,
+		entries:    (*pEntries)[:cap(*pEntries)],
+		data:       skipmap.NewUint64[int](),
+		flushDone:  make(chan struct{}),
+		writesDone: newSignal(),
 	}
-	mf.writesDone.ch = make(chan struct{})
 	return &mf
 }
 
@@ -194,22 +200,22 @@ func (mt *MemTable) View(key Key, fn func(data []byte)) bool {
 // must be called expediently. Otherwise, the memtable may stall.
 func (mt *MemTable) ZeroCopyView(key Key) ([]byte, Releaser, bool) {
 	s := mt.readState.Load()
-
+	
 	// Iterate newest->oldest
 	for i := len(s.files) - 1; i >= 0; i-- {
 		mf := s.files[i]
-
+		
 		if data, ok := mt.lookupAndPin(mf, key); ok {
 			return data, mf.buf.Unpin, true
 		}
 	}
-
+	
 	return nil, nil, false
 }
 
 func (mt *MemTable) lookupAndPin(mf *memFile, key Key) ([]byte, bool) {
 	// Skipmap Load is lock-free and thread-safe.
-	if pos, ok := mf.data.Load(uint64(key)); ok {
+	if pos, ok := mf.data.Load(key); ok {
 		mf.buf.refCount.Add(1)
 		entry := mf.entries[pos]
 		return mf.buf.raw[entry.Pos : entry.Pos+entry.LogicalSize], true
@@ -218,10 +224,10 @@ func (mt *MemTable) lookupAndPin(mf *memFile, key Key) ([]byte, bool) {
 }
 
 func makeEntry(
-	key Key, offset int64, val []byte, hasher Hasher, checksum *uint32,
+		key Key, offset int64, val []byte, hasher Hasher, checksum *uint32,
 ) metadata.BlobRecord {
 	entry := metadata.BlobRecord{
-		Hash:        uint64(key),
+		Hash:        key,
 		Pos:         offset,
 		LogicalSize: int64(len(val)), // Renamed from Size to LogicalSize
 		Flags:       metadata.InvalidChecksum,
@@ -253,7 +259,7 @@ func (mt *MemTable) putLargeWithChecksum(key Key, value []byte, checksum *uint32
 	blob.nextEntry = 1
 	blob.wPos = len(value)
 	blob.data.Store(key, 0)
-
+	
 	mt.mu.Lock()
 	shouldSend := mt.prepareFlushUnderLock(blob)
 	mt.publishSnapshot() // Make the blob visible to readers
@@ -263,69 +269,104 @@ func (mt *MemTable) putLargeWithChecksum(key Key, value []byte, checksum *uint32
 	}
 }
 
+func (mt *MemTable) setActiveReadySemaphoreUnderLock() func() {
+	ready := make(chan struct{})
+	mt.mu.activeReady = ready
+	return func() {
+		close(ready)
+		mt.mu.activeReady = nil
+	}
+}
+
 // putActive adds data to the active file using a unified atomic reservation.
 func (mt *MemTable) putActive(key Key, value []byte, checksum *uint32) {
 	mt.mu.Lock()
-
-	for mt.mu.active == nil {
-		mt.mu.activeReady.Wait()
+	
+	if wait := mt.mu.activeReady; wait != nil {
+		mt.mu.Unlock()
+		<-wait
+		mt.putActive(key, value, checksum)
+		return
 	}
-	active := mt.mu.active
-	wPos := active.wPos
-	entryIdx := active.nextEntry
-
+	
 	// 1. ROTATION BRANCH
-	if wPos+len(value) > active.buf.Cap() || entryIdx == len(active.entries) {
+	if active := mt.mu.active;
+			active.wPos+len(value) > active.buf.Cap() || active.nextEntry == len(active.entries) {
 		// SET RETIRED UNDER LOCK: This ensures no writer finishing after this
 		// point can miss the fact that the slab is retired.
 		mt.mu.active = nil
 		active.retired.Store(true)
 		shouldSend := mt.prepareFlushUnderLock(active)
-
+		clearSema := mt.setActiveReadySemaphoreUnderLock()
 		waitCh := active.writesDone.ch
-		// DOUBLE CHECK: If writes hit 0 before we set retired or during this block,
-		// we must close the channel ourselves.
-		if active.pendingWrites.Load() == 0 {
-			active.writesDone.Close()
-		}
+		// CRITICAL SYNCHRONIZATION: Read pendingWrites BEFORE unlock
+		//
+		// This check MUST happen before mt.mu.Unlock() to guarantee visibility of
+		// writer increments via the Go Memory Model's transitive happens-before chain:
+		//
+		//   Writer Thread:
+		//     1. mt.mu.Lock()
+		//     2. active.pendingWrites.Add(1)  ← Write to atomic
+		//     3. active.nextEntry++            ← Write to memFile
+		//     4. mt.mu.Unlock()                ← Creates synchronized-before edge
+		//
+		//   Rotator Thread:
+		//     5. mt.mu.Lock()                  ← Synchronized-after edge
+		//     6. hasPending := pendingWrites.Load()  ← Read under lock
+		//     7. mt.mu.Unlock()
+		//
+		// The mutex unlock/lock creates a happens-before edge that forces visibility
+		// of ALL memory operations from writer (including the atomic Add), even though
+		// atomics have independent ordering semantics.
+		//
+		// If this Load() happened AFTER unlock (line 7), the transitive chain breaks:
+		// Writer's Add(1) would have no guaranteed visibility, and rotator could see
+		// stale value 0, causing it to skip waiting while writers are still executing
+		// entries[entryIdx] writes. The flusher would then read stale/uninitialized
+		// data from the pooled entries array.
+		//
+		// See: https://go.dev/ref/mem (Mutex section)
+		hasPending := active.pendingWrites.Load() > 0
 		mt.mu.Unlock()
-
+		
 		// Allocate new slab
 		newMF := mt.newMemFile(0 /* pooled */)
-
+		
 		mt.mu.Lock()
 		mt.mu.active = newMF
-		mt.mu.activeReady.Broadcast()
+		clearSema()
 		mt.publishSnapshot()
 		mt.mu.Unlock()
-
-		// THE BLOCKING POINT: Now safe because the "Last Man Out" check is foolproof.
-		if waitCh != nil {
+		
+		if hasPending {
 			<-waitCh
 		}
-
+		
 		if shouldSend {
 			mt.sendToFlusher(active)
 		}
-
-		// Use recursion to handle the write on the new slab.
+		
+		// Recurse  to handle this write on the new slab.
 		// IMPORTANT: Do NOT manually store 1 in pendingWrites before this.
 		mt.putActive(key, value, checksum)
 		return
-	} else {
-		// 2. SUCCESS PATH: Atomic Reservation
-		active.pendingWrites.Add(1)
-		active.wPos += len(value)
-		active.nextEntry++
-		mt.mu.Unlock()
 	}
-
+	
+	// 2. Fast path: Atomic Reservation
+	active := mt.mu.active
+	active.pendingWrites.Add(1)
+	entryIdx := active.nextEntry
+	active.nextEntry++
+	wPos := active.wPos
+	active.wPos += len(value)
+	mt.mu.Unlock()
+	
 	// PARALLEL WRITE
 	active.buf.WriteAt(value, int64(wPos))
 	active.entries[entryIdx] = makeEntry(
 		key, int64(wPos), value, mt.Resilience.ChecksumHasher, checksum)
-	active.data.Store(uint64(key), entryIdx)
-
+	active.data.Store(key, entryIdx)
+	
 	// 3. CHECK-OUT: The "Last Man Out" logic
 	// We decrement first, then check if we are the closer.
 	if active.pendingWrites.Add(-1) == 0 {
@@ -340,7 +381,7 @@ func (mt *MemTable) putActive(key Key, value []byte, checksum *uint32) {
 // mt.mu.Lock() must be held
 func (mt *MemTable) prepareFlushUnderLock(mf *memFile) bool {
 	mf.buf.Seal(int64(mf.wPos))
-
+	
 	// Rotate active to flushing; mark active nil.
 	// It will remain nil until memory can be acquired to create new active.
 	mt.mu.flushing = append(mt.mu.flushing, mf)
@@ -371,39 +412,39 @@ func (mt *MemTable) sendToFlusher(mf *memFile) {
 func (mt *MemTable) openSegment() (*SegmentWriter, error) {
 	segmentID := mt.segmentID.Add(1)
 	segmentPath := getSegmentPath(mt.Path, mt.Shards, segmentID)
-	return NewSegmentWriter(segmentID, segmentPath, mt.SegmentSize, mt.footerPool)
+	return NewSegmentWriter(segmentID, segmentPath, mt.SegmentSize, mt.footerPool, mt.IO.FDataSync)
 }
 
 // flushWorker processes memfiles
 func (mt *MemTable) flushWorker() {
 	defer mt.wg.Done()
-
+	
 	writer, err := mt.openSegment()
 	if err != nil {
 		mt.ReportError(err)
 		return
 	}
-
+	
 	defer func() {
 		if closeErr := writer.Close(); closeErr != nil {
 			mt.ReportError(fmt.Errorf("writer close failed: %w", closeErr))
 		}
 	}()
-
+	
 	for {
 		select {
 		case mf, ok := <-mt.flushCh:
 			if !ok {
 				return
 			}
-
+			
 			nextWriter, flushErr := mt.processFlush(mf, writer)
 			if flushErr != nil {
 				mt.ReportError(flushErr)
 				// We do NOT return. We keep the loop running so we can
 				// pull the next mf from flushCh and trigger its close(mf.flushDone).
 			}
-
+			
 			writer = nextWriter
 		case <-mt.stopCh:
 			// Stop immediately - caller must call Drain() before Close() if needed
@@ -413,7 +454,7 @@ func (mt *MemTable) flushWorker() {
 }
 
 func (mt *MemTable) processFlush(
-	mf *memFile, writer *SegmentWriter,
+		mf *memFile, writer *SegmentWriter,
 ) (newWriter *SegmentWriter, fatal error) {
 	// 1. Guaranteed signal and RAM cleanup
 	defer func() {
@@ -421,17 +462,17 @@ func (mt *MemTable) processFlush(
 		mf.buf.Unpin()
 		close(mf.flushDone)
 	}()
-
+	
 	// 2. Short-circuit if we are already in trouble
 	if mt.IsDegraded() {
 		return writer, nil
 	}
-
+	
 	// 3. Physical Write
 	if err := mt.flushMemFile(mf, writer); err != nil {
 		return writer, err
 	}
-
+	
 	// 4. Segment Rotation Logic
 	if writer.CurrentPos() >= mt.SegmentSize {
 		if err := writer.Close(); err != nil {
@@ -443,7 +484,7 @@ func (mt *MemTable) processFlush(
 		}
 		return next, nil
 	}
-
+	
 	return writer, nil
 }
 
@@ -454,28 +495,28 @@ func (mt *MemTable) flushMemFile(mf *memFile, writer *SegmentWriter) error {
 			return err
 		}
 	}
-
+	
 	records := mf.entries[:mf.nextEntry]
-
+	
 	// Physical Write to NVMe (O_DIRECT)
 	// WriteSlab returns records with Pos transformed from RELATIVE to ABSOLUTE
 	absoluteRecords, err := writer.WriteSlab(mf.buf.AlignedBytes(), records)
 	if err != nil {
 		return fmt.Errorf("physical write failed: %w", err)
 	}
-
+	
 	if mt.testingInjectIndexErr != nil {
 		if err := mt.testingInjectIndexErr(); err != nil {
 			mt.ReportError(err)
 			return err
 		}
 	}
-
+	
 	// Update the Persistent Index with ABSOLUTE positions
 	if err := mt.PutBatch(writer.id, absoluteRecords); err != nil {
 		return fmt.Errorf("index update failed: %w", err)
 	}
-
+	
 	return nil
 }
 
@@ -483,7 +524,7 @@ func (mt *MemTable) flushMemFile(mf *memFile, writer *SegmentWriter) error {
 func (mt *MemTable) removeFrozen(target *memFile) {
 	mt.mu.Lock()
 	defer mt.mu.Unlock()
-
+	
 	found := false
 	for i, mf := range mt.mu.flushing {
 		if mf == target {
@@ -492,7 +533,7 @@ func (mt *MemTable) removeFrozen(target *memFile) {
 			break
 		}
 	}
-
+	
 	if found {
 		// Update the lock-free snapshot for readers.
 		// Since we are still under mt.mu.Lock(), and mf.buf.Unpin()
@@ -506,20 +547,22 @@ func (mt *MemTable) Drain() {
 	if mt.IsDegraded() {
 		return
 	}
-
+	
 	mt.mu.Lock()
 	active := mt.mu.active
 	var waitCh chan struct{}
 	shouldFlush := active != nil && active.wPos > 0 && mt.prepareFlushUnderLock(active)
+	clearSema := func() {}
 	if active != nil {
 		if active.pendingWrites.Load() > 0 {
 			waitCh = active.writesDone.ch
 		}
 		active.retired.Store(true)
 		mt.mu.active = nil
+		clearSema = mt.setActiveReadySemaphoreUnderLock()
 	}
 	mt.mu.Unlock() // mt.mu.active remains nil until we're done draining
-
+	
 	if waitCh != nil {
 		<-waitCh
 	}
@@ -543,11 +586,11 @@ func (mt *MemTable) Drain() {
 		case <-mt.stopCh:
 		}
 	}
-
+	
 	newActive := mt.newMemFile(0 /* pooled */)
 	mt.mu.Lock()
 	mt.mu.active = newActive
-	mt.mu.activeReady.Broadcast()
+	clearSema()
 	mt.publishSnapshot() // Make new active visible to readers
 	mt.mu.Unlock()
 }
@@ -575,15 +618,15 @@ func (mt *MemTable) publishSnapshot() {
 		files = append(files, mt.mu.active)
 	}
 	newSnap := &snapshot{files: files}
-
+	
 	// 2. PIN everything in the new snapshot
 	for _, mf := range newSnap.files {
 		mf.buf.refCount.Add(1)
 	}
-
+	
 	// 3. SWAP out the old snapshot
 	oldSnap := mt.readState.Swap(newSnap)
-
+	
 	// 4. UNPIN everything from the old snapshot
 	if oldSnap != nil {
 		for _, mf := range oldSnap.files {

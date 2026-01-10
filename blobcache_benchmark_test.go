@@ -24,21 +24,27 @@ import (
 )
 
 // --- WORKLOAD CONFIGURATION & BENCHMARKING STRATEGY ---
-// WriteWeight (10%): Only 1 in 10 operations results in a Put.
 //
-// To honestly test the storage layer, run with high iteration counts or long time:
+// Benchmark Semantics:
+//   -benchtime=XXXx means "perform XXX writes" (each ~1MB on average)
+//   Each write iteration includes interspersed reads (10% writes, 90% reads)
 //
-//	10GB Write:   -benchtime 102400x
-//	100GB Write:  -benchtime 1000000x (~100k blobs)
-//	256GB Write:  -benchtime 2621440x
+// Example workloads:
+//   -benchtime=10000x     →  10,000 writes  ≈ 10GB
+//   -benchtime=100000x    →  100,000 writes ≈ 100GB
+//   -benchtime=256000x    →  256,000 writes ≈ 256GB
+//   -benchtime=1000000x   →  1M writes      ≈ 1TB (tests eviction + hole punching)
 //
-// Sustainable Stress Test: -benchtime 30m
+// Write/Read Distribution:
+//   10% Write (new data)
+//   40% Hot Read (Zipfian: 10% of cache is hot)
+//   25% Cold Read (sequential scan pattern)
+//   25% Miss (negative lookups, tests bloom filter)
 // -------------------------------------------------------------------------
 const (
 	WriteWeight    = 10
 	HotReadWeight  = 40
 	ColdReadWeight = 25
-	MissWeight     = 25
 	
 	WriteBound    = WriteWeight
 	HotReadBound  = WriteBound + HotReadWeight
@@ -101,6 +107,8 @@ func BenchmarkBlobCache(b *testing.B) {
 	ctx, cancel := context.WithCancel(context.Background())
 	metricsChan := startSystemMonitor(ctx, &totalWriteBytes, tmpDir)
 	
+	// Reinterpret b.N: each iteration = one write
+	// e.g., -benchtime=1000000x means 1M writes (~1TB at 1MB/write)
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		wid := workerID.Add(1)
@@ -127,52 +135,57 @@ func BenchmarkBlobCache(b *testing.B) {
 		localPut := hdrhistogram.New(10, 10_000_000_000, 3)
 		localGet := hdrhistogram.New(10, 10_000_000_000, 3)
 		
+		// Each pb.Next() iteration = one write (with interspersed reads)
 		for pb.Next() {
-			op := rng.IntN(100)
-			maxID := writeHead.Load()
-			
-			if maxID < ReadMinKeys {
-				if op < 50 {
-					op = 0
+			dataWritten := false
+			for !dataWritten {
+				op := rng.IntN(100)
+				maxID := writeHead.Load()
+				
+				if maxID < ReadMinKeys {
+					if op < 50 {
+						op = 0
+					} else {
+						op = 99
+					}
+				}
+				
+				start := time.Now()
+				
+				if op < WriteBound {
+					id := writeHead.Add(1)
+					k := fastFormatKey(keyBuf, "key-", id)
+					blobSize := 100_000 + rng.IntN(1_900_000)
+					offset := rng.IntN(len(entropy) - blobSize)
+					cache.Put(k, entropy[offset:offset+blobSize])
+					totalWriteBytes.Add(int64(blobSize))
+					localPut.RecordValue(time.Since(start).Nanoseconds())
+					dataWritten = true // Exit inner loop, count this iteration
+				} else if op < HotReadBound {
+					id := zipf.Uint64() % maxID
+					k := fastFormatKey(keyBuf, "key-", id)
+					found := cache.View(k, func(r io.Reader) {
+						io.CopyN(io.Discard, r, 64) // Force page fault
+					})
+					localGet.RecordValue(time.Since(start).Nanoseconds())
+					numReads.Add(1)
+					if found {
+						numFound.Add(1)
+					}
+				} else if op < ColdReadBound {
+					baseID := rng.Uint64() % (maxID - 4)
+					for i := uint64(0); i < 4; i++ {
+						k := fastFormatKey(keyBuf, "key-", baseID+i)
+						cache.View(k, func(r io.Reader) {})
+					}
+					numReads.Add(4)
 				} else {
-					op = 99
+					k := fastFormatKey(keyBuf, "miss-", rng.Uint64())
+					cache.Get(k)
+					numReads.Add(1)
 				}
-			}
-			
-			start := time.Now()
-			
-			if op < WriteBound {
-				id := writeHead.Add(1)
-				k := fastFormatKey(keyBuf, "key-", id)
-				blobSize := 100_000 + rng.IntN(1_900_000)
-				offset := rng.IntN(len(entropy) - blobSize)
-				cache.Put(k, entropy[offset:offset+blobSize])
-				totalWriteBytes.Add(int64(blobSize))
-				localPut.RecordValue(time.Since(start).Nanoseconds())
-			} else if op < HotReadBound {
-				id := zipf.Uint64() % maxID
-				k := fastFormatKey(keyBuf, "key-", id)
-				found := cache.View(k, func(r io.Reader) {
-					io.CopyN(io.Discard, r, 64) // Force page fault
-				})
-				localGet.RecordValue(time.Since(start).Nanoseconds())
-				numReads.Add(1)
-				if found {
-					numFound.Add(1)
-				}
-			} else if op < ColdReadBound {
-				baseID := rng.Uint64() % (maxID - 4)
-				for i := uint64(0); i < 4; i++ {
-					k := fastFormatKey(keyBuf, "key-", baseID+i)
-					cache.View(k, func(r io.Reader) {})
-				}
-				numReads.Add(4)
-			} else {
-				k := fastFormatKey(keyBuf, "miss-", rng.Uint64())
-				cache.Get(k)
-				numReads.Add(1)
-			}
-		}
+			} // End inner loop
+		} // End pb.Next()
 		
 		mu.Lock()
 		globalPut.Merge(localPut)

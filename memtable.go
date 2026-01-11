@@ -373,3 +373,10 @@ func (mt *MemTable) Close() {
 	}
 	mt.wg.Wait()
 }
+
+// ClosePools releases all pre-allocated mmap buffers.
+// Must be called AFTER Librarian.Close() returns slabs to pools.
+func (mt *MemTable) ClosePools() {
+	mt.slabPool.Close()
+	mt.footerPool.Close()
+}

@@ -139,10 +139,13 @@ func (c *Cache) Close() error {
 	
 	// 1. Close Write Path (Stops new slabs)
 	c.memTable.Close()
-	
-	// 2. Close Read Path (Releases pinned memory)
+
+	// 2. Close Read Path (Releases pinned slabs back to pool)
 	c.librarian.Close()
-	
+
+	// 3. Release pool memory (must be after librarian returns slabs)
+	c.memTable.ClosePools()
+
 	c.wg.Wait()
 	
 	// Collect all close errors

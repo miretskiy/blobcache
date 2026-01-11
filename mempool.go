@@ -264,7 +264,7 @@ func (p *MmapPool) AcquireAligned(size int64) *MmapBuffer {
 
 func (p *MmapPool) ReleaseBytes(raw []byte) {
 	p.outstanding.Add(-1)
-	
+
 	select {
 	case p.buffers <- raw:
 		// Happy Return.
@@ -272,6 +272,15 @@ func (p *MmapPool) ReleaseBytes(raw []byte) {
 		// Overflow (Pool is full).
 		log.Error("the pool buffer is full")
 		_ = unix.Madvise(raw, unix.MADV_DONTNEED)
+		_ = unix.Munmap(raw)
+	}
+}
+
+// Close releases all pre-allocated mmap buffers.
+// Must be called when the pool is no longer needed to avoid memory leaks.
+func (p *MmapPool) Close() {
+	close(p.buffers)
+	for raw := range p.buffers {
 		_ = unix.Munmap(raw)
 	}
 }

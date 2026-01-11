@@ -187,45 +187,57 @@ v                                         |
 +---------------------------------------------------------+
 ```
 
-#### 5.1.1 The Resident Segment Cache: Extending the Memfile Lifecycle
-The `MmapPool` defines the physical boundary of the system's "Hot" zone. In this architecture, we decouple the pool depth from the flush concurrency to create a **Resident Segment Cache**. This allows the system to retain 128MB segments in RAM long after they have been persisted to the NVMe tier, specifically targeting the high-frequency "Read-After-Write" access pattern.
+#### 5.1.1 The Librarian: A Lock-Free Read-After-Write Cache
+The **Librarian** is a dedicated component that provides a multi-gigabyte L1 cache for recently written data. It maintains an immutable, atomic snapshot of `SharedSlab` pointers, enabling **wait-free** reads while the write path continues at full speed. This architecture specifically targets the high-frequency "Read-After-Write" access pattern common in blob workloads.
 
-A `memFile` now transitions through a four-stage lifecycle:
-* **Active:** The segment is open for concurrent `Put` operations via lock-free CAS reservations.
-* **Flushing:** The segment is frozen and immutable; a background worker is streaming its contents to disk using `O_DIRECT`.
-* **Cached:** The flush is complete, but the `MmapBuffer` remains resident in the pool and searchable via the Skipmap.
-* **Reclaimed:** When the `MmapPool` faces allocation pressure for a new `Active` segment, the oldest or coldest `Cached` segment is unmapped and its slot is recycled.
+**Configuration:** `WithMaxCachedSlabs(n)` controls the Librarian's capacity (default: 8 slabs ≈ 1GB).
+
+**The Slab Lifecycle:**
+
+A `SharedSlab` transitions through a five-stage lifecycle managed by reference counting:
+
+1. **Active:** The slab is open for concurrent `Put` operations. The MemTable holds one reference.
+2. **Published:** When the slab is created, the Librarian immediately acquires its own reference and adds the slab to its immutable view.
+3. **Flushing:** When full, the slab is frozen and handed to a flush worker (via `FlushTicket`), which holds its own reference during the Direct I/O write.
+4. **Cached:** After flush completes, the Librarian's reference keeps the slab resident. Readers can acquire zero-copy access via `TryInc()`.
+5. **Evicted:** When a new slab is published and the Librarian exceeds `MaxCachedSlabs`, the oldest slab is removed from the view and its reference is released.
 
 ```text
-[ MMAP POOL ]
+[ MMAP POOL ]              [ LIBRARIAN ]
+      |                           |
+      | 1. Acquire()              |
+      v                           |
++-----------------------+         |
+|  STAGE 1: ACTIVE      | ------->| 2. Publish()
+|  (MemTable ref)       |         |    (Librarian acquires ref)
++-----------------------+         |
+      |                           v
+      | 3. Frozen             +------------------------+
+      v                       | CATALOG (Atomic Slice) |
++-----------------------+     | [Slab0] -> [Slab1] ... |
+|  STAGE 2: FLUSHING    |     +------------------------+
+|  (Flusher ticket ref) |               |
++-----------------------+               | GET(key)
+      |                                 v
+      | 4. Persist Complete    +------------------------+
+      v                        | Zero-Copy via TryInc() |
++-----------------------+      +------------------------+
+|  STAGE 3: CACHED      |
+|  (Librarian ref only) | <-- Readers can still acquire
++-----------------------+
       |
-      | 1. Acquire (Pool Pop)
+      | 5. Capacity Exceeded (Oldest evicted)
       v
-+-----------------------+
-|  STAGE 1: ACTIVE      | --(PUTs)--> [ Write Path: Lock-Free CAS ]
-|  (Mutable RAM)        |
-+-----------------------+
-      |
-      | 2. Frozen (Handover)
-      v
-+-----------------------+
-|  STAGE 2: FLUSHING    | --(O_DIRECT)--> [ NVMe Segment File ]
-|  (Immutable RAM)      |
-+-----------------------+
-      |
-      | 3. Persisted (L1 Promotion)
-      v
-+-----------------------+
-|  STAGE 3: CACHED      | --(GETs)--> [ Zero-Copy Skipmap Hit ]
-|  (Resident Purgatory) |
-+-----------------------+
-      |
-      | 4. Pressure (Pool Push)
-      v
-[ RECLAIMED / RELEASED ]
+[ EVICTED / RELEASED ]
 ```
 
-This "Purgatory" state provides a multi-gigabyte L1 cache managed as 128MB units, avoiding the overhead of managing millions of individual 64KB block entries in the index. Serving a hit from a `Cached` segment involves a simple pointer offset within the `mmap` arena, resulting in the absolute theoretical minimum of CPU cycles and zero memory copies.
+**Lock-Free Guarantees:**
+
+* **Readers (Acquire):** Load the atomic slice pointer, iterate, and use `TryInc()` to safely pin a slab. If `TryInc()` fails (slab was evicted mid-iteration), treat as a miss.
+* **Writers (Publish):** Use Compare-And-Swap to atomically install a new slice. If CAS fails, retry. Only the successful publisher can unpin the victim.
+* **No Mutexes:** The entire hot path (publish + acquire) is wait-free, avoiding lock contention under high concurrency.
+
+This design provides a multi-gigabyte L1 cache managed as 128MB units, avoiding the overhead of managing millions of individual entries. Serving a hit from a `Cached` slab involves a simple pointer offset within the `mmap` arena, resulting in zero memory copies and minimal CPU cycles.
 
 ### 5.2 Short-Circuiting "Pathological" Blobs
 Large blobs (e.g., 20MB in a 64MB memtable) disrupt slab efficiency.

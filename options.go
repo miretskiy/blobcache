@@ -80,12 +80,11 @@ func WithMaxInflightSlabs(n int) Option {
 
 // WithMaxCachedSlabs sets how many sealed slabs are kept in memory for reading.
 // Increasing this improves read performance for recently written data at the cost of RAM.
-// Default: 16.
+// Set to 0 to disable the in-memory read cache (all reads go to disk).
+// Default: 4.
 func WithMaxCachedSlabs(n int) Option {
 	return funcOpt(func(c *config) { c.MaxCachedSlabs = n })
 }
-
-// ... (Rest of options remain largely renamed or unchanged) ...
 
 func WithBloomFPRate(rate float64) Option {
 	return funcOpt(func(c *config) { c.BloomFPRate = rate })
@@ -157,9 +156,9 @@ func defaultConfig(path string) config {
 		Shards:              0,
 		WriteBufferSize:     128 << 20, // 128MB
 		LargeWriteThreshold: 4 << 20,
-		SegmentSize:         2 << 30, // 64MB (Wait, usually segment size > slab size?)
+		SegmentSize:         2 << 30, // 2GB
 		MaxInflightSlabs:    6,
-		MaxCachedSlabs:      16, // Keep ~2GB of hot history (16 * 128MB)
+		MaxCachedSlabs:      8, // Keep ~1GB of recently written data in RAM
 		FlushConcurrency:    6,
 		BloomFPRate:         0.01,
 		BloomEstimatedKeys:  1_000_000,

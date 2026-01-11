@@ -1,6 +1,7 @@
 package blobcache
 
 import (
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -41,11 +42,11 @@ func TestApproxSize_UpdatedAfterEviction(t *testing.T) {
 func TestApproxSize_NoRepeatEviction(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	evictionCount := 0
+	var evictionCount atomic.Int64
 	cache, err := New(tmpDir,
 		WithMaxSize(5<<10), // 5KB limit
 		WithTestingInjectEvictError(func() error {
-			evictionCount++
+			evictionCount.Add(1)
 			return nil
 		}),
 	)
@@ -63,10 +64,10 @@ func TestApproxSize_NoRepeatEviction(t *testing.T) {
 
 	// Wait for first eviction to complete
 	require.Eventually(t, func() bool {
-		return evictionCount > 0
+		return evictionCount.Load() > 0
 	}, time.Second, 10*time.Millisecond, "eviction should run")
 
-	initialEvictions := evictionCount
+	initialEvictions := evictionCount.Load()
 
 	// Verify we're under limit now
 	require.Eventually(t, func() bool {
@@ -81,7 +82,7 @@ func TestApproxSize_NoRepeatEviction(t *testing.T) {
 	// Give time for any incorrect eviction to trigger
 	time.Sleep(100 * time.Millisecond)
 
-	finalEvictions := evictionCount
+	finalEvictions := evictionCount.Load()
 	// Should not trigger another eviction (we're under limit)
 	require.Equal(t, initialEvictions, finalEvictions, "should not re-trigger eviction when under limit")
 }

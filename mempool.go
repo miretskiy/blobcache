@@ -8,7 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	
+
 	"golang.org/x/sys/unix"
 )
 
@@ -20,6 +20,12 @@ type MmapBuffer struct {
 	refCount  atomic.Int64
 	pool      *MmapPool
 	onRelease []func()
+
+	// SAFETY GUARD:
+	// atomic boolean to detect double-free or use-after-free bugs.
+	// false = In Pool (Safe to Acquire)
+	// true  = Leased (Safe to Use)
+	leased atomic.Bool
 }
 
 // WriteAt performs a copy into the buffer.
@@ -70,10 +76,10 @@ func (b *MmapBuffer) Unpin() {
 		for _, fn := range b.onRelease {
 			fn()
 		}
-		
+
 		// 2. Clear hooks so they don't leak or double-run next time
 		b.onRelease = b.onRelease[:0]
-		
+
 		// 3. Reset buffer state and return to pool
 		b.resetAndRelease()
 	}
@@ -140,12 +146,12 @@ func allocate(size int64) *MmapBuffer {
 	if err != nil {
 		panic(fmt.Sprintf("mmap-pool: failed to allocate %d bytes: %v", size, err))
 	}
-	
+
 	// PRE-WARM: Force physical RAM commitment.
 	for i := 0; i < len(data); i += 4096 {
 		data[i] = 0
 	}
-	
+
 	buf := &MmapBuffer{raw: data}
 	buf.Reset()
 	runtime.AddCleanup(buf, func(d []byte) { _ = unix.Munmap(d) }, data)
@@ -175,7 +181,6 @@ func NewMmapPool(name string, bufferSize int64, headroom int64, capacity int) *M
 }
 
 func (p *MmapPool) Acquire() *MmapBuffer {
-	// buf := <-p.buffers
 	var buf *MmapBuffer
 	for buf == nil {
 		select {
@@ -186,6 +191,13 @@ func (p *MmapPool) Acquire() *MmapBuffer {
 				"pool", p.name, "outstanding", p.outstanding.Load())
 		}
 	}
+
+	// SAFETY GUARD: Verify we aren't acquiring a buffer already in use.
+	// This detects pool corruption (e.g., duplicate pointers in channel).
+	if !buf.leased.CompareAndSwap(false, true) {
+		panic(fmt.Sprintf("pool %s corruption: acquired buffer that is already leased!", p.name))
+	}
+
 	buf.Reset()
 	buf.refCount.Store(1)
 	return buf
@@ -199,7 +211,7 @@ func (p *MmapPool) AcquireAligned(size int64) *MmapBuffer {
 		// Happy Path: fits in our pre-mapped slabPool slabs
 		return p.Acquire()
 	}
-	
+
 	// Pathological Path: requires a larger one-off mmap
 	return p.AcquireUnpooled(size)
 }
@@ -207,6 +219,7 @@ func (p *MmapPool) AcquireAligned(size int64) *MmapBuffer {
 func (p *MmapPool) AcquireUnpooled(size int64) *MmapBuffer {
 	buf := allocate(size)
 	// slabPool is left as nil; refCount 1 represents the initial owner.
+	// Unpooled buffers are not guarded by 'leased' because they don't return to the pool.
 	buf.refCount.Store(1)
 	return buf
 }
@@ -215,18 +228,24 @@ func (p *MmapPool) Release(buf *MmapBuffer) {
 	if buf.pool == nil {
 		return
 	}
-	
+
+	// SAFETY GUARD: Verify we are releasing a leased buffer.
+	// This detects Double-Free bugs instantly.
+	if !buf.leased.CompareAndSwap(true, false) {
+		panic(fmt.Sprintf("pool %s double-free detected", p.name))
+	}
+
 	buf.Reset()
+	p.outstanding.Add(-1)
 	select {
 	case p.buffers <- buf:
-		// Hot return: RAM is preserved.
-		p.outstanding.Add(-1)
+		// Happy Return.
 	default:
+		// Overflow (Pool is full).
+		// This happens if we allocated extras during a peak load spike.
 		log.Error("the pool buffer is full")
-		// Pool is full. This was likely an "overflow" buffer
-		// created during high load. Evict and free RAM.
 		_ = unix.Madvise(buf.raw, unix.MADV_DONTNEED)
-		
+
 		// IMPORTANT: Sever the connection so that future Unpin()
 		// calls on this specific slab don't hit the slabPool again.
 		buf.pool = nil

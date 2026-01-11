@@ -1,11 +1,71 @@
 package blobcache
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/ncw/directio"
 	"github.com/stretchr/testify/require"
 )
+
+func TestFallocate_FileSize(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "fallocate_test.bin")
+
+	// Create file using OpenWriter (O_DIRECT on Linux, F_NOCACHE on Darwin)
+	f, err := OpenWriter(path)
+	require.NoError(t, err)
+	defer f.Close()
+
+	// Check initial size
+	info, err := f.Stat()
+	require.NoError(t, err)
+	t.Logf("Initial file size: %d", info.Size())
+	require.Equal(t, int64(0), info.Size(), "newly created file should be 0 bytes")
+
+	// Pre-allocate 16MB
+	allocSize := int64(16 * 1024 * 1024)
+	err = fallocate(f, allocSize)
+	if err != nil {
+		t.Logf("fallocate returned error (may be expected on some filesystems): %v", err)
+	}
+
+	// Check size after fallocate
+	info, err = f.Stat()
+	require.NoError(t, err)
+	t.Logf("File size after fallocate(%d): %d", allocSize, info.Size())
+
+	// Write some data at position 0
+	data := make([]byte, 4096)
+	for i := range data {
+		data[i] = byte(i % 256)
+	}
+	n, err := f.WriteAt(data, 0)
+	require.NoError(t, err)
+	require.Equal(t, 4096, n)
+
+	// Check size after write
+	info, err = f.Stat()
+	require.NoError(t, err)
+	t.Logf("File size after WriteAt(4096 bytes at offset 0): %d", info.Size())
+
+	// Write at offset 8192
+	n, err = f.WriteAt(data, 8192)
+	require.NoError(t, err)
+	require.Equal(t, 4096, n)
+
+	info, err = f.Stat()
+	require.NoError(t, err)
+	t.Logf("File size after WriteAt(4096 bytes at offset 8192): %d", info.Size())
+
+	// Close and re-check with os.Stat
+	require.NoError(t, f.Close())
+
+	info, err = os.Stat(path)
+	require.NoError(t, err)
+	t.Logf("Final file size (after close): %d", info.Size())
+}
 
 func TestAlignForHolePunch(t *testing.T) {
 	const bs = int64(directio.BlockSize) // 4096

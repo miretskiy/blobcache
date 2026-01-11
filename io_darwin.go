@@ -37,7 +37,8 @@ func isAligned(block []byte) bool {
 func fallocate(f *os.File, size int64) error {
 	// fstore_t structure for F_PREALLOCATE
 	fstore := syscall.Fstore_t{
-		Posmode: syscall.F_PEOFPOSMODE, // Allocate from current EOF
+		Flags:   syscall.F_ALLOCATECONTIG, // Try contiguous first
+		Posmode: syscall.F_PEOFPOSMODE,    // Allocate from current EOF
 		Offset:  0,
 		Length:  size,
 	}
@@ -49,23 +50,24 @@ func fallocate(f *os.File, size int64) error {
 		uintptr(syscall.F_PREALLOCATE),
 		uintptr(unsafe.Pointer(&fstore)),
 	)
-	if errno == 0 {
-		return nil
-	}
 
-	// Fall back to non-contiguous allocation
-	fstore.Flags = syscall.F_ALLOCATEALL
-	_, _, errno = syscall.Syscall(
-		syscall.SYS_FCNTL,
-		f.Fd(),
-		uintptr(syscall.F_PREALLOCATE),
-		uintptr(unsafe.Pointer(&fstore)),
-	)
+	// Fall back to non-contiguous allocation if contiguous failed
 	if errno != 0 {
-		return errno
+		fstore.Flags = syscall.F_ALLOCATEALL
+		_, _, errno = syscall.Syscall(
+			syscall.SYS_FCNTL,
+			f.Fd(),
+			uintptr(syscall.F_PREALLOCATE),
+			uintptr(unsafe.Pointer(&fstore)),
+		)
+		if errno != 0 {
+			return errno
+		}
 	}
 
-	return nil
+	// CRITICAL: Explicitly set the file size (Logical EOF)
+	// F_PREALLOCATE only reserves disk blocks but reports size 0.
+	return f.Truncate(size)
 }
 
 // fpunchhole_t matches the C struct used by fcntl(F_PUNCHHOLE)

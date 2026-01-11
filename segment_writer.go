@@ -137,8 +137,17 @@ func (sw *SegmentWriter) Close() error {
 		_ = sw.file.Close()
 		return fmt.Errorf("failed to write segment metadata: %w", err)
 	}
+	finalSize := sw.currentPos + int64(len(paddedMetadata))
 
-	// 4. Persistence Handshake.
+	// 4. Truncate to actual size so footer is at file end.
+	// fallocate pre-allocates more space; ReadSegmentFooterFromFile expects
+	// the footer at fileSize - footerSize.
+	if err := sw.file.Truncate(finalSize); err != nil {
+		_ = sw.file.Close()
+		return fmt.Errorf("failed to truncate segment: %w", err)
+	}
+
+	// 5. Persistence Handshake.
 	// fdatasync uses F_FULLFSYNC on Darwin to ensure it clears the drive cache.
 	if sw.syncData {
 		_ = fdatasync(sw.file)

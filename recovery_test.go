@@ -80,7 +80,7 @@ func TestRecovery_CorruptSegment(t *testing.T) {
 		t.Fatalf("failed to create cache: %v", err)
 	}
 
-	// Write test data
+	// Write test data - drain after each put to ensure separate segments
 	testData := map[string][]byte{
 		"key1": []byte("value1"),
 		"key2": []byte("value2"),
@@ -89,8 +89,8 @@ func TestRecovery_CorruptSegment(t *testing.T) {
 
 	for key, value := range testData {
 		cache.Put([]byte(key), value)
+		cache.Drain() // Force each key into a separate segment
 	}
-	cache.Drain()
 
 	// Close cache
 	if err := cache.Close(); err != nil {

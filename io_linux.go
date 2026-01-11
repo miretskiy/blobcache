@@ -4,7 +4,6 @@ package blobcache
 
 import (
 	"os"
-	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -18,7 +17,7 @@ var defaultIOConfig = IOConfig{
 // fdatasync syncs file data to disk without syncing metadata
 // Uses fdatasync(2) on Linux for better performance than fsync
 func fdatasync(f *os.File) error {
-	return syscall.Fdatasync(int(f.Fd()))
+	return unix.Fdatasync(int(f.Fd()))
 }
 
 // isAligned checks if the memory address of the slice is on a 4KB boundary.
@@ -33,7 +32,7 @@ func isAligned(block []byte) bool {
 // fallocate pre-allocates disk space for a file
 // Reduces fragmentation and improves write performance
 func fallocate(f *os.File, size int64) error {
-	return syscall.Fallocate(int(f.Fd()), 0, 0, size)
+	return unix.Fallocate(int(f.Fd()), 0, 0, size)
 }
 
 // PunchHole deallocates a range within a file (creates sparse file)
@@ -61,18 +60,18 @@ func Fadvise(fd uintptr, offset Offset_t, length int64, hint FadviseHint) error 
 	var linuxHint int
 	switch hint {
 	case FadvSequential:
-		linuxHint = syscall.POSIX_FADV_SEQUENTIAL
+		linuxHint = unix.FADV_SEQUENTIAL
 	case FadvDontNeed:
 		// On Linux, we use DONTNEED.
 		// If you want to be extra aggressive, you can also call NOREUSE,
 		// but DONTNEED is the standard for releasing Page Cache.
-		linuxHint = syscall.POSIX_FADV_DONTNEED
+		linuxHint = unix.FADV_DONTNEED
 	default:
 		return nil
 	}
 
 	// Signature: fd, offset, length, advice
-	return syscall.PosixFadvise(int(fd), offset, length, linuxHint)
+	return unix.Fadvise(int(fd), int64(offset), length, linuxHint)
 }
 
 // OpenWriter opens specified file for writing with O_DIRECT.

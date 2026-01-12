@@ -13,8 +13,8 @@ func TestFallocate_FileSize(t *testing.T) {
 	tmpDir := t.TempDir()
 	path := filepath.Join(tmpDir, "fallocate_test.bin")
 
-	// Create file using OpenWriter (O_DIRECT on Linux, F_NOCACHE on Darwin)
-	f, err := OpenWriter(path)
+	// Create file using OpenWriter with DirectIO enabled
+	f, err := OpenWriter(path, true)
 	require.NoError(t, err)
 	defer f.Close()
 

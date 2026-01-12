@@ -290,12 +290,122 @@ BlobCache utilizes `O_DIRECT`. This introduces the **Direct I/O Paradox**: By ch
 #### The Solution: User-Space Authority
 The "lie" is moved to the **MemTable**. Ingestion completes at RAM speeds, while the background Flush Worker handles the blocking Direct I/O call without affecting application latency.
 
+### 6.4 Empirical Validation: GC Invisibility Under Load
 
----
+The following benchmark validates that the `MmapPool` architecture successfully hides multi-gigabyte memory allocations from Go's garbage collector, eliminating GC as a performance bottleneck.
 
----
+**Test Configuration:**
+- 1M write iterations (~1TB logical throughput)
+- 32 vCPUs, NVMe storage
+- `GODEBUG=gctrace=1` enabled
 
----
+**GC Trace Analysis:**
+
+| Metric | Observed Value | Implication |
+|--------|---------------|-------------|
+| **Live Heap** | 33–113 MB | >98% of memory invisible to GC |
+| **RSS** | 5.79 GB | Actual memory footprint |
+| **GC Overhead** | 0% | No measurable CPU cost |
+| **GC Frequency** | Every 20–50 seconds | Minimal collection cycles |
+| **STW Pauses** | 0.05–0.2 ms | Sub-millisecond stop-the-world |
+
+**Sample GC Trace (steady-state):**
+```
+gc 19 @445.447s 0%: 0.075+7.8+0.026 ms clock, 2.2+0.23/60/159+0.85 ms cpu, 223->223->112 MB, 227 MB goal
+```
+
+**Interpretation:**
+- The GC sees only ~112 MB of live heap while the application uses 5.79 GB RSS
+- The ~5.5 GB difference represents `MmapPool` slabs and `Librarian` cache—completely invisible to Go's runtime
+- GC cycles occur once every 20–50 seconds (vs. every few hundred milliseconds for heap-allocated buffers)
+- 0% CPU overhead throughout the entire 882-second benchmark
+
+**What occupies the ~100 MB Go heap?**
+1. **Index Metadata:** Skipmap nodes and `Entry` structs
+2. **Bloom Filter:** Bitset for 1M+ keys
+3. **Goroutine Stacks:** 32 P workers and flush goroutines
+4. **Benchmark Infrastructure:** HDR histograms and counters
+
+**The iostat Validation:**
+During the benchmark, disk utilization remained at **100% continuously** with no drops to 0%. This confirms that the Direct I/O path maintained consistent pressure without any GC-induced stalls or buffer-related pauses.
+
+**Conclusion:**
+The `MmapPool` design achieves its primary goal: enabling multi-gigabyte, zero-copy buffer management without triggering garbage collection pressure. This allows BlobCache to saturate NVMe bandwidth while the Go runtime remains effectively idle.
+
+### 6.5 Direct I/O vs Buffered I/O: Empirical Comparison
+
+To validate the architectural choice of Direct I/O, a controlled A/B test was performed comparing `O_DIRECT` writes against standard buffered I/O (kernel page cache).
+
+**Test Configuration:**
+- 1M write iterations, Zipf(s=1.1, v=1.0) key distribution
+- AWS m7gd.8xlarge: 32 vCPUs, 128GB RAM, 1.9TB NVMe
+- Same codebase, toggled via `BLOBCACHE_BUFFERED_IO=1` environment variable
+
+**Latency Comparison (nanoseconds):**
+
+| Operation | Percentile | Direct I/O | Buffered I/O | Delta |
+|-----------|------------|------------|--------------|-------|
+| **GET** | p50 | 2,527 | 2,967 | +17% |
+| **GET** | p99 | 2,547,711 | 287,743 | **-89%** |
+| **GET** | p999 | 55,771,135 | 592,895 | **-99%** |
+| **PUT** | p50 | 108,159 | 143,487 | +33% |
+| **PUT** | p99 | 311,689,215 | 306,446,335 | ~Same |
+| **PUT** | p999 | 449,576,959 | 454,819,839 | ~Same |
+
+**System Behavior (vmstat):**
+
+| Metric | Direct I/O | Buffered I/O |
+|--------|------------|--------------|
+| Context Switches/sec | ~7,000 | 20,000–45,000 |
+| Free Memory | ~51 GB (stable) | 1–17 GB (volatile) |
+| Page Cache | ~69 GB | 107–120 GB |
+| Blocked Processes (`b`) | 0 | 7–22 |
+| kswapd Activity | Minimal | Elevated (cliff) |
+
+**Forensic Analysis: The "Traffic Jam" (`b=22`)**
+
+During buffered I/O peak load, the `b` (blocked processes) column spiked to **22**, indicating a system-wide lockup when the kernel hit its `vm.dirty_ratio` limit:
+
+1. **6 Flush Workers:** Blocked on `write()` waiting for disk sectors
+2. **1 Producer:** Blocked on memory allocation (waiting for pages to free)
+3. **1 Eviction Thread:** Blocked on `fallocate(PUNCH_HOLE)` requiring exclusive inode lock
+4. **~14 "Innocent Bystanders":** System daemons and Go runtime threads (GC helpers) swept into the global I/O freeze
+
+This "blocked list" demonstrates that buffered I/O creates unpredictable latency spikes—any operation becomes a game of Russian Roulette as the kernel thrashes.
+
+**The Memory Monopoly:**
+
+The page cache growth to **118 GB** illustrates the "write pollution" problem:
+- The application wrote 1TB of data
+- The kernel greedily cached it, evicting useful hot data (binaries, index files, cached reads)
+- The application effectively "DDOS'd" the node's memory subsystem without exceeding its own RSS limit
+
+**Analysis:**
+
+1. **GET Tail Latency:** Buffered I/O exhibits dramatically better read tail latencies (p99: 8.8× better, p999: 94× better). The kernel page cache serves hot data from RAM, avoiding disk I/O for frequently accessed blobs.
+
+2. **PUT Latency:** Direct I/O has slightly better p50 PUT latency (~108μs vs ~143μs) due to avoiding the kernel's buffer management overhead. Tail latencies are equivalent—both are dominated by NVMe write bandwidth saturation.
+
+3. **Memory Pressure:** Buffered I/O consumed nearly all available RAM for page cache (~120GB), triggering kswapd activity and a 3× increase in context switches. This "cliff" behavior is unpredictable under varying workloads.
+
+4. **Overall Throughput:** Identical (~881s for 1M ops). The bottleneck is NVMe bandwidth, not I/O path.
+
+**Why BlobCache Defaults to Direct I/O:**
+
+The data confirms that Direct I/O is not merely an optimization—it is a **structural requirement** for reliability at 1GB/s+ ingestion rates.
+
+1. **Predictable Memory:** BlobCache maintains explicit control over its memory footprint via `MmapPool` (~3.7GB fixed). Buffered I/O surrenders memory management to the kernel, which monopolizes 118GB+ and evicts application-critical data unpredictably.
+
+2. **System Isolation ("Good Citizenship"):** By strictly bounding memory to a fixed arena, BlobCache guarantees it will never trigger OOM kills, activate swap, or degrade neighboring workloads. The `swpd` column remained **0** throughout Direct I/O testing.
+
+3. **Deterministic Flow Control:** Direct I/O uses Go channels for backpressure (`MaxInflightSlabs`), while buffered I/O relies on chaotic kernel blocking (`b=22`). The former is debuggable; the latter is a black box.
+
+4. **Read-After-Write:** BlobCache's `Librarian` component provides its own "controlled page cache" for recently written data, capturing most of the read benefit without kernel overhead or "write pollution."
+
+5. **Sustained Saturation:** Direct I/O achieved a flat-line **100% disk utilization** for the entire 15-minute test with zero drops. The software bottleneck was effectively removed.
+
+**Configuration Option:**
+For workloads with known memory headroom and read-heavy access patterns, buffered I/O can be enabled via `WithDirectIOWrite(false)`. This may improve GET tail latencies at the cost of memory predictability.
 
 ---
 

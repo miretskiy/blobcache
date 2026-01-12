@@ -9,8 +9,9 @@ import (
 
 // IOConfig holds I/O strategy settings
 type IOConfig struct {
-	FDataSync bool // Use fdatasync for durability
-	Fadvise   bool // Use fadvise to provide data access hints to the kernel.
+	FDataSync     bool // Use fdatasync for durability
+	Fadvise       bool // Use fadvise to provide data access hints to the kernel.
+	DirectIOWrite bool // Use O_DIRECT (Linux) or F_NOCACHE (Darwin) for segment writes
 }
 
 // ResilienceConfig holds data integrity settings
@@ -146,6 +147,10 @@ func WithFlushConcurrency(n int) Option {
 
 func WithFadvise(enabled bool) Option {
 	return funcOpt(func(c *config) { c.IO.Fadvise = enabled })
+}
+
+func WithDirectIOWrite(enabled bool) Option {
+	return funcOpt(func(c *config) { c.IO.DirectIOWrite = enabled })
 }
 
 func defaultConfig(path string) config {

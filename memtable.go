@@ -361,7 +361,7 @@ func (mt *MemTable) openSegment() (*SegmentWriter, error) {
 	segmentID := mt.segmentID.Add(1)
 	return NewSegmentWriter(
 		segmentID, getSegmentPath(mt.Path, mt.Shards, segmentID),
-		mt.SegmentSize, mt.footerPool, mt.IO.FDataSync,
+		mt.SegmentSize, mt.footerPool, mt.IO.FDataSync, mt.IO.DirectIOWrite,
 	)
 }
 

@@ -10,8 +10,9 @@ import (
 )
 
 var defaultIOConfig = IOConfig{
-	FDataSync: false,
-	Fadvise:   true,
+	FDataSync:     false,
+	Fadvise:       true,
+	DirectIOWrite: true,
 }
 
 // fdatasync syncs file data to disk without syncing metadata
@@ -74,10 +75,14 @@ func Fadvise(fd uintptr, offset Offset_t, length int64, hint FadviseHint) error 
 	return unix.Fadvise(int(fd), int64(offset), length, linuxHint)
 }
 
-// OpenWriter opens specified file for writing with O_DIRECT.
-func OpenWriter(path string) (*os.File, error) {
-	// We use unix.O_DIRECT for hardware-aligned zero-copy.
-	// We also use O_WRONLY because the writer handle is append-only.
+// OpenWriter opens specified file for writing.
+// If directIO is true, uses O_DIRECT to bypass the page cache.
+func OpenWriter(path string, directIO bool) (*os.File, error) {
+	// We use O_WRONLY because the writer handle is append-only.
 	// We do NOT use O_APPEND because we use WriteAt for precise positioning.
-	return os.OpenFile(path, os.O_CREATE|os.O_WRONLY|unix.O_DIRECT, 0644)
+	flags := os.O_CREATE | os.O_WRONLY
+	if directIO {
+		flags |= unix.O_DIRECT
+	}
+	return os.OpenFile(path, flags, 0644)
 }

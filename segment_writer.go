@@ -27,12 +27,11 @@ type SegmentWriter struct {
 	syncData   bool
 }
 
-// NewSegmentWriter initializes a large-scale segment file. It uses the
-// platform-specific OpenWriter to bypass the OS page cache (O_DIRECT on Linux,
-// F_NOCACHE on Darwin), ensuring that massive sequential writes do not
-// "pollute" RAM or starve the read path.
+// NewSegmentWriter initializes a large-scale segment file. If directIO is true,
+// uses O_DIRECT (Linux) or F_NOCACHE (Darwin) to bypass the OS page cache,
+// ensuring that massive sequential writes do not "pollute" RAM.
 func NewSegmentWriter(
-	id int64, path string, segmentSize int64, pool poolProvider, syncData bool,
+	id int64, path string, segmentSize int64, pool poolProvider, syncData bool, directIO bool,
 ) (*SegmentWriter, error) {
 	// 1. Ensure the parent directory structure exists.
 	// This creates "segments/0000/" recursively if they are missing.
@@ -41,8 +40,8 @@ func NewSegmentWriter(
 		return nil, fmt.Errorf("failed to create segment directory %s: %w", dir, err)
 	}
 
-	// 2. Now open the file (OpenWriter handles O_DIRECT/F_NOCACHE)
-	f, err := OpenWriter(path)
+	// 2. Now open the file
+	f, err := OpenWriter(path, directIO)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open segment %d: %w", id, err)
 	}

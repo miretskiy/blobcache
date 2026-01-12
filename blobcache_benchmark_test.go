@@ -70,12 +70,16 @@ func BenchmarkBlobCache(b *testing.B) {
 	const blobSizeLo = 100_000
 	const blobSizeHiRng = 1_900_000
 	
+	// Toggle DirectIO via environment variable for A/B testing
+	directIO := os.Getenv("BLOBCACHE_BUFFERED_IO") != "1"
+
 	cache, err := New(tmpDir,
 		WithMaxSize(400<<30),
 		WithWriteBufferSize(128<<20),
 		WithSegmentSize(2<<30),
-		WithMaxInflightSlabs(16),
+		WithMaxInflightSlabs(32),
 		WithFlushConcurrency(6),
+		WithDirectIOWrite(directIO),
 	)
 	if err != nil {
 		b.Fatal(err)
@@ -124,18 +128,11 @@ func BenchmarkBlobCache(b *testing.B) {
 		rng := rand.New(rand.NewPCG(uint64(time.Now().UnixNano()), uint64(wid)))
 		
 		// ZIPFIAN CONFIGURATION:
-		// s = 1.01: Required by Go (s > 1). This is the "heaviest" tail allowed.
-		// v = calculated from hotFraction: the fraction of cache that should be "hot"
-		//     hotFraction = 0.10 means 10% of the cache (40GB of 400GB) is hot
-		//     With 1MB average blobs, that's ~40,000 hot keys
+		// s = 1.1: The "magic number" for cache workloads. Creates a curve where
+		//          top ~10-15% of keys account for ~60-70% of accesses.
+		// v = 1.0: Ensures the curve starts at Rank 1 (no plateau).
 		// Range = 1<<25: up to 32M keys.
-		const (
-			hotFraction = 0.10 // 10% of cache should be hot
-			avgBlobSize = (blobSizeLo + blobSizeHiRng) / 2
-		)
-		hotBytes := float64(cache.MaxSize) * hotFraction
-		v := hotBytes / avgBlobSize
-		zipf := rand.NewZipf(rng, 1.01, v, 1<<25)
+		zipf := rand.NewZipf(rng, 1.1, 1.0, 1<<25)
 		if zipf == nil {
 			b.Fatal("Zipf nil: check s > 1.0 and v >= 1.0")
 		}

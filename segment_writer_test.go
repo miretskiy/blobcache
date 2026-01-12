@@ -110,7 +110,7 @@ func TestSegmentWriter_FullCycle(t *testing.T) {
 	path := filepath.Join(tmpDir, "777.seg")
 	
 	t.Run("AlignedPhysicalWrites", func(t *testing.T) {
-		sw, err := NewSegmentWriter(segID, path, segSize, pool, false)
+		sw, err := NewSegmentWriter(segID, path, segSize, pool, false, true)
 		require.NoError(t, err)
 		
 		// Slab 1

@@ -11,8 +11,9 @@ import (
 )
 
 var defaultIOConfig = IOConfig{
-	FDataSync: false,
-	Fadvise:   false,
+	FDataSync:     false,
+	Fadvise:       false,
+	DirectIOWrite: true,
 }
 
 // fdatasync syncs file data to disk
@@ -131,19 +132,19 @@ func Fadvise(fd uintptr, offset Offset_t, length int64, hint FadviseHint) error 
 	}
 }
 
-// OpenWriter opens specified file for writing; emulates O_DIRECT via F_NOCACHE
-func OpenWriter(path string) (*os.File, error) {
+// OpenWriter opens specified file for writing.
+// If directIO is true, uses F_NOCACHE to bypass the page cache.
+func OpenWriter(path string, directIO bool) (*os.File, error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return nil, err
 	}
-	// Darwin's equivalent to O_DIRECT (bypassing the Page Cache)
-	if _, err := unix.FcntlInt(f.Fd(), unix.F_NOCACHE, 1); err != nil {
-		// Attempt to close to avoid FD leak.
-		// We don't wrap the Close error into the return because the
-		// fcntl failure is the reason this operation failed.
-		_ = f.Close()
-		return nil, err
+	if directIO {
+		// Darwin's equivalent to O_DIRECT (bypassing the Page Cache)
+		if _, err := unix.FcntlInt(f.Fd(), unix.F_NOCACHE, 1); err != nil {
+			_ = f.Close()
+			return nil, err
+		}
 	}
 	return f, nil
 }

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/miretskiy/blobcache/base"
 	"github.com/miretskiy/blobcache/metadata"
 	"github.com/zhangyunhao116/skipmap"
 )
@@ -59,6 +60,16 @@ func (idx *Index) Get(hash uint64) (Entry, bool) {
 	return n.entry, true
 }
 
+// SetBlobErrno marks a blob with an error code in the in-memory index.
+// This is a RAM-only operation; the error is not persisted to disk.
+func (idx *Index) SetBlobErrno(hash uint64, errno base.BlobErrno) {
+	n, ok := idx.blobs.Load(hash)
+	if !ok {
+		return
+	}
+	n.entry.SetErrno(errno)
+}
+
 // GetSegmentRecord retrieves the metadata for a specific segment.
 // It reconstructs the record from fragmented chunks if necessary.
 // Returns (record, true) if found, or (zero-value, false) if not.
@@ -106,6 +117,7 @@ func (idx *Index) IngestBatch(segID int64, batch []metadata.BlobRecord) error {
 
 // validateNonOverlapping ensures blob positions are monotonically increasing
 // and don't overlap. Assumes records are in write order (O(n) check).
+// Uses PhysicalSize since that's the actual bytes stored on disk.
 func validateNonOverlapping(records []metadata.BlobRecord) error {
 	if len(records) <= 1 {
 		return nil
@@ -114,11 +126,11 @@ func validateNonOverlapping(records []metadata.BlobRecord) error {
 	for i := 0; i < len(records)-1; i++ {
 		curr := records[i]
 		next := records[i+1]
-		currEnd := curr.Pos + curr.LogicalSize
+		currEnd := curr.Pos + curr.PhysicalSize // Use PhysicalSize for actual stored bytes
 
 		if currEnd > next.Pos {
 			return fmt.Errorf("overlap: blob[%d] pos=%d size=%d ends at %d, blob[%d] starts at %d",
-				i, curr.Pos, curr.LogicalSize, currEnd, i+1, next.Pos)
+				i, curr.Pos, curr.PhysicalSize, currEnd, i+1, next.Pos)
 		}
 	}
 

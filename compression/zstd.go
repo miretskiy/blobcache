@@ -26,7 +26,8 @@ func compressZstd(dst, src []byte, level Level) ([]byte, error) {
 
 	// If the library returned a different slice, it allocated a new one
 	// because the provided dst was too small.
-	if len(res) > 0 && &res[0] != &dst[0] {
+	// We check capacity to detect reallocation, handling the case where dst has length 0.
+	if cap(res) > cap(dst) {
 		return nil, ErrBufferTooSmall
 	}
 	return res, nil

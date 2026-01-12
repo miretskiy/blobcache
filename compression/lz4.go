@@ -19,9 +19,11 @@ func lzLevel(l Level) lz4.CompressionLevel {
 
 func compressLZ4(dst, src []byte, level Level) ([]byte, error) {
 	var c lz4.CompressorHC
-	if level == CompressionBest {
-		c.Level = lzLevel(level)
-	}
+	c.Level = lzLevel(level)
+
+	// LZ4's CompressBlock checks len(dst), not cap(dst).
+	// Expand dst to its full capacity before compressing.
+	dst = dst[:cap(dst)]
 
 	// CompressBlock naturally errors or returns 0 if dst is too small.
 	n, err := c.CompressBlock(src, dst)

@@ -6,7 +6,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	
+
+	"github.com/miretskiy/blobcache/compression"
 	"github.com/miretskiy/blobcache/metadata"
 	"github.com/zhangyunhao116/skipmap"
 )
@@ -15,47 +16,47 @@ import (
 type MemTable struct {
 	config
 	Batcher
-	ErrorRporter
-	
+	ErrorReporter
+
 	segmentID  atomic.Int64
 	slabPool   *MmapPool
 	footerPool *MmapPool
 	publisher  Publisher
-	
+
 	mu struct {
 		sync.Mutex
 		active      *ActiveSlab
 		activeReady chan struct{}
 	}
-	
+
 	flushCh chan FlushTicket
 	flushWg sync.WaitGroup // Tracks in-flight flush operations
 	stopCh  chan struct{}
 	wg      sync.WaitGroup // Tracks worker goroutines
 }
 
-func NewMemTable(cfg config, b Batcher, reporter ErrorRporter, pub Publisher) *MemTable {
+func NewMemTable(cfg config, b Batcher, reporter ErrorReporter, pub Publisher) *MemTable {
 	poolCapacity := cfg.MaxCachedSlabs + cfg.MaxInflightSlabs + 2
-	
+
 	mt := &MemTable{
-		config:       cfg,
-		Batcher:      b,
-		ErrorRporter: reporter,
-		publisher:    pub,
-		slabPool:     NewMmapPool("slab", cfg.WriteBufferSize, cfg.LargeWriteThreshold, poolCapacity),
-		footerPool:   NewMmapPool("footer", 256<<10, 0, cfg.MaxInflightSlabs+1),
-		flushCh:      make(chan FlushTicket, cfg.MaxInflightSlabs),
-		stopCh:       make(chan struct{}),
+		config:        cfg,
+		Batcher:       b,
+		ErrorReporter: reporter,
+		publisher:     pub,
+		slabPool:      NewMmapPool("slab", cfg.WriteBufferSize, cfg.LargeWriteThreshold, poolCapacity),
+		footerPool:    NewMmapPool("footer", 256<<10, 0, cfg.MaxInflightSlabs+1),
+		flushCh:       make(chan FlushTicket, cfg.MaxInflightSlabs),
+		stopCh:        make(chan struct{}),
 	}
 	mt.segmentID.Store(time.Now().UnixNano())
-	
+
 	mt.mu.active = mt.newActiveSlab(0)
-	
+
 	mt.wg.Add(cfg.FlushConcurrency)
 	for i := 0; i < cfg.FlushConcurrency; i++ {
 		go mt.flushWorker()
 	}
-	
+
 	return mt
 }
 
@@ -73,7 +74,7 @@ func (mt *MemTable) newActiveSlab(size int) *ActiveSlab {
 		}
 		return mt.slabPool.Acquire()
 	}()
-	
+
 	as := &ActiveSlab{
 		SharedSlab: SharedSlab{
 			buf:   buf,
@@ -81,12 +82,40 @@ func (mt *MemTable) newActiveSlab(size int) *ActiveSlab {
 		},
 		writesDone: newSignal(),
 	}
-	
+
 	if mt.publisher != nil {
 		mt.publisher.Publish(&as.SharedSlab)
 	}
-	
+
 	return as
+}
+
+// maybeCompress applies the 1/8th heuristic compression if enabled.
+// Returns a BufferHandle containing compressed data. If handle.IsZero(), no compression was applied.
+// Release() MUST be called on the returned handle.
+func (mt *MemTable) maybeCompress(src []byte) BufferHandle {
+	cfg := mt.Compression
+
+	// Skip compression if disabled or blob is too small (MinSize=0 means no minimum)
+	if cfg.Codec == compression.CodexNone || (cfg.MinSize > 0 && int64(len(src)) < cfg.MinSize) {
+		return BufferHandle{}
+	}
+
+	// 1/8th heuristic: dst buffer is 7/8 of src size (len - len>>3).
+	// If compression can't achieve at least 12.5% savings, abort and store raw.
+	maxDst := len(src) - len(src)>>3
+	handle := AcquireBuffer(0, maxDst)
+
+	result, err := compression.Compress(cfg.Codec, cfg.Level, handle.Bytes(), src)
+	if compression.IsBufferTooSmall(err) || len(result) >= len(src) {
+		// Compression didn't help (buffer too small or no savings), store raw
+		handle.Release()
+		return BufferHandle{}
+	}
+
+	// Compression succeeded - update handle to point to actual compressed data
+	handle.buf = result
+	return handle
 }
 
 // --- Write Logic ---
@@ -108,12 +137,24 @@ func (mt *MemTable) putWithChecksum(key Key, value []byte, checksum *uint32) {
 }
 
 func (mt *MemTable) putLarge(key Key, value []byte, checksum *uint32) {
-	// Bypass lock for large writes, but still subject to pool backpressure
-	as := mt.newActiveSlab(len(value))
-	as.buf.WriteAt(value, 0)
-	record := makeEntry(key, 0, value, mt.Resilience.ChecksumHasher, checksum)
+	// 1. Compress in caller's goroutine (distributed compression)
+	compressed := mt.maybeCompress(value)
+	defer compressed.Release()
+
+	// 2. Bypass lock for large writes, allocate slab for data size
+	var as *ActiveSlab
+	if compressed.IsZero() {
+		as = mt.newActiveSlab(len(value))
+		as.buf.WriteAt(value, 0)
+		as.wPos = int64(len(value))
+	} else {
+		as = mt.newActiveSlab(len(compressed.Bytes()))
+		as.buf.WriteAt(compressed.Bytes(), 0)
+		as.wPos = int64(len(compressed.Bytes()))
+	}
+
+	record := makeEntry(key, 0, value, compressed.Bytes(), mt.Compression.Codec, mt.Resilience.ChecksumHasher, checksum)
 	as.index.Store(key, record)
-	as.wPos = int64(len(value))
 
 	if !mt.IsDegraded() {
 		mt.sendToFlusher(as) // Acquires its own reference via PurchaseTicket
@@ -124,49 +165,57 @@ func (mt *MemTable) putLarge(key Key, value []byte, checksum *uint32) {
 }
 
 func (mt *MemTable) putActive(key Key, value []byte, checksum *uint32) {
+	// 1. Compress before lock (parallel compression) - only on first call
+	c := mt.maybeCompress(value)
+	defer c.Release()
+	mt.putActiveCompressed(key, value, checksum, c)
+}
+
+func (mt *MemTable) putActiveCompressed(
+	key Key, value []byte, checksum *uint32, compressed BufferHandle,
+) {
 	mt.mu.Lock()
-	
+
 	// 1. Wait for Rotation (Backpressure)
 	if mt.mu.activeReady != nil {
 		wait := mt.mu.activeReady
 		mt.mu.Unlock()
 		<-wait
-		mt.putActive(key, value, checksum)
+		mt.putActiveCompressed(key, value, checksum, compressed)
 		return
 	}
-	
+
 	active := mt.mu.active
-	
+	writeSize := int64(len(value))
+	if !compressed.IsZero() {
+		writeSize = int64(len(compressed.Bytes()))
+	}
+
 	// 2. Check Capacity & Rotate
-	if active.wPos+int64(len(value)) > int64(active.buf.Cap()) {
-		// ROTATION REQUIRED:
-		// We obtain a "Heavy Lifting" closure that must be run OUTSIDE the lock.
-		// This closure handles:
-		// 1. Waiting for pending writes on old slab
-		// 2. Sending old slab to flusher
-		// 3. Allocating the NEW slab (Blocking!)
-		// 4. Re-acquiring lock to install new slab and clear barrier
+	if active.wPos+writeSize > int64(active.buf.Cap()) {
 		rotateUnlocked := mt.prepareRotationLocked()
 		mt.mu.Unlock()
-		
 		rotateUnlocked()
-		
-		// Retry write on the new slab
-		mt.putActive(key, value, checksum)
+		mt.putActiveCompressed(key, value, checksum, compressed)
 		return
 	}
-	
+
 	// 3. Reservation
 	active.pendingWrites.Add(1)
 	wPos := active.wPos
-	active.wPos += int64(len(value))
+	active.wPos += writeSize
 	mt.mu.Unlock()
-	
-	// 4. Write
-	active.buf.WriteAt(value, wPos)
-	record := makeEntry(key, wPos, value, mt.Resilience.ChecksumHasher, checksum)
+
+	// 4. Write data
+	if compressed.IsZero() {
+		active.buf.WriteAt(value, wPos)
+	} else {
+		active.buf.WriteAt(compressed.Bytes(), wPos)
+	}
+
+	record := makeEntry(key, wPos, value, compressed.Bytes(), mt.Compression.Codec, mt.Resilience.ChecksumHasher, checksum)
 	active.index.Store(key, record)
-	
+
 	// 5. Complete
 	if active.pendingWrites.Add(-1) == 0 {
 		if active.retired.Load() {
@@ -179,22 +228,22 @@ func (mt *MemTable) putActive(key Key, value []byte, checksum *uint32) {
 // that performs the allocation and switch-over outside the lock.
 func (mt *MemTable) prepareRotationLocked() func() {
 	old := mt.mu.active
-	
+
 	// 1. Setup Barrier (Block other writers)
 	mt.mu.activeReady = make(chan struct{})
-	
+
 	// 2. Seal & Retire Old Slab
 	old.buf.Seal(old.wPos)
 	old.retired.Store(true)
-	
+
 	// 3. Detach Active (Set to nil so nobody touches it while we allocate)
 	mt.mu.active = nil
-	
+
 	// Capture state for the unlocked closure
 	waitCh := old.writesDone.ch
 	hasPending := old.pendingWrites.Load() > 0
 	shouldSend := !mt.IsDegraded()
-	
+
 	return func() {
 		// A. Wait for pending writes on OLD slab
 		if hasPending {
@@ -245,20 +294,37 @@ func (mt *MemTable) Drain() {
 }
 
 func makeEntry(
-		key Key, offset int64, val []byte, hasher Hasher, checksum *uint32,
+	key Key, offset int64, original []byte, compressed []byte, codec compression.Codex,
+	hasher Hasher, checksum *uint32,
 ) metadata.BlobRecord {
-	entry := metadata.BlobRecord{
-		Hash:        key,
-		Pos:         offset,
-		LogicalSize: int64(len(val)),
-		Flags:       metadata.InvalidChecksum,
+	// Determine sizes based on whether compression was applied
+	logicalSize := int64(len(original))
+	physicalSize := logicalSize
+	if compressed != nil {
+		physicalSize = int64(len(compressed))
+	} else {
+		codec = compression.CodexNone
 	}
+
+	entry := metadata.BlobRecord{
+		Hash:         key,
+		Pos:          offset,
+		LogicalSize:  logicalSize,
+		PhysicalSize: physicalSize,
+		Flags:        metadata.InvalidChecksum,
+	}
+
+	// Set compression codec in flags
+	entry.SetCompression(codec)
+
+	// Checksum is computed on ORIGINAL data (before compression)
+	// This allows verification after decompression
 	if checksum != nil {
-		entry.Flags = uint64(*checksum)
+		entry.Flags = (entry.Flags &^ 0xFFFFFFFF) | uint64(*checksum)
 	} else if hasher != nil {
 		h := hasher()
-		h.Write(val)
-		entry.Flags = uint64(h.Sum32())
+		h.Write(original)
+		entry.Flags = (entry.Flags &^ 0xFFFFFFFF) | uint64(h.Sum32())
 	}
 	return entry
 }
@@ -286,7 +352,7 @@ func (mt *MemTable) flushWorker() {
 			mt.ReportError(fmt.Errorf("writer close failed: %w", closeErr))
 		}
 	}()
-	
+
 	for {
 		select {
 		case ticket, ok := <-mt.flushCh:
@@ -311,43 +377,43 @@ func (mt *MemTable) processFlush(as *ActiveSlab, writer *SegmentWriter) (*Segmen
 	if mt.IsDegraded() {
 		return writer, nil
 	}
-	
+
 	if mt.testingInjectWriteErr != nil {
 		if err := mt.testingInjectWriteErr(); err != nil {
 			return writer, err
 		}
 	}
-	
+
 	// 1. Collect Records
 	var records []metadata.BlobRecord
 	as.index.Range(func(_ uint64, val metadata.BlobRecord) bool {
 		records = append(records, val)
 		return true
 	})
-	
+
 	// 2. Sort by Physical Position (Offset) for linear I/O
 	slices.SortFunc(records, func(a, b metadata.BlobRecord) int {
 		return int(a.Pos - b.Pos)
 	})
-	
+
 	// 3. Write Physical Slab
 	alignedData := as.buf.AlignedBytes()
 	absoluteRecords, err := writer.WriteSlab(alignedData, records)
 	if err != nil {
 		return writer, fmt.Errorf("physical write failed: %w", err)
 	}
-	
+
 	if mt.testingInjectIndexErr != nil {
 		if err := mt.testingInjectIndexErr(); err != nil {
 			return writer, err
 		}
 	}
-	
+
 	// 4. Update Index
 	if err := mt.PutBatch(writer.id, absoluteRecords); err != nil {
 		return writer, fmt.Errorf("index update failed: %w", err)
 	}
-	
+
 	if writer.CurrentPos() >= mt.SegmentSize {
 		if err := writer.Close(); err != nil {
 			return nil, fmt.Errorf("close segment failed: %w", err)

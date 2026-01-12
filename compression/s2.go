@@ -13,7 +13,8 @@ func compressS2(dst, src []byte, level Level) ([]byte, error) {
 	}
 
 	// S2 uses append logic; if it grows beyond dst capacity, it reallocates.
-	if len(res) > 0 && &res[0] != &dst[0] {
+	// Check capacity to detect reallocation, handling case where dst has length 0.
+	if cap(res) > cap(dst) {
 		return nil, ErrBufferTooSmall
 	}
 	return res, nil

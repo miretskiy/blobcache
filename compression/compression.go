@@ -2,6 +2,8 @@ package compression
 
 import (
 	"errors"
+
+	"github.com/miretskiy/blobcache/base"
 )
 
 type Codex uint8
@@ -13,6 +15,21 @@ const (
 	CodexLZ4
 	CodexS2
 )
+
+func (c Codex) String() string {
+	switch c {
+	case CodexNone:
+		return "none"
+	case CodexZstd:
+		return "zstd"
+	case CodexLZ4:
+		return "lz4"
+	case CodexS2:
+		return "s2"
+	default:
+		return "unknown"
+	}
+}
 
 const (
 	CompressionDefault Level = iota
@@ -47,15 +64,25 @@ func Compress(codec Codex, level Level, dst, src []byte) ([]byte, error) {
 
 // Decompress restores data into the provided dst buffer.
 // This is a zero-allocation operation if dst is sized correctly.
+// Returns base.CompressionError on decompression failure.
 func Decompress(codec Codex, dst, src []byte) error {
+	var err error
 	switch codec {
 	case CodexZstd:
-		return decompressZstd(dst, src)
+		err = decompressZstd(dst, src)
 	case CodexLZ4:
-		return decompressLZ4(dst, src)
+		err = decompressLZ4(dst, src)
 	case CodexS2:
-		return decompressS2(dst, src)
+		err = decompressS2(dst, src)
 	default:
 		return nil
 	}
+
+	if err != nil {
+		return &base.CompressionError{
+			Codec: codec.String(),
+			Err:   err,
+		}
+	}
+	return nil
 }

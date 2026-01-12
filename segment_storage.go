@@ -1,6 +1,7 @@
 package blobcache
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -8,6 +9,8 @@ import (
 	"path/filepath"
 	"sync"
 
+	"github.com/miretskiy/blobcache/base"
+	"github.com/miretskiy/blobcache/compression"
 	"github.com/miretskiy/blobcache/index"
 )
 
@@ -38,30 +41,54 @@ func (s *Storage) Close() error {
 }
 
 // ReadBlob returns an io.Reader for the specified index entry.
-// It handles segment file lookup, kernel prefetching hints, and checksum verification.
-func (s *Storage) ReadBlob(e index.Entry) (io.Reader, error) {
+// It handles segment file lookup, kernel prefetching hints, decompression, and checksum verification.
+// The caller MUST call the returned Releaser when done with the reader.
+func (s *Storage) ReadBlob(e index.Entry) (io.Reader, Releaser, error) {
 	sf, err := s.getSegmentFile(e.SegmentID)
 	if err != nil {
-		return nil, fmt.Errorf("storage: segment %d not found: %w", e.SegmentID, err)
+		return nil, Releaser{}, fmt.Errorf("storage: segment %d not found: %w", e.SegmentID, err)
 	}
 
 	// 1. Kernel Hinting (Hybrid I/O)
-	// Since reads are buffered, we tell the kernel exactly what we are about to read.
+	// Use PhysicalSize - this is the actual bytes stored on disk.
 	if s.IO.Fadvise {
-		_ = Fadvise(sf.file.Fd(), Offset_t(e.Pos), e.LogicalSize, FadvSequential)
+		_ = Fadvise(sf.file.Fd(), Offset_t(e.Pos), e.PhysicalSize, FadvSequential)
 	}
 
-	// 2. Base Reader
-	// SectionReader provides a view into the segment file without moving the file pointer.
-	var reader io.Reader = io.NewSectionReader(sf, e.Pos, e.LogicalSize)
+	// 2. Read data/decompress if needed.
+	var reader io.Reader = io.NewSectionReader(sf, e.Pos, e.PhysicalSize)
+	var releaser Releaser
+	if e.IsCompressed() {
+		// Acquire buffer for compressed data
+		compressedHandle := AcquireBuffer(int(e.PhysicalSize), int(e.PhysicalSize))
+		defer compressedHandle.Release() // Release after decompression
+
+		// Read all compressed bytes
+		if n, err := io.ReadFull(reader, compressedHandle.Bytes()); err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				return nil, Releaser{}, &base.TruncatedError{Expected: e.PhysicalSize, Got: int64(n)}
+			}
+			return nil, Releaser{}, err // IO error, returned as-is
+		}
+
+		// Acquire buffer for decompressed data
+		decompressedHandle := AcquireBuffer(int(e.LogicalSize), int(e.LogicalSize))
+		if err := compression.Decompress(e.Compression(), decompressedHandle.Bytes(), compressedHandle.Bytes()); err != nil {
+			decompressedHandle.Release()
+			return nil, Releaser{}, err // CompressionError, returned as-is
+		}
+
+		reader = bytes.NewReader(decompressedHandle.Bytes())
+		releaser = Releaser{buffer: decompressedHandle}
+	}
 
 	// 3. Optional Integrity Layer
-	// We wrap the reader so the checksum is verified as the user consumes the data.
+	// Checksum is computed on ORIGINAL (uncompressed) data.
 	if s.Resilience.VerifyOnRead && e.HasChecksum() {
 		reader = newChecksumVerifyingReader(reader, s.Resilience.ChecksumHasher, e.Checksum())
 	}
 
-	return reader, nil
+	return reader, releaser, nil
 }
 
 // getSegmentPath returns the path for a segment file

@@ -8,7 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	
+
 	"golang.org/x/sys/unix"
 )
 
@@ -20,7 +20,7 @@ type MmapBuffer struct {
 	refCount  atomic.Int32 // Changed to Int32 for CAS compatibility
 	pool      *MmapPool
 	onRelease []func()
-	
+
 	// SAFETY GUARD:
 	// atomic boolean to detect double-free logic errors within a single lifecycle.
 	// Note: Since structs are no longer pooled, this protects against calling
@@ -95,7 +95,7 @@ func (b *MmapBuffer) Unpin() {
 		}
 		// 2. Clear hooks (helpful for GC, though struct is dying anyway)
 		b.onRelease = nil
-		
+
 		// 3. Reset state and return memory to pool (or Munmap)
 		b.resetAndRelease()
 	}
@@ -113,9 +113,9 @@ func (b *MmapBuffer) resetAndRelease() {
 		// which refCount 0 -> -1 protection usually catches first.
 		return
 	}
-	
+
 	b.Reset()
-	
+
 	if b.pool != nil {
 		// POOLED: Return the raw bytes to the pool.
 		// The struct 'b' is abandoned and will be GC'd.
@@ -131,12 +131,12 @@ func (b *MmapBuffer) NewSectionReader(offset, size int64) io.ReadCloser {
 	if offset < 0 || size < 0 || offset+size > int64(len(b.raw)) {
 		return &MmapHandle{Reader: bytes.NewReader(nil)}
 	}
-	
+
 	// Use TryInc for consistency, though callers usually hold a valid ref here.
 	if !b.TryInc() {
 		return &MmapHandle{Reader: bytes.NewReader(nil)}
 	}
-	
+
 	h := &MmapHandle{
 		Reader: bytes.NewReader(b.raw[offset : offset+size]),
 		buffer: b,
@@ -177,7 +177,7 @@ func allocateRaw(size int64) []byte {
 	if err != nil {
 		panic(fmt.Sprintf("mmap-pool: failed to allocate %d bytes: %v", size, err))
 	}
-	
+
 	// PRE-WARM: Force physical RAM commitment.
 	for i := 0; i < len(data); i += 4096 {
 		data[i] = 0
@@ -224,7 +224,7 @@ func NewMmapPool(name string, bufferSize int64, headroom int64, capacity int) *M
 
 func (p *MmapPool) Acquire() *MmapBuffer {
 	var raw []byte
-	
+
 	// 1. Get Memory (Block if empty)
 	for raw == nil {
 		select {
@@ -235,7 +235,7 @@ func (p *MmapPool) Acquire() *MmapBuffer {
 				"pool", p.name, "outstanding", p.outstanding.Load())
 		}
 	}
-	
+
 	// 2. Wrap in FRESH struct
 	// This ensures that any pointer to an old MmapBuffer (held by a reader)
 	// remains distinct from this new one, even if they share the same memory address.
@@ -243,11 +243,11 @@ func (p *MmapPool) Acquire() *MmapBuffer {
 		raw:  raw,
 		pool: p,
 	}
-	
+
 	buf.Reset()
 	buf.refCount.Store(1)
 	buf.leased.Store(true)
-	
+
 	return buf
 }
 
@@ -257,7 +257,7 @@ func (p *MmapPool) AcquireAligned(size int64) *MmapBuffer {
 		// Happy Path: fits in our pre-mapped pool
 		return p.Acquire()
 	}
-	
+
 	// Pathological Path: requires a larger one-off mmap
 	return NewMmapBuffer(size)
 }

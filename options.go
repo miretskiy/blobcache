@@ -3,8 +3,9 @@ package blobcache
 import (
 	"hash"
 	"hash/crc32"
-	
+
 	"github.com/cespare/xxhash/v2"
+	"github.com/miretskiy/blobcache/compression"
 )
 
 // IOConfig holds I/O strategy settings
@@ -20,6 +21,13 @@ type ResilienceConfig struct {
 	VerifyOnRead   bool   // Verify checksums on reads
 }
 
+// CompressionConfig holds compression strategy settings
+type CompressionConfig struct {
+	Codec   compression.Codex // Compression algorithm (None, Zstd, LZ4, S2)
+	Level   compression.Level // Compression level (Default, Speed, Best)
+	MinSize int64             // Don't compress blobs smaller than this (default: 512)
+}
+
 type KeyHasherFn func(b []byte) uint64
 
 // config holds internal configuration
@@ -28,12 +36,12 @@ type config struct {
 	MaxSize   int64
 	KeyHasher KeyHasherFn
 	Shards    int
-	
+
 	// --- Slab Configuration ---
 	WriteBufferSize  int64 // Size of one memory slab
 	MaxInflightSlabs int   // Max slabs queueing for flush
 	MaxCachedSlabs   int   // Max slabs kept in memory for reading
-	
+
 	LargeWriteThreshold int64
 	SegmentSize         int64
 	FlushConcurrency    int
@@ -41,7 +49,8 @@ type config struct {
 	BloomEstimatedKeys  int
 	IO                  IOConfig
 	Resilience          ResilienceConfig
-	
+	Compression         CompressionConfig
+
 	// Testing hooks
 	testingInjectWriteErr func() error
 	testingInjectIndexErr func() error
@@ -153,6 +162,24 @@ func WithDirectIOWrite(enabled bool) Option {
 	return funcOpt(func(c *config) { c.IO.DirectIOWrite = enabled })
 }
 
+// WithCompression enables compression with the specified codec.
+// Compression is performed in the calling goroutine during Put() to distribute
+// CPU load and prevent flush workers from becoming bottlenecks.
+func WithCompression(codec compression.Codex) Option {
+	return funcOpt(func(c *config) { c.Compression.Codec = codec })
+}
+
+// WithCompressionLevel sets the compression level.
+func WithCompressionLevel(level compression.Level) Option {
+	return funcOpt(func(c *config) { c.Compression.Level = level })
+}
+
+// WithCompressionMinSize sets the minimum blob size for compression.
+// Blobs smaller than this are stored uncompressed.
+func WithCompressionMinSize(size int64) Option {
+	return funcOpt(func(c *config) { c.Compression.MinSize = size })
+}
+
 func defaultConfig(path string) config {
 	return config{
 		Path:                path,
@@ -168,5 +195,11 @@ func defaultConfig(path string) config {
 		BloomFPRate:         0.01,
 		BloomEstimatedKeys:  1_000_000,
 		IO:                  defaultIOConfig,
+
+		Compression: CompressionConfig{
+			Codec:   compression.CodexNone, // Disabled by default
+			Level:   compression.CompressionDefault,
+			MinSize: 512, // Don't compress small blobs
+		},
 	}
 }

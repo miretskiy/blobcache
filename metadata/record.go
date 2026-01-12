@@ -6,6 +6,7 @@ import (
 	"hash/crc32"
 	"time"
 
+	"github.com/miretskiy/blobcache/base"
 	"github.com/miretskiy/blobcache/compression"
 )
 
@@ -22,6 +23,10 @@ const (
 	InvalidChecksumFlag uint64 = 1 << 32
 	DeletedFlag         uint64 = 1 << 33
 
+	// BlobErrno field (bits 34-38): 5-bit error code (32 values)
+	blobErrnoShift = 34
+	blobErrnoMask  = uint64(0x1F) << blobErrnoShift
+
 	// Compression Schema (Top 4 bits: 60-63)
 	compressionShift = 60
 	compressionMask  = uint64(0xF) << compressionShift
@@ -35,7 +40,8 @@ const (
 // and high-fidelity storage metrics.
 // Flags layout:
 // [63-60]: CompressionType
-// [59-34]: Reserved
+// [59-39]: Reserved
+// [38-34]: BlobErrno (5-bit error code, 32 values)
 // [33]:    DeletedFlag
 // [32]:    InvalidChecksumFlag
 // [31-00]: CRC32 Checksum
@@ -88,6 +94,23 @@ func (b *BlobRecord) Checksum() uint32 {
 
 func (b *BlobRecord) HasChecksum() bool {
 	return (b.Flags & InvalidChecksumFlag) == 0
+}
+
+// --- Error Methods ---
+
+// Errno returns the error code for this record.
+func (b *BlobRecord) Errno() base.BlobErrno {
+	return base.BlobErrno((b.Flags & blobErrnoMask) >> blobErrnoShift)
+}
+
+// SetErrno sets the error code for this record.
+func (b *BlobRecord) SetErrno(e base.BlobErrno) {
+	b.Flags = (b.Flags &^ blobErrnoMask) | (uint64(e&0x1F) << blobErrnoShift)
+}
+
+// HasError returns true if the record has a non-zero error code.
+func (b *BlobRecord) HasError() bool {
+	return b.Errno() != base.ErrNone
 }
 
 // --- Serialization Logic ---

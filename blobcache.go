@@ -10,7 +10,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	
+
+	"github.com/miretskiy/blobcache/base"
 	"github.com/miretskiy/blobcache/bloom"
 	"github.com/miretskiy/blobcache/index"
 	"github.com/miretskiy/blobcache/metadata"
@@ -35,29 +36,30 @@ type Cache struct {
 		deletions   atomic.Int64              // Track cumulative deletions since last rebuild
 		lastRebuild atomic.Pointer[time.Time] // When the last rebuild happened.
 	}
-	
+
 	// --- ARCHITECTURE COMPONENTS ---
 	memTable  *MemTable  // The Write Engine (Producer)
 	librarian *Librarian // The Read Cache (Consumer)
-	
+
 	// LogicalSize tracking for reactive eviction
 	approxSize      atomic.Int64 // Approximate total size (updated during flush/eviction)
 	evictionRunning atomic.Bool  // Prevents concurrent evictions
-	
+
 	// Background error tracking
 	bgError atomic.Pointer[error] // First background error (nil = healthy)
-	
+
 	// Background workers
 	evictionTrigger chan struct{} // Capacity 1: trigger eviction, blocks when eviction running
 	stopCh          chan struct{}
 	wg              sync.WaitGroup
 }
 
-// ErrorRporter interface allows memtable to check/set degraded state
+// ErrorReporter interface allows memtable to check/set degraded state
 // without direct dependency on Cache
-type ErrorRporter interface {
+type ErrorReporter interface {
 	IsDegraded() bool
 	ReportError(error)
+	ReportBlobError(key Key, errno base.BlobErrno)
 }
 
 func (c *Cache) IsDegraded() bool {
@@ -68,6 +70,14 @@ func (c *Cache) ReportError(err error) {
 	if c.bgError.CompareAndSwap(nil, &err) {
 		log.Error("entering degraded mode (memory-only)", "error", err)
 	}
+}
+
+func (c *Cache) ReportBlobError(key Key, errno base.BlobErrno) {
+	if errno == base.ErrNone {
+		return
+	}
+	log.Warn("blob error reported", "key", key, "errno", errno)
+	c.index.SetBlobErrno(key, errno)
 }
 
 // BGError returns any background error (nil if healthy)
@@ -84,13 +94,13 @@ func New(path string, opts ...Option) (*Cache, error) {
 	for _, opt := range opts {
 		opt.apply(&cfg)
 	}
-	
+
 	// Ensure directory structure exists and validate configuration
 	idx, err := checkOrInitialize(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("initialization failed: %w", err)
 	}
-	
+
 	// Create new bloom filter and figure out how much data on disk from segment meta.
 	var totalSize int64
 	filter := bloom.New(uint(cfg.BloomEstimatedKeys), cfg.BloomFPRate)
@@ -105,19 +115,19 @@ func New(path string, opts ...Option) (*Cache, error) {
 	}); err != nil {
 		return nil, err
 	}
-	
+
 	c := &Cache{
 		config:          cfg,
 		index:           idx,
-		librarian:       NewLibrarian(cfg.MaxCachedSlabs),
 		storage:         NewStorage(cfg, idx),
 		evictionTrigger: make(chan struct{}, 1),
 		stopCh:          make(chan struct{}),
 	}
+	c.librarian = NewLibrarian(cfg.MaxCachedSlabs, c)
 	c.bloom.Store(filter)
 	c.approxSize.Store(totalSize)
 	c.memTable = NewMemTable(c.config, c, c, c.librarian)
-	
+
 	return c, nil
 }
 
@@ -136,7 +146,7 @@ func (c *Cache) Close() error {
 	default:
 		close(c.stopCh)
 	}
-	
+
 	// 1. Close Write Path (Stops new slabs)
 	c.memTable.Close()
 
@@ -147,7 +157,7 @@ func (c *Cache) Close() error {
 	c.memTable.ClosePools()
 
 	c.wg.Wait()
-	
+
 	// Collect all close errors
 	return errors.Join(
 		c.storage.Close(),
@@ -163,12 +173,12 @@ func (c *Cache) Drain() {
 // checkOrInitialize ensures directory structure exists and validates configuration
 func checkOrInitialize(cfg config) (*index.Index, error) {
 	markerPath := filepath.Join(cfg.Path, ".initialized")
-	
+
 	// Check if already initialized
 	if _, err := os.Stat(markerPath); err == nil {
 		return index.NewIndex(cfg.Path)
 	}
-	
+
 	// Not initialized - create directory structure
 	for i := 0; i < max(1, cfg.Shards); i++ {
 		shardDir := filepath.Join(cfg.Path, "segments", fmt.Sprintf("%04d", i))
@@ -176,7 +186,7 @@ func checkOrInitialize(cfg config) (*index.Index, error) {
 			return nil, fmt.Errorf("failed to create %04d: %w", i, err)
 		}
 	}
-	
+
 	idx, err := index.NewIndex(cfg.Path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open index: %w", err)
@@ -185,7 +195,7 @@ func checkOrInitialize(cfg config) (*index.Index, error) {
 	if err := os.WriteFile(markerPath, []byte{}, 0o644); err != nil {
 		return nil, fmt.Errorf("failed to write marker: %w", err)
 	}
-	
+
 	return idx, nil
 }
 
@@ -215,13 +225,21 @@ func (c *Cache) search(key []byte) (data []byte, r io.Reader, rel Releaser, ok b
 		return nil, nil, Releaser{}, false
 	}
 
-	diskReader, err := c.storage.ReadBlob(entry)
+	// 4. Check corruption flag
+	if entry.HasError() {
+		log.Debug("blob marked as corrupt", "hash", h, "errno", entry.Errno())
+		return nil, nil, Releaser{}, false
+	}
+
+	// 5. Read from disk
+	diskReader, diskReleaser, err := c.storage.ReadBlob(entry)
 	if err != nil {
+		diskReleaser.Release()
 		c.handleStorageError(h, entry, err)
 		return nil, nil, Releaser{}, false
 	}
 
-	return nil, diskReader, Releaser{}, true
+	return nil, diskReader, diskReleaser, true
 }
 
 // ZeroCopyView provides a unified reader for both RAM and Disk hits.
@@ -231,12 +249,12 @@ func (c *Cache) ZeroCopyView(key []byte) (io.Reader, Releaser, bool) {
 	if !ok {
 		return nil, Releaser{}, false
 	}
-	
+
 	if data != nil {
 		// RAM Hit: Wrap raw bytes in a reader.
 		return bytes.NewReader(data), rel, true
 	}
-	
+
 	// Disk Hit: Reader is already set.
 	return r, rel, true
 }
@@ -247,12 +265,12 @@ func (c *Cache) Append(key []byte, dst []byte) ([]byte, bool) {
 		return dst, false
 	}
 	defer rel.Release()
-	
+
 	if data != nil {
 		// Fast Path: Direct append (Zero Alloc)
 		return append(dst, data...), true
 	}
-	
+
 	// Slow Path: Disk Reader
 	buf := bytes.NewBuffer(dst)
 	buf.Reset()
@@ -269,7 +287,7 @@ func (c *Cache) View(key []byte, fn func(r io.Reader)) bool {
 		return false
 	}
 	defer rel.Release()
-	
+
 	if data != nil {
 		fn(bytes.NewReader(data))
 	} else {
@@ -305,14 +323,14 @@ func (c *Cache) PutBatch(segID int64, records []metadata.BlobRecord) error {
 	if err := c.index.IngestBatch(segID, records); err != nil {
 		return err
 	}
-	
+
 	// Phase 2: Update size tracking
 	var addedBytes int64
 	for _, rec := range records {
 		addedBytes += rec.LogicalSize
 	}
 	newSize := c.approxSize.Add(addedBytes)
-	
+
 	// Phase 3: Trigger eviction if over limit
 	if c.MaxSize > 0 && newSize > c.MaxSize && !c.IsDegraded() {
 		c.triggerEviction()
@@ -328,34 +346,31 @@ func (c *Cache) triggerEviction() {
 }
 
 func (c *Cache) handleStorageError(h Key, e index.Entry, err error) {
+	// 1. Transient errors: Skip and retry later
 	if IsTransientIOError(err) {
 		log.Error("transient storage error (skipping)", "hash", h, "error", err)
 		return
 	}
-	
-	log.Warn("permanent storage failure: removing stale index entry", "hash", h, "error", err)
-	
-	err = c.index.DeleteBlobs(e)
-	if err == nil {
-		c.approxSize.Add(-e.LogicalSize)
-		// Update Bloom metrics: This key is now a "Ghost"
-		c.bloom.ghosts.Add(1)
-		c.bloom.deletions.Add(1)
-	} else {
-		log.Warn("index update failure", "hash", h, "error", err)
-	}
+
+	// 2. Non-transient errors: Mark blob as corrupt
+	// By definition, any non-transient error is permanent.
+	// We mark the blob with errno but keep metadata for observability.
+	// Let normal eviction handle cleanup if needed.
+	errno := base.ToErrno(err)
+	log.Warn("permanent blob error detected", "hash", h, "errno", errno, "error", err)
+	c.ReportBlobError(h, errno)
 }
 
 func (c *Cache) rebuildBloom() error {
 	newFilter := bloom.New(uint(c.BloomEstimatedKeys), c.BloomFPRate)
-	
+
 	var stopRecording func()
 	var consumeRecording func(bloom.HashConsumer)
-	
+
 	if oldFilter := c.bloom.Load(); oldFilter != nil {
 		stopRecording, consumeRecording = oldFilter.RecordAdditions()
 	}
-	
+
 	err := c.index.ForEachSegment(func(segment metadata.SegmentRecord) bool {
 		for _, rec := range segment.Records {
 			if !rec.IsDeleted() {
@@ -370,18 +385,18 @@ func (c *Cache) rebuildBloom() error {
 		}
 		return err
 	}
-	
+
 	oldFilter := c.bloom.Swap(newFilter)
-	
+
 	if oldFilter != nil && stopRecording != nil {
 		stopRecording()
 		consumeRecording(newFilter.AddHash)
 	}
-	
+
 	c.bloom.deletions.Store(0)
 	now := time.Now()
 	c.bloom.lastRebuild.Store(&now)
-	
+
 	return nil
 }
 
@@ -391,16 +406,16 @@ func (c *Cache) maybeTriggerBloomRebuild() error {
 	if last != nil && time.Since(*last) < 5*time.Minute {
 		return nil
 	}
-	
+
 	shouldRebuild := false
-	
+
 	// 2. Proactive: Cumulative Staleness check
 	staleCount := c.bloom.deletions.Load()
 	threshold := int64(float64(c.BloomEstimatedKeys) * 0.10)
 	if staleCount > threshold {
 		shouldRebuild = true
 	}
-	
+
 	// 3. Reactive: Observed FPR check
 	if !shouldRebuild {
 		hits := c.bloom.hits.Load()
@@ -412,7 +427,7 @@ func (c *Cache) maybeTriggerBloomRebuild() error {
 			}
 		}
 	}
-	
+
 	if shouldRebuild {
 		return c.rebuildBloom()
 	}
@@ -422,10 +437,10 @@ func (c *Cache) maybeTriggerBloomRebuild() error {
 // evictionWorker handles eviction requests and periodic compaction
 func (c *Cache) evictionWorker() {
 	defer c.wg.Done()
-	
+
 	compactionTicker := time.NewTicker(10 * time.Minute)
 	defer compactionTicker.Stop()
-	
+
 	for {
 		select {
 		case <-c.evictionTrigger:
@@ -436,7 +451,7 @@ func (c *Cache) evictionWorker() {
 					return // Stop worker permanently
 				}
 			}
-		
+
 		case <-compactionTicker.C:
 			// Periodic compaction
 			if !c.IsDegraded() {
@@ -444,7 +459,7 @@ func (c *Cache) evictionWorker() {
 					log.Warn("compaction failed", "error", err)
 				}
 			}
-		
+
 		case <-c.stopCh:
 			return
 		}
@@ -454,7 +469,7 @@ func (c *Cache) evictionWorker() {
 // runEvictionSieve evicts blobs using Sieve algorithm until under size limit
 func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
 	evictionStart := time.Now()
-	
+
 	if c.testingInjectEvictErr != nil {
 		if err := c.testingInjectEvictErr(); err != nil {
 			return err
@@ -464,21 +479,21 @@ func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
 		return nil
 	}
 	defer c.evictionRunning.Store(false)
-	
+
 	currentSize := c.approxSize.Load()
 	if currentSize <= maxCacheSize {
 		return nil
 	}
-	
+
 	target := int64(float64(maxCacheSize) * evictionHysteresis)
 	toEvictBytes := currentSize - target
-	
+
 	var (
 		victims             []index.Entry
 		evictedBytes        int64
 		physicallyReclaimed int64
 	)
-	
+
 	// 1. SELECTION PHASE
 	for evictedBytes < toEvictBytes {
 		victim, err := c.index.Evict()
@@ -488,26 +503,26 @@ func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
 		victims = append(victims, victim)
 		evictedBytes += victim.LogicalSize
 	}
-	
+
 	if len(victims) == 0 {
 		return nil
 	}
-	
+
 	// 2. COMMIT PHASE
 	if err := c.index.DeleteBlobs(victims...); err != nil {
 		return fmt.Errorf("eviction durability sync failed: %w", err)
 	}
-	
+
 	// 3. RECLAMATION PHASE
 	for _, v := range victims {
 		reclaimed, _ := c.storage.HolePunchBlob(v.SegmentID, v.Pos, v.LogicalSize)
 		physicallyReclaimed += reclaimed
 	}
-	
+
 	// 4. METRICS & MAINTENANCE
 	c.approxSize.Add(-evictedBytes)
 	evictedCount := len(victims)
-	
+
 	log.Info("eviction completed",
 		"duration", time.Since(evictionStart),
 		"evicted_count", evictedCount,
@@ -515,13 +530,13 @@ func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
 		"reclaimed_mb", physicallyReclaimed/(1024*1024),
 		"reclaim_pct", 100*float64(physicallyReclaimed)/float64(evictedBytes),
 		"remaining_mb", c.approxSize.Load()/(1024*1024))
-	
+
 	c.bloom.deletions.Add(int64(evictedCount))
-	
+
 	if err := c.maybeTriggerBloomRebuild(); err != nil {
 		log.Error("bloom rebuild failed", "error", err)
 	}
-	
+
 	return nil
 }
 

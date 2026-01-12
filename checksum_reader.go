@@ -1,9 +1,11 @@
 package blobcache
 
 import (
-	"fmt"
+	"errors"
 	"hash"
 	"io"
+
+	"github.com/miretskiy/blobcache/base"
 )
 
 type Hasher func() hash.Hash32
@@ -37,12 +39,13 @@ func (c *checksumVerifyingReader) Read(p []byte) (n int, err error) {
 		_, _ = c.hash.Write(p[:n])
 	}
 
-	if err == io.EOF {
+	if errors.Is(err, io.EOF) {
 		computed := c.hash.Sum32()
 		if computed != c.expected {
-			// Suggestion: Use hex (%08x) for checksums. It makes comparing
-			// logs with hex-dumped data much easier for humans.
-			c.err = fmt.Errorf("checksum mismatch: expected %08x, got %08x", c.expected, computed)
+			c.err = &base.ChecksumError{
+				Expected: c.expected,
+				Got:      computed,
+			}
 			return n, c.err
 		}
 	}

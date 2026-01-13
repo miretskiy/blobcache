@@ -92,12 +92,12 @@ func TestFooter_EncodeAndDecode_WithCompression(t *testing.T) {
 }
 
 func TestFooter_HolePunchingAlignment(t *testing.T) {
-	// Verify that PhysicalMetadataSize accounts for the larger 40-byte records
+	// Verify that PhysicalMetadataSize accounts for 48-byte records
 	numRecords := 100
 
 	pSize := PhysicalMetadataSize(numRecords)
-	// (16 + 4000 + 20) = 4036. This fits in ONE 4KB page (4096)
-	require.Equal(t, int64(4096), pSize)
+	// (16 + 100*48 + 20) = 4836. This rounds to 8KB (8192)
+	require.Equal(t, int64(8192), pSize)
 	require.True(t, pSize%4096 == 0)
 }
 
@@ -118,14 +118,14 @@ func TestCompressionHeuristic_FlagSafety(t *testing.T) {
 }
 
 func TestSegmentRecord_InvalidRecordCount_Updated(t *testing.T) {
-	// With 40-byte records, a 32-byte addition should fail
+	// With 48-byte records, a 32-byte addition should fail
 	buf := make([]byte, SegmentRecordHeaderSize+32)
 	binary.LittleEndian.PutUint64(buf[0:8], 1)
 	binary.LittleEndian.PutUint64(buf[8:16], uint64(time.Now().Unix()))
 
 	_, err := DecodeSegmentRecord(buf)
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "not a multiple of 40")
+	require.Contains(t, err.Error(), "not a multiple of 48")
 }
 
 func TestFooter_ManyRecords_LargeSlab(t *testing.T) {
@@ -150,8 +150,8 @@ func TestFooter_ManyRecords_LargeSlab(t *testing.T) {
 
 	footerBytes := AppendSegmentRecordWithFooter(nil, sr)
 
-	// The metadata block should be (16 + (5000 * 40) + 20) = 200,036 bytes.
-	// Rounded to 4KB: 200,704 bytes.
+	// The metadata block should be (16 + (5000 * 48) + 20) = 240,036 bytes.
+	// Rounded to 4KB: 240,640 bytes.
 	require.Equal(t, int(PhysicalMetadataSize(5000)), len(footerBytes))
 
 	decodedSR, err := decodeFooterSection(footerBytes)

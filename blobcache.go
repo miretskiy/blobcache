@@ -41,6 +41,12 @@ type Cache struct {
 	memTable  *MemTable  // The Write Engine (Producer)
 	librarian *Librarian // The Read Cache (Consumer)
 
+	// Global monotonic sequence counter for operation ordering.
+	// Initialized to time.Now().UnixNano() for continuity across restarts.
+	// This ensures sequences are always increasing even after crashes,
+	// without needing to scan WAL/segments for the last sequence.
+	globalSeq atomic.Uint64
+
 	// LogicalSize tracking for reactive eviction
 	approxSize      atomic.Int64 // Approximate total size (updated during flush/eviction)
 	evictionRunning atomic.Bool  // Prevents concurrent evictions
@@ -78,6 +84,12 @@ func (c *Cache) ReportBlobError(key Key, errno base.BlobErrno) {
 	}
 	log.Warn("blob error reported", "key", key, "errno", errno)
 	c.index.SetBlobErrno(key, errno)
+}
+
+// nextSeq atomically increments and returns the next sequence ID.
+// This is THE source of truth for operation ordering.
+func (c *Cache) nextSeq() uint64 {
+	return c.globalSeq.Add(1)
 }
 
 // BGError returns any background error (nil if healthy)
@@ -123,6 +135,14 @@ func New(path string, opts ...Option) (*Cache, error) {
 		evictionTrigger: make(chan struct{}, 1),
 		stopCh:          make(chan struct{}),
 	}
+
+	// Initialize sequence counter with current nanosecond timestamp.
+	// This guarantees monotonicity across process restarts:
+	// - UnixNano gives ~292 years before overflow
+	// - Even if we restart 1 second later, new sequences are guaranteed higher
+	// - Clock skew is acceptable (we just need monotonicity within a run)
+	c.globalSeq.Store(uint64(time.Now().UnixNano()))
+
 	c.librarian = NewLibrarian(cfg.MaxCachedSlabs, c)
 	c.bloom.Store(filter)
 	c.approxSize.Store(totalSize)
@@ -302,17 +322,50 @@ func (c *Cache) Get(key []byte) ([]byte, bool) {
 
 func (c *Cache) Put(key []byte, value []byte) {
 	h := c.KeyHasher(key)
-	c.memTable.Put(h, value)
 	c.bloom.Load().Add(h)
+	c.putWithRetry(h, value, nil)
 }
 
 func (c *Cache) PutChecksummed(key []byte, value []byte, checksum uint32) {
 	h := c.KeyHasher(key)
-	c.memTable.PutChecksummed(h, value, checksum)
 	c.bloom.Load().Add(h)
+	c.putWithRetry(h, value, &checksum)
 }
 
-// --- BATCH & MAINTENANCE ---
+// putWithRetry handles the zombie writer resurrection protocol.
+// If a write is rejected (seqID too old due to slab rotation), we check
+// if a newer version already exists. If so, we return success (idempotent).
+// If not, we acquire a fresh seqID and retry.
+func (c *Cache) putWithRetry(h Key, value []byte, checksum *uint32) {
+	seqID := c.nextSeq()
+
+	for {
+		var err error
+		if checksum != nil {
+			err = c.memTable.PutChecksummed(seqID, h, value, *checksum)
+		} else {
+			err = c.memTable.Put(seqID, h, value)
+		}
+
+		if err == nil {
+			return
+		}
+
+		if !errors.Is(err, errSequenceTooOld) {
+			c.ReportError(err)
+			return
+		}
+
+		// Zombie Investigation: Check if a newer version exists in the global index.
+		// If it does, we "succeeded" (last write wins, our data is obsolete).
+		if existing, found := c.index.Get(h); found && existing.SeqID >= seqID {
+			return
+		}
+
+		// Resurrection: Acquire fresh seqID and retry
+		seqID = c.nextSeq()
+	}
+}
 
 type Batcher interface {
 	PutBatch(segID int64, records []metadata.BlobRecord) error

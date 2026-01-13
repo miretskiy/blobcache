@@ -1,6 +1,7 @@
 package blobcache
 
 import (
+	"errors"
 	"fmt"
 	"slices"
 	"sync"
@@ -11,6 +12,20 @@ import (
 	"github.com/miretskiy/blobcache/metadata"
 	"github.com/zhangyunhao116/skipmap"
 )
+
+const (
+	// numIndexShards is a power of 2 for fast modulo via bitmask.
+	// 256 shards provides low contention (~2% collision with 32 concurrent writers).
+	numIndexShards = 256
+	indexShardMask = numIndexShards - 1
+)
+
+// errSequenceTooOld is returned when a write's seqID is older than maxSealedSeq.
+// This happens when a slow writer awakens after slab rotation. The caller should:
+// 1. Check the global index to see if a newer version exists
+// 2. If newer exists, return success (idempotent - last write wins)
+// 3. If older or missing, acquire a new seqID and retry
+var errSequenceTooOld = errors.New("sequence ID too old: write belongs to sealed slab")
 
 // MemTable is the Write Engine.
 type MemTable struct {
@@ -27,7 +42,18 @@ type MemTable struct {
 		sync.Mutex
 		active      *ActiveSlab
 		activeReady chan struct{}
+
+		// maxSealedSeq is the highest SeqID in the last sealed slab.
+		// Prevents "Time Travel" where a slow writer lands in a NEW slab after rotation,
+		// hiding a newer write that's already in an OLD (sealed) slab.
+		maxSealedSeq uint64
 	}
+
+	// Sharded locks for per-key consistency within active slab.
+	// Prevents "Check-Then-Act" race where two threads updating the same key
+	// both read stale state and the slower (older) write overwrites the faster (newer).
+	// Usage: indexLocks[hash & indexShardMask].Lock()
+	indexLocks [numIndexShards]sync.Mutex
 
 	flushCh chan FlushTicket
 	flushWg sync.WaitGroup // Tracks in-flight flush operations
@@ -120,23 +146,22 @@ func (mt *MemTable) maybeCompress(src []byte) BufferHandle {
 
 // --- Write Logic ---
 
-func (mt *MemTable) Put(key Key, value []byte) {
-	mt.putWithChecksum(key, value, nil)
+func (mt *MemTable) Put(seqID uint64, key Key, value []byte) error {
+	return mt.putWithChecksum(seqID, key, value, nil)
 }
 
-func (mt *MemTable) PutChecksummed(key Key, value []byte, checksum uint32) {
-	mt.putWithChecksum(key, value, &checksum)
+func (mt *MemTable) PutChecksummed(seqID uint64, key Key, value []byte, checksum uint32) error {
+	return mt.putWithChecksum(seqID, key, value, &checksum)
 }
 
-func (mt *MemTable) putWithChecksum(key Key, value []byte, checksum *uint32) {
+func (mt *MemTable) putWithChecksum(seqID uint64, key Key, value []byte, checksum *uint32) error {
 	if int64(len(value)) > mt.LargeWriteThreshold {
-		mt.putLarge(key, value, checksum)
-	} else {
-		mt.putActive(key, value, checksum)
+		return mt.putLarge(seqID, key, value, checksum)
 	}
+	return mt.putActive(seqID, key, value, checksum)
 }
 
-func (mt *MemTable) putLarge(key Key, value []byte, checksum *uint32) {
+func (mt *MemTable) putLarge(seqID uint64, key Key, value []byte, checksum *uint32) error {
 	// 1. Compress in caller's goroutine (distributed compression)
 	compressed := mt.maybeCompress(value)
 	defer compressed.Release()
@@ -153,8 +178,9 @@ func (mt *MemTable) putLarge(key Key, value []byte, checksum *uint32) {
 		as.wPos = int64(len(compressed.Bytes()))
 	}
 
-	record := makeEntry(key, 0, value, compressed.Bytes(), mt.Compression.Codec, mt.Resilience.ChecksumHasher, checksum)
+	record := makeEntry(seqID, key, 0, value, compressed.Bytes(), mt.Compression.Codec, mt.Resilience.ChecksumHasher, checksum)
 	as.index.Store(key, record)
+	as.currentMaxSeq = seqID
 
 	if !mt.IsDegraded() {
 		mt.sendToFlusher(as) // Acquires its own reference via PurchaseTicket
@@ -162,27 +188,35 @@ func (mt *MemTable) putLarge(key Key, value []byte, checksum *uint32) {
 
 	// Release "Active Writer" reference.
 	as.buf.Unpin()
+	return nil
 }
 
-func (mt *MemTable) putActive(key Key, value []byte, checksum *uint32) {
+func (mt *MemTable) putActive(seqID uint64, key Key, value []byte, checksum *uint32) error {
 	// 1. Compress before lock (parallel compression) - only on first call
 	c := mt.maybeCompress(value)
 	defer c.Release()
-	mt.putActiveCompressed(key, value, checksum, c)
+	return mt.putActiveCompressed(seqID, key, value, checksum, c)
 }
 
 func (mt *MemTable) putActiveCompressed(
-	key Key, value []byte, checksum *uint32, compressed BufferHandle,
-) {
+	seqID uint64, key Key, value []byte, checksum *uint32, compressed BufferHandle,
+) error {
 	mt.mu.Lock()
 
-	// 1. Wait for Rotation (Backpressure)
+	// 1. Lifecycle Guard: Reject writes older than already-sealed data.
+	// This prevents "Time Travel" where a slow writer lands in a NEW slab
+	// after rotation, hiding a newer write already in an OLD (sealed) slab.
+	if seqID <= mt.mu.maxSealedSeq {
+		mt.mu.Unlock()
+		return errSequenceTooOld
+	}
+
+	// 2. Wait for Rotation (Backpressure)
 	if mt.mu.activeReady != nil {
 		wait := mt.mu.activeReady
 		mt.mu.Unlock()
 		<-wait
-		mt.putActiveCompressed(key, value, checksum, compressed)
-		return
+		return mt.putActiveCompressed(seqID, key, value, checksum, compressed)
 	}
 
 	active := mt.mu.active
@@ -191,37 +225,52 @@ func (mt *MemTable) putActiveCompressed(
 		writeSize = int64(len(compressed.Bytes()))
 	}
 
-	// 2. Check Capacity & Rotate
+	// 3. Check Capacity & Rotate
 	if active.wPos+writeSize > int64(active.buf.Cap()) {
 		rotateUnlocked := mt.prepareRotationLocked()
 		mt.mu.Unlock()
 		rotateUnlocked()
-		mt.putActiveCompressed(key, value, checksum, compressed)
-		return
+		return mt.putActiveCompressed(seqID, key, value, checksum, compressed)
 	}
 
-	// 3. Reservation
+	// 4. Reservation
 	active.pendingWrites.Add(1)
 	wPos := active.wPos
 	active.wPos += writeSize
+
+	// Track highest seqID in this slab for rotation handoff
+	if seqID > active.currentMaxSeq {
+		active.currentMaxSeq = seqID
+	}
+
 	mt.mu.Unlock()
 
-	// 4. Write data
+	// 5. Write data
 	if compressed.IsZero() {
 		active.buf.WriteAt(value, wPos)
 	} else {
 		active.buf.WriteAt(compressed.Bytes(), wPos)
 	}
 
-	record := makeEntry(key, wPos, value, compressed.Bytes(), mt.Compression.Codec, mt.Resilience.ChecksumHasher, checksum)
-	active.index.Store(key, record)
+	record := makeEntry(seqID, key, wPos, value, compressed.Bytes(), mt.Compression.Codec, mt.Resilience.ChecksumHasher, checksum)
 
-	// 5. Complete
+	// 6. Concurrency Guard: Prevent "Check-Then-Act" race.
+	// Two threads updating the same key could both read stale state and
+	// the slower (older) write could overwrite the faster (newer) one.
+	shard := key & indexShardMask
+	mt.indexLocks[shard].Lock()
+	if existing, ok := active.index.Load(key); !ok || seqID > existing.SeqID {
+		active.index.Store(key, record)
+	}
+	mt.indexLocks[shard].Unlock()
+
+	// 7. Complete
 	if active.pendingWrites.Add(-1) == 0 {
 		if active.retired.Load() {
 			active.writesDone.Close()
 		}
 	}
+	return nil
 }
 
 // prepareRotationLocked sets up the rotation barrier and returns a closure
@@ -232,11 +281,17 @@ func (mt *MemTable) prepareRotationLocked() func() {
 	// 1. Setup Barrier (Block other writers)
 	mt.mu.activeReady = make(chan struct{})
 
-	// 2. Seal & Retire Old Slab
+	// 2. Update Gatekeeper: Capture the highest seqID from the old slab.
+	// This becomes the new threshold - any write with seqID <= this is rejected.
+	if old.currentMaxSeq > mt.mu.maxSealedSeq {
+		mt.mu.maxSealedSeq = old.currentMaxSeq
+	}
+
+	// 3. Seal & Retire Old Slab
 	old.buf.Seal(old.wPos)
 	old.retired.Store(true)
 
-	// 3. Detach Active (Set to nil so nobody touches it while we allocate)
+	// 4. Detach Active (Set to nil so nobody touches it while we allocate)
 	mt.mu.active = nil
 
 	// Capture state for the unlocked closure
@@ -294,7 +349,7 @@ func (mt *MemTable) Drain() {
 }
 
 func makeEntry(
-	key Key, offset int64, original []byte, compressed []byte, codec compression.Codex,
+	seqID uint64, key Key, offset int64, original []byte, compressed []byte, codec compression.Codex,
 	hasher Hasher, checksum *uint32,
 ) metadata.BlobRecord {
 	// Determine sizes based on whether compression was applied
@@ -311,6 +366,7 @@ func makeEntry(
 		Pos:          offset,
 		LogicalSize:  logicalSize,
 		PhysicalSize: physicalSize,
+		SeqID:        seqID,
 		Flags:        metadata.InvalidChecksum,
 	}
 

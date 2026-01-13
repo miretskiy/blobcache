@@ -194,7 +194,7 @@ func TestMemTable_Integration_Rotation(t *testing.T) {
 
 	for i := 0; i < blobCount; i++ {
 		key := Key(i)
-		mt.Put(key, data)
+		require.NoError(t, mt.Put(uint64(i+1), key, data))
 	}
 
 	mt.Drain()

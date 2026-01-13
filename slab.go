@@ -103,6 +103,11 @@ type ActiveSlab struct {
 
 	pendingWrites atomic.Int64
 	retired       atomic.Bool
+
+	// currentMaxSeq tracks the highest SeqID written to this slab.
+	// Used during rotation to set maxSealedSeq in MemTable.
+	// Accessed only under MemTable.mu.Lock, so no atomics needed.
+	currentMaxSeq uint64
 }
 
 type FlushTicket struct {

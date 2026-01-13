@@ -13,9 +13,9 @@ import (
 const (
 	segmentMagic = 0xB10BCA4EB10BCA4E
 
-	// EncodedBlobRecordSize is now 40 bytes:
-	// Hash(8) + Pos(8) + LogicalSize(8) + PhysicalSize(8) + Flags(8)
-	EncodedBlobRecordSize   = 40
+	// EncodedBlobRecordSize is 48 bytes:
+	// Hash(8) + Pos(8) + LogicalSize(8) + PhysicalSize(8) + SeqID(8) + Flags(8)
+	EncodedBlobRecordSize   = 48
 	SegmentRecordHeaderSize = 16
 	SegmentFooterSize       = 20
 
@@ -38,6 +38,12 @@ const (
 // BlobRecord represents a single entry in the SegmentRecord.
 // It tracks both logical and physical sizes to enable zero-allocation reads
 // and high-fidelity storage metrics.
+//
+// SeqID provides total ordering for all operations, enabling:
+//   - WAL rotation: Know which sequences are committed
+//   - CAS semantics: Newer writes always win
+//   - Consistency: Prevent serving stale values
+//
 // Flags layout:
 // [63-60]: CompressionType
 // [59-39]: Reserved
@@ -50,6 +56,7 @@ type BlobRecord struct {
 	Pos          int64  // Offset within segment
 	LogicalSize  int64  // Original uncompressed size for pre-allocation
 	PhysicalSize int64  // Actual size on disk (compressed)
+	SeqID        uint64 // Monotonic sequence ID for ordering
 	Flags        uint64 // Metadata, status, and checksum flags
 }
 
@@ -130,8 +137,9 @@ type SegmentFooter struct {
 func AppendBlobRecord(buf []byte, rec BlobRecord) []byte {
 	buf = binary.LittleEndian.AppendUint64(buf, rec.Hash)
 	buf = binary.LittleEndian.AppendUint64(buf, uint64(rec.Pos))
-	buf = binary.LittleEndian.AppendUint64(buf, uint64(rec.LogicalSize))  // Added
-	buf = binary.LittleEndian.AppendUint64(buf, uint64(rec.PhysicalSize)) // Added
+	buf = binary.LittleEndian.AppendUint64(buf, uint64(rec.LogicalSize))
+	buf = binary.LittleEndian.AppendUint64(buf, uint64(rec.PhysicalSize))
+	buf = binary.LittleEndian.AppendUint64(buf, rec.SeqID)
 	buf = binary.LittleEndian.AppendUint64(buf, rec.Flags)
 	return buf
 }
@@ -143,9 +151,10 @@ func DecodeBlobRecord(buf []byte) (BlobRecord, error) {
 	return BlobRecord{
 		Hash:         binary.LittleEndian.Uint64(buf[0:8]),
 		Pos:          int64(binary.LittleEndian.Uint64(buf[8:16])),
-		LogicalSize:  int64(binary.LittleEndian.Uint64(buf[16:24])), // Added
-		PhysicalSize: int64(binary.LittleEndian.Uint64(buf[24:32])), // Added
-		Flags:        binary.LittleEndian.Uint64(buf[32:40]),
+		LogicalSize:  int64(binary.LittleEndian.Uint64(buf[16:24])),
+		PhysicalSize: int64(binary.LittleEndian.Uint64(buf[24:32])),
+		SeqID:        binary.LittleEndian.Uint64(buf[32:40]),
+		Flags:        binary.LittleEndian.Uint64(buf[40:48]),
 	}, nil
 }
 

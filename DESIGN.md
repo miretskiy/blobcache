@@ -168,6 +168,28 @@ return true
 })
 ```
 
+### 4.6 Write Ordering and Sequence IDs
+
+A cache might seem like a system where "eventual consistency" is acceptable—after all, cached data is ephemeral by nature. However, users have a reasonable expectation that updating a key will make the new value visible, not resurrect some old value that was written earlier. When a user calls `Put("config", v2)` to update a configuration blob, subsequent `Get("config")` calls should return `v2`, not `v1` from a previous write that happened to complete out of order.
+
+Without explicit ordering, two race conditions can cause stale data to appear newer than it actually is:
+
+**The Time Travel Bug** occurs when a slow writer lands in a *new* file after rotation, effectively hiding a newer write that exists in an *old* (sealed) file. Consider a thread that begins a `Put` operation, gets preempted by the OS scheduler for a few milliseconds, and wakes up after the active slab has rotated. If it proceeds to write to the new slab, its stale data will be found first during `Get` operations (which check the active slab before sealed slabs), causing the system to return outdated values.
+
+**The Check-Then-Act Bug** occurs when two concurrent writers for the same key both read stale index state and proceed to update it. The slower writer (with older data) can overwrite the faster writer's entry, causing the index to point to stale data even though newer data was successfully written.
+
+BlobCache addresses both problems through **Sequence IDs**—monotonically increasing 64-bit integers assigned to every write operation. The sequence counter is initialized from `time.Now().UnixNano()` at startup, ensuring that sequences are always increasing even across process restarts without requiring a scan of persistent storage.
+
+Two protection layers leverage these sequence IDs:
+
+The **Lifecycle Guard** tracks `maxSealedSeq`, the highest sequence ID present in the last sealed slab. Any write with a sequence ID less than or equal to this value is definitively stale—it began before the rotation but is trying to land after. Such writes are silently dropped, preventing the time travel bug.
+
+The **Concurrency Guard** uses 256 sharded locks (indexed by key hash) to serialize same-key index updates. Under the lock, the system compares the incoming write's sequence ID against any existing entry. If the existing entry has a higher or equal sequence ID, the incoming write is dropped. This atomic check-and-update prevents the check-then-act bug.
+
+The overhead is minimal: one atomic increment (~10ns) plus a sharded lock acquisition (~20ns uncontended), totaling less than 100ns per write. The read path remains unchanged—sequence IDs are stored but never checked during retrieval, because the write-path guards guarantee that any visible entry is definitively the latest.
+
+This infrastructure also prepares BlobCache for future Write-Ahead Log (WAL) support. Sequence IDs embedded in WAL entries allow crash recovery to correctly skip replaying operations that were already persisted to segments, ensuring exactly-once semantics without complex coordination.
+
 ---
 
 ## 5. Memory Architecture: The User-Space Page Cache

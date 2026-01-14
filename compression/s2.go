@@ -21,6 +21,15 @@ func compressS2(dst, src []byte, level Level) ([]byte, error) {
 }
 
 func decompressS2(dst, src []byte) error {
-	_, err := s2.Decode(dst, src)
-	return err
+	res, err := s2.Decode(dst, src)
+	if err != nil {
+		return err
+	}
+
+	// S2 uses append semantics - it will reallocate if dst is too small.
+	// Detect this by comparing capacities.
+	if cap(res) > cap(dst) {
+		return ErrBufferTooSmall
+	}
+	return nil
 }

@@ -1,4 +1,4 @@
-package blobcache
+package sys
 
 import (
 	"os"
@@ -13,8 +13,8 @@ func TestFallocate_FileSize(t *testing.T) {
 	tmpDir := t.TempDir()
 	path := filepath.Join(tmpDir, "fallocate_test.bin")
 
-	// Create file using OpenWriter with DirectIO enabled
-	f, err := OpenWriter(path, true)
+	// Create file using OpenDirect with DirectIO enabled
+	f, err := OpenDirect(path, true)
 	require.NoError(t, err)
 	defer f.Close()
 
@@ -26,7 +26,7 @@ func TestFallocate_FileSize(t *testing.T) {
 
 	// Pre-allocate 16MB
 	allocSize := int64(16 * 1024 * 1024)
-	err = fallocate(f, allocSize)
+	err = Fallocate(f, allocSize)
 	if err != nil {
 		t.Logf("fallocate returned error (may be expected on some filesystems): %v", err)
 	}
@@ -145,7 +145,7 @@ func TestAlignForHolePunch(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gotOffset, gotLength, gotCanPunch := alignForHolePunch(tt.offset, tt.length)
+			gotOffset, gotLength, gotCanPunch := AlignForHolePunch(tt.offset, tt.length)
 
 			require.Equal(t, tt.expectCanPunch, gotCanPunch, "canPunch mismatch")
 			if tt.expectCanPunch {

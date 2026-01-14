@@ -1,4 +1,4 @@
-package blobcache
+package sys
 
 import (
 	"errors"
@@ -20,10 +20,10 @@ const (
 
 type Offset_t int64
 
-// alignForHolePunch aligns offset and length to filesystem block boundaries
+// AlignForHolePunch aligns offset and length to filesystem block boundaries
 // Returns (alignedOffset, alignedLength, canPunch)
 // canPunch is false if there are no complete blocks to punch
-func alignForHolePunch(offset, length int64) (int64, int64, bool) {
+func AlignForHolePunch(offset, length int64) (int64, int64, bool) {
 	// Round offset UP to next block boundary (don't punch into previous blob)
 	alignedOffset := (offset + mask) &^ mask
 	length -= alignedOffset - offset

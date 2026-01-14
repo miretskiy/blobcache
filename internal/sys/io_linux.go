@@ -1,6 +1,6 @@
 //go:build linux
 
-package blobcache
+package sys
 
 import (
 	"os"
@@ -9,20 +9,17 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-var defaultIOConfig = IOConfig{
-	FDataSync:     false,
-	Fadvise:       true,
-	DirectIOWrite: true,
-}
+// UseFadvise indicates whether fadvise is effective on this platform.
+const UseFadvise = true
 
-// fdatasync syncs file data to disk without syncing metadata
+// Fdatasync syncs file data to disk without syncing metadata
 // Uses fdatasync(2) on Linux for better performance than fsync
-func fdatasync(f *os.File) error {
+func Fdatasync(f *os.File) error {
 	return unix.Fdatasync(int(f.Fd()))
 }
 
-// isAligned checks if the memory address of the slice is on a 4KB boundary.
-func isAligned(block []byte) bool {
+// IsAligned checks if the memory address of the slice is on a 4KB boundary.
+func IsAligned(block []byte) bool {
 	if len(block) == 0 {
 		return true
 	}
@@ -30,9 +27,9 @@ func isAligned(block []byte) bool {
 	return uintptr(unsafe.Pointer(&block[0]))&4095 == 0
 }
 
-// fallocate pre-allocates disk space for a file
+// Fallocate pre-allocates disk space for a file
 // Reduces fragmentation and improves write performance
-func fallocate(f *os.File, size int64) error {
+func Fallocate(f *os.File, size int64) error {
 	return unix.Fallocate(int(f.Fd()), 0, 0, size)
 }
 
@@ -41,7 +38,7 @@ func fallocate(f *os.File, size int64) error {
 // Aligns to filesystem block boundaries to avoid punching adjacent blobs
 // Returns the actual number of bytes reclaimed (after alignment)
 func PunchHole(f *os.File, offset, length int64) (int64, error) {
-	alignedOffset, alignedLength, canPunch := alignForHolePunch(offset, length)
+	alignedOffset, alignedLength, canPunch := AlignForHolePunch(offset, length)
 	if !canPunch {
 		return 0, nil
 	}
@@ -75,9 +72,9 @@ func Fadvise(fd uintptr, offset Offset_t, length int64, hint FadviseHint) error 
 	return unix.Fadvise(int(fd), int64(offset), length, linuxHint)
 }
 
-// OpenWriter opens specified file for writing.
+// OpenDirect opens specified file for writing.
 // If directIO is true, uses O_DIRECT to bypass the page cache.
-func OpenWriter(path string, directIO bool) (*os.File, error) {
+func OpenDirect(path string, directIO bool) (*os.File, error) {
 	// We use O_WRONLY because the writer handle is append-only.
 	// We do NOT use O_APPEND because we use WriteAt for precise positioning.
 	flags := os.O_CREATE | os.O_WRONLY

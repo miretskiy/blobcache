@@ -2,6 +2,8 @@ package blobcache
 
 import (
 	"os"
+
+	"github.com/miretskiy/blobcache/internal/sys"
 )
 
 type segmentFile struct {
@@ -15,7 +17,7 @@ func (s *segmentFile) ReadAt(p []byte, off int64) (int, error) {
 
 func (s *segmentFile) PunchHole(offset, length int64) (int64, error) {
 	// Calls the OS-specific implementation (fallocate on Linux, F_PUNCHHOLE on Darwin)
-	return PunchHole(s.file, offset, length)
+	return sys.PunchHole(s.file, offset, length)
 }
 
 func (s *segmentFile) Close() error {

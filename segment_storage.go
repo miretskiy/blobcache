@@ -12,6 +12,7 @@ import (
 	"github.com/miretskiy/blobcache/base"
 	"github.com/miretskiy/blobcache/compression"
 	"github.com/miretskiy/blobcache/index"
+	"github.com/miretskiy/blobcache/internal/sys"
 )
 
 type Storage struct {
@@ -51,8 +52,11 @@ func (s *Storage) ReadBlob(e index.Entry) (io.Reader, Releaser, error) {
 
 	// 1. Kernel Hinting (Hybrid I/O)
 	// Use PhysicalSize - this is the actual bytes stored on disk.
+	// Fadvise is advisory - errors are logged but not fatal.
 	if s.IO.Fadvise {
-		_ = Fadvise(sf.file.Fd(), Offset_t(e.Pos), e.PhysicalSize, FadvSequential)
+		if err := sys.Fadvise(sf.file.Fd(), sys.Offset_t(e.Pos), e.PhysicalSize, sys.FadvSequential); err != nil {
+			log.Warn("fadvise failed", "segID", e.SegmentID, "err", err)
+		}
 	}
 
 	// 2. Read data/decompress if needed.

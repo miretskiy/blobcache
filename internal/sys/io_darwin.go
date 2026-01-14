@@ -1,6 +1,6 @@
 //go:build darwin
 
-package blobcache
+package sys
 
 import (
 	"os"
@@ -10,16 +10,14 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-var defaultIOConfig = IOConfig{
-	FDataSync:     false,
-	Fadvise:       false,
-	DirectIOWrite: true,
-}
+// UseFadvise indicates whether fadvise is effective on this platform.
+// Darwin's fadvise equivalent (F_RDAHEAD) is less capable than Linux.
+const UseFadvise = false
 
-// fdatasync syncs file data to disk
+// Fdatasync syncs file data to disk
 // Darwin doesn't have fdatasync, so we use F_FULLFSYNC which ensures
 // data reaches physical disk (not just drive cache)
-func fdatasync(f *os.File) error {
+func Fdatasync(f *os.File) error {
 	_, _, errno := syscall.Syscall(syscall.SYS_FCNTL, f.Fd(), uintptr(syscall.F_FULLFSYNC), 0)
 	if errno != 0 {
 		return errno
@@ -27,15 +25,15 @@ func fdatasync(f *os.File) error {
 	return nil
 }
 
-// isAligned always returns true on Darwin as F_NOCACHE does not
+// IsAligned always returns true on Darwin as F_NOCACHE does not
 // enforce the same strict memory-alignment rules as Linux O_DIRECT.
-func isAligned(_ []byte) bool {
+func IsAligned(_ []byte) bool {
 	return true
 }
 
-// fallocate pre-allocates disk space for a file
+// Fallocate pre-allocates disk space for a file
 // Darwin uses F_PREALLOCATE via fcntl
-func fallocate(f *os.File, size int64) error {
+func Fallocate(f *os.File, size int64) error {
 	// fstore_t structure for F_PREALLOCATE
 	fstore := syscall.Fstore_t{
 		Flags:   syscall.F_ALLOCATECONTIG, // Try contiguous first
@@ -84,7 +82,7 @@ type fpunchhole_t struct {
 // Aligns to filesystem block boundaries to avoid punching adjacent blobs.
 // Returns the actual number of bytes reclaimed (after alignment)
 func PunchHole(f *os.File, offset, length int64) (int64, error) {
-	alignedOffset, alignedLength, canPunch := alignForHolePunch(offset, length)
+	alignedOffset, alignedLength, canPunch := AlignForHolePunch(offset, length)
 	if !canPunch {
 		return 0, nil
 	}
@@ -132,9 +130,9 @@ func Fadvise(fd uintptr, _ Offset_t, _ int64, hint FadviseHint) error {
 	}
 }
 
-// OpenWriter opens specified file for writing.
+// OpenDirect opens specified file for writing.
 // If directIO is true, uses F_NOCACHE to bypass the page cache.
-func OpenWriter(path string, directIO bool) (*os.File, error) {
+func OpenDirect(path string, directIO bool) (*os.File, error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return nil, err

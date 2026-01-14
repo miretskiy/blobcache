@@ -14,6 +14,7 @@ import (
 	"github.com/miretskiy/blobcache/base"
 	"github.com/miretskiy/blobcache/bloom"
 	"github.com/miretskiy/blobcache/index"
+	"github.com/miretskiy/blobcache/internal/sys"
 	"github.com/miretskiy/blobcache/metadata"
 )
 
@@ -414,7 +415,7 @@ func (c *Cache) triggerEviction() {
 
 func (c *Cache) handleStorageError(h Key, e index.Entry, err error) {
 	// 1. Transient errors: Skip and retry later
-	if IsTransientIOError(err) {
+	if sys.IsTransientIOError(err) {
 		log.Error("transient storage error (skipping)", "hash", h, "error", err)
 		return
 	}

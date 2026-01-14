@@ -6,6 +6,7 @@ import (
 
 	"github.com/cespare/xxhash/v2"
 	"github.com/miretskiy/blobcache/compression"
+	"github.com/miretskiy/blobcache/internal/sys"
 )
 
 // IOConfig holds I/O strategy settings
@@ -180,7 +181,11 @@ func defaultConfig(path string) config {
 		FlushConcurrency:    6,
 		BloomFPRate:         0.01,
 		BloomEstimatedKeys:  1_000_000,
-		IO:                  defaultIOConfig,
+		IO: IOConfig{
+			FDataSync:     false,
+			Fadvise:       sys.UseFadvise,
+			DirectIOWrite: true,
+		},
 
 		Compression: CompressionConfig{
 			Codec:   compression.CodexNone, // Disabled by default

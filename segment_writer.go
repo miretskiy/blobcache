@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/miretskiy/blobcache/internal/sys"
 	"github.com/miretskiy/blobcache/metadata"
 )
 
@@ -41,13 +42,13 @@ func NewSegmentWriter(
 	}
 
 	// 2. Now open the file
-	f, err := OpenWriter(path, directIO)
+	f, err := sys.OpenDirect(path, directIO)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open segment %d: %w", id, err)
 	}
 
 	// 3. Pre-allocate
-	if err := fallocate(f, segmentSize); err != nil {
+	if err := sys.Fallocate(f, segmentSize); err != nil {
 		log.Error("warning: fallocate failed", "segID", id, "err", err)
 	}
 
@@ -76,7 +77,7 @@ func (sw *SegmentWriter) WriteSlab(
 	}
 
 	// Safety check for alignment (abstracted helper)
-	if !isAligned(data) {
+	if !sys.IsAligned(data) {
 		return nil, fmt.Errorf("buffer address %p is not hardware-aligned", &data[0])
 	}
 
@@ -89,7 +90,9 @@ func (sw *SegmentWriter) WriteSlab(
 	}
 
 	if sw.syncData {
-		_ = fdatasync(sw.file)
+		if err := sys.Fdatasync(sw.file); err != nil {
+			return nil, fmt.Errorf("fdatasync failed: %w", err)
+		}
 	}
 
 	// 3. Advance the global file pointer by the size of the data written
@@ -149,7 +152,10 @@ func (sw *SegmentWriter) Close() error {
 	// 5. Persistence Handshake.
 	// fdatasync uses F_FULLFSYNC on Darwin to ensure it clears the drive cache.
 	if sw.syncData {
-		_ = fdatasync(sw.file)
+		if err := sys.Fdatasync(sw.file); err != nil {
+			_ = sw.file.Close()
+			return fmt.Errorf("fdatasync failed on segment close: %w", err)
+		}
 	}
 
 	err := sw.file.Close()

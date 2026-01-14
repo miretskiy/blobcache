@@ -2,9 +2,17 @@ package compression
 
 import (
 	"errors"
+	"sync"
 
 	"github.com/DataDog/zstd"
 )
+
+// ctxPool holds reusable zstd.Ctx instances to amortize allocation costs.
+// Each Ctx maintains internal compression/decompression state that can be
+// reused across operations, avoiding repeated memory allocations.
+var ctxPool = sync.Pool{
+	New: func() any { return zstd.NewCtx() },
+}
 
 func zLevel(l Level) int {
 	switch l {
@@ -18,8 +26,11 @@ func zLevel(l Level) int {
 }
 
 func compressZstd(dst, src []byte, level Level) ([]byte, error) {
-	// zstd.CompressLevel will use dst if it has enough capacity.
-	res, err := zstd.CompressLevel(dst, src, zLevel(level))
+	ctx := ctxPool.Get().(zstd.Ctx)
+	defer ctxPool.Put(ctx)
+
+	// ctx.CompressLevel reuses internal buffers for better performance.
+	res, err := ctx.CompressLevel(dst, src, zLevel(level))
 	if err != nil {
 		return nil, err
 	}
@@ -34,14 +45,30 @@ func compressZstd(dst, src []byte, level Level) ([]byte, error) {
 }
 
 func decompressZstd(dst, src []byte) error {
-	// We use Decompress and verify the pointer to ensure the
-	// LogicalSize hint from metadata was respected.
-	res, err := zstd.Decompress(dst, src)
+	// DataDog/zstd's DecompressInto panics when dst is empty.
+	// Handle this edge case by using the allocating Decompress instead.
+	if len(dst) == 0 {
+		result, err := zstd.Decompress(nil, src)
+		if err != nil {
+			return err
+		}
+		if len(result) != 0 {
+			return errors.New("zstd decompression: expected empty output")
+		}
+		return nil
+	}
+
+	ctx := ctxPool.Get().(zstd.Ctx)
+	defer ctxPool.Put(ctx)
+
+	// ctx.DecompressInto reuses internal buffers and requires dst to be
+	// pre-sized to hold the decompressed output.
+	n, err := ctx.DecompressInto(dst, src)
 	if err != nil {
 		return err
 	}
-	if len(res) > 0 && &res[0] != &dst[0] {
-		return errors.New("zstd decompression: buffer address mismatch")
+	if n != len(dst) {
+		return errors.New("zstd decompression: size mismatch")
 	}
 	return nil
 }

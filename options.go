@@ -51,10 +51,7 @@ type config struct {
 	Resilience          ResilienceConfig
 	Compression         CompressionConfig
 
-	// Testing hooks
-	testingInjectWriteErr func() error
-	testingInjectIndexErr func() error
-	testingInjectEvictErr func() error
+	knobs *TestingKnobs
 }
 
 // Option configures BlobCache
@@ -134,22 +131,6 @@ func WithKeyHasher(hasher KeyHasherFn) Option {
 	return funcOpt(func(c *config) { c.KeyHasher = hasher })
 }
 
-func WithTestingFlushOnPut() Option {
-	return funcOpt(func(c *config) { c.SegmentSize = 0 })
-}
-
-func WithTestingInjectWriteError(fn func() error) Option {
-	return funcOpt(func(c *config) { c.testingInjectWriteErr = fn })
-}
-
-func WithTestingInjectIndexError(fn func() error) Option {
-	return funcOpt(func(c *config) { c.testingInjectIndexErr = fn })
-}
-
-func WithTestingInjectEvictError(fn func() error) Option {
-	return funcOpt(func(c *config) { c.testingInjectEvictErr = fn })
-}
-
 func WithFlushConcurrency(n int) Option {
 	return funcOpt(func(c *config) { c.FlushConcurrency = n })
 }
@@ -178,6 +159,11 @@ func WithCompressionLevel(level compression.Level) Option {
 // Blobs smaller than this are stored uncompressed.
 func WithCompressionMinSize(size int64) Option {
 	return funcOpt(func(c *config) { c.Compression.MinSize = size })
+}
+
+// WithTestingKnobs configures testing hooks for error injection and behavior overrides.
+func WithTestingKnobs(knobs *TestingKnobs) Option {
+	return funcOpt(func(c *config) { c.knobs = knobs })
 }
 
 func defaultConfig(path string) config {

@@ -20,11 +20,13 @@ func TestCache_DegradedMode_FlushWriteError(t *testing.T) {
 
 	cache, err := New(tmpDir,
 		WithWriteBufferSize(2<<10), // 2KB buffer
-		WithTestingInjectWriteError(func() error {
-			if callCount.Add(1) == 1 {
-				return errInjected // Fail first write
-			}
-			return nil
+		WithTestingKnobs(&TestingKnobs{
+			InjectWriteErr: func() error {
+				if callCount.Add(1) == 1 {
+					return errInjected // Fail first write
+				}
+				return nil
+			},
 		}),
 	)
 	require.NoError(t, err)
@@ -33,7 +35,7 @@ func TestCache_DegradedMode_FlushWriteError(t *testing.T) {
 	// Write enough to trigger flush
 	value := make([]byte, 1024)
 	for i := 0; i < 3; i++ {
-		cache.Put([]byte(fmt.Sprintf("key-%d", i)), value)
+		cache.Put(fmt.Appendf(nil, "key-%d", i), value)
 	}
 
 	// Drain to ensure flush completes (and fails)
@@ -45,7 +47,7 @@ func TestCache_DegradedMode_FlushWriteError(t *testing.T) {
 
 	// Subsequent Puts should still work (memory-only)
 	for i := 10; i < 20; i++ {
-		cache.Put([]byte(fmt.Sprintf("key-%d", i)), value)
+		cache.Put(fmt.Appendf(nil, "key-%d", i), value)
 	}
 
 	// Verify data still accessible from memtable
@@ -63,11 +65,13 @@ func TestCache_DegradedMode_IndexError(t *testing.T) {
 
 	cache, err := New(tmpDir,
 		WithWriteBufferSize(2<<10),
-		WithTestingInjectIndexError(func() error {
-			if callCount.Add(1) == 1 {
-				return errInjected
-			}
-			return nil
+		WithTestingKnobs(&TestingKnobs{
+			InjectIndexErr: func() error {
+				if callCount.Add(1) == 1 {
+					return errInjected
+				}
+				return nil
+			},
 		}),
 	)
 	require.NoError(t, err)
@@ -76,7 +80,7 @@ func TestCache_DegradedMode_IndexError(t *testing.T) {
 	// Trigger flush
 	value := make([]byte, 1024)
 	for i := 0; i < 3; i++ {
-		cache.Put([]byte(fmt.Sprintf("key-%d", i)), value)
+		cache.Put(fmt.Appendf(nil, "key-%d", i), value)
 	}
 	cache.Drain()
 
@@ -100,8 +104,10 @@ func TestCache_DegradedMode_MemtableEviction(t *testing.T) {
 	cache, err := New(tmpDir,
 		WithWriteBufferSize(1<<10), // 1KB buffer (small for fast rotation)
 		// Default MaxInflightSlabs is 6
-		WithTestingInjectWriteError(func() error {
-			return errInjected // Always fail
+		WithTestingKnobs(&TestingKnobs{
+			InjectWriteErr: func() error {
+				return errInjected // Always fail
+			},
 		}),
 	)
 	require.NoError(t, err)
@@ -111,10 +117,10 @@ func TestCache_DegradedMode_MemtableEviction(t *testing.T) {
 
 	// Fill and rotate 6 memtables (to fill files list - default MaxInflightSlabs=6)
 	for i := 0; i < 12; i++ {
-		cache.Put([]byte(fmt.Sprintf("key-%d", i)), value)
+		cache.Put(fmt.Appendf(nil, "key-%d", i), value)
 		if (i+1)%2 == 0 {
 			// Every 2 Puts triggers rotation (512*2 > 1KB buffer)
-			cache.Put([]byte(fmt.Sprintf("trigger-%d", i)), make([]byte, 100))
+			cache.Put(fmt.Appendf(nil, "trigger-%d", i), make([]byte, 100))
 		}
 	}
 
@@ -127,9 +133,9 @@ func TestCache_DegradedMode_MemtableEviction(t *testing.T) {
 
 	// Trigger more rotations (should drop oldest)
 	for i := 20; i < 30; i++ {
-		cache.Put([]byte(fmt.Sprintf("new-key-%d", i)), value)
+		cache.Put(fmt.Appendf(nil, "new-key-%d", i), value)
 		if (i+1)%2 == 0 {
-			cache.Put([]byte(fmt.Sprintf("new-trigger-%d", i)), make([]byte, 100))
+			cache.Put(fmt.Appendf(nil, "new-trigger-%d", i), make([]byte, 100))
 		}
 	}
 
@@ -148,12 +154,14 @@ func TestCache_DegradedMode_EvictionError(t *testing.T) {
 
 	cache, err := New(tmpDir,
 		WithMaxSize(5<<10), // 5KB limit
-		WithTestingFlushOnPut(),
-		WithTestingInjectEvictError(func() error {
-			if callCount.Add(1) == 1 {
-				return errInjected
-			}
-			return nil
+		WithSegmentSize(0), // Flush on put
+		WithTestingKnobs(&TestingKnobs{
+			InjectEvictErr: func() error {
+				if callCount.Add(1) == 1 {
+					return errInjected
+				}
+				return nil
+			},
 		}),
 	)
 	require.NoError(t, err)
@@ -166,7 +174,7 @@ func TestCache_DegradedMode_EvictionError(t *testing.T) {
 
 	// Fill to trigger eviction
 	for i := 0; i < 7; i++ {
-		cache.Put([]byte(fmt.Sprintf("key-%d", i)), value)
+		cache.Put(fmt.Appendf(nil, "key-%d", i), value)
 	}
 	cache.Drain()
 
@@ -192,8 +200,10 @@ func TestCache_DegradedMode_DrainDuringDegraded(t *testing.T) {
 
 	cache, err := New(tmpDir,
 		WithWriteBufferSize(1<<10), // 1KB buffer
-		WithTestingInjectWriteError(func() error {
-			return errInjected // Always fail
+		WithTestingKnobs(&TestingKnobs{
+			InjectWriteErr: func() error {
+				return errInjected // Always fail
+			},
 		}),
 	)
 	require.NoError(t, err)
@@ -233,7 +243,7 @@ func TestCache_Close_WithoutDrain(t *testing.T) {
 	// Write data but DON'T drain
 	value := make([]byte, 512)
 	for i := 0; i < 10; i++ {
-		cache.Put([]byte(fmt.Sprintf("key-%d", i)), value)
+		cache.Put(fmt.Appendf(nil, "key-%d", i), value)
 	}
 
 	// Close without drain should succeed (data may be lost)

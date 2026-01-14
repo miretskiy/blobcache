@@ -20,7 +20,7 @@ func TestCache_SegmentMode(t *testing.T) {
 
 	// Write multiple keys
 	for i := 0; i < 10; i++ {
-		key := []byte(fmt.Sprintf("key-%d", i))
+		key := fmt.Appendf(nil, "key-%d", i)
 		value := make([]byte, 1024*1024) // 1MB each
 		for j := range value {
 			value[j] = byte((i + j) % 256)
@@ -31,7 +31,7 @@ func TestCache_SegmentMode(t *testing.T) {
 
 	// Read them back and verify
 	for i := 0; i < 10; i++ {
-		key := []byte(fmt.Sprintf("key-%d", i))
+		key := fmt.Appendf(nil, "key-%d", i)
 		value, found := readAll(t, cache, key)
 		require.True(t, found, "key-%d should be found", i)
 
@@ -62,7 +62,7 @@ func TestCache_SegmentModeWithDirectIO(t *testing.T) {
 	// Write keys with various sizes (test alignment handling)
 	sizes := []int{1024, 5000, 1024 * 1024, 999, 4096}
 	for i, size := range sizes {
-		key := []byte(fmt.Sprintf("key-%d", i))
+		key := fmt.Appendf(nil, "key-%d", i)
 		value := make([]byte, size)
 		for j := range value {
 			value[j] = byte(j % 256)
@@ -74,7 +74,7 @@ func TestCache_SegmentModeWithDirectIO(t *testing.T) {
 
 	// Verify all keys
 	for i, size := range sizes {
-		key := []byte(fmt.Sprintf("key-%d", i))
+		key := fmt.Appendf(nil, "key-%d", i)
 		value, found := readAll(t, cache, key)
 		require.True(t, found, "key-%d should be found", i)
 		require.Equal(t, size, len(value), "key-%d size mismatch", i)

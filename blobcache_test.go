@@ -109,7 +109,7 @@ func TestCache_Eviction_Headroom(t *testing.T) {
 
 	// Put enough data to trigger eviction (30KB > 20KB limit)
 	for i := 0; i < 30; i++ {
-		key := []byte(fmt.Sprintf("key-%d", i))
+		key := fmt.Appendf(nil, "key-%d", i)
 		cache.Put(key, make([]byte, 1024))
 	}
 	cache.Drain()
@@ -203,7 +203,7 @@ func BenchmarkCache_Get_WithBloom(b *testing.B) {
 	cache.Drain()
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, _ = cache.Get(key)
 	}
 }

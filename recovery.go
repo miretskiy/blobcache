@@ -98,7 +98,9 @@ func RecoverIndex(path string, opts ...Option) (*Cache, error) {
 		stopCh:  make(chan struct{}),
 	}
 	c.librarian = NewLibrarian(cfg.MaxCachedSlabs, c)
+	c.Knobs = cfg.knobs
 	c.memTable = NewMemTable(c.config, c, c, c.librarian)
+	c.memTable.Knobs = c.Knobs
 
 	// Build Bloom Filter synchronously
 	log.Info("rebuilding bloom filter from recovered segments...")

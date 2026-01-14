@@ -45,9 +45,11 @@ func TestApproxSize_NoRepeatEviction(t *testing.T) {
 	var evictionCount atomic.Int64
 	cache, err := New(tmpDir,
 		WithMaxSize(5<<10), // 5KB limit
-		WithTestingInjectEvictError(func() error {
-			evictionCount.Add(1)
-			return nil
+		WithTestingKnobs(&TestingKnobs{
+			InjectEvictErr: func() error {
+				evictionCount.Add(1)
+				return nil
+			},
 		}),
 	)
 	require.NoError(t, err)

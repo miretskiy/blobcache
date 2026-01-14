@@ -14,14 +14,14 @@ func TestCache_ReadAfterWrite(t *testing.T) {
 	tmpDir, _ := os.MkdirTemp("", "blobcache-test-*")
 	defer os.RemoveAll(tmpDir)
 
-	cache, err := New(tmpDir, WithTestingFlushOnPut())
+	cache, err := New(tmpDir, WithSegmentSize(0))
 	require.NoError(t, err)
 	defer cache.Close()
 
 	// Write multiple keys rapidly
 	for i := 0; i < 1000; i++ {
-		key := []byte(fmt.Sprintf("key-%d", i))
-		value := []byte(fmt.Sprintf("value-%d-data", i))
+		key := fmt.Appendf(nil, "key-%d", i)
+		value := fmt.Appendf(nil, "value-%d-data", i)
 
 		cache.Put(key, value)
 
@@ -33,8 +33,8 @@ func TestCache_ReadAfterWrite(t *testing.T) {
 
 	// Verify all keys are still readable (from memtable)
 	for i := 0; i < 1000; i++ {
-		key := []byte(fmt.Sprintf("key-%d", i))
-		expected := []byte(fmt.Sprintf("value-%d-data", i))
+		key := fmt.Appendf(nil, "key-%d", i)
+		expected := fmt.Appendf(nil, "value-%d-data", i)
 
 		result, found := readAll(t, cache, key)
 		require.True(t, found, "key-%d should be readable from memtable", i)
@@ -45,8 +45,8 @@ func TestCache_ReadAfterWrite(t *testing.T) {
 	cache.Drain()
 
 	for i := 0; i < 1000; i++ {
-		key := []byte(fmt.Sprintf("key-%d", i))
-		expected := []byte(fmt.Sprintf("value-%d-data", i))
+		key := fmt.Appendf(nil, "key-%d", i)
+		expected := fmt.Appendf(nil, "value-%d-data", i)
 
 		result, found := readAll(t, cache, key)
 		require.True(t, found, "key-%d should be readable from disk after Drain", i)

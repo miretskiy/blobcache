@@ -13,7 +13,7 @@ func TestRecovery_CorruptIndex(t *testing.T) {
 
 	// Create cache and write some data
 	cache, err := New(tmpDir,
-		WithTestingFlushOnPut(),
+		WithSegmentSize(0),
 		WithMaxSize(100<<20),
 	)
 	if err != nil {
@@ -45,7 +45,7 @@ func TestRecovery_CorruptIndex(t *testing.T) {
 
 	// Run recovery
 	recovered, err := RecoverIndex(tmpDir,
-		WithTestingFlushOnPut(),
+		WithSegmentSize(0),
 		WithMaxSize(100<<20),
 	)
 	if err != nil {
@@ -73,7 +73,7 @@ func TestRecovery_CorruptSegment(t *testing.T) {
 
 	// Create cache and write some data
 	cache, err := New(tmpDir,
-		WithTestingFlushOnPut(),
+		WithSegmentSize(0),
 		WithMaxSize(100<<20),
 	)
 	if err != nil {
@@ -129,7 +129,7 @@ func TestRecovery_CorruptSegment(t *testing.T) {
 
 	// Run recovery - should remove the corrupt segment
 	recovered, err := RecoverIndex(tmpDir,
-		WithTestingFlushOnPut(),
+		WithSegmentSize(0),
 		WithMaxSize(100<<20),
 	)
 	if err != nil {
@@ -185,7 +185,7 @@ func TestRecovery_InvalidSegmentID(t *testing.T) {
 
 	// Create cache and write data
 	cache, err := New(tmpDir,
-		WithTestingFlushOnPut(),
+		WithSegmentSize(0),
 	)
 	if err != nil {
 		t.Fatalf("failed to create cache: %v", err)
@@ -207,7 +207,7 @@ func TestRecovery_InvalidSegmentID(t *testing.T) {
 
 	// Run recovery - should skip invalid segment
 	recovered, err := RecoverIndex(tmpDir,
-		WithTestingFlushOnPut(),
+		WithSegmentSize(0),
 	)
 	if err != nil {
 		t.Fatalf("recovery failed: %v", err)

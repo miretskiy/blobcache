@@ -29,7 +29,7 @@ func fdatasync(f *os.File) error {
 
 // isAligned always returns true on Darwin as F_NOCACHE does not
 // enforce the same strict memory-alignment rules as Linux O_DIRECT.
-func isAligned(block []byte) bool {
+func isAligned(_ []byte) bool {
 	return true
 }
 
@@ -111,7 +111,7 @@ func PunchHole(f *os.File, offset, length int64) (int64, error) {
 
 // Fadvise on darwin is less flexible than linux in that it's a global, file descriptor
 // based operation.  But we keep the same signature as linux (ignoring offset and the length).
-func Fadvise(fd uintptr, offset Offset_t, length int64, hint FadviseHint) error {
+func Fadvise(fd uintptr, _ Offset_t, _ int64, hint FadviseHint) error {
 	switch hint {
 	case FadvDontNeed:
 		// F_NOCACHE: 1 turns off, 0 turns on

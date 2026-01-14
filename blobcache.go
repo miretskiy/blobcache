@@ -58,6 +58,9 @@ type Cache struct {
 	evictionTrigger chan struct{} // Capacity 1: trigger eviction, blocks when eviction running
 	stopCh          chan struct{}
 	wg              sync.WaitGroup
+
+	// Knobs provides testing hooks. Set directly in tests: c.Knobs = &TestingKnobs{...}
+	Knobs *TestingKnobs
 }
 
 // ErrorReporter interface allows memtable to check/set degraded state
@@ -66,6 +69,12 @@ type ErrorReporter interface {
 	IsDegraded() bool
 	ReportError(error)
 	ReportBlobError(key Key, errno base.BlobErrno)
+}
+
+// SequenceVendor provides monotonic sequence IDs for write ordering.
+// Implement this interface to override the default sequence generation in tests.
+type SequenceVendor interface {
+	NextSeq() uint64
 }
 
 func (c *Cache) IsDegraded() bool {
@@ -89,6 +98,9 @@ func (c *Cache) ReportBlobError(key Key, errno base.BlobErrno) {
 // nextSeq atomically increments and returns the next sequence ID.
 // This is THE source of truth for operation ordering.
 func (c *Cache) nextSeq() uint64 {
+	if c.Knobs != nil && c.Knobs.SequenceVendor != nil {
+		return c.Knobs.SequenceVendor.NextSeq()
+	}
 	return c.globalSeq.Add(1)
 }
 
@@ -146,7 +158,9 @@ func New(path string, opts ...Option) (*Cache, error) {
 	c.librarian = NewLibrarian(cfg.MaxCachedSlabs, c)
 	c.bloom.Store(filter)
 	c.approxSize.Store(totalSize)
+	c.Knobs = cfg.knobs
 	c.memTable = NewMemTable(c.config, c, c, c.librarian)
+	c.memTable.Knobs = c.Knobs
 
 	return c, nil
 }
@@ -523,8 +537,8 @@ func (c *Cache) evictionWorker() {
 func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
 	evictionStart := time.Now()
 
-	if c.testingInjectEvictErr != nil {
-		if err := c.testingInjectEvictErr(); err != nil {
+	if c.Knobs != nil && c.Knobs.InjectEvictErr != nil {
+		if err := c.Knobs.InjectEvictErr(); err != nil {
 			return err
 		}
 	}

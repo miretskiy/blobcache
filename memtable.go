@@ -32,6 +32,7 @@ type MemTable struct {
 	config
 	Batcher
 	ErrorReporter
+	Knobs *TestingKnobs
 
 	segmentID  atomic.Int64
 	slabPool   *MmapPool
@@ -287,8 +288,7 @@ func (mt *MemTable) prepareRotationLocked() func() {
 		mt.mu.maxSealedSeq = old.currentMaxSeq
 	}
 
-	// 3. Seal & Retire Old Slab
-	old.buf.Seal(old.wPos)
+	// 3. Retire Old Slab
 	old.retired.Store(true)
 
 	// 4. Detach Active (Set to nil so nobody touches it while we allocate)
@@ -434,8 +434,8 @@ func (mt *MemTable) processFlush(as *ActiveSlab, writer *SegmentWriter) (*Segmen
 		return writer, nil
 	}
 
-	if mt.testingInjectWriteErr != nil {
-		if err := mt.testingInjectWriteErr(); err != nil {
+	if mt.Knobs != nil && mt.Knobs.InjectWriteErr != nil {
+		if err := mt.Knobs.InjectWriteErr(); err != nil {
 			return writer, err
 		}
 	}
@@ -453,14 +453,14 @@ func (mt *MemTable) processFlush(as *ActiveSlab, writer *SegmentWriter) (*Segmen
 	})
 
 	// 3. Write Physical Slab
-	alignedData := as.buf.AlignedBytes()
+	alignedData := as.buf.AlignedBytes(as.wPos)
 	absoluteRecords, err := writer.WriteSlab(alignedData, records)
 	if err != nil {
 		return writer, fmt.Errorf("physical write failed: %w", err)
 	}
 
-	if mt.testingInjectIndexErr != nil {
-		if err := mt.testingInjectIndexErr(); err != nil {
+	if mt.Knobs != nil && mt.Knobs.InjectIndexErr != nil {
+		if err := mt.Knobs.InjectIndexErr(); err != nil {
 			return writer, err
 		}
 	}

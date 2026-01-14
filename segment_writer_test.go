@@ -121,16 +121,15 @@ func TestSegmentWriter_FullCycle(t *testing.T) {
 		// Slab 1
 		slab1 := pool.Acquire()
 		data1 := []byte("direct-io-block-1")
-		// Use WriteAt instead of Append.
 		slab1.WriteAt(data1, 0)
-		slab1.Seal(int64(len(data1))) // Mark as ready for O_DIRECT.
+		slab1Len := int64(len(data1))
 
 		recs1 := []metadata.BlobRecord{{
 			Hash:        101,
 			Pos:         0,
-			LogicalSize: int64(len(data1)), // Renamed field.
+			LogicalSize: slab1Len,
 		}}
-		_, err = sw.WriteSlab(slab1.AlignedBytes(), recs1)
+		_, err = sw.WriteSlab(slab1.AlignedBytes(slab1Len), recs1)
 		require.NoError(t, err)
 		slab1.Unpin()
 
@@ -138,14 +137,14 @@ func TestSegmentWriter_FullCycle(t *testing.T) {
 		slab2 := pool.Acquire()
 		data2 := []byte("direct-io-block-2")
 		slab2.WriteAt(data2, 0)
-		slab2.Seal(int64(len(data2)))
+		slab2Len := int64(len(data2))
 
 		recs2 := []metadata.BlobRecord{{
 			Hash:        202,
 			Pos:         0,
-			LogicalSize: int64(len(data2)),
+			LogicalSize: slab2Len,
 		}}
-		_, err = sw.WriteSlab(slab2.AlignedBytes(), recs2)
+		_, err = sw.WriteSlab(slab2.AlignedBytes(slab2Len), recs2)
 		require.NoError(t, err)
 		slab2.Unpin()
 

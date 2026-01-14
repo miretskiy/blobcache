@@ -22,7 +22,6 @@ func TestMmapPool_AcquireUnpooled(t *testing.T) {
 		t.Errorf("Expected at least %d bytes, got %d", giantSize, len(buf.raw))
 	}
 
-	buf.Seal(giantSize)
 	buf.Unpin() // Should Munmap via GC/Cleanup instead of returning to channel.
 }
 
@@ -31,7 +30,6 @@ func TestMmapPool_AcquireUnpooled(t *testing.T) {
 func TestMmapBuffer_ReaderRefCounting(t *testing.T) {
 	pool := NewMmapPool("", 1024, 0, 1)
 	buf := pool.Acquire()
-	buf.Seal(1024) // Mark as ready for release once readers finish
 
 	// Create concurrent readers.
 	r1 := buf.NewSectionReader(0, 10)  // refCount = 2
@@ -69,7 +67,6 @@ func TestMmapBuffer_ReaderRefCounting(t *testing.T) {
 func TestMmapPool_SafetyNet(t *testing.T) {
 	pool := NewMmapPool("", 1024, 0, 1)
 	buf := pool.Acquire()
-	buf.Seal(100)
 
 	// Create a reader and leak it (don't call Close).
 	func() {
@@ -116,7 +113,7 @@ func TestMmapBuffer_WriteAt_Stress(t *testing.T) {
 			defer wg.Done()
 			for j := 0; j < iters; j++ {
 				offset := int64((workerID*iters + j) * entrySize)
-				payload := []byte(fmt.Sprintf("w-%02d-i-%03d", workerID, j))
+				payload := fmt.Appendf(nil, "w-%02d-i-%03d", workerID, j)
 
 				buf.WriteAt(payload, offset)
 			}
@@ -124,8 +121,7 @@ func TestMmapBuffer_WriteAt_Stress(t *testing.T) {
 	}
 	wg.Wait()
 
-	// Seal and verify a random entry
-	buf.Seal(concurrency * iters * entrySize)
+	// Verify a random entry
 	checkReader := buf.NewSectionReader(entrySize*5, entrySize)
 	data := make([]byte, len("w-00-i-005"))
 	n, err := io.ReadFull(checkReader, data)

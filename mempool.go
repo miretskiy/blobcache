@@ -16,7 +16,6 @@ import (
 
 type MmapBuffer struct {
 	raw       []byte
-	wPos      atomic.Int64
 	refCount  atomic.Int32 // Changed to Int32 for CAS compatibility
 	pool      *MmapPool
 	onRelease []func()
@@ -60,32 +59,15 @@ func (b *MmapBuffer) Bytes() []byte {
 }
 
 // AlignedBytes returns the slice rounded to the nearest 4KB page.
-func (b *MmapBuffer) AlignedBytes() []byte {
-	off := b.wPos.Load()
-	if off < 0 {
+// The caller provides the write offset (how much valid data is in the buffer).
+func (b *MmapBuffer) AlignedBytes(off int64) []byte {
+	if off <= 0 {
 		return nil
 	}
 	return b.raw[:roundToPage(off)]
 }
 
-// Seal finalizes the buffer size.
-func (b *MmapBuffer) Seal(finalOffset int64) {
-	b.wPos.Store(finalOffset)
-}
-
-func (b *MmapBuffer) Len() int {
-	off := b.wPos.Load()
-	if off < 0 {
-		return 0
-	}
-	return int(off)
-}
-
 func (b *MmapBuffer) Cap() int { return len(b.raw) }
-
-func (b *MmapBuffer) Reset() {
-	b.wPos.Store(-1) // Set back to Active sentinel
-}
 
 func (b *MmapBuffer) Unpin() {
 	if b.refCount.Add(-1) == 0 {
@@ -113,8 +95,6 @@ func (b *MmapBuffer) resetAndRelease() {
 		// which refCount 0 -> -1 protection usually catches first.
 		return
 	}
-
-	b.Reset()
 
 	if b.pool != nil {
 		// POOLED: Return the raw bytes to the pool.
@@ -192,7 +172,6 @@ func NewMmapBuffer(size int64) *MmapBuffer {
 	buf := &MmapBuffer{
 		raw: raw,
 	}
-	buf.Reset()
 	buf.refCount.Store(1)
 	buf.leased.Store(true)
 	return buf
@@ -244,7 +223,6 @@ func (p *MmapPool) Acquire() *MmapBuffer {
 		pool: p,
 	}
 
-	buf.Reset()
 	buf.refCount.Store(1)
 	buf.leased.Store(true)
 

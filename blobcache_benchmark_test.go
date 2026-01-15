@@ -16,7 +16,7 @@ import (
 	"time"
 
 	"github.com/HdrHistogram/hdrhistogram-go"
-	"github.com/miretskiy/blobcache/index"
+	"github.com/miretskiy/blobcache/internal/index"
 	"github.com/miretskiy/blobcache/internal/record"
 	"github.com/shirou/gopsutil/v3/disk"
 	"github.com/shirou/gopsutil/v3/process"
@@ -346,7 +346,7 @@ func BenchmarkEviction_SieveVictimSelection(b *testing.B) {
 	tmpDir := b.TempDir()
 	defer os.RemoveAll(tmpDir)
 
-	idx, err := index.NewIndex(tmpDir)
+	idx, err := index.Open(tmpDir, 1_000_000)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -393,7 +393,7 @@ func BenchmarkEviction_SieveVictimSelection(b *testing.B) {
 
 	// Mark some as visited to exercise Sieve skipping logic
 	for i := 0; i < b.N; i += 7 {
-		idx.Get(uint64(i))
+		idx.DeprecatedGetByHash(uint64(i))
 	}
 
 	b.Logf("Index populated: %d entries across %d segments", b.N, currentSegID)

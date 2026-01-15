@@ -52,7 +52,7 @@ func TestCache_SelfHealing_OnCorruption(t *testing.T) {
 	cache.Drain()
 
 	// 1. Manually corrupt the storage by deleting the segment file
-	entry, ok := cache.index.Get(h)
+	entry, ok := cache.index.DeprecatedGetByHash(h)
 	require.True(t, ok)
 
 	// Use shard-aware path helper
@@ -67,7 +67,7 @@ func TestCache_SelfHealing_OnCorruption(t *testing.T) {
 	require.False(t, found, "Get should return false after storage failure")
 
 	// 3. Verify blob is marked as corrupt but still in index
-	entry, inIndex := cache.index.Get(h)
+	entry, inIndex := cache.index.DeprecatedGetByHash(h)
 	require.True(t, inIndex, "Index entry should still exist")
 	require.True(t, entry.HasError(), "Blob should be marked as corrupt")
 	require.NotEqual(t, base.ErrNone, entry.Errno(), "Errno should be set")
@@ -148,7 +148,7 @@ func TestCache_HolePunching_Physical(t *testing.T) {
 
 	// Get entry info
 	h := cache.KeyHasher(key)
-	entry, ok := cache.index.Get(h)
+	entry, ok := cache.index.DeprecatedGetByHash(h)
 	require.True(t, ok)
 
 	segmentPath := getSegmentPath(tmpDir, cache.Shards, entry.SegmentID)
@@ -235,7 +235,7 @@ func TestCache_Compression_Zstd(t *testing.T) {
 
 	// Verify compression actually happened by checking stored size
 	h := cache.KeyHasher(key)
-	entry, ok := cache.index.Get(h)
+	entry, ok := cache.index.DeprecatedGetByHash(h)
 	require.True(t, ok)
 
 	t.Logf("LogicalSize: %d, PhysicalSize: %d, Ratio: %.2f%%",
@@ -276,7 +276,7 @@ func TestCache_Compression_IncompressibleData(t *testing.T) {
 
 	// Check that it was stored uncompressed (1/8th heuristic aborted)
 	h := cache.KeyHasher(key)
-	entry, ok := cache.index.Get(h)
+	entry, ok := cache.index.DeprecatedGetByHash(h)
 	require.True(t, ok)
 
 	t.Logf("LogicalSize: %d, PhysicalSize: %d, IsCompressed: %v",
@@ -315,7 +315,7 @@ func TestCache_Compression_SmallBlob_NoCompress(t *testing.T) {
 
 	// Verify it was NOT compressed due to size threshold
 	h := cache.KeyHasher(key)
-	entry, ok := cache.index.Get(h)
+	entry, ok := cache.index.DeprecatedGetByHash(h)
 	require.True(t, ok)
 
 	require.False(t, entry.IsCompressed(), "small blob should not be compressed")
@@ -346,7 +346,7 @@ func TestCache_Compression_MinSizeZero_NoRestriction(t *testing.T) {
 
 	// Verify it WAS compressed despite being small (MinSize=0 disables restriction)
 	h := cache.KeyHasher(key)
-	entry, ok := cache.index.Get(h)
+	entry, ok := cache.index.DeprecatedGetByHash(h)
 	require.True(t, ok)
 
 	t.Logf("LogicalSize: %d, PhysicalSize: %d, IsCompressed: %v",
@@ -402,7 +402,7 @@ func TestCache_Compression_LZ4(t *testing.T) {
 	require.Equal(t, original, result)
 
 	h := cache.KeyHasher(key)
-	entry, _ := cache.index.Get(h)
+	entry, _ := cache.index.DeprecatedGetByHash(h)
 
 	t.Logf("LogicalSize: %d, PhysicalSize: %d, Ratio: %.2f%%",
 		entry.LogicalSize, entry.PhysicalSize,

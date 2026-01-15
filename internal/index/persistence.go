@@ -11,21 +11,29 @@ import (
 	"github.com/miretskiy/blobcache/internal/record"
 )
 
-const (
-	// maxValueSize defines the maximum size for a Bitcask value (64KB).
-	maxValueSize = 64 << 10
-)
+// maxChunkSize is the maximum size for a Bitcask value (default 64KB).
+var maxChunkSize uint64 = 64 << 10
 
-// maxBlobsPerSegment is the number of footer entries we can pack into one Bitcask entry.
-var maxBlobsPerSegment = (maxValueSize - record.SegmentFooterHeaderSize) / record.FooterEntrySize
+// footerEntrySize returns the serialized size of a FooterEntry.
+// Currently fixed at 48 bytes, but will support variable-length keys in the future.
+func footerEntrySize(e *record.FooterEntry) int {
+	// For now, all entries are fixed size (48 bytes).
+	// When 128-bit keys are added, this will compute: 48 + len(key)
+	return record.FooterEntrySize
+}
 
-func testingSetMaxBlobsPerSegment(n int) func() {
-	old := maxBlobsPerSegment
-	maxBlobsPerSegment = n
+// testingSetMaxChunkSize sets a custom max chunk size for testing.
+// Usage: defer testingSetMaxChunkSize(123)()
+func testingSetMaxChunkSize(size uint64) func() {
+	old := maxChunkSize
+	maxChunkSize = size
 	return func() {
-		maxBlobsPerSegment = old
+		maxChunkSize = old
 	}
 }
+
+// ScanSegmentFn is the callback for scanning segment records.
+type ScanSegmentFn func(record.SegmentFooter) bool
 
 type persistence struct {
 	db *bitcask.Bitcask
@@ -34,7 +42,7 @@ type persistence struct {
 func newPersistence(basePath string) (*persistence, error) {
 	dbPath := filepath.Join(basePath, "db")
 	// Bitcask's MaxValueSize ensures individual records stay within 64KB
-	db, err := bitcask.Open(dbPath, bitcask.WithMaxValueSize(maxValueSize))
+	db, err := bitcask.Open(dbPath, bitcask.WithMaxValueSize(maxChunkSize))
 	if err != nil {
 		return nil, fmt.Errorf("failed to open bitcask: %w", err)
 	}
@@ -88,16 +96,31 @@ func (p *persistence) DeleteRecordsFromSegment(segID int64, hashes map[uint64]st
 	}
 
 	var chunkIdx int64
-	for i := 0; i < len(liveEntries); i++ {
-		currentFooter.Entries = append(currentFooter.Entries, liveEntries[i])
+	currentSize := record.SegmentFooterHeaderSize
 
-		if len(currentFooter.Entries) >= maxBlobsPerSegment || i == len(liveEntries)-1 {
+	for i := 0; i < len(liveEntries); i++ {
+		entrySize := footerEntrySize(&liveEntries[i])
+
+		// Check if adding this entry would exceed the limit (and we have entries to flush)
+		if uint64(currentSize+entrySize) > maxChunkSize && len(currentFooter.Entries) > 0 {
 			data := record.AppendSegmentFooter(nil, currentFooter)
 			if err := txn.Put(p.makeKey(segID, chunkIdx), data); err != nil {
 				return err
 			}
 			chunkIdx++
-			currentFooter.Entries = currentFooter.Entries[:0] // Use [:0] to keep capacity
+			currentFooter.Entries = currentFooter.Entries[:0]
+			currentSize = record.SegmentFooterHeaderSize
+		}
+
+		currentFooter.Entries = append(currentFooter.Entries, liveEntries[i])
+		currentSize += entrySize
+
+		// Flush on last entry
+		if i == len(liveEntries)-1 {
+			data := record.AppendSegmentFooter(nil, currentFooter)
+			if err := txn.Put(p.makeKey(segID, chunkIdx), data); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -129,6 +152,9 @@ func (p *persistence) writeBatch(segID int64, batch []record.FooterEntry) error 
 	// This ensures the keys are [SegID][0], [SegID][1], etc.
 	var chunkIdx int64
 
+	// Track current chunk size (header is always present)
+	currentSize := record.SegmentFooterHeaderSize
+
 	flush := func() error {
 		if len(currentFooter.Entries) == 0 {
 			return nil
@@ -138,18 +164,24 @@ func (p *persistence) writeBatch(segID int64, batch []record.FooterEntry) error 
 			return err
 		}
 		currentFooter.Entries = currentFooter.Entries[:0]
+		currentSize = record.SegmentFooterHeaderSize
 		chunkIdx++
 		return nil
 	}
 
-	for _, entry := range batch {
-		currentFooter.Entries = append(currentFooter.Entries, entry)
-		if len(currentFooter.Entries) >= maxBlobsPerSegment {
+	for i := range batch {
+		entrySize := footerEntrySize(&batch[i])
+
+		// Check if adding this entry would exceed the limit
+		if uint64(currentSize+entrySize) > maxChunkSize && len(currentFooter.Entries) > 0 {
 			if err := flush(); err != nil {
 				return err
 			}
 			currentFooter.CTime = time.Now().Unix()
 		}
+
+		currentFooter.Entries = append(currentFooter.Entries, batch[i])
+		currentSize += entrySize
 	}
 
 	if err := flush(); err != nil {

@@ -17,7 +17,9 @@ func TestPersistence(t *testing.T) {
 
 	t.Run("BatchSplitting", func(t *testing.T) {
 		segID := int64(100)
-		count := maxBlobsPerSegment + 5
+		// Calculate how many entries fit in default chunk size
+		entriesPerChunk := (maxChunkSize - record.SegmentFooterHeaderSize) / record.FooterEntrySize
+		count := int(entriesPerChunk) + 5
 		batch := make([]record.FooterEntry, count)
 		for i := 0; i < count; i++ {
 			batch[i] = record.FooterEntry{Hash: uint64(i), LogicalSize: 100}
@@ -96,8 +98,8 @@ func TestDeleteRecordsFromSegment_Collapse(t *testing.T) {
 	require.NoError(t, err)
 	defer os.RemoveAll(path)
 
-	// Override global limit for this test
-	defer testingSetMaxBlobsPerSegment(10)()
+	// Override global limit for this test: header(16) + 10 entries * 48 bytes = 496 bytes
+	defer testingSetMaxChunkSize(16 + 10*record.FooterEntrySize)()
 
 	p, err := newPersistence(path)
 	require.NoError(t, err)
@@ -144,4 +146,43 @@ func TestDeleteRecordsFromSegment_Collapse(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, 1, finalCount, "Should have collapsed from 3 chunks to 1")
 	assert.Equal(t, 5, totalLive, "Should only have 5 entries remaining in persistence")
+}
+
+func TestDurableIndex(t *testing.T) {
+	tmp := t.TempDir()
+
+	// Create and populate index
+	idx, err := Open(tmp, 1000)
+	require.NoError(t, err)
+
+	segID := int64(1)
+	batch := []record.FooterEntry{
+		{Hash: 100, Pos: 0, PhysicalSize: 100},
+		{Hash: 200, Pos: 100, PhysicalSize: 200},
+		{Hash: 300, Pos: 300, PhysicalSize: 150},
+	}
+
+	err = idx.IngestBatch(segID, batch)
+	require.NoError(t, err)
+
+	// Verify in-memory lookup
+	item, ok := idx.DeprecatedGetByHash(200)
+	require.True(t, ok)
+	require.Equal(t, int64(200), item.PhysicalSize)
+	require.Equal(t, segID, item.SegmentID)
+
+	require.Equal(t, 3, idx.Len())
+
+	// Close and reopen
+	require.NoError(t, idx.Close())
+
+	idx2, err := Open(tmp, 1000)
+	require.NoError(t, err)
+	defer idx2.Close()
+
+	// Verify data survived
+	require.Equal(t, 3, idx2.Len())
+	item, ok = idx2.DeprecatedGetByHash(200)
+	require.True(t, ok)
+	require.Equal(t, int64(200), item.PhysicalSize)
 }

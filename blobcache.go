@@ -13,7 +13,7 @@ import (
 
 	"github.com/miretskiy/blobcache/base"
 	"github.com/miretskiy/blobcache/bloom"
-	"github.com/miretskiy/blobcache/index"
+	"github.com/miretskiy/blobcache/internal/index"
 	"github.com/miretskiy/blobcache/internal/record"
 	"github.com/miretskiy/blobcache/internal/sys"
 )
@@ -28,7 +28,7 @@ const (
 // Cache is a high-performance blob storage with bloom filter optimization
 type Cache struct {
 	config
-	index   *index.Index
+	index   *index.DurableIndex
 	storage *Storage
 	bloom   struct {
 		atomic.Pointer[bloom.Filter]
@@ -206,12 +206,18 @@ func (c *Cache) Drain() {
 }
 
 // checkOrInitialize ensures directory structure exists and validates configuration
-func checkOrInitialize(cfg config) (*index.Index, error) {
+func checkOrInitialize(cfg config) (*index.DurableIndex, error) {
 	markerPath := filepath.Join(cfg.Path, ".initialized")
+
+	// Use BloomEstimatedKeys as index capacity hint
+	capacityHint := cfg.BloomEstimatedKeys
+	if capacityHint < 1024 {
+		capacityHint = 1024
+	}
 
 	// Check if already initialized
 	if _, err := os.Stat(markerPath); err == nil {
-		return index.NewIndex(cfg.Path)
+		return index.Open(cfg.Path, capacityHint)
 	}
 
 	// Not initialized - create directory structure
@@ -222,7 +228,7 @@ func checkOrInitialize(cfg config) (*index.Index, error) {
 		}
 	}
 
-	idx, err := index.NewIndex(cfg.Path)
+	idx, err := index.Open(cfg.Path, capacityHint)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open index: %w", err)
 	}
@@ -253,7 +259,7 @@ func (c *Cache) search(key []byte) (data []byte, r io.Reader, rel Releaser, ok b
 	}
 
 	// 3. Disk Hit (Storage)
-	entry, found := c.index.Get(h)
+	entry, found := c.index.DeprecatedGetByHash(h)
 	if !found {
 		// BLOOM GHOST: Bloom said yes, Index said no.
 		c.bloom.ghosts.Add(1)
@@ -373,7 +379,7 @@ func (c *Cache) putWithRetry(h Key, value []byte, checksum *uint32) {
 
 		// Zombie Investigation: Check if a newer version exists in the global index.
 		// If it does, we "succeeded" (last write wins, our data is obsolete).
-		if existing, found := c.index.Get(h); found && existing.SeqID >= seqID {
+		if existing, found := c.index.DeprecatedGetByHash(h); found && existing.SeqID >= seqID {
 			return
 		}
 
@@ -413,7 +419,7 @@ func (c *Cache) triggerEviction() {
 	}
 }
 
-func (c *Cache) handleStorageError(h Key, e index.Entry, err error) {
+func (c *Cache) handleStorageError(h Key, e index.Item, err error) {
 	// 1. Transient errors: Skip and retry later
 	if sys.IsTransientIOError(err) {
 		log.Error("transient storage error (skipping)", "hash", h, "error", err)
@@ -557,7 +563,7 @@ func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
 	toEvictBytes := currentSize - target
 
 	var (
-		victims             []index.Entry
+		victims             []index.Item
 		evictedBytes        int64
 		physicallyReclaimed int64
 	)

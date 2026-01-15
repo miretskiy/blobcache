@@ -37,8 +37,7 @@ func makeTestKey(i int) Key {
 
 func makeItem(segmentID int64, physSize int64) Item {
 	return Item{
-		Header: record.Header{
-			Magic:        record.RecordMagic,
+		FooterEntry: record.FooterEntry{
 			PhysicalSize: physSize,
 		},
 		SegmentID: segmentID,

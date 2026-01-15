@@ -36,11 +36,14 @@ const (
 type Key [16]byte
 
 // Item holds the in-memory metadata for a blob entry.
-// Embeds record.Header for single source of truth on record fields.
+// Embeds record.FooterEntry for direct persistence mapping.
+//
+// NOTE: Item.Hash is redundant with the map key (Key [16]byte), but we keep it
+// because FooterEntry.Hash is required for on-disk format. When we upgrade to
+// 128-bit hashes, FooterEntry.Hash will also change.
 type Item struct {
-	record.Header       // Magic, Flags, SeqID, KeyLen, PhysicalLen, LogicalLen
-	SegmentID     int64 // Which segment file contains this blob
-	Pos           int64 // Byte offset to record header in segment
+	record.FooterEntry        // Hash, Pos, LogicalSize, PhysicalSize, SeqID, Flags
+	SegmentID          int64  // Which segment file contains this blob
 }
 
 // BlobIndex is the main entry point for the in-memory index.

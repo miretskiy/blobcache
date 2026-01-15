@@ -11,18 +11,18 @@ import (
 
 	"github.com/miretskiy/blobcache/base"
 	"github.com/miretskiy/blobcache/compression"
-	"github.com/miretskiy/blobcache/index"
+	"github.com/miretskiy/blobcache/internal/index"
 	"github.com/miretskiy/blobcache/internal/record"
 	"github.com/miretskiy/blobcache/internal/sys"
 )
 
 type Storage struct {
 	config
-	index *index.Index
+	index *index.DurableIndex
 	cache sync.Map // segmentID (int64) -> SegmentFile
 }
 
-func NewStorage(cfg config, idx *index.Index) *Storage {
+func NewStorage(cfg config, idx *index.DurableIndex) *Storage {
 	s := Storage{config: cfg, index: idx}
 	return &s
 }
@@ -45,7 +45,7 @@ func (s *Storage) Close() error {
 // ReadBlob returns an io.Reader for the specified index entry.
 // It handles segment file lookup, kernel prefetching hints, decompression, and checksum verification.
 // The caller MUST call the returned Releaser when done with the reader.
-func (s *Storage) ReadBlob(e index.Entry) (io.Reader, Releaser, error) {
+func (s *Storage) ReadBlob(e index.Item) (io.Reader, Releaser, error) {
 	sf, err := s.getSegmentFile(e.SegmentID)
 	if err != nil {
 		return nil, Releaser{}, fmt.Errorf("storage: segment %d not found: %w", e.SegmentID, err)

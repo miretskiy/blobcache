@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/miretskiy/blobcache/index"
+	"github.com/miretskiy/blobcache/internal/index"
 	"github.com/miretskiy/blobcache/internal/record"
 )
 
@@ -35,7 +35,7 @@ func RecoverIndex(path string, opts ...Option) (*Cache, error) {
 	}
 
 	// Create a raw Index. We talk to this directly, bypassing c.PutBatch().
-	recoveryIdx, err := index.NewIndex(tempParentPath)
+	recoveryIdx, err := index.Open(tempParentPath, 100000)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create recovery index: %w", err)
 	}
@@ -89,7 +89,7 @@ func RecoverIndex(path string, opts ...Option) (*Cache, error) {
 
 	// 4. Final Assembly
 	// Re-open the index at the proper path
-	idx, err := index.NewIndex(path)
+	idx, err := index.Open(path, 100000)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open recovered index: %w", err)
 	}
@@ -113,7 +113,7 @@ func RecoverIndex(path string, opts ...Option) (*Cache, error) {
 
 	// Set starting size by scanning the index truth
 	var totalSize int64
-	c.index.ForEachBlob(func(e index.Entry) bool {
+	c.index.ForEachBlob(func(e index.Item) bool {
 		totalSize += e.LogicalSize
 		return true
 	})

@@ -5,7 +5,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/miretskiy/blobcache/index"
+	"github.com/miretskiy/blobcache/internal/index"
 	"github.com/miretskiy/blobcache/internal/record"
 )
 
@@ -20,7 +20,7 @@ func Benchmark_BloomRebuild(b *testing.B) {
 			tmpDir, _ := os.MkdirTemp("", "bloom-rebuild-*")
 			defer os.RemoveAll(tmpDir)
 
-			idx, _ := index.NewIndex(tmpDir)
+			idx, _ := index.Open(tmpDir, numKeys)
 			defer idx.Close()
 
 			// Populate with "Mixed" hashes to simulate real entropy
@@ -53,7 +53,7 @@ func Benchmark_BloomRebuild(b *testing.B) {
 				// REBUILD PATH: Use the Skipmap Range.
 				// It's all in RAM and pointer-stable, so it's the fastest way
 				// to populate the filter.
-				idx.ForEachBlob(func(v index.Entry) bool {
+				idx.ForEachBlob(func(v index.Item) bool {
 					filter.AddHash(v.Hash) // Use AddHash to skip internal mixer if already mixed
 					return true
 				})

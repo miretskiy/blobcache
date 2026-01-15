@@ -258,7 +258,7 @@ func TestCache_RetryLoop_IdempotentSuccess(t *testing.T) {
 	cache.Drain()
 
 	// Verify it's in the index with seqID=101
-	existingRecord, found := cache.index.Get(h)
+	existingRecord, found := cache.index.DeprecatedGetByHash(h)
 	require.True(t, found)
 	require.Equal(t, uint64(101), existingRecord.SeqID)
 
@@ -268,7 +268,7 @@ func TestCache_RetryLoop_IdempotentSuccess(t *testing.T) {
 	cache.Drain()
 
 	// Verify the index now has seqID=200
-	existingRecord, found = cache.index.Get(h)
+	existingRecord, found = cache.index.DeprecatedGetByHash(h)
 	require.True(t, found)
 	require.Equal(t, uint64(200), existingRecord.SeqID)
 

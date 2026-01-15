@@ -21,13 +21,13 @@ func Benchmark_IndexLookup(b *testing.B) {
 			tmpDir, _ := os.MkdirTemp("", "bench-index-lookup-*")
 			defer os.RemoveAll(tmpDir)
 
-			idx, _ := NewIndex(tmpDir)
+			idx, _ := Open(tmpDir, numKeys)
 			defer idx.Close()
 
 			// Prepare Batch
 			entries := make([]record.FooterEntry, numKeys)
 			for i := 0; i < numKeys; i++ {
-				// Mix the SegmentID to simulate xxHash entropy
+				// Mix the hash to simulate xxHash entropy
 				h := uint64(i) * 0x9e3779b97f4a7c15
 				entries[i] = record.FooterEntry{
 					Hash:        h,
@@ -56,7 +56,7 @@ func Benchmark_IndexLookup(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				// Re-mix to find the actual key
 				h := uint64(i%numKeys) * 0x9e3779b97f4a7c15
-				val, ok := idx.Get(h)
+				val, ok := idx.DeprecatedGetByHash(h)
 				if !ok {
 					b.Fatalf("Lookup failed for hash %d", h)
 				}

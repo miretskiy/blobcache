@@ -1,11 +1,3 @@
-// Segment file format definitions.
-//
-// Structure:
-//
-//	[ FILE HEADER (8B) ] [ RECORD STREAM ] [ ENVELOPE (var) ] [ TRAILER (40B) ]
-//
-// The Envelope is written only on clean close and enables O(1) index rebuild.
-// If missing (crash), recovery falls back to linear record scanning.
 package record
 
 import (
@@ -40,6 +32,15 @@ var FileHeaderBytes = [FileHeaderSize]byte{
 	0x53, 0xC4, 0x0B, 0xB1, // FileMagic (little-endian)
 	0x01, 0x00, 0x00, 0x00, // FileVersion (little-endian)
 }
+
+// Segment file format definitions.
+//
+// Structure:
+//
+//	[ FILE HEADER (8B) ] [ RECORD STREAM ] [ ENVELOPE (var) ] [ TRAILER (40B) ]
+//
+// The Envelope is written only on clean close and enables O(1) index rebuild.
+// If missing (crash), recovery falls back to linear record scanning.
 
 // Segment errors.
 var (
@@ -428,9 +429,9 @@ func roundToPage(size int64) int64 {
 //
 // BRIDGE: Matches metadata.ReadSegmentFooterFromFile for backward compatibility.
 func ReadSegmentFooterFromFile(
-	file interface {
-		ReadAt([]byte, int64) (int, error)
-	}, fileSize int64, segmentID int64,
+		file interface {
+	ReadAt([]byte, int64) (int, error)
+}, fileSize int64, segmentID int64,
 ) (SegmentFooter, int64, error) {
 	if fileSize < int64(LegacyFooterSize) {
 		return SegmentFooter{}, 0, errors.New("record: file too small for footer")

@@ -7,8 +7,11 @@ import (
 	"strings"
 
 	"github.com/miretskiy/blobcache/index"
-	"github.com/miretskiy/blobcache/metadata"
+	"github.com/miretskiy/blobcache/internal/record"
 )
+
+// TODO: Code is sloopy and probably wrong; ignroing errors is a no-no.
+// Iterating over all blobs to compute total size -- not needed, I think.
 
 // RecoverIndex scans all segment mu and rebuilds the index from scratch.
 // It bypasses Cache-level orchestration (eviction/bloom) to ensure a clean rebuild.
@@ -67,7 +70,7 @@ func RecoverIndex(path string, opts ...Option) (*Cache, error) {
 
 			// USE THE LOWER LEVEL PRIMITIVE:
 			// IngestBatch directly updates the Skipmap/Sieve metadata.
-			if err := recoveryIdx.IngestBatch(segment.SegmentID, segment.Records); err != nil {
+			if err := recoveryIdx.IngestBatch(segment.SegmentID, segment.Entries); err != nil {
 				recoveryIdx.Close()
 				return nil, fmt.Errorf("recovery ingestion failed for seg %d: %w", segment.SegmentID, err)
 			}
@@ -121,20 +124,20 @@ func RecoverIndex(path string, opts ...Option) (*Cache, error) {
 }
 
 // readSegmentFooter reads and validates a segment file's footer
-// Returns the SegmentRecord if valid, or an error if corrupt/incomplete
-func readSegmentFooter(path string, segmentID int64) (metadata.SegmentRecord, error) {
+// Returns the SegmentFooter if valid, or an error if corrupt/incomplete
+func readSegmentFooter(path string, segmentID int64) (record.SegmentFooter, error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return metadata.SegmentRecord{}, err
+		return record.SegmentFooter{}, err
 	}
 	defer file.Close()
 
 	stat, err := file.Stat()
 	if err != nil {
-		return metadata.SegmentRecord{}, err
+		return record.SegmentFooter{}, err
 	}
 
-	segment, _, err := metadata.ReadSegmentFooterFromFile(file, stat.Size(), segmentID)
+	segment, _, err := record.ReadSegmentFooterFromFile(file, stat.Size(), segmentID)
 	return segment, err
 }
 

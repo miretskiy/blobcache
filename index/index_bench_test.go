@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/miretskiy/blobcache/metadata"
+	"github.com/miretskiy/blobcache/internal/record"
 )
 
 // Benchmark_IndexLookup compares index Get() performance
@@ -25,12 +25,11 @@ func Benchmark_IndexLookup(b *testing.B) {
 			defer idx.Close()
 
 			// Prepare Batch
-			// Note: We use metadata.BlobRecord directly to feed IngestBatch
-			records := make([]metadata.BlobRecord, numKeys)
+			entries := make([]record.FooterEntry, numKeys)
 			for i := 0; i < numKeys; i++ {
 				// Mix the SegmentID to simulate xxHash entropy
 				h := uint64(i) * 0x9e3779b97f4a7c15
-				records[i] = metadata.BlobRecord{
+				entries[i] = record.FooterEntry{
 					Hash:        h,
 					Pos:         int64(i * 1024),
 					LogicalSize: 1024,
@@ -46,7 +45,7 @@ func Benchmark_IndexLookup(b *testing.B) {
 				if end > numKeys {
 					end = numKeys
 				}
-				if err := idx.IngestBatch(int64(i/batchSize), records[i:end]); err != nil {
+				if err := idx.IngestBatch(int64(i/batchSize), entries[i:end]); err != nil {
 					b.Fatal(err)
 				}
 			}

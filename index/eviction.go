@@ -5,7 +5,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/miretskiy/blobcache/metadata"
+	"github.com/miretskiy/blobcache/internal/record"
 )
 
 // node is internal to the eviction policy. It "owns" the Entry data.
@@ -21,9 +21,9 @@ var nodePool = sync.Pool{
 }
 
 // newNode is an internal helper for the policy factory
-func newNode(rec metadata.BlobRecord, segID int64) *node {
+func newNode(entry record.FooterEntry, segID int64) *node {
 	n := nodePool.Get().(*node)
-	n.entry = Entry{BlobRecord: rec, SegmentID: segID}
+	n.entry = Entry{FooterEntry: entry, SegmentID: segID}
 	n.visited.Store(false)
 	n.next, n.prev = nil, nil
 	return n
@@ -40,7 +40,7 @@ func (p *sievePolicy) Add(entry Entry) *node {
 	p.Lock()
 	defer p.Unlock()
 
-	n := newNode(entry.BlobRecord, entry.SegmentID)
+	n := newNode(entry.FooterEntry, entry.SegmentID)
 	n.prev = p.head
 	if p.head != nil {
 		p.head.next = n

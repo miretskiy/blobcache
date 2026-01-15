@@ -83,10 +83,39 @@ v
 
 The Index is the "control plane" of BlobCache. It coordinates between sub-nanosecond RAM lookups and the Bitcask-powered durable metadata log. It is designed to be highly concurrent, crash-consistent, and memory-efficient.
 
-### 4.1 High-Speed Lookup (Skipmap)
-At the core of the Index is a **Lock-Free Skipmap** (`skipmap.Uint64Map`).
-* **Why Skipmap?** Standard Go maps require a global mutex or complex sharding for high concurrency. The skipmap allows multiple goroutines to perform O(log N) lookups and insertions simultaneously without heavy lock contention.
-* **The Pointer Handshake:** The skipmap stores a pointer to a `*node`. This node is shared between the lookup map and the eviction policy, ensuring that "visited" bits and metadata updates are visible to both structures instantly.
+### 4.1 High-Speed Lookup (Sharded Arena Index)
+
+At the core of the Index is a **256-Shard Arena-Backed Hash Table** (`internal/index.BlobIndex`).
+
+**Why Sharded Arenas?**
+
+* **GC Optimization**: Go's garbage collector must scan all heap pointers. A skipmap with millions of `*node` pointers creates substantial GC pressure (scan time grows linearly with pointer count). The arena design eliminates heap pointers entirely—nodes use `uint32` indices into pre-allocated slices, making the data structure "scan-free" from the GC's perspective.
+
+* **Cache Efficiency**: Arena-backed nodes are contiguous in memory, improving CPU cache hit rates during iteration (eviction scans). Pointer-chasing in a skipmap causes cache misses on every hop.
+
+* **Bounded Lock Hold Times**: Each shard has its own `RWMutex`. With 256 shards and XXHash3's uniform distribution, contention is near-zero even under high concurrency. The eviction algorithm limits work per lock hold to 64 items (~13µs), preventing priority inversion.
+
+**The Architecture**:
+
+```go
+type BlobIndex struct {
+    shards [256]shard  // Independent locks + arenas
+}
+
+type shard struct {
+    mu       sync.RWMutex
+    items    map[Key]uint32  // Key -> Arena Index (O(1) lookup)
+    nodes    []node          // Arena: contiguous, no pointers
+    freeHead uint32          // Free list for node reuse
+    hand     uint32          // SIEVE cursor position
+    head     uint32          // Circular list head (newest)
+}
+```
+
+**Key Operations**:
+- `Get()`: RLock + map lookup + atomic visited bit (~20ns uncontended)
+- `Put()`: Lock + map insert + arena alloc (~50ns uncontended)
+- `EvictBatch()`: Hybrid strategy (Random Greedy for small targets, Proportional Fair for large)
 
 
 
@@ -98,19 +127,25 @@ While blobs are stored in large Segment files, their metadata is stored in a **B
 * **Atomic Transactions:** Ingestion batches and eviction sets are committed via transactions, preventing index pointers from referencing non-durable data.
 
 ### 4.3 The Sieve Eviction Policy
-BlobCache implements the **Sieve Algorithm** (a modern "Cache-Conscious" alternative to LRU) to manage the RAM footprint.
+BlobCache implements the **SIEVE/Clock Algorithm** (a modern "Cache-Conscious" alternative to LRU) to manage the RAM footprint.
 
-**The Sieve Data Structure**
-The `sievePolicy` maintains a doubly-linked FIFO list of nodes. Unlike LRU, Sieve only sets a boolean `visited` flag via an atomic operation.
+**The Arena-Backed Sieve Structure**
+
+Each shard maintains a circular doubly-linked list of nodes using arena indices (not pointers). The `hand` cursor walks the list looking for "cold" victims.
 
 ```go
 type node struct {
-entry   Entry
-visited atomic.Bool
-next    *node
-prev    *node
+    key     Key              // Back-reference for eviction callbacks
+    item    Item             // Blob metadata (embeds record.Header)
+    next    uint32           // Arena index (not pointer!)
+    prev    uint32           // Arena index (not pointer!)
+    visited atomic.Uint32    // 0=cold (evictable), 1=hot (skip)
 }
 ```
+
+**Hybrid Eviction Strategy**:
+- **Small targets (<64KB)**: Random Greedy—pick a random start shard, evict until target met
+- **Large targets (≥64KB)**: Proportional Fair—each shard pays its fair share of the quota
 
 **The Eviction Algorithm (The "Hand")**
 
@@ -146,10 +181,18 @@ STEP 3: POST-EVICTION
 ```
 
 ### 4.4 Memory Footprint
-For a system targeting **8 Million Entries** on **1TB of NVMe**, the Resident Set Size (RSS) overhead is $\approx 1.1GB$ ($1000:1$ efficiency ratio).
+For a system targeting **8 Million Entries** on **1TB of NVMe**, the Resident Set Size (RSS) overhead is $\approx 900MB$ ($1100:1$ efficiency ratio).
 
-**1. Per-Node Memory:** ~97 bytes (Entry struct, pointers, visited flag, skipmap overhead).
-**2. Total Index Overhead:** ~800MB for Skipmap + Nodes, ~9.6MB for Bloom Filter, ~256MB for Bitcask KeyDir.
+**Per-Node Memory (Arena Design):**
+- `Key` (16 bytes) + `Item` (64 bytes) + indices (8 bytes) + visited (4 bytes) ≈ **92 bytes**
+- Map overhead per entry ≈ 32 bytes
+- **Total per entry:** ~124 bytes (vs ~150+ bytes for skipmap with pointers)
+
+**Total Index Overhead:**
+- Arena nodes: 8M × 92 bytes = ~736MB
+- Map overhead: 8M × 32 bytes = ~256MB
+- Bloom Filter: ~9.6MB
+- **GC benefit:** Near-zero scan time (no heap pointers in arena)
 
 ### 4.5 Start up and Crash Recovery
 `NewIndex` performs a **Persistence Scan**:
@@ -287,17 +330,28 @@ The **Segment Footer** is a page-aligned (4KB) block at the absolute EOF. If the
 ```text
 SEGMENT METADATA BLOCK (N * 4KB Aligned)
 +-----------------------------------------------------------+
-| Segment Header (ID, CTime)                      [16 bytes]|
+| Segment Header (SegmentID, CTime)               [16 bytes]|
 +-----------------------------------------------------------+
-| Blob Record 0 (Hash, Pos, Size, Flags)          [32 bytes]|
+| Footer Entry 0 (48 bytes each):                           |
+|   - Hash         (8B)  Key hash (xxhash)                  |
+|   - Pos          (8B)  Byte offset in segment             |
+|   - LogicalSize  (8B)  Uncompressed size                  |
+|   - PhysicalSize (8B)  Compressed size on disk            |
+|   - SeqID        (8B)  Monotonic sequence ID              |
+|   - Flags        (8B)  Compression, deleted, CRC32        |
 +-----------------------------------------------------------+
-| Alignment Padding (Zeros)                       [Variable]|
+| Footer Entry 1 ...                              [48 bytes]|
 +-----------------------------------------------------------+
-| FOOTER (Fixed 20 bytes at absolute EOF):                  |
+| Alignment Padding (Zeros to 4KB boundary)       [Variable]|
++-----------------------------------------------------------+
+| TAIL (Fixed 20 bytes at absolute EOF):                    |
 |   - Record Data Length                          [8 bytes] |
+|   - CRC32 Checksum                              [4 bytes] |
 |   - Magic Number (0xB10BCA4EB10BCA4E)           [8 bytes] |
 +-----------------------------------------------------------+
 ```
+
+Each **Footer Entry** (48 bytes) provides sufficient metadata for index reconstruction without scanning record headers.
 
 ### 6.3 Direct I/O & The Latency Paradox
 BlobCache utilizes `O_DIRECT`. This introduces the **Direct I/O Paradox**: By choosing the slowest physical path to the disk (bypassing the Page Cache), we achieve the highest possible application throughput.

@@ -12,6 +12,7 @@ import (
 	"github.com/miretskiy/blobcache/base"
 	"github.com/miretskiy/blobcache/compression"
 	"github.com/miretskiy/blobcache/index"
+	"github.com/miretskiy/blobcache/internal/record"
 	"github.com/miretskiy/blobcache/internal/sys"
 )
 
@@ -51,16 +52,18 @@ func (s *Storage) ReadBlob(e index.Entry) (io.Reader, Releaser, error) {
 	}
 
 	// 1. Kernel Hinting (Hybrid I/O)
-	// Use PhysicalSize - this is the actual bytes stored on disk.
-	// Fadvise is advisory - errors are logged but not fatal.
+	// Prefetch header + value. Fadvise is advisory - errors are logged but not fatal.
 	if s.IO.Fadvise {
-		if err := sys.Fadvise(sf.file.Fd(), sys.Offset_t(e.Pos), e.PhysicalSize, sys.FadvSequential); err != nil {
+		totalSize := int64(record.HeaderSize) + e.PhysicalSize
+		if err := sys.Fadvise(sf.file.Fd(), sys.Offset_t(e.Pos), totalSize, sys.FadvSequential); err != nil {
 			log.Warn("fadvise failed", "segID", e.SegmentID, "err", err)
 		}
 	}
 
 	// 2. Read data/decompress if needed.
-	var reader io.Reader = io.NewSectionReader(sf, e.Pos, e.PhysicalSize)
+	// Skip past the record header to read just the value.
+	valuePos := e.Pos + int64(record.HeaderSize)
+	var reader io.Reader = io.NewSectionReader(sf, valuePos, e.PhysicalSize)
 	var releaser Releaser
 	if e.IsCompressed() {
 		// Acquire buffer for compressed data

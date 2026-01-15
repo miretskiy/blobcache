@@ -6,8 +6,8 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/miretskiy/blobcache/internal/record"
 	"github.com/miretskiy/blobcache/internal/sys"
-	"github.com/miretskiy/blobcache/metadata"
 )
 
 // poolProvider allows SegmentWriter to acquire hardware-aligned buffers
@@ -18,13 +18,13 @@ type poolProvider interface {
 
 // SegmentWriter manages long-running, sequential writes to a large segment file.
 // It ingests multiple MemTable slabs (e.g., 128MB each) and accumulates
-// metadata records until the segment is full or explicitly sealed.
+// footer entries until the segment is full or explicitly sealed.
 type SegmentWriter struct {
 	id         int64
 	file       *os.File
 	currentPos int64
 	pool       poolProvider
-	records    []metadata.BlobRecord
+	entries    []record.FooterEntry
 	syncData   bool
 }
 
@@ -63,12 +63,12 @@ func NewSegmentWriter(
 // WriteSlab appends a memory-aligned slab of data to the segment.
 // 'data' MUST be 4KB-aligned (via MmapBuffer.AlignedBytes()) or the write
 // will fail with EINVAL on Linux systems.
-// Returns the records with Pos transformed from relative to absolute positions.
+// Returns the entries with Pos transformed from relative to absolute positions.
 func (sw *SegmentWriter) WriteSlab(
-	data []byte, records []metadata.BlobRecord,
-) ([]metadata.BlobRecord, error) {
+	data []byte, entries []record.FooterEntry,
+) ([]record.FooterEntry, error) {
 	if len(data) == 0 {
-		return records, nil
+		return entries, nil
 	}
 
 	// If some previous operation left us unaligned, we must fail fast.
@@ -99,40 +99,40 @@ func (sw *SegmentWriter) WriteSlab(
 	sw.currentPos += int64(len(data))
 
 	// 4. Transform to absolute positions (create copy, don't mutate input)
-	numRecords := len(sw.records)
-	for i := range records {
-		rec := records[i]
-		rec.Pos += slabStart
-		sw.records = append(sw.records, rec)
+	numEntries := len(sw.entries)
+	for i := range entries {
+		entry := entries[i]
+		entry.Pos += slabStart
+		sw.entries = append(sw.entries, entry)
 	}
 
-	return sw.records[numRecords:], nil
+	return sw.entries[numEntries:], nil
 }
 
 // Close finalizes and "seals" the segment. It appends the immutable
-// "Birth Snapshot" metadata block, which includes the index for every blob
+// "Birth Snapshot" footer block, which includes the index for every blob
 // written since the file was opened. Once closed, the segment is read-only.
 func (sw *SegmentWriter) Close() error {
 	if sw.file == nil {
 		return nil
 	}
 
-	// 1. Construct the immutable Metadata Record
-	sr := metadata.SegmentRecord{
-		Records:   sw.records,
+	// 1. Construct the immutable Segment Footer
+	sf := record.SegmentFooter{
+		Entries:   sw.entries,
 		SegmentID: sw.id,
-		CTime:     time.Now(),
+		CTime:     time.Now().Unix(),
 	}
 
-	// 2. Serialize Metadata into an Aligned Buffer.
+	// 2. Serialize Footer into an Aligned Buffer.
 	// We use the slabPool to satisfy O_DIRECT alignment and avoid GC pressure.
-	physicalMetaSize := metadata.PhysicalMetadataSize(len(sw.records))
+	physicalMetaSize := record.SegmentFooterPhysicalSize(len(sw.entries))
 	tmpBuf := sw.pool.AcquireAligned(physicalMetaSize)
 	defer tmpBuf.Unpin()
 
-	// AppendSegmentRecordWithFooter ensures the 20-byte footer is pinned
+	// AppendSegmentFooterWithTail ensures the 20-byte legacy tail is pinned
 	// to the absolute end of the 4KB-aligned block.
-	paddedMetadata := metadata.AppendSegmentRecordWithFooter(tmpBuf.Bytes(), sr)
+	paddedMetadata := record.AppendSegmentFooterWithTail(tmpBuf.Bytes(), sf)
 
 	// 3. Final hardware write for the metadata block.
 	if _, err := sw.file.WriteAt(paddedMetadata, sw.currentPos); err != nil {

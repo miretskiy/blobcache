@@ -6,14 +6,21 @@ import (
 
 	"github.com/miretskiy/blobcache/base"
 	"github.com/miretskiy/blobcache/compression"
-	"github.com/miretskiy/blobcache/metadata"
+	"github.com/miretskiy/blobcache/internal/record"
 	"github.com/zhangyunhao116/skipmap"
 )
+
+// SlabEntry is stored in the slab's in-memory index.
+// Embeds record.Header to access compression/error flags and sizes.
+type SlabEntry struct {
+	record.Header       // Flags, SeqID, PhysicalSize, LogicalSize (Magic/KeyLen unused here)
+	Pos           int64 // Byte offset within slab buffer
+}
 
 // SharedSlab represents a populated chunk of memory and its index.
 type SharedSlab struct {
 	buf   *MmapBuffer
-	index *skipmap.Uint64Map[metadata.BlobRecord]
+	index *skipmap.Uint64Map[SlabEntry]
 }
 
 // Releaser is a zero-allocation handle for releasing a read lock or buffer.
@@ -42,14 +49,14 @@ func (r *Releaser) Release() {
 // the returned data and promptly release it via Releaser.
 func (s *SharedSlab) Acquire(key Key) ([]byte, Releaser, bool, base.BlobErrno) {
 	// 1. Lock-free lookup
-	record, ok := s.index.Load(key)
+	rec, ok := s.index.Load(key)
 	if !ok {
 		return nil, Releaser{}, false, base.ErrNone
 	}
 
 	// 2. Check if record has existing error
-	if record.HasError() {
-		return nil, Releaser{}, true, record.Errno()
+	if rec.HasError() {
+		return nil, Releaser{}, true, rec.Errno()
 	}
 
 	// 3. SAFE PIN (CAS Loop)
@@ -61,16 +68,17 @@ func (s *SharedSlab) Acquire(key Key) ([]byte, Releaser, bool, base.BlobErrno) {
 		return nil, Releaser{}, false, base.ErrNone
 	}
 
-	// 4. Get Physical Data (stored bytes)
-	physicalData := s.buf.raw[record.Pos : record.Pos+record.PhysicalSize]
+	// 4. Get Physical Data (skip past header to value bytes)
+	valueStart := rec.Pos + int64(record.HeaderSize)
+	physicalData := s.buf.raw[valueStart : valueStart+rec.PhysicalSize]
 	releaser := Releaser{slab: s}
 
 	// 5. Handle Decompression
-	if record.IsCompressed() {
+	if rec.IsCompressed() {
 		defer releaser.Release() // Release slab when done using physicalData
 
-		handle := AcquireBuffer(int(record.LogicalSize), int(record.LogicalSize))
-		if err := compression.Decompress(record.Compression(), handle.Bytes(), physicalData); err != nil {
+		handle := AcquireBuffer(int(rec.LogicalSize), int(rec.LogicalSize))
+		if err := compression.Decompress(rec.Compression(), handle.Bytes(), physicalData); err != nil {
 			handle.Release()
 			return nil, Releaser{}, false, base.ErrDecompression
 		}

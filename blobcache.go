@@ -14,8 +14,8 @@ import (
 	"github.com/miretskiy/blobcache/base"
 	"github.com/miretskiy/blobcache/bloom"
 	"github.com/miretskiy/blobcache/index"
+	"github.com/miretskiy/blobcache/internal/record"
 	"github.com/miretskiy/blobcache/internal/sys"
-	"github.com/miretskiy/blobcache/metadata"
 )
 
 type Key = uint64
@@ -129,11 +129,11 @@ func New(path string, opts ...Option) (*Cache, error) {
 	// Create new bloom filter and figure out how much data on disk from segment meta.
 	var totalSize int64
 	filter := bloom.New(uint(cfg.BloomEstimatedKeys), cfg.BloomFPRate)
-	if err := idx.ForEachSegment(func(segment metadata.SegmentRecord) bool {
-		for _, rec := range segment.Records {
-			if !rec.IsDeleted() {
-				filter.Add(rec.Hash)
-				totalSize += rec.LogicalSize
+	if err := idx.ForEachSegment(func(segment record.SegmentFooter) bool {
+		for _, entry := range segment.Entries {
+			if !entry.IsDeleted() {
+				filter.Add(entry.Hash)
+				totalSize += entry.LogicalSize
 			}
 		}
 		return true
@@ -383,19 +383,19 @@ func (c *Cache) putWithRetry(h Key, value []byte, checksum *uint32) {
 }
 
 type Batcher interface {
-	PutBatch(segID int64, records []metadata.BlobRecord) error
+	PutBatch(segID int64, entries []record.FooterEntry) error
 }
 
-func (c *Cache) PutBatch(segID int64, records []metadata.BlobRecord) error {
+func (c *Cache) PutBatch(segID int64, entries []record.FooterEntry) error {
 	// Phase 1: Ingest into Index
-	if err := c.index.IngestBatch(segID, records); err != nil {
+	if err := c.index.IngestBatch(segID, entries); err != nil {
 		return err
 	}
 
 	// Phase 2: Update size tracking
 	var addedBytes int64
-	for _, rec := range records {
-		addedBytes += rec.LogicalSize
+	for _, entry := range entries {
+		addedBytes += entry.LogicalSize
 	}
 	newSize := c.approxSize.Add(addedBytes)
 
@@ -439,10 +439,10 @@ func (c *Cache) rebuildBloom() error {
 		stopRecording, consumeRecording = oldFilter.RecordAdditions()
 	}
 
-	err := c.index.ForEachSegment(func(segment metadata.SegmentRecord) bool {
-		for _, rec := range segment.Records {
-			if !rec.IsDeleted() {
-				newFilter.AddHash(rec.Hash)
+	err := c.index.ForEachSegment(func(segment record.SegmentFooter) bool {
+		for _, entry := range segment.Entries {
+			if !entry.IsDeleted() {
+				newFilter.AddHash(entry.Hash)
 			}
 		}
 		return true

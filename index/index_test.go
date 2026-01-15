@@ -5,7 +5,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/miretskiy/blobcache/metadata"
+	"github.com/miretskiy/blobcache/internal/record"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -29,7 +29,7 @@ func TestIndex_BasicIO(t *testing.T) {
 	defer cleanup()
 
 	hash := uint64(12345)
-	batch := []metadata.BlobRecord{
+	batch := []record.FooterEntry{
 		{Hash: hash, LogicalSize: 1024, Pos: 5000},
 	}
 
@@ -59,7 +59,7 @@ func TestIndex_PersistenceRecovery(t *testing.T) {
 	require.NoError(t, err)
 
 	hash := uint64(888)
-	err = idx.IngestBatch(42, []metadata.BlobRecord{{Hash: hash, Pos: 0, LogicalSize: 99}})
+	err = idx.IngestBatch(42, []record.FooterEntry{{Hash: hash, Pos: 0, LogicalSize: 99}})
 	require.NoError(t, err)
 	idx.Close()
 
@@ -78,8 +78,8 @@ func TestIndex_SegmentDeletion(t *testing.T) {
 	defer cleanup()
 
 	// Fill two segments
-	require.NoError(t, idx.IngestBatch(1, []metadata.BlobRecord{{Hash: 10, Pos: 0, LogicalSize: 100}}))
-	require.NoError(t, idx.IngestBatch(2, []metadata.BlobRecord{{Hash: 20, Pos: 100, LogicalSize: 100}}))
+	require.NoError(t, idx.IngestBatch(1, []record.FooterEntry{{Hash: 10, Pos: 0, LogicalSize: 100}}))
+	require.NoError(t, idx.IngestBatch(2, []record.FooterEntry{{Hash: 20, Pos: 100, LogicalSize: 100}}))
 
 	// Delete segment 1
 	err := idx.DeleteSegment(1)
@@ -98,7 +98,7 @@ func TestIndex_EvictionOrchestration(t *testing.T) {
 	defer cleanup()
 
 	// Insert two blobs
-	idx.IngestBatch(1, []metadata.BlobRecord{
+	idx.IngestBatch(1, []record.FooterEntry{
 		{Hash: 1, Pos: 0, LogicalSize: 10},
 		{Hash: 2, Pos: 10, LogicalSize: 10},
 	})
@@ -128,10 +128,10 @@ func TestIndex_Concurrency(t *testing.T) {
 	for w := 0; w < workers; w++ {
 		go func(id int) {
 			defer wg.Done()
-			batch := make([]metadata.BlobRecord, itemsPerWorker)
+			batch := make([]record.FooterEntry, itemsPerWorker)
 			pos := int64(0)
 			for i := 0; i < itemsPerWorker; i++ {
-				batch[i] = metadata.BlobRecord{
+				batch[i] = record.FooterEntry{
 					Hash:        uint64(id*itemsPerWorker + i),
 					Pos:         pos,
 					LogicalSize: 100,
@@ -164,9 +164,9 @@ func TestIndex_Stats(t *testing.T) {
 	// Segment 1: 5 blobs
 	// Segment 2: 5 blobs
 	for s := int64(1); s <= 2; s++ {
-		batch := make([]metadata.BlobRecord, 5)
+		batch := make([]record.FooterEntry, 5)
 		for i := 0; i < 5; i++ {
-			batch[i] = metadata.BlobRecord{Hash: uint64(s*10 + int64(i))}
+			batch[i] = record.FooterEntry{Hash: uint64(s*10 + int64(i))}
 		}
 		require.NoError(t, idx.IngestBatch(s, batch))
 	}
@@ -203,7 +203,7 @@ func TestIndex_Stats_EmptyBatch(t *testing.T) {
 	defer cleanup()
 
 	// Attempting to ingest an empty batch
-	err := idx.IngestBatch(1, []metadata.BlobRecord{})
+	err := idx.IngestBatch(1, []record.FooterEntry{})
 	require.NoError(t, err)
 
 	stats := idx.Stats()
@@ -212,7 +212,7 @@ func TestIndex_Stats_EmptyBatch(t *testing.T) {
 
 func makeEntry(segID int64, hash uint64, pos, size int64) Entry {
 	return Entry{
-		BlobRecord: metadata.BlobRecord{
+		FooterEntry: record.FooterEntry{
 			Hash:        hash,
 			Pos:         pos,
 			LogicalSize: size,
@@ -238,8 +238,8 @@ func TestIndex_DeleteBlobs_Batch(t *testing.T) {
 
 	// 2. Prepare Bitcask state
 	// Simulate existing segments on disk
-	blobs1 := []metadata.BlobRecord{{Hash: 1}, {Hash: 2}, {Hash: 3}}
-	blobs2 := []metadata.BlobRecord{{Hash: 10}, {Hash: 11}}
+	blobs1 := []record.FooterEntry{{Hash: 1}, {Hash: 2}, {Hash: 3}}
+	blobs2 := []record.FooterEntry{{Hash: 10}, {Hash: 11}}
 
 	require.NoError(t, idx.segments.writeBatch(seg1, blobs1))
 	require.NoError(t, idx.segments.writeBatch(seg2, blobs2))
@@ -273,21 +273,21 @@ func TestIndex_DeleteBlobs_Batch(t *testing.T) {
 	// 6. Verify Persistence Path (Durable Path)
 	// Check Seg 1
 	foundHashes1 := make(map[uint64]bool)
-	err = idx.segments.scanSegment(seg1, func(seg metadata.SegmentRecord) bool {
-		for _, rec := range seg.Records {
-			foundHashes1[rec.Hash] = true
+	err = idx.segments.scanSegment(seg1, func(seg record.SegmentFooter) bool {
+		for _, entry := range seg.Entries {
+			foundHashes1[entry.Hash] = true
 		}
 		return true
 	})
 	assert.NoError(t, err)
 	assert.NotContains(t, foundHashes1, uint64(1), "Hash 1 should be purged from Bitcask")
-	assert.Equal(t, 2, len(foundHashes1), "Seg 1 should have 2 records left")
+	assert.Equal(t, 2, len(foundHashes1), "Seg 1 should have 2 entries left")
 
 	// Check Seg 2
 	foundHashes2 := make(map[uint64]bool)
-	err = idx.segments.scanSegment(seg2, func(seg metadata.SegmentRecord) bool {
-		for _, rec := range seg.Records {
-			foundHashes2[rec.Hash] = true
+	err = idx.segments.scanSegment(seg2, func(seg record.SegmentFooter) bool {
+		for _, entry := range seg.Entries {
+			foundHashes2[entry.Hash] = true
 		}
 		return true
 	})

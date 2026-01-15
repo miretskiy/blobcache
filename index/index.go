@@ -5,13 +5,14 @@ import (
 	"fmt"
 
 	"github.com/miretskiy/blobcache/base"
-	"github.com/miretskiy/blobcache/metadata"
+	"github.com/miretskiy/blobcache/internal/record"
 	"github.com/zhangyunhao116/skipmap"
 )
 
 // Entry represents a blob stored in blob cache.
+// BRIDGE: Embeds record.FooterEntry (replaces metadata.BlobRecord).
 type Entry struct {
-	metadata.BlobRecord
+	record.FooterEntry
 	SegmentID int64
 }
 
@@ -19,7 +20,7 @@ type Entry struct {
 type ValueFn func(Entry) bool
 
 // ScanSegmentFn is the callback for scanning segment records.
-type ScanSegmentFn func(metadata.SegmentRecord) bool
+type ScanSegmentFn func(record.SegmentFooter) bool
 
 // Index coordinates high-speed RAM lookups, persistence, and eviction.
 type Index struct {
@@ -40,8 +41,8 @@ func NewIndex(basePath string) (*Index, error) {
 		evictor:  &sievePolicy{},
 	}
 
-	err = p.scanAll(func(seg metadata.SegmentRecord) bool {
-		for _, rec := range seg.Records {
+	err = p.scanAll(func(seg record.SegmentFooter) bool {
+		for _, rec := range seg.Entries {
 			if !rec.IsDeleted() {
 				idx.blobs.Store(rec.Hash, idx.evictor.Add(Entry{rec, seg.SegmentID}))
 			}
@@ -73,18 +74,18 @@ func (idx *Index) SetBlobErrno(hash uint64, errno base.BlobErrno) {
 // GetSegmentRecord retrieves the metadata for a specific segment.
 // It reconstructs the record from fragmented chunks if necessary.
 // Returns (record, true) if found, or (zero-value, false) if not.
-func (idx *Index) GetSegmentRecord(segmentID int64) (metadata.SegmentRecord, bool) {
-	var fullRecord metadata.SegmentRecord
+func (idx *Index) GetSegmentRecord(segmentID int64) (record.SegmentFooter, bool) {
+	var fullRecord record.SegmentFooter
 	var found bool
 
 	// We utilize scanSegment which handles the Range boundary safety.
-	err := idx.segments.scanSegment(segmentID, func(seg metadata.SegmentRecord) bool {
+	err := idx.segments.scanSegment(segmentID, func(seg record.SegmentFooter) bool {
 		if !found {
 			fullRecord = seg
 			found = true
 		} else {
-			// Append records from subsequent chunks
-			fullRecord.Records = append(fullRecord.Records, seg.Records...)
+			// Append entries from subsequent chunks
+			fullRecord.Entries = append(fullRecord.Entries, seg.Entries...)
 		}
 		return true
 	})
@@ -92,14 +93,14 @@ func (idx *Index) GetSegmentRecord(segmentID int64) (metadata.SegmentRecord, boo
 	// If there was a lower-level I/O error or the segment wasn't found,
 	// we return false.
 	if err != nil || !found {
-		return metadata.SegmentRecord{}, false
+		return record.SegmentFooter{}, false
 	}
 
 	return fullRecord, true
 }
 
-func (idx *Index) IngestBatch(segID int64, batch []metadata.BlobRecord) error {
-	// Validate: records must be contiguous and non-overlapping
+func (idx *Index) IngestBatch(segID int64, batch []record.FooterEntry) error {
+	// Validate: entries must be contiguous and non-overlapping
 	if err := validateNonOverlapping(batch); err != nil {
 		return fmt.Errorf("segment %d validation failed: %w", segID, err)
 	}
@@ -116,16 +117,16 @@ func (idx *Index) IngestBatch(segID int64, batch []metadata.BlobRecord) error {
 }
 
 // validateNonOverlapping ensures blob positions are monotonically increasing
-// and don't overlap. Assumes records are in write order (O(n) check).
+// and don't overlap. Assumes entries are in write order (O(n) check).
 // Uses PhysicalSize since that's the actual bytes stored on disk.
-func validateNonOverlapping(records []metadata.BlobRecord) error {
-	if len(records) <= 1 {
+func validateNonOverlapping(entries []record.FooterEntry) error {
+	if len(entries) <= 1 {
 		return nil
 	}
 
-	for i := 0; i < len(records)-1; i++ {
-		curr := records[i]
-		next := records[i+1]
+	for i := 0; i < len(entries)-1; i++ {
+		curr := entries[i]
+		next := entries[i+1]
 		currEnd := curr.Pos + curr.PhysicalSize // Use PhysicalSize for actual stored bytes
 
 		if currEnd > next.Pos {
@@ -161,12 +162,12 @@ func (idx *Index) DeleteSegment(segmentID int64) error {
 
 	// 1. Collect keys and purge RAM
 	// We must capture the scan error to know if we actually saw the whole segment
-	err := idx.segments.scanSegment(segmentID, func(seg metadata.SegmentRecord) bool {
+	err := idx.segments.scanSegment(segmentID, func(seg record.SegmentFooter) bool {
 		// DIAGNOSTIC: Ensure we are only touching what we intended
 		if seg.SegmentID != segmentID {
-			panic(fmt.Sprintf("CRITICAL: scanSegment(%d) returned records for segment %d", segmentID, seg.SegmentID))
+			panic(fmt.Sprintf("CRITICAL: scanSegment(%d) returned entries for segment %d", segmentID, seg.SegmentID))
 		}
-		for _, rec := range seg.Records {
+		for _, rec := range seg.Entries {
 			if n, ok := idx.blobs.LoadAndDelete(rec.Hash); ok {
 				idx.evictor.removeNode(n)
 			}
@@ -277,7 +278,7 @@ func (idx *Index) Stats() IndexStats {
 	}
 
 	// Count segments from disk (O(N) but useful for background tasks)
-	_ = idx.ForEachSegment(func(metadata.SegmentRecord) bool {
+	_ = idx.ForEachSegment(func(record.SegmentFooter) bool {
 		stats.SegmentCount++
 		return true
 	})

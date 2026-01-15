@@ -9,7 +9,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/miretskiy/blobcache/base"
-	"github.com/miretskiy/blobcache/metadata"
+	"github.com/miretskiy/blobcache/internal/record"
 	"github.com/stretchr/testify/require"
 )
 
@@ -47,22 +47,22 @@ func (tp *TrackedPool) Teardown() {
 	tp.extraRegions = nil
 }
 
-// MockBatcher implements: PutBatch(segID int64, records []metadata.BlobRecord) error
+// MockBatcher implements: PutBatch(segID int64, entries []record.FooterEntry) error
 type MockBatcher struct {
 	mu      sync.Mutex
-	Batches map[int64][]metadata.BlobRecord
+	Batches map[int64][]record.FooterEntry
 	Count   int
 }
 
-func (m *MockBatcher) PutBatch(segID int64, records []metadata.BlobRecord) error {
+func (m *MockBatcher) PutBatch(segID int64, entries []record.FooterEntry) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.Batches == nil {
-		m.Batches = make(map[int64][]metadata.BlobRecord)
+		m.Batches = make(map[int64][]record.FooterEntry)
 	}
 	// Copy slice to simulate persistent storage.
-	m.Batches[segID] = append(m.Batches[segID], records...)
-	m.Count += len(records)
+	m.Batches[segID] = append(m.Batches[segID], entries...)
+	m.Count += len(entries)
 	return nil
 }
 
@@ -124,12 +124,12 @@ func TestSegmentWriter_FullCycle(t *testing.T) {
 		slab1.WriteAt(data1, 0)
 		slab1Len := int64(len(data1))
 
-		recs1 := []metadata.BlobRecord{{
+		entries1 := []record.FooterEntry{{
 			Hash:        101,
 			Pos:         0,
 			LogicalSize: slab1Len,
 		}}
-		_, err = sw.WriteSlab(slab1.AlignedBytes(slab1Len), recs1)
+		_, err = sw.WriteSlab(slab1.AlignedBytes(slab1Len), entries1)
 		require.NoError(t, err)
 		slab1.Unpin()
 
@@ -139,12 +139,12 @@ func TestSegmentWriter_FullCycle(t *testing.T) {
 		slab2.WriteAt(data2, 0)
 		slab2Len := int64(len(data2))
 
-		recs2 := []metadata.BlobRecord{{
+		entries2 := []record.FooterEntry{{
 			Hash:        202,
 			Pos:         0,
 			LogicalSize: slab2Len,
 		}}
-		_, err = sw.WriteSlab(slab2.AlignedBytes(slab2Len), recs2)
+		_, err = sw.WriteSlab(slab2.AlignedBytes(slab2Len), entries2)
 		require.NoError(t, err)
 		slab2.Unpin()
 
@@ -156,13 +156,13 @@ func TestSegmentWriter_FullCycle(t *testing.T) {
 		defer f.Close()
 
 		info, _ := f.Stat()
-		footer, _, err := metadata.ReadSegmentFooterFromFile(f, info.Size(), segID)
+		footer, _, err := record.ReadSegmentFooterFromFile(f, info.Size(), segID)
 		require.NoError(t, err)
 
 		// Verify Pos rounding (critical for Direct I/O reads)
 		// Slab 2 should be positioned at the next 4KB boundary.
 		expectedOffset := testRoundToPage(int64(len(data1)))
-		require.Equal(t, expectedOffset, footer.Records[1].Pos)
+		require.Equal(t, expectedOffset, footer.Entries[1].Pos)
 	})
 }
 

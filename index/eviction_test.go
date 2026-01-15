@@ -3,7 +3,7 @@ package index
 import (
 	"testing"
 
-	"github.com/miretskiy/blobcache/metadata"
+	"github.com/miretskiy/blobcache/internal/record"
 	"github.com/stretchr/testify/require"
 )
 
@@ -13,10 +13,10 @@ func TestSievePolicy_Advanced(t *testing.T) {
 		p := &sievePolicy{}
 		nodes := make([]*node, count)
 		for i := 0; i < count; i++ {
-			// FIX: Pass the Entry data to Add, which returns the *node handle
+			// Pass the Entry data to Add, which returns the *node handle
 			nodes[i] = p.Add(Entry{
-				BlobRecord: metadata.BlobRecord{Hash: uint64(i)},
-				SegmentID:  1,
+				FooterEntry: record.FooterEntry{Hash: uint64(i)},
+				SegmentID:   1,
 			})
 		}
 		return p, nodes
@@ -91,10 +91,10 @@ func TestSieve_Interleaved(t *testing.T) {
 	nodes := make(map[uint64]*node)
 
 	for i := 0; i < total; i++ {
-		// FIX: Use p.Add(Entry) instead of manual newNode
+		// Use p.Add(Entry) instead of manual newNode
 		n := p.Add(Entry{
-			BlobRecord: metadata.BlobRecord{Hash: uint64(i)},
-			SegmentID:  1,
+			FooterEntry: record.FooterEntry{Hash: uint64(i)},
+			SegmentID:   1,
 		})
 		nodes[uint64(i)] = n
 	}

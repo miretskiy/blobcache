@@ -17,7 +17,7 @@ import (
 
 	"github.com/HdrHistogram/hdrhistogram-go"
 	"github.com/miretskiy/blobcache/index"
-	"github.com/miretskiy/blobcache/metadata"
+	"github.com/miretskiy/blobcache/internal/record"
 	"github.com/shirou/gopsutil/v3/disk"
 	"github.com/shirou/gopsutil/v3/process"
 )
@@ -359,14 +359,14 @@ func BenchmarkEviction_SieveVictimSelection(b *testing.B) {
 	var (
 		currentSegID   int64 = 1
 		currentSegSize int64
-		batch          []metadata.BlobRecord
+		batch          []record.FooterEntry
 	)
 
 	for i := 0; i < b.N; i++ {
 		// Randomized blob size: 100KB to 2MB (not page-aligned)
 		blobSize := int64(100_000 + rng.IntN(1_900_000))
 
-		batch = append(batch, metadata.BlobRecord{
+		batch = append(batch, record.FooterEntry{
 			Hash:        uint64(i),
 			Pos:         currentSegSize,
 			LogicalSize: blobSize,

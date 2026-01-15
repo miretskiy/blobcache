@@ -4,7 +4,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/miretskiy/blobcache/metadata"
+	"github.com/miretskiy/blobcache/internal/record"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -18,16 +18,16 @@ func TestPersistence(t *testing.T) {
 	t.Run("BatchSplitting", func(t *testing.T) {
 		segID := int64(100)
 		count := maxBlobsPerSegment + 5
-		batch := make([]metadata.BlobRecord, count)
+		batch := make([]record.FooterEntry, count)
 		for i := 0; i < count; i++ {
-			batch[i] = metadata.BlobRecord{Hash: uint64(i), LogicalSize: 100}
+			batch[i] = record.FooterEntry{Hash: uint64(i), LogicalSize: 100}
 		}
 
 		err := p.writeBatch(segID, batch)
 		require.NoError(t, err)
 
 		chunks := 0
-		err = p.scanSegment(segID, func(seg metadata.SegmentRecord) bool {
+		err = p.scanSegment(segID, func(seg record.SegmentFooter) bool {
 			chunks++
 			require.Equal(t, segID, seg.SegmentID)
 			return true
@@ -38,13 +38,13 @@ func TestPersistence(t *testing.T) {
 	})
 
 	t.Run("PrefixIsolation", func(t *testing.T) {
-		err := p.writeBatch(200, []metadata.BlobRecord{{Hash: 200}})
+		err := p.writeBatch(200, []record.FooterEntry{{Hash: 200}})
 		require.NoError(t, err)
-		err = p.writeBatch(300, []metadata.BlobRecord{{Hash: 300}})
+		err = p.writeBatch(300, []record.FooterEntry{{Hash: 300}})
 		require.NoError(t, err)
 
 		seen300 := false
-		err = p.scanSegment(200, func(seg metadata.SegmentRecord) bool {
+		err = p.scanSegment(200, func(seg record.SegmentFooter) bool {
 			if seg.SegmentID == 300 {
 				seen300 = true
 			}
@@ -57,7 +57,7 @@ func TestPersistence(t *testing.T) {
 
 	t.Run("ScanAllOrdering", func(t *testing.T) {
 		var ids []int64
-		err := p.scanAll(func(seg metadata.SegmentRecord) bool {
+		err := p.scanAll(func(seg record.SegmentFooter) bool {
 			// Deduplicate split segments for order checking
 			if len(ids) == 0 || ids[len(ids)-1] != seg.SegmentID {
 				ids = append(ids, seg.SegmentID)
@@ -71,7 +71,7 @@ func TestPersistence(t *testing.T) {
 
 	t.Run("Delete", func(t *testing.T) {
 		var keyToDelete []byte
-		err := p.scanSegment(200, func(seg metadata.SegmentRecord) bool {
+		err := p.scanSegment(200, func(seg record.SegmentFooter) bool {
 			keyToDelete = seg.IndexKey
 			return false
 		})
@@ -82,7 +82,7 @@ func TestPersistence(t *testing.T) {
 		require.NoError(t, err)
 
 		count := 0
-		err = p.scanSegment(200, func(seg metadata.SegmentRecord) bool {
+		err = p.scanSegment(200, func(seg record.SegmentFooter) bool {
 			count++
 			return true
 		})
@@ -107,9 +107,9 @@ func TestDeleteRecordsFromSegment_Collapse(t *testing.T) {
 
 	// 25 blobs + limit of 10 = 3 chunks ([10], [10], [5])
 	totalBlobs := 25
-	batch := make([]metadata.BlobRecord, totalBlobs)
+	batch := make([]record.FooterEntry, totalBlobs)
 	for i := 0; i < totalBlobs; i++ {
-		batch[i] = metadata.BlobRecord{Hash: uint64(i + 1)}
+		batch[i] = record.FooterEntry{Hash: uint64(i + 1)}
 	}
 
 	err = p.writeBatch(segID, batch)
@@ -117,7 +117,7 @@ func TestDeleteRecordsFromSegment_Collapse(t *testing.T) {
 
 	// Verify initial state
 	count := 0
-	p.scanSegment(segID, func(seg metadata.SegmentRecord) bool {
+	p.scanSegment(segID, func(seg record.SegmentFooter) bool {
 		count++
 		return true
 	})
@@ -135,13 +135,13 @@ func TestDeleteRecordsFromSegment_Collapse(t *testing.T) {
 	// Verify collapse to 1 chunk
 	finalCount := 0
 	totalLive := 0
-	err = p.scanSegment(segID, func(seg metadata.SegmentRecord) bool {
+	err = p.scanSegment(segID, func(seg record.SegmentFooter) bool {
 		finalCount++
-		totalLive += len(seg.Records)
+		totalLive += len(seg.Entries)
 		return true
 	})
 
 	assert.NoError(t, err)
 	assert.Equal(t, 1, finalCount, "Should have collapsed from 3 chunks to 1")
-	assert.Equal(t, 5, totalLive, "Should only have 5 records remaining in persistence")
+	assert.Equal(t, 5, totalLive, "Should only have 5 entries remaining in persistence")
 }

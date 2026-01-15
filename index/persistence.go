@@ -8,7 +8,7 @@ import (
 
 	"go.mills.io/bitcask/v2"
 
-	"github.com/miretskiy/blobcache/metadata"
+	"github.com/miretskiy/blobcache/internal/record"
 )
 
 const (
@@ -16,8 +16,8 @@ const (
 	maxValueSize = 64 << 10
 )
 
-// maxBlobsPerSegment is the number of metadata records we can pack into one Bitcask entry.
-var maxBlobsPerSegment = (maxValueSize - metadata.SegmentRecordHeaderSize) / metadata.EncodedBlobRecordSize
+// maxBlobsPerSegment is the number of footer entries we can pack into one Bitcask entry.
+var maxBlobsPerSegment = (maxValueSize - record.SegmentFooterHeaderSize) / record.FooterEntrySize
 
 func testingSetMaxBlobsPerSegment(n int) func() {
 	old := maxBlobsPerSegment
@@ -43,21 +43,21 @@ func newPersistence(basePath string) (*persistence, error) {
 }
 
 func (p *persistence) DeleteRecordsFromSegment(segID int64, hashes map[uint64]struct{}) error {
-	var liveRecords []metadata.BlobRecord
+	var liveEntries []record.FooterEntry
 	var originalKeys [][]byte
-	var cTime time.Time
+	var cTime int64
 
 	// 1. Flatten and Filter: Collect only what is still alive
-	err := p.scanSegment(segID, func(seg metadata.SegmentRecord) bool {
+	err := p.scanSegment(segID, func(seg record.SegmentFooter) bool {
 		originalKeys = append(originalKeys, seg.IndexKey)
-		if cTime.IsZero() {
+		if cTime == 0 {
 			cTime = seg.CTime
 		}
 
-		for _, rec := range seg.Records {
+		for _, entry := range seg.Entries {
 			// If it's NOT in our deletion set AND wasn't already deleted, keep it
-			if _, deleted := hashes[rec.Hash]; !deleted && !rec.IsDeleted() {
-				liveRecords = append(liveRecords, rec)
+			if _, deleted := hashes[entry.Hash]; !deleted && !entry.IsDeleted() {
+				liveEntries = append(liveEntries, entry)
 			}
 		}
 		return true
@@ -75,28 +75,29 @@ func (p *persistence) DeleteRecordsFromSegment(segID int64, hashes map[uint64]st
 		_ = txn.Delete(k)
 	}
 
-	// 3. Re-Pack: Write back only the live records into the minimum number of chunks
-	var currentSeg metadata.SegmentRecord
-	currentSeg.SegmentID = segID
-	currentSeg.CTime = cTime
+	// 3. Re-Pack: Write back only the live entries into the minimum number of chunks
+	currentFooter := record.SegmentFooter{
+		SegmentID: segID,
+		CTime:     cTime,
+	}
 
 	// Handle the 'empty segment' case: write one empty tombstone at index 0
-	if len(liveRecords) == 0 {
-		data := metadata.AppendSegmentRecord(nil, currentSeg)
+	if len(liveEntries) == 0 {
+		data := record.AppendSegmentFooter(nil, currentFooter)
 		return txn.Put(p.makeKey(segID, 0), data)
 	}
 
 	var chunkIdx int64
-	for i := 0; i < len(liveRecords); i++ {
-		currentSeg.Records = append(currentSeg.Records, liveRecords[i])
+	for i := 0; i < len(liveEntries); i++ {
+		currentFooter.Entries = append(currentFooter.Entries, liveEntries[i])
 
-		if len(currentSeg.Records) >= maxBlobsPerSegment || i == len(liveRecords)-1 {
-			data := metadata.AppendSegmentRecord(nil, currentSeg)
+		if len(currentFooter.Entries) >= maxBlobsPerSegment || i == len(liveEntries)-1 {
+			data := record.AppendSegmentFooter(nil, currentFooter)
 			if err := txn.Put(p.makeKey(segID, chunkIdx), data); err != nil {
 				return err
 			}
 			chunkIdx++
-			currentSeg.Records = currentSeg.Records[:0] // Use [:0] to keep capacity
+			currentFooter.Entries = currentFooter.Entries[:0] // Use [:0] to keep capacity
 		}
 	}
 
@@ -111,7 +112,7 @@ func (p *persistence) makeKey(segID int64, chunkIdx int64) []byte {
 	return key
 }
 
-func (p *persistence) writeBatch(segID int64, batch []metadata.BlobRecord) error {
+func (p *persistence) writeBatch(segID int64, batch []record.FooterEntry) error {
 	if len(batch) == 0 {
 		return nil
 	}
@@ -119,34 +120,35 @@ func (p *persistence) writeBatch(segID int64, batch []metadata.BlobRecord) error
 	txn := p.db.Transaction()
 	defer txn.Discard()
 
-	var currentSeg metadata.SegmentRecord
-	currentSeg.SegmentID = segID
-	currentSeg.CTime = time.Now()
+	currentFooter := record.SegmentFooter{
+		SegmentID: segID,
+		CTime:     time.Now().Unix(),
+	}
 
 	// Track which chunk we are currently writing for this specific segment.
 	// This ensures the keys are [SegID][0], [SegID][1], etc.
 	var chunkIdx int64
 
 	flush := func() error {
-		if len(currentSeg.Records) == 0 {
+		if len(currentFooter.Entries) == 0 {
 			return nil
 		}
-		data := metadata.AppendSegmentRecord(nil, currentSeg)
+		data := record.AppendSegmentFooter(nil, currentFooter)
 		if err := txn.Put(p.makeKey(segID, chunkIdx), data); err != nil {
 			return err
 		}
-		currentSeg.Records = currentSeg.Records[:0]
+		currentFooter.Entries = currentFooter.Entries[:0]
 		chunkIdx++
 		return nil
 	}
 
-	for _, rec := range batch {
-		currentSeg.Records = append(currentSeg.Records, rec)
-		if len(currentSeg.Records) >= maxBlobsPerSegment {
+	for _, entry := range batch {
+		currentFooter.Entries = append(currentFooter.Entries, entry)
+		if len(currentFooter.Entries) >= maxBlobsPerSegment {
 			if err := flush(); err != nil {
 				return err
 			}
-			currentSeg.CTime = time.Now()
+			currentFooter.CTime = time.Now().Unix()
 		}
 	}
 
@@ -182,13 +184,13 @@ func (p *persistence) loadAndInvoke(key bitcask.Key, fn ScanSegmentFn) error {
 		return fmt.Errorf("failed to get chunk %v: %w", key, err)
 	}
 
-	seg, err := metadata.DecodeSegmentRecord(buf)
+	footer, err := record.DecodeSegmentFooter(buf)
 	if err != nil {
 		return fmt.Errorf("failed to decode chunk %v: %w", key, err)
 	}
 
-	seg.IndexKey = key
-	if !fn(seg) {
+	footer.IndexKey = key
+	if !fn(footer) {
 		// Stop requested by caller
 		return nil
 	}

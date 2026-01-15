@@ -109,519 +109,85 @@ Timeline (without per-key locking):
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 0.4 Data Structure Changes
-
-#### BlobRecord: Add SeqID Field
-
-```go
-// metadata/record.go
-
-// Current: 40 bytes (5 × uint64)
-// New:     48 bytes (6 × uint64)
-
-const (
-    // EncodedBlobRecordSize updated from 40 to 48 bytes:
-    // Hash(8) + Pos(8) + LogicalSize(8) + PhysicalSize(8) + Flags(8) + SeqID(8)
-    EncodedBlobRecordSize = 48
-)
-
-type BlobRecord struct {
-    Hash         uint64 // xxhash of key
-    Pos          int64  // Offset within segment
-    LogicalSize  int64  // Original uncompressed size
-    PhysicalSize int64  // Actual size on disk (compressed)
-    Flags        uint64 // Metadata, status, and checksum flags
-    SeqID        uint64 // Monotonic sequence ID for ordering (NEW)
-}
-```
-
-**Design Decision**: Adding a dedicated field vs packing into Flags:
-- **Dedicated field chosen** because:
-  - SeqID needs full 64-bit range (initialized from nanosecond timestamp)
-  - Flags already heavily used (checksum, compression, errno, deleted)
-  - 8 bytes overhead is negligible vs correctness benefits
-  - Simpler debugging and inspection
-
-#### Serialization Updates
-
-```go
-// metadata/record.go
-
-func AppendBlobRecord(buf []byte, rec BlobRecord) []byte {
-    buf = binary.LittleEndian.AppendUint64(buf, rec.Hash)
-    buf = binary.LittleEndian.AppendUint64(buf, uint64(rec.Pos))
-    buf = binary.LittleEndian.AppendUint64(buf, uint64(rec.LogicalSize))
-    buf = binary.LittleEndian.AppendUint64(buf, uint64(rec.PhysicalSize))
-    buf = binary.LittleEndian.AppendUint64(buf, rec.Flags)
-    buf = binary.LittleEndian.AppendUint64(buf, rec.SeqID) // NEW
-    return buf
-}
-
-func DecodeBlobRecord(buf []byte) (BlobRecord, error) {
-    if len(buf) < EncodedBlobRecordSize {
-        return BlobRecord{}, fmt.Errorf("buffer too small for blob record")
-    }
-    return BlobRecord{
-        Hash:         binary.LittleEndian.Uint64(buf[0:8]),
-        Pos:          int64(binary.LittleEndian.Uint64(buf[8:16])),
-        LogicalSize:  int64(binary.LittleEndian.Uint64(buf[16:24])),
-        PhysicalSize: int64(binary.LittleEndian.Uint64(buf[24:32])),
-        Flags:        binary.LittleEndian.Uint64(buf[32:40]),
-        SeqID:        binary.LittleEndian.Uint64(buf[40:48]), // NEW
-    }, nil
-}
-```
-
-### 0.5 Global Sequence Counter
-
-```go
-// blobcache.go
-
-type Cache struct {
-    // ... existing fields ...
-
-    // Global monotonic sequence counter.
-    // Initialized to time.Now().UnixNano() for continuity across restarts.
-    // This ensures sequences are always increasing even after crashes,
-    // without needing to scan WAL/segments for the last sequence.
-    globalSeq atomic.Uint64
-}
-
-func Open(path string, opts ...Option) (*Cache, error) {
-    c := &Cache{
-        // ...
-    }
-
-    // Initialize sequence counter with current nanosecond timestamp.
-    // This guarantees monotonicity across process restarts:
-    // - UnixNano gives ~292 years before overflow
-    // - Even if we restart 1 second later, new sequences are guaranteed higher
-    // - Clock skew is acceptable (we just need monotonicity within a run)
-    c.globalSeq.Store(uint64(time.Now().UnixNano()))
-
-    return c, nil
-}
-
-// nextSeq atomically increments and returns the next sequence ID.
-// This is THE source of truth for operation ordering.
-func (c *Cache) nextSeq() uint64 {
-    return c.globalSeq.Add(1)
-}
-```
-
-**Why UnixNano initialization?**
-- Provides automatic continuity across restarts without scanning storage
-- Even with 1ns resolution, provides ~292 years before overflow
-- Clock skew between restarts is acceptable - we only need monotonicity within a process lifetime
-- Simpler than persisting and recovering the last sequence ID
-
-### 0.6 MemTable Integration
-
-```go
-// memtable.go
-
-const (
-    // Power of 2 for fast modulo via bitmask
-    numIndexShards = 1024
-    indexShardMask = numIndexShards - 1
-)
-
-type MemTable struct {
-    // ... existing fields ...
-
-    // Sharded locks for per-key consistency within active slab.
-    // Usage: indexLocks[hash & indexShardMask].Lock()
-    indexLocks [numIndexShards]sync.Mutex
-
-    // Highest SeqID in the last sealed slab.
-    // Used by Lifecycle Guard to drop stale writes.
-    maxSealedSeq atomic.Uint64
-
-    // Highest SeqID seen in current active slab.
-    // Captured during rotation to update maxSealedSeq.
-    currentMaxSeq atomic.Uint64
-}
-
-// Put is called from Cache.Put with the pre-assigned sequence ID.
-// The seqID parameter is the "ticket" establishing this write's place in history.
-func (mt *MemTable) Put(seqID uint64, key Key, value []byte) {
-    mt.putWithChecksum(seqID, key, value, nil)
-}
-
-func (mt *MemTable) putActive(seqID uint64, key Key, value []byte, checksum *uint32) {
-    // 1. Compress before lock (parallel compression)
-    c := mt.maybeCompress(value)
-    defer c.Release()
-    mt.putActiveCompressed(seqID, key, value, checksum, c)
-}
-
-func (mt *MemTable) putActiveCompressed(
-    seqID uint64, key Key, value []byte, checksum *uint32, compressed BufferHandle,
-) {
-    mt.mu.Lock()
-
-    // ─────────────────────────────────────────────────────────────
-    // LAYER 1: LIFECYCLE GUARD (Global Check)
-    // ─────────────────────────────────────────────────────────────
-    // If this write's sequence is older than the last sealed slab,
-    // it's a "zombie" - drop it immediately.
-    if seqID <= mt.maxSealedSeq.Load() {
-        mt.mu.Unlock()
-        return // Silently drop stale write
-    }
-
-    // Track highest SeqID for this active slab (for future seal)
-    if seqID > mt.currentMaxSeq.Load() {
-        mt.currentMaxSeq.Store(seqID)
-    }
-
-    // 1. Wait for Rotation (Backpressure) - existing logic
-    if mt.mu.activeReady != nil {
-        wait := mt.mu.activeReady
-        mt.mu.Unlock()
-        <-wait
-        // IMPORTANT: Re-check lifecycle guard after waking up!
-        // Rotation may have happened while we waited.
-        mt.putActiveCompressed(seqID, key, value, checksum, compressed)
-        return
-    }
-
-    active := mt.mu.active
-    writeSize := int64(len(value))
-    if !compressed.IsZero() {
-        writeSize = int64(len(compressed.Bytes()))
-    }
-
-    // 2. Check Capacity & Rotate - existing logic with seq tracking
-    if active.wPos+writeSize > int64(active.buf.Cap()) {
-        rotateUnlocked := mt.prepareRotationLocked()
-        mt.mu.Unlock()
-        rotateUnlocked()
-        mt.putActiveCompressed(seqID, key, value, checksum, compressed)
-        return
-    }
-
-    // 3. Reservation
-    active.pendingWrites.Add(1)
-    wPos := active.wPos
-    active.wPos += writeSize
-    mt.mu.Unlock()
-
-    // 4. Write data (no lock - I/O parallelism)
-    if compressed.IsZero() {
-        active.buf.WriteAt(value, wPos)
-    } else {
-        active.buf.WriteAt(compressed.Bytes(), wPos)
-    }
-
-    // ─────────────────────────────────────────────────────────────
-    // LAYER 2: CONCURRENCY GUARD (Per-Key Check)
-    // ─────────────────────────────────────────────────────────────
-    // Serialize index updates for THIS key to prevent check-then-act race.
-    shard := key & indexShardMask
-    mt.indexLocks[shard].Lock()
-
-    // Check if a newer write already exists for this key
-    existing, found := active.index.Load(key)
-    if found && existing.SeqID >= seqID {
-        // A newer version exists - this write is a "zombie"
-        // The data at wPos becomes a "ghost blob" (acceptable overhead)
-        mt.indexLocks[shard].Unlock()
-        active.completePendingWrite()
-        return
-    }
-
-    // Create and store the new record with SeqID
-    record := makeEntry(seqID, key, wPos, value, compressed.Bytes(),
-                        mt.Compression.Codec, mt.Resilience.ChecksumHasher, checksum)
-    active.index.Store(key, record)
-
-    mt.indexLocks[shard].Unlock()
-
-    // 5. Complete - existing logic
-    active.completePendingWrite()
-}
-
-func (mt *MemTable) prepareRotationLocked() func() {
-    old := mt.mu.active
-
-    // Capture the highest SeqID in this slab BEFORE rotation
-    sealedMaxSeq := mt.currentMaxSeq.Load()
-
-    // 1. Setup Barrier (Block other writers)
-    mt.mu.activeReady = make(chan struct{})
-
-    // 2. Seal & Retire Old Slab
-    old.buf.Seal(old.wPos)
-    old.retired.Store(true)
-
-    // ... existing rotation logic ...
-
-    return func() {
-        // ... existing rotation logic ...
-
-        // CRITICAL: Update maxSealedSeq BEFORE installing new slab
-        // This ensures the Lifecycle Guard kicks in for stale threads
-        mt.maxSealedSeq.Store(sealedMaxSeq)
-
-        // Reset currentMaxSeq for the new slab
-        mt.currentMaxSeq.Store(0)
-
-        // ... rest of rotation ...
-    }
-}
-
-// Updated makeEntry to include SeqID
-func makeEntry(
-    seqID uint64, key Key, offset int64, original []byte, compressed []byte,
-    codec compression.Codex, hasher Hasher, checksum *uint32,
-) metadata.BlobRecord {
-    // ... existing logic ...
-
-    entry := metadata.BlobRecord{
-        Hash:         key,
-        Pos:          offset,
-        LogicalSize:  logicalSize,
-        PhysicalSize: physicalSize,
-        Flags:        metadata.InvalidChecksum,
-        SeqID:        seqID, // NEW: Include sequence ID
-    }
-
-    // ... existing checksum logic ...
-
-    return entry
-}
-```
-
-### 0.7 Cache.Put Integration
-
-```go
-// blobcache.go
-
-func (c *Cache) Put(key, value []byte) error {
-    h := c.config.KeyHasher(key)
-
-    // 1. ORDERING: Establish this write's place in history
-    // This is atomic and happens FIRST - before any I/O or state change.
-    seqID := c.nextSeq()
-
-    // 2. VISIBILITY: Update bloom filter
-    c.bloom.Load().Add(h)
-
-    // 3. (Future) DURABILITY: WAL commit would go here
-    // if c.wal != nil {
-    //     if err := c.wal.Commit(wal.Entry{SeqID: seqID, ...}); err != nil {
-    //         return err
-    //     }
-    // }
-
-    // 4. VISIBILITY: MemTable flow (now with SeqID)
-    c.memTable.Put(seqID, h, value)
-
-    return nil
-}
-```
-
-### 0.8 Read Path Impact (MINIMAL)
-
-**Critical Design Goal**: The read path must NOT be slowed down by sequence IDs.
-
-```go
-// The read path is UNCHANGED:
-// - Bloom filter check (fast)
-// - Librarian (RAM) lookup
-// - Index.Get() lookup
-// - Storage read
-
-// SeqID is stored but NOT checked during reads.
-// Why? Because the write path guarantees "latest wins" via the two guards.
-// By the time a record is visible in the index, it's definitively the latest.
-
-func (idx *Index) Get(hash uint64) (Entry, bool) {
-    n, ok := idx.blobs.Load(hash)
-    if !ok {
-        return Entry{}, false
-    }
-    n.visited.Store(true)
-    return n.entry, true // SeqID is in entry but not checked
-}
-```
-
-### 0.9 Recovery Considerations
-
-During WAL recovery (Phase 1), sequence IDs enable correct replay:
-
-```go
-// Future: WAL recovery uses SeqID to detect "ghost writes"
-func (c *Cache) replayPut(entry wal.Entry) {
-    // Check if index already has a newer version
-    existing, found := c.index.Get(entry.KeyHash)
-    if found && existing.SeqID >= entry.SeqID {
-        // This WAL entry is stale - a newer version was already persisted
-        // to segments before the crash. Skip replay.
-        return
-    }
-
-    // Replay the Put
-    c.memTable.Put(entry.SeqID, entry.KeyHash, entry.Value)
-}
-```
-
-### 0.10 Testing Strategy
-
-#### Unit Tests
-
-1. **Lifecycle Guard Tests** (`memtable_seq_test.go`):
-   ```go
-   // Test: Writes with SeqID <= maxSealedSeq are dropped
-   func TestLifecycleGuard_DropsStaleWrites(t *testing.T)
-
-   // Test: Rotation correctly updates maxSealedSeq
-   func TestLifecycleGuard_RotationUpdatesSeq(t *testing.T)
-
-   // Test: Wake-up after rotation re-checks guard
-   func TestLifecycleGuard_ReCheckAfterWakeup(t *testing.T)
-   ```
-
-2. **Concurrency Guard Tests** (`memtable_seq_test.go`):
-   ```go
-   // Test: Higher SeqID wins for same key
-   func TestConcurrencyGuard_HigherSeqWins(t *testing.T)
-
-   // Test: Sharded locks don't block unrelated keys
-   func TestConcurrencyGuard_ShardedLockIndependence(t *testing.T)
-
-   // Test: Check-then-act race is prevented
-   func TestConcurrencyGuard_RacePrevention(t *testing.T)
-   ```
-
-3. **Serialization Tests** (`metadata/record_test.go`):
-   ```go
-   // Test: BlobRecord with SeqID roundtrips correctly
-   func TestBlobRecord_SeqIDRoundtrip(t *testing.T)
-
-   // Test: Segment footer with SeqID fields validates
-   func TestSegmentRecord_SeqIDInFooter(t *testing.T)
-   ```
-
-#### Integration Tests
-
-1. **Time Travel Prevention** (`integration_test.go`):
-   ```go
-   // Simulate slow writer + rotation + fast writer
-   func TestIntegration_NoTimeTravelBug(t *testing.T)
-   ```
-
-2. **Concurrent Same-Key Writes** (`integration_test.go`):
-   ```go
-   // Multiple goroutines writing same key with different values
-   func TestIntegration_LatestValueWins(t *testing.T)
-   ```
-
-#### Benchmarks
-
-```go
-// Ensure SeqID doesn't regress write performance
-func BenchmarkPut_WithSeqID(b *testing.B)
-
-// Ensure read path is unchanged
-func BenchmarkGet_WithSeqID(b *testing.B)
-
-// Measure sharded lock contention
-func BenchmarkPut_SameKey_Contention(b *testing.B)
-```
-
-### 0.11 Migration Considerations
-
-**Backward Compatibility**:
-- Old segment files have 40-byte records (no SeqID)
-- New segment files have 48-byte records (with SeqID)
-
-**Migration Strategy**:
-```go
-// During segment read, detect record size and handle both formats
-func DecodeBlobRecord(buf []byte) (BlobRecord, error) {
-    // Support both old (40-byte) and new (48-byte) formats
-    if len(buf) >= 48 {
-        // New format with SeqID
-        return BlobRecord{
-            // ... all fields including SeqID ...
-        }, nil
-    } else if len(buf) >= 40 {
-        // Old format without SeqID - assign SeqID=0
-        // This is safe because:
-        // 1. Old records are already persisted (won't race)
-        // 2. New writes always have SeqID > 0 (initialized from UnixNano)
-        return BlobRecord{
-            // ... fields without SeqID ...
-            SeqID: 0, // Legacy record
-        }, nil
-    }
-    return BlobRecord{}, fmt.Errorf("buffer too small")
-}
-```
-
-### 0.12 Implementation Status: COMPLETE
-
-Phase 0 has been fully implemented. The sequence ID infrastructure provides correctness guarantees that benefit blobcache even in pure cache mode, without WAL enabled.
-
-#### Why Sequence IDs Matter for a Cache (Not Just WAL)
-
-It may seem counterintuitive to add ordering infrastructure to a cache—after all, caches are ephemeral, and "eventual consistency" might seem acceptable. However, blobcache's architecture creates subtle race conditions that can violate user expectations even in cache mode.
-
-Consider a user who calls `Put("config", v2)` to update a configuration blob. They expect subsequent `Get("config")` calls to return `v2`. Without sequence IDs, a slow writer from a previous `Put("config", v1)` could wake up after rotation, write to the new active slab, and cause `Get` to return `v1`—the user's update appears to have been silently dropped. This "time travel" bug is particularly insidious because it's non-deterministic and depends on OS scheduling.
-
-The sequence ID infrastructure prevents this by establishing a total order on operations. When a write's sequence ID is older than the sealed slab's maximum, it's definitively stale and dropped. This costs approximately 50ns per write (one atomic increment plus a sharded lock acquisition) but guarantees that users never observe stale data due to write reordering.
+### 0.4 Implementation Receipts (COMPLETE)
+
+The following table maps PLAN concepts to actual implementation locations:
+
+| Concept | File:Line | Notes |
+|---------|-----------|-------|
+| **Data Structures** | | |
+| FooterEntry with SeqID | `internal/record/segment.go:178-185` | 48-byte record |
+| FooterEntrySize = 48 | `internal/record/segment.go:156` | |
+| Header.SeqID | `internal/record/record.go:79` | |
+| **Global Sequence Counter** | | |
+| globalSeq atomic.Uint64 | `blobcache.go:49` | |
+| nextSeq() method | `blobcache.go:101-106` | With testing hook |
+| UnixNano initialization | `blobcache.go:152-157` | |
+| **MemTable Guards** | | |
+| numIndexShards = 256 | `memtable.go:19` | PLAN said 1024, refined to 256 |
+| indexLocks | `memtable.go:57` | Sharded mutex array |
+| maxSealedSeq | `memtable.go:47-50` | Inside mu struct |
+| Lifecycle Guard check | `memtable.go:215-221` | Returns errSequenceTooOld |
+| Concurrency Guard | `memtable.go:267-275` | Per-key serialization |
+| Rotation handoff | `memtable.go:294-298` | Updates maxSealedSeq |
+| currentMaxSeq | `memtable.go:252-254` | Per-slab tracking |
+| **Cache Integration** | | |
+| putWithRetry | `blobcache.go:354-383` | Zombie resurrection loop |
+| **Tests** | | |
+| TestMemTable_LifecycleGuard | `sequence_test.go:13` | |
+| TestMemTable_ConcurrencyGuard | `sequence_test.go:46` | |
+| TestMemTable_ConcurrentWritesSameKey | `sequence_test.go:82` | |
+| TestMemTable_RotationUpdatesMaxSealedSeq | `sequence_test.go:130` | |
+| TestCache_RetryLoop_ZombieResurrection | `sequence_test.go:182` | |
+| TestCache_RetryLoop_IdempotentSuccess | `sequence_test.go:236` | |
+| **Documentation** | | |
+| DESIGN.md section 4.6 | Lines 171-192 | Race conditions + guards |
+
+#### Implementation Refinements
+
+The actual implementation refined several PLAN details:
+
+1. **256 shards vs 1024**: Sufficient for 32 concurrent writers (~2% collision)
+2. **maxSealedSeq inside mu**: Protected by mutex, atomic not needed
+3. **currentMaxSeq per-slab**: Cleaner tracking during rotation
+4. **errSequenceTooOld**: Returns error instead of silent drop (enables retry)
+5. **putWithRetry loop**: Zombie resurrection protocol not in original PLAN
+
+### 0.5 Implementation Status: COMPLETE
+
+Phase 0 is fully implemented. The sequence ID infrastructure provides correctness guarantees that benefit blobcache even in pure cache mode, without WAL enabled.
+
+#### Why Sequence IDs Matter for a Cache
+
+It may seem counterintuitive to add ordering infrastructure to a cache—after all, caches are ephemeral. However, blobcache's architecture creates subtle race conditions that can violate user expectations even in cache mode.
+
+Consider a user who calls `Put("config", v2)` to update a configuration blob. They expect subsequent `Get("config")` calls to return `v2`. Without sequence IDs, a slow writer from a previous `Put("config", v1)` could wake up after rotation, write to the new active slab, and cause `Get` to return `v1`—the user's update appears to have been silently dropped.
+
+The sequence ID infrastructure prevents this by establishing a total order on operations. The overhead is approximately 50ns per write (one atomic increment plus a sharded lock acquisition) but guarantees that users never observe stale data due to write reordering.
 
 The same infrastructure enables future WAL support without retrofitting—sequence IDs in the WAL allow recovery to correctly skip entries that were already persisted to segments before a crash.
-
-#### Implementation Summary
-
-The core changes span three areas:
-
-**BlobRecord Extension**: Added a `SeqID` field to the 48-byte blob record format. Old 40-byte records are handled transparently during deserialization by assigning `SeqID=0`, which is safe because all new writes have sequences initialized from `time.Now().UnixNano()`.
-
-**Global Sequence Counter**: The `Cache` struct maintains a `globalSeq` counter initialized from the current nanosecond timestamp. This eliminates the need to scan storage on startup to find the highest sequence—any realistic restart delay ensures new sequences exceed all prior values.
-
-**MemTable Guards**: Two protection layers prevent the race conditions described in sections 0.2-0.3. The Lifecycle Guard (`maxSealedSeq`) drops writes that are older than the last sealed slab. The Concurrency Guard (1024 sharded locks) serializes same-key index updates to prevent check-then-act races.
-
-#### Bug Fix: Dual wPos Fields
-
-During implementation, a flaky test (`TestMemTable_Integration_Rotation`) exposed a design flaw in the `MmapBuffer` abstraction. The buffer maintained its own `wPos` field separate from `ActiveSlab.wPos`, creating a synchronization bug.
-
-When `LargeWriteThreshold=0` (used in tests to force specific code paths), all writes flowed through `putLarge`, which updated `ActiveSlab.wPos` but never called `MmapBuffer.Seal()`. The buffer's internal `wPos` remained at `-1`, causing `AlignedBytes()` to return `nil` and zero bytes to be written to segments.
-
-The fix consolidated write position tracking: `MmapBuffer.AlignedBytes()` now takes the offset as a parameter, and `ActiveSlab.wPos` is the single source of truth. This eliminated `Seal()`, `Reset()`, and the duplicate `wPos` field from `MmapBuffer`, simplifying the abstraction and removing the synchronization requirement entirely.
-
-#### Testing Infrastructure
-
-The implementation includes a `TestingKnobs` struct for deterministic testing of sequence-dependent behavior. The `SequenceVendor` interface allows tests to inject controlled sequence IDs, enabling verification that the Lifecycle and Concurrency guards correctly handle edge cases like out-of-order arrivals and concurrent same-key writes.
-
-#### Checklist
-
-- [x] Add `SeqID` field to `metadata.BlobRecord`
-- [x] Update `EncodedBlobRecordSize` constant (40 → 48)
-- [x] Update `AppendBlobRecord` serialization
-- [x] Update `DecodeBlobRecord` deserialization (with backward compat)
-- [x] Add `globalSeq atomic.Uint64` to `Cache` struct
-- [x] Initialize `globalSeq` with `time.Now().UnixNano()` in `Open()`
-- [x] Add `nextSeq()` method to `Cache`
-- [x] Add `indexLocks [256]sync.Mutex` to `MemTable`
-- [x] Add `maxSealedSeq atomic.Uint64` to `MemTable`
-- [x] Add `currentMaxSeq atomic.Uint64` to `ActiveSlab`
-- [x] Update `MemTable.Put()` to use sequence IDs
-- [x] Implement Lifecycle Guard in `putActiveCompressed()`
-- [x] Implement Concurrency Guard in `putActiveCompressed()`
-- [x] Update `prepareRotationLocked()` to capture/update `maxSealedSeq`
-- [x] Update `makeEntry()` to include `seqID`
-- [x] Update `Cache.Put()` to call `nextSeq()` and pass to MemTable
-- [x] Add unit tests for both guards (`sequence_test.go`)
-- [x] Add `TestingKnobs` infrastructure for deterministic testing
-- [x] Fix dual wPos bug in MmapBuffer/ActiveSlab
 
 ---
 
 ## Part 1: Write-Ahead Log (WAL) Implementation
+
+> **STATUS: NOT IMPLEMENTED** - This section contains the design for future WAL implementation.
+
+<!-- REMOVED: Detailed pseudocode sections 0.4-0.11 -->
+<!-- These were implementation guides that are now complete. See receipts table above. -->
+
+<!--
+Original sections removed (now implemented):
+- 0.4 Data Structure Changes (BlobRecord with SeqID)
+- 0.5 Global Sequence Counter
+- 0.6 MemTable Integration
+- 0.7 Cache.Put Integration
+- 0.8 Read Path Impact
+- 0.9 Recovery Considerations
+- 0.10 Testing Strategy
+- 0.11 Migration Considerations
+- 0.12 Implementation Status (checklist)
+-->
 
 ### 1.1 Overview
 
@@ -770,364 +336,6 @@ type request struct {
 }
 ```
 
-#### Step 2: WAL Manager (`wal/manager.go`)
-
-```go
-package wal
-
-type Manager struct {
-    mu   sync.Mutex
-    cond *sync.Cond
-
-    // Double buffering (ping-pong)
-    pending  []*request
-    flushing []*request
-
-    writerBusy bool
-
-    // I/O
-    file       *os.File
-    buffers    net.Buffers  // Reused for writev
-    scratchBuf []byte       // Pre-allocated encoding buffer
-
-    // Config
-    syncMode   SyncMode     // FDataSync, FSync, or None
-    maxSize    int64        // Rotate when exceeded
-    currentPos int64        // Current write position
-
-    // Metrics
-    commitLatency histogram
-    batchSize     histogram
-}
-
-type SyncMode int
-
-const (
-    SyncModeNone     SyncMode = iota // No sync (test only)
-    SyncModeFDataSync                 // fdatasync (data only)
-    SyncModeFSync                     // fsync (data + metadata)
-)
-```
-
-#### Step 3: Group Commit Implementation
-
-```go
-func (w *Manager) Commit(entry Entry) error {
-    req := &request{entry: entry}
-
-    w.mu.Lock()
-    w.pending = append(w.pending, req)
-
-    for {
-        if req.done {
-            w.mu.Unlock()
-            return req.err
-        }
-
-        if w.writerBusy {
-            w.cond.Wait()
-            continue
-        }
-
-        // Become leader
-        w.writerBusy = true
-
-        // Ping-pong swap
-        toFlush := w.pending
-        w.pending = w.flushing[:0] // Reuse capacity
-        w.flushing = toFlush
-
-        w.mu.Unlock()
-
-        // I/O without lock
-        err := w.syncToDisk(toFlush)
-
-        w.mu.Lock()
-        w.writerBusy = false
-
-        // Complete all requests in batch
-        for _, r := range toFlush {
-            r.err = err
-            r.done = true
-        }
-
-        w.cond.Broadcast()
-    }
-}
-```
-
-#### Step 4: Efficient Disk Sync (`wal/io.go`)
-
-```go
-func (w *Manager) syncToDisk(batch []*request) error {
-    if len(batch) == 0 {
-        return nil
-    }
-
-    // Build net.Buffers for scatter/gather I/O
-    w.buffers = w.buffers[:0]
-
-    for _, req := range batch {
-        encoded := w.encodeEntry(&req.entry)
-        w.buffers = append(w.buffers, encoded)
-    }
-
-    // writev - single syscall for all entries
-    n, err := w.buffers.WriteTo(w.file)
-    if err != nil {
-        return fmt.Errorf("writev failed: %w", err)
-    }
-    w.currentPos += n
-
-    // Sync based on configured mode
-    switch w.syncMode {
-    case SyncModeFDataSync:
-        if err := fdatasync(w.file); err != nil {
-            return fmt.Errorf("fdatasync failed: %w", err)
-        }
-    case SyncModeFSync:
-        if err := w.file.Sync(); err != nil {
-            return fmt.Errorf("fsync failed: %w", err)
-        }
-    }
-
-    return nil
-}
-
-func (w *Manager) encodeEntry(e *Entry) []byte {
-    // Use scratch buffer to avoid allocations
-    // Header(24) + Key + Value + CRC(4)
-    size := 28 + len(e.Key) + len(e.Value)
-    if cap(w.scratchBuf) < size {
-        w.scratchBuf = make([]byte, size)
-    }
-    buf := w.scratchBuf[:size]
-
-    // Header (24 bytes)
-    buf[0] = byte(e.Type)
-    buf[1] = 0 // flags (reserved)
-    binary.LittleEndian.PutUint16(buf[2:4], uint16(len(e.Key)))
-    binary.LittleEndian.PutUint32(buf[4:8], uint32(len(e.Value)))
-    binary.LittleEndian.PutUint64(buf[8:16], e.SeqID)    // SeqID for ordering
-    binary.LittleEndian.PutUint64(buf[16:24], e.KeyHash) // Hash for fast lookup
-
-    // Payload
-    copy(buf[24:], e.Key)
-    copy(buf[24+len(e.Key):], e.Value)
-
-    // CRC32 footer (covers header + payload)
-    payloadEnd := 24 + len(e.Key) + len(e.Value)
-    crc := crc32.ChecksumIEEE(buf[:payloadEnd])
-    binary.LittleEndian.PutUint32(buf[payloadEnd:], crc)
-
-    return buf
-}
-```
-
-#### Step 5: Recovery (`wal/recovery.go`)
-
-```go
-type RecoveryResult struct {
-    Puts    []Entry
-    Deletes []Entry
-    Corrupt int // Number of corrupt entries skipped
-}
-
-func (w *Manager) Recover() (*RecoveryResult, error) {
-    result := &RecoveryResult{}
-
-    // Seek past header
-    if _, err := w.file.Seek(WalHeaderSize, io.SeekStart); err != nil {
-        return nil, err
-    }
-
-    reader := bufio.NewReader(w.file)
-
-    for {
-        entry, err := w.readEntry(reader)
-        if err == io.EOF {
-            break
-        }
-        if err != nil {
-            // CRC mismatch or truncated entry
-            result.Corrupt++
-            // Try to resync to next valid entry
-            if !w.resync(reader) {
-                break // Can't recover further
-            }
-            continue
-        }
-
-        switch entry.Type {
-        case EntryTypePut:
-            result.Puts = append(result.Puts, entry)
-        case EntryTypeDelete:
-            result.Deletes = append(result.Deletes, entry)
-        }
-    }
-
-    return result, nil
-}
-```
-
-#### Step 6: Configuration Options (`options.go`)
-
-```go
-// WAL Configuration
-type WALConfig struct {
-    Enabled   bool      // Enable WAL (default: false for cache mode)
-    Dir       string    // WAL directory (default: same as data)
-    SyncMode  SyncMode  // Sync strategy (default: FDataSync)
-    MaxSize   int64     // Max WAL file size before rotation (default: 256MB)
-    BufferCap int       // Pre-allocated request buffer capacity (default: 4096)
-}
-
-// Options
-func WithWAL(cfg WALConfig) Option {
-    return func(c *config) {
-        c.WAL = cfg
-    }
-}
-
-func WithWALEnabled() Option {
-    return func(c *config) {
-        c.WAL.Enabled = true
-    }
-}
-
-func WithWALDir(dir string) Option {
-    return func(c *config) {
-        c.WAL.Dir = dir
-    }
-}
-
-func WithWALSyncMode(mode SyncMode) Option {
-    return func(c *config) {
-        c.WAL.SyncMode = mode
-    }
-}
-```
-
-#### Step 7: Delete API (`blobcache.go`)
-
-```go
-// Delete removes or tombstones a key from the cache.
-// Returns true if the key existed, false otherwise.
-func (c *Cache) Delete(key []byte) (bool, error) {
-    h := c.config.KeyHasher(key)
-
-    // 1. ORDERING: Assign sequence ID FIRST (even for deletes)
-    seqID := c.nextSeq()
-
-    // Check if key exists
-    _, found := c.index.Get(h)
-    if !found {
-        return false, nil
-    }
-
-    // WAL commit (if enabled)
-    if c.wal != nil {
-        if err := c.wal.Commit(wal.Entry{
-            Type:    wal.EntryTypeDelete,
-            SeqID:   seqID,  // Include SeqID for recovery ordering
-            KeyHash: h,
-            Key:     key,
-        }); err != nil {
-            return false, fmt.Errorf("WAL commit failed: %w", err)
-        }
-    }
-
-    // Remove from index (with SeqID check for concurrent deletes)
-    entry, deleted := c.index.DeleteIfOlder(h, seqID)
-    if !deleted {
-        return false, nil
-    }
-
-    // Update approximate size
-    c.approxSize.Add(-entry.LogicalSize)
-
-    // Mark segment region for hole punching (background)
-    c.storage.MarkDeleted(entry.SegmentID, entry.Pos, entry.PhysicalSize)
-
-    return true, nil
-}
-```
-
-#### Step 8: Integration with Put (`blobcache.go`)
-
-```go
-func (c *Cache) Put(key, value []byte) error {
-    h := c.config.KeyHasher(key)
-
-    // 1. ORDERING: Establish this write's place in history FIRST
-    seqID := c.nextSeq()
-
-    // 2. Update bloom filter
-    c.bloom.Load().Add(h)
-
-    // 3. WAL commit (if enabled) - BEFORE visibility
-    if c.wal != nil {
-        if err := c.wal.Commit(wal.Entry{
-            Type:    wal.EntryTypePut,
-            SeqID:   seqID,  // Include SeqID for recovery ordering
-            KeyHash: h,
-            Key:     key,
-            Value:   value,
-        }); err != nil {
-            return fmt.Errorf("WAL commit failed: %w", err)
-        }
-    }
-
-    // 4. MemTable flow with SeqID (Phase 0 integration)
-    c.memTable.Put(seqID, h, value)
-    return nil
-}
-```
-
-#### Step 9: Startup Recovery (`blobcache.go`)
-
-```go
-func Open(path string, opts ...Option) (*Cache, error) {
-    // ... existing setup ...
-
-    if cfg.WAL.Enabled {
-        walPath := cfg.WAL.Dir
-        if walPath == "" {
-            walPath = filepath.Join(path, "wal")
-        }
-
-        walMgr, err := wal.Open(walPath, cfg.WAL)
-        if err != nil {
-            return nil, fmt.Errorf("open WAL: %w", err)
-        }
-
-        // Check for recovery
-        if walMgr.NeedsRecovery() {
-            result, err := walMgr.Recover()
-            if err != nil {
-                return nil, fmt.Errorf("WAL recovery failed: %w", err)
-            }
-
-            // Replay operations
-            for _, entry := range result.Puts {
-                c.replayPut(entry)
-            }
-            for _, entry := range result.Deletes {
-                c.replayDelete(entry)
-            }
-
-            // Truncate WAL after successful recovery
-            if err := walMgr.Truncate(); err != nil {
-                return nil, fmt.Errorf("WAL truncate failed: %w", err)
-            }
-        }
-
-        c.wal = walMgr
-    }
-
-    return c, nil
-}
-```
 
 ### 1.6 Testing Strategy
 
@@ -1149,6 +357,9 @@ func Open(path string, opts ...Option) (*Cache, error) {
 ---
 
 ## Part 2: Segment Compaction Implementation
+
+> **STATUS: NOT IMPLEMENTED** - This section contains the design for future compaction implementation.
+> Current code has only a placeholder: `maybeCompactSegments()` returns nil.
 
 ### 2.1 Overview
 
@@ -1584,7 +795,16 @@ func WithCompactionInterval(d time.Duration) Option {
 
 ## Part 3: DESIGN.md Updates
 
-### 3.1 New Sections to Add
+> **STATUS: PARTIALLY COMPLETE**
+> - ✅ Sequence IDs: Added to DESIGN.md section 4.6 (lines 171-192)
+> - ⏳ WAL: Not added yet (implementation not started)
+> - ⏳ Compaction: Placeholder in section 10.2 (implementation not started)
+
+### 3.1 Sequence IDs Section
+
+> **✅ COMPLETE** - Already in DESIGN.md section 4.6
+
+The following content is now in DESIGN.md (not needed in PLAN anymore):
 
 ```markdown
 ## Sequence IDs and Consistency

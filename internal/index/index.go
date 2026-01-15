@@ -7,12 +7,17 @@
 //
 // Eviction uses the SIEVE/Clock algorithm with byte-based targets and a
 // hybrid strategy (random greedy for small targets, proportional fair for large).
+//
+// Design Philosophy: RAM stores only "coordinates" (24 bytes per item).
+// Full metadata (SeqID, LogicalSize, compression) lives on disk in record.Header
+// and is read on-demand during Get() operations.
 package index
 
 import (
 	"math/rand"
 
-	"github.com/miretskiy/blobcache/internal/record"
+	"github.com/miretskiy/blobcache/base"
+	"github.com/miretskiy/blobcache/compression"
 )
 
 // Public constants that callers may need to reference.
@@ -35,15 +40,78 @@ const (
 // Defined as an array (not slice) for GC optimization - no heap pointer.
 type Key [16]byte
 
-// Item holds the in-memory metadata for a blob entry.
-// Embeds record.FooterEntry for direct persistence mapping.
+// Item holds the minimum coordinates needed to locate a blob on disk.
+// This "lean" design (24 bytes) enables 1TB capacity with ~18GB RAM (4KB blobs).
 //
-// NOTE: Item.Hash is redundant with the map key (Key [16]byte), but we keep it
-// because FooterEntry.Hash is required for on-disk format. When we upgrade to
-// 128-bit hashes, FooterEntry.Hash will also change.
+// Layout (24 bytes, 8-byte aligned):
+//
+//	Hash        uint64 // 8B: Back-reference for eviction/map deletes
+//	SegmentID   uint32 // 4B: Supports 4 billion segments
+//	Offset      uint32 // 4B: Supports 4GB segment files
+//	PhysicalLen uint32 // 4B: Supports 4GB blobs
+//	Flags       uint32 // 4B: Deleted, errno, compression (alignment freebie)
+//
+// Full metadata (SeqID, LogicalSize) is read from disk Header on Get().
 type Item struct {
-	record.FooterEntry        // Hash, Pos, LogicalSize, PhysicalSize, SeqID, Flags
-	SegmentID          int64  // Which segment file contains this blob
+	Hash        uint64 // Key hash (xxhash) - back-reference for eviction
+	SegmentID   uint32 // Which segment file contains this blob
+	Offset      uint32 // Byte offset within segment (to record header)
+	PhysicalLen uint32 // On-disk size in bytes (header + key + value)
+	Flags       uint32 // Status flags (deleted, errno, compression codec)
+}
+
+// Item flag constants (packed into 32 bits).
+const (
+	// Compression codec in bits 31-28 (4 bits, 16 values).
+	itemFlagCompressionShift = 28
+	itemFlagCompressionMask  = uint32(0xF) << itemFlagCompressionShift
+
+	// BlobErrno in bits 27-23 (5 bits, 32 values).
+	itemFlagErrnoShift = 23
+	itemFlagErrnoMask  = uint32(0x1F) << itemFlagErrnoShift
+
+	// Status flags.
+	itemFlagDeleted = uint32(1) << 22 // Tombstone marker
+)
+
+// IsDeleted returns true if the blob is marked as deleted.
+func (item *Item) IsDeleted() bool {
+	return (item.Flags & itemFlagDeleted) != 0
+}
+
+// SetDeleted marks the blob as deleted.
+func (item *Item) SetDeleted() {
+	item.Flags |= itemFlagDeleted
+}
+
+// Errno returns the error code for this blob.
+func (item *Item) Errno() base.BlobErrno {
+	return base.BlobErrno((item.Flags & itemFlagErrnoMask) >> itemFlagErrnoShift)
+}
+
+// SetErrno sets the error code for this blob.
+func (item *Item) SetErrno(errno base.BlobErrno) {
+	item.Flags = (item.Flags &^ itemFlagErrnoMask) | (uint32(errno&0x1F) << itemFlagErrnoShift)
+}
+
+// HasError returns true if the blob has a non-zero error code.
+func (item *Item) HasError() bool {
+	return item.Errno() != base.ErrNone
+}
+
+// Compression returns the compression codec for this blob.
+func (item *Item) Compression() compression.Codex {
+	return compression.Codex((item.Flags & itemFlagCompressionMask) >> itemFlagCompressionShift)
+}
+
+// SetCompression sets the compression codec for this blob.
+func (item *Item) SetCompression(c compression.Codex) {
+	item.Flags = (item.Flags &^ itemFlagCompressionMask) | (uint32(c) << itemFlagCompressionShift)
+}
+
+// IsCompressed returns true if the blob is compressed.
+func (item *Item) IsCompressed() bool {
+	return item.Compression() != compression.CodexNone
 }
 
 // BlobIndex is the main entry point for the in-memory index.
@@ -231,8 +299,9 @@ func (idx *BlobIndex) Stats() Stats {
 	}
 
 	// Estimate memory: node size * arena nodes + map overhead
-	const nodeSize = 16 + 64 + 4 + 4 + 4 // key + item + next + prev + visited
-	const mapEntryOverhead = 32          // approximate per-entry map overhead
+	// node = Key(16) + Item(24) + next(4) + prev(4) + visited(4) = 52 bytes
+	const nodeSize = 16 + 24 + 4 + 4 + 4
+	const mapEntryOverhead = 32 // approximate per-entry map overhead
 	s.MemoryEst = int64(s.ArenaNodes)*nodeSize + int64(s.Items)*mapEntryOverhead
 
 	return s

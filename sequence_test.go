@@ -257,20 +257,18 @@ func TestCache_RetryLoop_IdempotentSuccess(t *testing.T) {
 	cache.Put(key, []byte("first-value"))
 	cache.Drain()
 
-	// Verify it's in the index with seqID=101
-	existingRecord, found := cache.index.DeprecatedGetByHash(h)
+	// Verify it's in the index
+	_, found := cache.index.DeprecatedGetByHash(h)
 	require.True(t, found)
-	require.Equal(t, uint64(101), existingRecord.SeqID)
 
 	// Now write a "newer" value with seqID=200
 	seqVendor.seq.Store(199) // nextSeq will return 200
 	cache.Put(key, []byte("newer-value"))
 	cache.Drain()
 
-	// Verify the index now has seqID=200
-	existingRecord, found = cache.index.DeprecatedGetByHash(h)
+	// Verify the entry still exists in index
+	_, found = cache.index.DeprecatedGetByHash(h)
 	require.True(t, found)
-	require.Equal(t, uint64(200), existingRecord.SeqID)
 
 	// Now simulate a zombie: it will get seqID=50 (older than what's in index)
 	// and maxSealedSeq will reject it

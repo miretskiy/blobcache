@@ -68,11 +68,24 @@ func RecoverIndex(path string, opts ...Option) (*Cache, error) {
 				continue
 			}
 
+			// Convert FooterEntry to lean Items for index
+			items := make([]index.Item, len(segment.Entries))
+			for i, e := range segment.Entries {
+				physicalLen := uint32(record.HeaderSize) + uint32(e.KeyLen) + uint32(e.PhysicalSize)
+				items[i] = index.Item{
+					Hash:        e.Hash,
+					SegmentID:   segmentID,
+					Offset:      uint32(e.Pos),
+					PhysicalLen: physicalLen,
+				}
+				items[i].SetCompression(e.Compression())
+			}
+
 			// USE THE LOWER LEVEL PRIMITIVE:
 			// IngestBatch directly updates the Skipmap/Sieve metadata.
-			if err := recoveryIdx.IngestBatch(segment.SegmentID, segment.Entries); err != nil {
+			if err := recoveryIdx.IngestBatch(segmentID, items); err != nil {
 				recoveryIdx.Close()
-				return nil, fmt.Errorf("recovery ingestion failed for seg %d: %w", segment.SegmentID, err)
+				return nil, fmt.Errorf("recovery ingestion failed for seg %d: %w", segmentID, err)
 			}
 			validCount++
 		}
@@ -112,9 +125,10 @@ func RecoverIndex(path string, opts ...Option) (*Cache, error) {
 	}
 
 	// Set starting size by scanning the index truth
+	// Note: PhysicalLen is total record size (header + key + value)
 	var totalSize int64
 	c.index.ForEachBlob(func(e index.Item) bool {
-		totalSize += e.LogicalSize
+		totalSize += int64(e.PhysicalLen)
 		return true
 	})
 	c.approxSize.Store(totalSize)
@@ -125,7 +139,7 @@ func RecoverIndex(path string, opts ...Option) (*Cache, error) {
 
 // readSegmentFooter reads and validates a segment file's footer
 // Returns the SegmentFooter if valid, or an error if corrupt/incomplete
-func readSegmentFooter(path string, segmentID int64) (record.SegmentFooter, error) {
+func readSegmentFooter(path string, segmentID uint32) (record.SegmentFooter, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return record.SegmentFooter{}, err
@@ -137,13 +151,14 @@ func readSegmentFooter(path string, segmentID int64) (record.SegmentFooter, erro
 		return record.SegmentFooter{}, err
 	}
 
-	segment, _, err := record.ReadSegmentFooterFromFile(file, stat.Size(), segmentID)
+	// ReadSegmentFooterFromFile uses int64 for backward compat with existing segments
+	segment, _, err := record.ReadSegmentFooterFromFile(file, stat.Size(), int64(segmentID))
 	return segment, err
 }
 
 // extractSegmentID extracts the segment SegmentID from a filename like "123456.seg"
-func extractSegmentID(filename string) int64 {
-	var id int64
+func extractSegmentID(filename string) uint32 {
+	var id uint32
 	// Parse filename: "123456.seg" -> 123456
 	fmt.Sscanf(filename, "%d.seg", &id)
 	return id

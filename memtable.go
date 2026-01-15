@@ -6,7 +6,6 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/miretskiy/blobcache/compression"
 	"github.com/miretskiy/blobcache/internal/record"
@@ -34,7 +33,7 @@ type MemTable struct {
 	ErrorReporter
 	Knobs *TestingKnobs
 
-	segmentID  atomic.Int64
+	segmentID  atomic.Uint32
 	slabPool   *MmapPool
 	footerPool *MmapPool
 	publisher  Publisher
@@ -75,9 +74,11 @@ func NewMemTable(cfg config, b Batcher, reporter ErrorReporter, pub Publisher) *
 		flushCh:       make(chan FlushTicket, cfg.MaxInflightSlabs),
 		stopCh:        make(chan struct{}),
 	}
-	mt.segmentID.Store(time.Now().UnixNano())
 
 	mt.mu.active = mt.newActiveSlab(0)
+
+	// Initialize segment ID from highest existing segment (workers will increment before use)
+	mt.segmentID.Store(maxSegmentID(cfg.Path, cfg.Shards))
 
 	mt.wg.Add(cfg.FlushConcurrency)
 	for i := 0; i < cfg.FlushConcurrency; i++ {
@@ -464,6 +465,7 @@ func (mt *MemTable) processFlush(as *ActiveSlab, writer *SegmentWriter) (*Segmen
 			PhysicalSize: e.PhysicalSize,
 			SeqID:        e.SeqID,
 			Flags:        e.Flags,
+			KeyLen:       e.KeyLen, // From embedded record.Header
 		})
 		return true
 	})
@@ -502,8 +504,9 @@ func (mt *MemTable) processFlush(as *ActiveSlab, writer *SegmentWriter) (*Segmen
 
 func (mt *MemTable) openSegment() (*SegmentWriter, error) {
 	segmentID := mt.segmentID.Add(1)
+	path := getSegmentPath(mt.Path, mt.Shards, segmentID)
 	return NewSegmentWriter(
-		segmentID, getSegmentPath(mt.Path, mt.Shards, segmentID),
+		segmentID, path,
 		mt.SegmentSize, mt.footerPool, mt.IO.FDataSync, mt.IO.DirectIOWrite,
 	)
 }

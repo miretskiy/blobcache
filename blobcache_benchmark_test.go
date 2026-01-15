@@ -17,7 +17,6 @@ import (
 
 	"github.com/HdrHistogram/hdrhistogram-go"
 	"github.com/miretskiy/blobcache/internal/index"
-	"github.com/miretskiy/blobcache/internal/record"
 	"github.com/shirou/gopsutil/v3/disk"
 	"github.com/shirou/gopsutil/v3/process"
 )
@@ -357,19 +356,19 @@ func BenchmarkEviction_SieveVictimSelection(b *testing.B) {
 	const segmentSize = 2 << 30 // 2GB per segment
 
 	var (
-		currentSegID   int64 = 1
-		currentSegSize int64
-		batch          []record.FooterEntry
+		currentSegID   uint32 = 1
+		currentSegSize uint32
+		batch          []index.Item
 	)
 
 	for i := 0; i < b.N; i++ {
 		// Randomized blob size: 100KB to 2MB (not page-aligned)
-		blobSize := int64(100_000 + rng.IntN(1_900_000))
+		blobSize := uint32(100_000 + rng.IntN(1_900_000))
 
-		batch = append(batch, record.FooterEntry{
+		batch = append(batch, index.Item{
 			Hash:        uint64(i),
-			Pos:         currentSegSize,
-			LogicalSize: blobSize,
+			Offset:      currentSegSize,
+			PhysicalLen: blobSize,
 		})
 		currentSegSize += blobSize
 
@@ -408,7 +407,7 @@ func BenchmarkEviction_SieveVictimSelection(b *testing.B) {
 		if err != nil {
 			b.Fatalf("Eviction failed at %d/%d: %v", i, b.N, err)
 		}
-		totalBytes += victim.LogicalSize
+		totalBytes += int64(victim.PhysicalLen)
 	}
 
 	elapsed := time.Since(start)

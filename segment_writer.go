@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/miretskiy/blobcache/internal/index"
 	"github.com/miretskiy/blobcache/internal/record"
 	"github.com/miretskiy/blobcache/internal/sys"
 )
@@ -20,11 +21,11 @@ type poolProvider interface {
 // It ingests multiple MemTable slabs (e.g., 128MB each) and accumulates
 // footer entries until the segment is full or explicitly sealed.
 type SegmentWriter struct {
-	id         int64
+	id         uint32
 	file       *os.File
 	currentPos int64
 	pool       poolProvider
-	entries    []record.FooterEntry
+	entries    []record.FooterEntry // Full entries for segment footer
 	syncData   bool
 }
 
@@ -32,7 +33,7 @@ type SegmentWriter struct {
 // uses O_DIRECT (Linux) or F_NOCACHE (Darwin) to bypass the OS page cache,
 // ensuring that massive sequential writes do not "pollute" RAM.
 func NewSegmentWriter(
-	id int64, path string, segmentSize int64, pool poolProvider, syncData bool, directIO bool,
+	id uint32, path string, segmentSize int64, pool poolProvider, syncData bool, directIO bool,
 ) (*SegmentWriter, error) {
 	// 1. Ensure the parent directory structure exists.
 	// This creates "segments/0000/" recursively if they are missing.
@@ -63,12 +64,13 @@ func NewSegmentWriter(
 // WriteSlab appends a memory-aligned slab of data to the segment.
 // 'data' MUST be 4KB-aligned (via MmapBuffer.AlignedBytes()) or the write
 // will fail with EINVAL on Linux systems.
-// Returns the entries with Pos transformed from relative to absolute positions.
+// Returns lean index.Item entries with absolute positions for index updates.
+// The full FooterEntry data is kept internally for the segment footer.
 func (sw *SegmentWriter) WriteSlab(
 	data []byte, entries []record.FooterEntry,
-) ([]record.FooterEntry, error) {
+) ([]index.Item, error) {
 	if len(data) == 0 {
-		return entries, nil
+		return nil, nil
 	}
 
 	// If some previous operation left us unaligned, we must fail fast.
@@ -98,15 +100,28 @@ func (sw *SegmentWriter) WriteSlab(
 	// 3. Advance the global file pointer by the size of the data written
 	sw.currentPos += int64(len(data))
 
-	// 4. Transform to absolute positions (create copy, don't mutate input)
-	numEntries := len(sw.entries)
+	// 4. Transform to absolute positions and store full entries for footer
+	items := make([]index.Item, 0, len(entries))
 	for i := range entries {
 		entry := entries[i]
-		entry.Pos += slabStart
+		absolutePos := entry.Pos + slabStart
+		entry.Pos = absolutePos
 		sw.entries = append(sw.entries, entry)
+
+		// Create lean Item for index (coordinates only)
+		// PhysicalLen = header + key + value (total record size on disk)
+		physicalLen := uint32(record.HeaderSize) + uint32(entry.KeyLen) + uint32(entry.PhysicalSize)
+		item := index.Item{
+			Hash:        entry.Hash,
+			SegmentID:   sw.id,
+			Offset:      uint32(absolutePos),
+			PhysicalLen: physicalLen,
+		}
+		item.SetCompression(entry.Compression())
+		items = append(items, item)
 	}
 
-	return sw.entries[numEntries:], nil
+	return items, nil
 }
 
 // Close finalizes and "seals" the segment. It appends the immutable
@@ -120,7 +135,7 @@ func (sw *SegmentWriter) Close() error {
 	// 1. Construct the immutable Segment Footer
 	sf := record.SegmentFooter{
 		Entries:   sw.entries,
-		SegmentID: sw.id,
+		SegmentID: int64(sw.id), // SegmentFooter uses int64 for disk format
 		CTime:     time.Now().Unix(),
 	}
 

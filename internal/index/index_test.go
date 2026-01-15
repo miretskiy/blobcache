@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/miretskiy/blobcache/internal/record"
 	"github.com/stretchr/testify/require"
 	"github.com/zeebo/xxh3"
 	"github.com/zhangyunhao116/skipmap"
@@ -35,12 +34,10 @@ func makeTestKey(i int) Key {
 	return k
 }
 
-func makeItem(segmentID int64, physSize int64) Item {
+func makeItem(segmentID uint32, physLen uint32) Item {
 	return Item{
-		FooterEntry: record.FooterEntry{
-			PhysicalSize: physSize,
-		},
-		SegmentID: segmentID,
+		SegmentID:   segmentID,
+		PhysicalLen: physLen,
 	}
 }
 
@@ -118,21 +115,21 @@ func TestBasicCRUD(t *testing.T) {
 	idx := New(1024)
 	k1 := makeTestKey(1)
 	item1 := makeItem(1, 50)
-	item1.Pos = 100
+	item1.Offset = 100
 
 	// Put & Get
 	idx.Put(k1, item1)
 	got, found := idx.Get(k1)
 	require.True(t, found, "Key should be found after Put")
 	require.Equal(t, item1.SegmentID, got.SegmentID)
-	require.Equal(t, item1.Pos, got.Pos)
+	require.Equal(t, item1.Offset, got.Offset)
 
 	// Update
 	item2 := makeItem(2, 60)
-	item2.Pos = 200
+	item2.Offset = 200
 	idx.Put(k1, item2)
 	got, _ = idx.Get(k1)
-	require.Equal(t, int64(2), got.SegmentID, "Update failed: SegmentID should change")
+	require.Equal(t, uint32(2), got.SegmentID, "Update failed: SegmentID should change")
 
 	// Delete
 	require.True(t, idx.Delete(k1), "Delete should return true for existing key")
@@ -147,7 +144,7 @@ func TestArenaReuse(t *testing.T) {
 
 	// Fill
 	for i := 0; i < count; i++ {
-		idx.Put(makeTestKey(i), makeItem(int64(i), 10))
+		idx.Put(makeTestKey(i), makeItem(uint32(i), 10))
 	}
 
 	getArenaSize := func() int {
@@ -169,7 +166,7 @@ func TestArenaReuse(t *testing.T) {
 
 	// Refill
 	for i := 0; i < count; i++ {
-		idx.Put(makeTestKey(i), makeItem(int64(i), 20))
+		idx.Put(makeTestKey(i), makeItem(uint32(i), 20))
 	}
 
 	finalSize := getArenaSize()
@@ -209,7 +206,7 @@ func TestEviction_ClockLogic(t *testing.T) {
 	evicted := idx.EvictBatch(100)
 
 	require.Len(t, evicted, 1, "Should evict exactly 1 item")
-	require.Equal(t, int64(3), evicted[0].SegmentID, "Should evict C (SegmentID 3)")
+	require.Equal(t, uint32(3), evicted[0].SegmentID, "Should evict C (SegmentID 3)")
 
 	_, hasA := idx.Get(A)
 	_, hasC := idx.Get(C)
@@ -220,11 +217,11 @@ func TestEviction_ClockLogic(t *testing.T) {
 func TestEviction_SizeBased(t *testing.T) {
 	idx := New(1000)
 	count := 100
-	itemSize := int64(1024)
+	var itemSize uint32 = 1024
 
 	// Insert 100KB
 	for i := 0; i < count; i++ {
-		idx.Put(makeTestKey(i), makeItem(int64(i), itemSize))
+		idx.Put(makeTestKey(i), makeItem(uint32(i), itemSize))
 	}
 
 	// Request eviction of 50KB
@@ -233,11 +230,11 @@ func TestEviction_SizeBased(t *testing.T) {
 
 	var totalFreed int64
 	for _, it := range evicted {
-		totalFreed += int64(it.PhysicalSize)
+		totalFreed += int64(it.PhysicalLen)
 	}
 
 	require.GreaterOrEqual(t, totalFreed, target, "Evicted too little")
-	require.LessOrEqual(t, totalFreed, target+itemSize*20, "Evicted way too much")
+	require.LessOrEqual(t, totalFreed, target+int64(itemSize)*20, "Evicted way too much")
 }
 
 func TestLen(t *testing.T) {
@@ -245,7 +242,7 @@ func TestLen(t *testing.T) {
 	require.Equal(t, 0, idx.Len())
 
 	for i := 0; i < 50; i++ {
-		idx.Put(makeTestKey(i), makeItem(int64(i), 100))
+		idx.Put(makeTestKey(i), makeItem(uint32(i), 100))
 	}
 	require.Equal(t, 50, idx.Len())
 
@@ -256,7 +253,7 @@ func TestLen(t *testing.T) {
 func TestStats(t *testing.T) {
 	idx := New(100)
 	for i := 0; i < 100; i++ {
-		idx.Put(makeTestKey(i), makeItem(int64(i), 100))
+		idx.Put(makeTestKey(i), makeItem(uint32(i), 100))
 	}
 
 	stats := idx.Stats()
@@ -295,7 +292,7 @@ func TestConcurrency_Correctness(t *testing.T) {
 			r := rand.New(rand.NewSource(int64(id)))
 			for opsCount.Add(1) <= numOps {
 				k := makeTestKey(r.Intn(keySpace))
-				idx.Put(k, makeItem(int64(id), 100))
+				idx.Put(k, makeItem(uint32(id), 100))
 				if r.Intn(100) == 0 {
 					runtime.Gosched()
 				}
@@ -355,7 +352,7 @@ func BenchmarkGC_Comparison(b *testing.B) {
 				defer wg.Done()
 				for i := 0; i < chunk; i++ {
 					k := makeTestKey(offset + i)
-					idx.Put(k, makeItem(int64(offset+i), 100))
+					idx.Put(k, makeItem(uint32(offset+i), 100))
 				}
 			}(w * chunk)
 		}
@@ -393,7 +390,7 @@ func BenchmarkGC_Comparison(b *testing.B) {
 				defer wg.Done()
 				for i := 0; i < chunk; i++ {
 					k := makeTestKey(offset + i)
-					idx.Put(k, makeItem(int64(offset+i), 100))
+					idx.Put(k, makeItem(uint32(offset+i), 100))
 				}
 			}(w * chunk)
 		}

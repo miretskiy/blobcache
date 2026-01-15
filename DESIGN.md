@@ -180,19 +180,58 @@ STEP 3: POST-EVICTION
                             HAND (Points to next live node)
 ```
 
-### 4.4 Memory Footprint
-For a system targeting **8 Million Entries** on **1TB of NVMe**, the Resident Set Size (RSS) overhead is $\approx 900MB$ ($1100:1$ efficiency ratio).
+### 4.4 Memory Requirements (Index Overhead)
 
-**Per-Node Memory (Arena Design):**
-- `Key` (16 bytes) + `Item` (64 bytes) + indices (8 bytes) + visited (4 bytes) ≈ **92 bytes**
-- Map overhead per entry ≈ 32 bytes
-- **Total per entry:** ~124 bytes (vs ~150+ bytes for skipmap with pointers)
+The primary constraint on blobcache capacity is the **Item Count**, not the total storage size. The In-Memory Index requires a fixed amount of RAM (~85 bytes) for every object stored to maintain O(1) lookup speeds.
 
-**Total Index Overhead:**
-- Arena nodes: 8M × 92 bytes = ~736MB
-- Map overhead: 8M × 32 bytes = ~256MB
-- Bloom Filter: ~9.6MB
-- **GC benefit:** Near-zero scan time (no heap pointers in arena)
+**The Constant:** Allocated memory grows at a linear rate of **~85 MB per 1 Million Items**.
+
+#### Index Memory vs. Storage Capacity
+
+This table correlates the Index RAM Overhead (RSS) with the amount of disk space those items would consume at different average blob sizes.
+
+| Item Count | Index RAM Overhead | Storage @ 4KB (Tiny) | Storage @ 64KB (Avg) | Storage @ 128KB (Mod) |
+|------------|-------------------|----------------------|----------------------|-----------------------|
+| 1 Million | 85 MB | 4 GB | 64 GB | 128 GB |
+| 10 Million | 850 MB | 40 GB | 640 GB | 1.28 TB |
+| 50 Million | 4.3 GB | 200 GB | 3.2 TB | 6.4 TB |
+| 100 Million | 8.5 GB | 400 GB | 6.4 TB | 12.8 TB |
+| 250 Million | 21.3 GB | 1 TB | 16 TB | 32 TB |
+
+#### Workload Analysis
+
+**RAM-Bound Workload (Tiny Blobs):**
+- If you store 4 KB blobs, a 1 TB drive holds ~250 Million items.
+- **Result:** You will need 21.3 GB of RAM just for the index.
+- **Constraint:** You will run out of RAM before you run out of Disk.
+
+**Disk-Bound Workload (Moderate Blobs):**
+- If you store 128 KB blobs, a 1 TB drive holds only ~8 Million items.
+- **Result:** You only need ~680 MB of RAM for the index.
+- **Constraint:** You will run out of Disk long before you feel any memory pressure.
+
+#### Calculating Your Requirement
+
+To estimate the memory overhead for your specific workload:
+
+$$\text{Index RAM (MB)} \approx \frac{\text{Disk Capacity (MB)}}{\text{Avg Blob Size (MB)}} \times 0.000085$$
+
+**Example:**
+- Disk: 4 TB
+- Blob Size: 128 KB
+- Items: 4,000,000 MB / 0.128 MB ≈ 31.25 Million
+- Required Index RAM: 31.25 × 85 MB ≈ **2.6 GB**
+
+#### Per-Entry Memory Breakdown
+
+| Component | Size | Notes |
+|-----------|------|-------|
+| `index.Item` | 32 bytes | Hash (16B) + SegmentID (4B) + Offset (4B) + PhysicalLen (4B) + Flags (4B) |
+| Arena node overhead | 21 bytes | Circular list indices (8B) + visited flag (4B) + alignment |
+| Map entry overhead | ~32 bytes | Go map bucket overhead |
+| **Total per entry** | ~85 bytes | |
+
+**GC Benefit:** Near-zero scan time (no heap pointers in arena design).
 
 ### 4.5 Start up and Crash Recovery
 `NewIndex` performs a **Persistence Scan**:

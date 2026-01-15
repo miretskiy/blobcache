@@ -6,7 +6,6 @@ import (
 	"fmt"
 
 	"github.com/miretskiy/blobcache/base"
-	"github.com/miretskiy/blobcache/internal/record"
 )
 
 // KeyFromHash converts a uint64 hash to a 128-bit Key.
@@ -42,12 +41,12 @@ func Open(basePath string, initialCapacity int) (*DurableIndex, error) {
 		segments:  p,
 	}
 
-	// Load all persisted entries into memory
-	err = p.scanAll(func(seg record.SegmentFooter) bool {
-		for _, rec := range seg.Entries {
-			if !rec.IsDeleted() {
-				k := KeyFromHash(rec.Hash)
-				idx.Put(k, Item{FooterEntry: rec, SegmentID: seg.SegmentID})
+	// Load all persisted items into memory
+	err = p.scanAll(func(m SegmentManifest) bool {
+		for _, item := range m.Items {
+			if !item.IsDeleted() {
+				k := KeyFromHash(item.Hash)
+				idx.Put(k, item)
 			}
 		}
 		return true
@@ -84,64 +83,39 @@ func (idx *DurableIndex) SetBlobErrno(hash uint64, errno base.BlobErrno) {
 	s.nodes[i].item.SetErrno(errno)
 }
 
-// GetSegmentRecord retrieves the metadata for a specific segment.
-// It reconstructs the record from fragmented chunks if necessary.
-// Returns (record, true) if found, or (zero-value, false) if not.
-func (idx *DurableIndex) GetSegmentRecord(segmentID int64) (record.SegmentFooter, bool) {
-	var fullRecord record.SegmentFooter
+// GetSegmentManifest retrieves the metadata for a specific segment.
+// It reconstructs the manifest from fragmented chunks if necessary.
+// Returns (manifest, true) if found, or (zero-value, false) if not.
+func (idx *DurableIndex) GetSegmentManifest(segmentID uint32) (SegmentManifest, bool) {
+	var fullManifest SegmentManifest
 	var found bool
 
-	err := idx.segments.scanSegment(segmentID, func(seg record.SegmentFooter) bool {
+	err := idx.segments.scanSegment(segmentID, func(m SegmentManifest) bool {
 		if !found {
-			fullRecord = seg
+			fullManifest = m
 			found = true
 		} else {
-			// Append entries from subsequent chunks
-			fullRecord.Entries = append(fullRecord.Entries, seg.Entries...)
+			// Append items from subsequent chunks
+			fullManifest.Items = append(fullManifest.Items, m.Items...)
 		}
 		return true
 	})
 
 	if err != nil || !found {
-		return record.SegmentFooter{}, false
+		return SegmentManifest{}, false
 	}
-	return fullRecord, true
+	return fullManifest, true
 }
 
-// IngestBatch writes a batch of entries for a segment to both RAM and disk.
-// Entries must be non-overlapping within the segment.
-func (idx *DurableIndex) IngestBatch(segID int64, batch []record.FooterEntry) error {
-	if err := validateNonOverlapping(batch); err != nil {
-		return fmt.Errorf("segment %d validation failed: %w", segID, err)
-	}
-
-	if err := idx.segments.writeBatch(segID, batch); err != nil {
+// IngestBatch writes a batch of items for a segment to both RAM and disk.
+func (idx *DurableIndex) IngestBatch(segID uint32, items []Item) error {
+	if err := idx.segments.writeBatch(segID, items); err != nil {
 		return err
 	}
 
-	for _, rec := range batch {
-		k := KeyFromHash(rec.Hash)
-		idx.Put(k, Item{FooterEntry: rec, SegmentID: segID})
-	}
-	return nil
-}
-
-// validateNonOverlapping ensures blob positions are monotonically increasing
-// and don't overlap. Assumes entries are in write order (O(n) check).
-func validateNonOverlapping(entries []record.FooterEntry) error {
-	if len(entries) <= 1 {
-		return nil
-	}
-
-	for i := 0; i < len(entries)-1; i++ {
-		curr := entries[i]
-		next := entries[i+1]
-		currEnd := curr.Pos + curr.PhysicalSize
-
-		if currEnd > next.Pos {
-			return fmt.Errorf("overlap: blob[%d] pos=%d size=%d ends at %d, blob[%d] starts at %d",
-				i, curr.Pos, curr.PhysicalSize, currEnd, i+1, next.Pos)
-		}
+	for _, item := range items {
+		k := KeyFromHash(item.Hash)
+		idx.Put(k, item)
 	}
 	return nil
 }
@@ -157,19 +131,19 @@ func (idx *DurableIndex) Evict() (Item, error) {
 }
 
 // DeleteSegment removes all entries for a segment from both RAM and disk.
-func (idx *DurableIndex) DeleteSegment(segmentID int64) error {
+func (idx *DurableIndex) DeleteSegment(segmentID uint32) error {
 	var keys [][]byte
 
-	err := idx.segments.scanSegment(segmentID, func(seg record.SegmentFooter) bool {
-		if seg.SegmentID != segmentID {
-			panic(fmt.Sprintf("scanSegment(%d) returned entries for segment %d", segmentID, seg.SegmentID))
+	err := idx.segments.scanSegment(segmentID, func(m SegmentManifest) bool {
+		if m.SegmentID != segmentID {
+			panic(fmt.Sprintf("scanSegment(%d) returned entries for segment %d", segmentID, m.SegmentID))
 		}
-		for _, rec := range seg.Entries {
-			k := KeyFromHash(rec.Hash)
+		for _, item := range m.Items {
+			k := KeyFromHash(item.Hash)
 			idx.Delete(k)
 		}
-		if len(seg.IndexKey) > 0 {
-			keys = append(keys, seg.IndexKey)
+		if len(m.IndexKey) > 0 {
+			keys = append(keys, m.IndexKey)
 		}
 		return true
 	})
@@ -212,7 +186,7 @@ func (idx *DurableIndex) flushDeletions(items []Item) error {
 	}
 
 	// Group by SegmentID
-	bySegment := make(map[int64]map[uint64]struct{})
+	bySegment := make(map[uint32]map[uint64]struct{})
 	for _, item := range items {
 		if _, ok := bySegment[item.SegmentID]; !ok {
 			bySegment[item.SegmentID] = make(map[uint64]struct{})
@@ -250,15 +224,15 @@ func (idx *DurableIndex) ForEachBlob(fn func(Item) bool) {
 	}
 }
 
-// ForEachSegment iterates over all segment metadata records stored on disk.
-func (idx *DurableIndex) ForEachSegment(fn ScanSegmentFn) error {
+// ForEachSegment iterates over all segment manifests stored on disk.
+func (idx *DurableIndex) ForEachSegment(fn ScanManifestFn) error {
 	return idx.segments.scanAll(fn)
 }
 
 // DurableStats provides a snapshot of the durable index state.
 type DurableStats struct {
-	Stats                   // Embedded in-memory stats
-	SegmentCount int        // Number of segments on disk
+	Stats            // Embedded in-memory stats
+	SegmentCount int // Number of segments on disk
 }
 
 // DurableStats returns statistics including persistence info.
@@ -268,7 +242,7 @@ func (idx *DurableIndex) DurableStats() DurableStats {
 	}
 
 	// Count segments from disk
-	_ = idx.ForEachSegment(func(record.SegmentFooter) bool {
+	_ = idx.ForEachSegment(func(SegmentManifest) bool {
 		stats.SegmentCount++
 		return true
 	})

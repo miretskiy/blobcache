@@ -54,7 +54,7 @@ func TestFooterEntry_CompressionAndSizes(t *testing.T) {
 		PhysicalSize: 4096,  // 4KB compressed
 		Flags:        0,
 	}
-	entry.SetCompression(uint8(compression.CodexZstd)) // Set compression bit
+	entry.SetCompression(compression.CodexZstd) // Set compression bit
 
 	require.True(t, entry.IsCompressed())
 	require.Equal(t, compression.CodexZstd, entry.Compression())
@@ -76,10 +76,10 @@ func TestSegmentFooter_EncodeAndDecode_WithCompression(t *testing.T) {
 
 	// Create entries with mixed compression and sizes
 	entry1 := FooterEntry{Hash: 1, Pos: 0, LogicalSize: 1000, PhysicalSize: 1000, Flags: 0}
-	entry1.SetCompression(uint8(compression.CodexNone))
+	entry1.SetCompression(compression.CodexNone)
 
 	entry2 := FooterEntry{Hash: 2, Pos: 1000, LogicalSize: 5000, PhysicalSize: 1200, Flags: 0}
-	entry2.SetCompression(uint8(compression.CodexLZ4))
+	entry2.SetCompression(compression.CodexLZ4)
 
 	sf := SegmentFooter{
 		Entries:   []FooterEntry{entry1, entry2},
@@ -113,14 +113,14 @@ func TestFooterEntry_FlagSafety(t *testing.T) {
 	// Test that setting compression doesn't clobber other flags like Deleted
 	entry := FooterEntry{Flags: 0}
 	entry.SetDeleted()
-	entry.SetCompression(uint8(compression.CodexZstd))
+	entry.SetCompression(compression.CodexZstd)
 
 	require.True(t, entry.IsDeleted())
 	require.True(t, entry.IsCompressed())
 	require.Equal(t, compression.CodexZstd, entry.Compression())
 
 	// Unset compression
-	entry.SetCompression(uint8(compression.CodexNone))
+	entry.SetCompression(compression.CodexNone)
 	require.False(t, entry.IsCompressed())
 	require.True(t, entry.IsDeleted()) // Deleted bit must remain
 }
@@ -147,7 +147,7 @@ func TestSegmentFooter_ManyEntries_LargeSlab(t *testing.T) {
 			PhysicalSize: 2048,
 			Flags:        0,
 		}
-		entries[i].SetCompression(uint8(compression.CodexZstd))
+		entries[i].SetCompression(compression.CodexZstd)
 	}
 
 	sf := SegmentFooter{

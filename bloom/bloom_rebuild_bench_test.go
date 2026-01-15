@@ -6,7 +6,6 @@ import (
 	"testing"
 
 	"github.com/miretskiy/blobcache/internal/index"
-	"github.com/miretskiy/blobcache/internal/record"
 )
 
 // Benchmark_BloomRebuild measures time to rebuild bloom filter from index
@@ -26,19 +25,19 @@ func Benchmark_BloomRebuild(b *testing.B) {
 			// Populate with "Mixed" hashes to simulate real entropy
 			const batchSize = 1024
 			for i := 0; i < numKeys; i += batchSize {
-				entries := make([]record.FooterEntry, batchSize)
+				items := make([]index.Item, batchSize)
 				for k := 0; k < batchSize; k++ {
 					id := uint64(i + k)
 					// Use a simple Knuth mixer to prevent "Silly Hash" linearity
 					mixedHash := id * 0x9e3779b97f4a7c15
 
-					entries[k] = record.FooterEntry{
+					items[k] = index.Item{
 						Hash:        mixedHash,
-						Pos:         int64(id % 1000),
-						LogicalSize: 1024,
+						Offset:      uint32(id % 1000),
+						PhysicalLen: 1024,
 					}
 				}
-				_ = idx.IngestBatch(int64(i/batchSize), entries)
+				_ = idx.IngestBatch(uint32(i/batchSize), items)
 			}
 
 			// Pre-calculate filter specs

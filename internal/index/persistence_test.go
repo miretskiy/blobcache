@@ -4,7 +4,6 @@ import (
 	"os"
 	"testing"
 
-	"github.com/miretskiy/blobcache/internal/record"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -16,22 +15,22 @@ func TestPersistence(t *testing.T) {
 	defer p.close()
 
 	t.Run("BatchSplitting", func(t *testing.T) {
-		segID := int64(100)
-		// Calculate how many entries fit in default chunk size
-		entriesPerChunk := (maxChunkSize - record.SegmentFooterHeaderSize) / record.FooterEntrySize
-		count := int(entriesPerChunk) + 5
-		batch := make([]record.FooterEntry, count)
+		var segID uint32 = 100
+		// Calculate how many items fit in default chunk size
+		itemsPerChunk := (maxChunkSize - uint64(ManifestHeaderSize)) / ItemSize
+		count := int(itemsPerChunk) + 5
+		items := make([]Item, count)
 		for i := 0; i < count; i++ {
-			batch[i] = record.FooterEntry{Hash: uint64(i), LogicalSize: 100}
+			items[i] = Item{Hash: uint64(i), SegmentID: segID, PhysicalLen: 100}
 		}
 
-		err := p.writeBatch(segID, batch)
+		err := p.writeBatch(segID, items)
 		require.NoError(t, err)
 
 		chunks := 0
-		err = p.scanSegment(segID, func(seg record.SegmentFooter) bool {
+		err = p.scanSegment(segID, func(m SegmentManifest) bool {
 			chunks++
-			require.Equal(t, segID, seg.SegmentID)
+			require.Equal(t, segID, m.SegmentID)
 			return true
 		})
 
@@ -40,14 +39,14 @@ func TestPersistence(t *testing.T) {
 	})
 
 	t.Run("PrefixIsolation", func(t *testing.T) {
-		err := p.writeBatch(200, []record.FooterEntry{{Hash: 200}})
+		err := p.writeBatch(200, []Item{{Hash: 200, SegmentID: 200}})
 		require.NoError(t, err)
-		err = p.writeBatch(300, []record.FooterEntry{{Hash: 300}})
+		err = p.writeBatch(300, []Item{{Hash: 300, SegmentID: 300}})
 		require.NoError(t, err)
 
 		seen300 := false
-		err = p.scanSegment(200, func(seg record.SegmentFooter) bool {
-			if seg.SegmentID == 300 {
+		err = p.scanSegment(200, func(m SegmentManifest) bool {
+			if m.SegmentID == 300 {
 				seen300 = true
 			}
 			return true
@@ -58,23 +57,23 @@ func TestPersistence(t *testing.T) {
 	})
 
 	t.Run("ScanAllOrdering", func(t *testing.T) {
-		var ids []int64
-		err := p.scanAll(func(seg record.SegmentFooter) bool {
+		var ids []uint32
+		err := p.scanAll(func(m SegmentManifest) bool {
 			// Deduplicate split segments for order checking
-			if len(ids) == 0 || ids[len(ids)-1] != seg.SegmentID {
-				ids = append(ids, seg.SegmentID)
+			if len(ids) == 0 || ids[len(ids)-1] != m.SegmentID {
+				ids = append(ids, m.SegmentID)
 			}
 			return true
 		})
 
 		require.NoError(t, err)
-		require.Equal(t, []int64{100, 200, 300}, ids, "Global scan should be in SegmentID order")
+		require.Equal(t, []uint32{100, 200, 300}, ids, "Global scan should be in SegmentID order")
 	})
 
 	t.Run("Delete", func(t *testing.T) {
 		var keyToDelete []byte
-		err := p.scanSegment(200, func(seg record.SegmentFooter) bool {
-			keyToDelete = seg.IndexKey
+		err := p.scanSegment(200, func(m SegmentManifest) bool {
+			keyToDelete = m.IndexKey
 			return false
 		})
 		require.NoError(t, err)
@@ -84,7 +83,7 @@ func TestPersistence(t *testing.T) {
 		require.NoError(t, err)
 
 		count := 0
-		err = p.scanSegment(200, func(seg record.SegmentFooter) bool {
+		err = p.scanSegment(200, func(m SegmentManifest) bool {
 			count++
 			return true
 		})
@@ -98,28 +97,28 @@ func TestDeleteRecordsFromSegment_Collapse(t *testing.T) {
 	require.NoError(t, err)
 	defer os.RemoveAll(path)
 
-	// Override global limit for this test: header(16) + 10 entries * 48 bytes = 496 bytes
-	defer testingSetMaxChunkSize(16 + 10*record.FooterEntrySize)()
+	// Override global limit for this test: header(12) + 10 items * 24 bytes = 252 bytes
+	defer testingSetMaxChunkSize(uint64(ManifestHeaderSize) + 10*ItemSize)()
 
 	p, err := newPersistence(path)
 	require.NoError(t, err)
 	defer p.close()
 
-	segID := int64(777)
+	var segID uint32 = 777
 
 	// 25 blobs + limit of 10 = 3 chunks ([10], [10], [5])
 	totalBlobs := 25
-	batch := make([]record.FooterEntry, totalBlobs)
+	items := make([]Item, totalBlobs)
 	for i := 0; i < totalBlobs; i++ {
-		batch[i] = record.FooterEntry{Hash: uint64(i + 1)}
+		items[i] = Item{Hash: uint64(i + 1), SegmentID: segID}
 	}
 
-	err = p.writeBatch(segID, batch)
+	err = p.writeBatch(segID, items)
 	require.NoError(t, err)
 
 	// Verify initial state
 	count := 0
-	p.scanSegment(segID, func(seg record.SegmentFooter) bool {
+	p.scanSegment(segID, func(m SegmentManifest) bool {
 		count++
 		return true
 	})
@@ -137,15 +136,15 @@ func TestDeleteRecordsFromSegment_Collapse(t *testing.T) {
 	// Verify collapse to 1 chunk
 	finalCount := 0
 	totalLive := 0
-	err = p.scanSegment(segID, func(seg record.SegmentFooter) bool {
+	err = p.scanSegment(segID, func(m SegmentManifest) bool {
 		finalCount++
-		totalLive += len(seg.Entries)
+		totalLive += len(m.Items)
 		return true
 	})
 
 	assert.NoError(t, err)
 	assert.Equal(t, 1, finalCount, "Should have collapsed from 3 chunks to 1")
-	assert.Equal(t, 5, totalLive, "Should only have 5 entries remaining in persistence")
+	assert.Equal(t, 5, totalLive, "Should only have 5 items remaining in persistence")
 }
 
 func TestDurableIndex(t *testing.T) {
@@ -155,20 +154,20 @@ func TestDurableIndex(t *testing.T) {
 	idx, err := Open(tmp, 1000)
 	require.NoError(t, err)
 
-	segID := int64(1)
-	batch := []record.FooterEntry{
-		{Hash: 100, Pos: 0, PhysicalSize: 100},
-		{Hash: 200, Pos: 100, PhysicalSize: 200},
-		{Hash: 300, Pos: 300, PhysicalSize: 150},
+	var segID uint32 = 1
+	items := []Item{
+		{Hash: 100, SegmentID: segID, Offset: 0, PhysicalLen: 100},
+		{Hash: 200, SegmentID: segID, Offset: 100, PhysicalLen: 200},
+		{Hash: 300, SegmentID: segID, Offset: 300, PhysicalLen: 150},
 	}
 
-	err = idx.IngestBatch(segID, batch)
+	err = idx.IngestBatch(segID, items)
 	require.NoError(t, err)
 
 	// Verify in-memory lookup
 	item, ok := idx.DeprecatedGetByHash(200)
 	require.True(t, ok)
-	require.Equal(t, int64(200), item.PhysicalSize)
+	require.Equal(t, uint32(200), item.PhysicalLen)
 	require.Equal(t, segID, item.SegmentID)
 
 	require.Equal(t, 3, idx.Len())
@@ -184,5 +183,5 @@ func TestDurableIndex(t *testing.T) {
 	require.Equal(t, 3, idx2.Len())
 	item, ok = idx2.DeprecatedGetByHash(200)
 	require.True(t, ok)
-	require.Equal(t, int64(200), item.PhysicalSize)
+	require.Equal(t, uint32(200), item.PhysicalLen)
 }

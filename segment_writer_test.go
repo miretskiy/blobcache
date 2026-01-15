@@ -9,6 +9,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/miretskiy/blobcache/base"
+	"github.com/miretskiy/blobcache/internal/index"
 	"github.com/miretskiy/blobcache/internal/record"
 	"github.com/stretchr/testify/require"
 )
@@ -47,22 +48,22 @@ func (tp *TrackedPool) Teardown() {
 	tp.extraRegions = nil
 }
 
-// MockBatcher implements: PutBatch(segID int64, entries []record.FooterEntry) error
+// MockBatcher implements: PutBatch(segID uint32, items []index.Item) error
 type MockBatcher struct {
 	mu      sync.Mutex
-	Batches map[int64][]record.FooterEntry
+	Batches map[uint32][]index.Item
 	Count   int
 }
 
-func (m *MockBatcher) PutBatch(segID int64, entries []record.FooterEntry) error {
+func (m *MockBatcher) PutBatch(segID uint32, items []index.Item) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.Batches == nil {
-		m.Batches = make(map[int64][]record.FooterEntry)
+		m.Batches = make(map[uint32][]index.Item)
 	}
 	// Copy slice to simulate persistent storage.
-	m.Batches[segID] = append(m.Batches[segID], entries...)
-	m.Count += len(entries)
+	m.Batches[segID] = append(m.Batches[segID], items...)
+	m.Count += len(items)
 	return nil
 }
 
@@ -107,7 +108,7 @@ func TestSegmentWriter_FullCycle(t *testing.T) {
 	tmpDir := t.TempDir()
 	const slabSize = 1024 * 1024
 	const segSize = 4 * 1024 * 1024
-	const segID = int64(777)
+	const segID = uint32(777)
 
 	pool := NewTrackedPool(4, slabSize)
 	defer pool.Teardown()
@@ -156,7 +157,7 @@ func TestSegmentWriter_FullCycle(t *testing.T) {
 		defer f.Close()
 
 		info, _ := f.Stat()
-		footer, _, err := record.ReadSegmentFooterFromFile(f, info.Size(), segID)
+		footer, _, err := record.ReadSegmentFooterFromFile(f, info.Size(), int64(segID))
 		require.NoError(t, err)
 
 		// Verify Pos rounding (critical for Direct I/O reads)

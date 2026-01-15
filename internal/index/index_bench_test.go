@@ -5,8 +5,6 @@ import (
 	"os"
 	"testing"
 	"time"
-
-	"github.com/miretskiy/blobcache/internal/record"
 )
 
 // Benchmark_IndexLookup compares index Get() performance
@@ -25,14 +23,14 @@ func Benchmark_IndexLookup(b *testing.B) {
 			defer idx.Close()
 
 			// Prepare Batch
-			entries := make([]record.FooterEntry, numKeys)
+			items := make([]Item, numKeys)
 			for i := 0; i < numKeys; i++ {
 				// Mix the hash to simulate xxHash entropy
 				h := uint64(i) * 0x9e3779b97f4a7c15
-				entries[i] = record.FooterEntry{
+				items[i] = Item{
 					Hash:        h,
-					Pos:         int64(i * 1024),
-					LogicalSize: 1024,
+					Offset:      uint32(i * 1024),
+					PhysicalLen: 1024,
 				}
 			}
 
@@ -45,7 +43,7 @@ func Benchmark_IndexLookup(b *testing.B) {
 				if end > numKeys {
 					end = numKeys
 				}
-				if err := idx.IngestBatch(int64(i/batchSize), entries[i:end]); err != nil {
+				if err := idx.IngestBatch(uint32(i/batchSize), items[i:end]); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -61,7 +59,7 @@ func Benchmark_IndexLookup(b *testing.B) {
 					b.Fatalf("Lookup failed for hash %d", h)
 				}
 				// Tiny check to ensure the compiler doesn't elide the loop
-				if val.LogicalSize != 1024 {
+				if val.PhysicalLen != 1024 {
 					b.Fatal("Data corruption detected")
 				}
 			}

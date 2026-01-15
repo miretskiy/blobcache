@@ -21,7 +21,7 @@ type shard struct {
 // Uses uint32 indices instead of pointers for GC optimization.
 type node struct {
 	key     Key           // Back-reference for eviction callbacks
-	item    Item          // Blob metadata (embeds record.Header)
+	item    Item          // Lean blob coordinates (24 bytes)
 	next    uint32        // Index in 'nodes' slice (circular list)
 	prev    uint32        // Index in 'nodes' slice (circular list)
 	visited atomic.Uint32 // SIEVE algorithm: 0=cold, 1=hot
@@ -145,7 +145,7 @@ func (s *shard) evictUpTo(quotaBytes int64, dst *[]Item, maxCount int) int64 {
 		item := s.nodes[victimIdx].item
 
 		*dst = append(*dst, item)
-		localFreed += int64(item.PhysicalSize) // Use PhysicalSize from record.Header
+		localFreed += int64(item.PhysicalLen)
 		count++
 
 		delete(s.items, s.nodes[victimIdx].key)

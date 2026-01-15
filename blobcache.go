@@ -14,7 +14,6 @@ import (
 	"github.com/miretskiy/blobcache/base"
 	"github.com/miretskiy/blobcache/bloom"
 	"github.com/miretskiy/blobcache/internal/index"
-	"github.com/miretskiy/blobcache/internal/record"
 	"github.com/miretskiy/blobcache/internal/sys"
 )
 
@@ -129,11 +128,11 @@ func New(path string, opts ...Option) (*Cache, error) {
 	// Create new bloom filter and figure out how much data on disk from segment meta.
 	var totalSize int64
 	filter := bloom.New(uint(cfg.BloomEstimatedKeys), cfg.BloomFPRate)
-	if err := idx.ForEachSegment(func(segment record.SegmentFooter) bool {
-		for _, entry := range segment.Entries {
-			if !entry.IsDeleted() {
-				filter.Add(entry.Hash)
-				totalSize += entry.LogicalSize
+	if err := idx.ForEachSegment(func(m index.SegmentManifest) bool {
+		for _, item := range m.Items {
+			if !item.IsDeleted() {
+				filter.Add(item.Hash)
+				totalSize += int64(item.PhysicalLen) // Track on-disk size
 			}
 		}
 		return true
@@ -166,7 +165,7 @@ func New(path string, opts ...Option) (*Cache, error) {
 	return c, nil
 }
 
-// Start begins background operations (eviction worker)
+// Start begins background operations (eviction worker).
 func (c *Cache) Start() {
 	c.wg.Add(1)
 	go c.evictionWorker()
@@ -377,9 +376,10 @@ func (c *Cache) putWithRetry(h Key, value []byte, checksum *uint32) {
 			return
 		}
 
-		// Zombie Investigation: Check if a newer version exists in the global index.
+		// Zombie Investigation: Check if a version exists in the global index.
 		// If it does, we "succeeded" (last write wins, our data is obsolete).
-		if existing, found := c.index.DeprecatedGetByHash(h); found && existing.SeqID >= seqID {
+		// Note: SeqID is not stored in RAM index, so we just check existence.
+		if _, found := c.index.DeprecatedGetByHash(h); found {
 			return
 		}
 
@@ -389,19 +389,19 @@ func (c *Cache) putWithRetry(h Key, value []byte, checksum *uint32) {
 }
 
 type Batcher interface {
-	PutBatch(segID int64, entries []record.FooterEntry) error
+	PutBatch(segID uint32, items []index.Item) error
 }
 
-func (c *Cache) PutBatch(segID int64, entries []record.FooterEntry) error {
+func (c *Cache) PutBatch(segID uint32, items []index.Item) error {
 	// Phase 1: Ingest into Index
-	if err := c.index.IngestBatch(segID, entries); err != nil {
+	if err := c.index.IngestBatch(segID, items); err != nil {
 		return err
 	}
 
-	// Phase 2: Update size tracking
+	// Phase 2: Update size tracking (using PhysicalLen = on-disk size)
 	var addedBytes int64
-	for _, entry := range entries {
-		addedBytes += entry.LogicalSize
+	for _, item := range items {
+		addedBytes += int64(item.PhysicalLen)
 	}
 	newSize := c.approxSize.Add(addedBytes)
 
@@ -445,10 +445,10 @@ func (c *Cache) rebuildBloom() error {
 		stopRecording, consumeRecording = oldFilter.RecordAdditions()
 	}
 
-	err := c.index.ForEachSegment(func(segment record.SegmentFooter) bool {
-		for _, entry := range segment.Entries {
-			if !entry.IsDeleted() {
-				newFilter.AddHash(entry.Hash)
+	err := c.index.ForEachSegment(func(m index.SegmentManifest) bool {
+		for _, item := range m.Items {
+			if !item.IsDeleted() {
+				newFilter.AddHash(item.Hash)
 			}
 		}
 		return true
@@ -575,7 +575,7 @@ func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
 			break
 		}
 		victims = append(victims, victim)
-		evictedBytes += victim.LogicalSize
+		evictedBytes += int64(victim.PhysicalLen)
 	}
 
 	if len(victims) == 0 {
@@ -589,7 +589,7 @@ func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
 
 	// 3. RECLAMATION PHASE
 	for _, v := range victims {
-		reclaimed, _ := c.storage.HolePunchBlob(v.SegmentID, v.Pos, v.LogicalSize)
+		reclaimed, _ := c.storage.HolePunchBlob(v.SegmentID, v.Offset, v.PhysicalLen)
 		physicallyReclaimed += reclaimed
 	}
 

@@ -153,8 +153,8 @@ func AppendTrailer(dst []byte, t Trailer) []byte {
 // Footer serialization constants.
 const (
 	// FooterEntrySize is the encoded size of a single FooterEntry.
-	// Wire format: Hash(8) + Pos(8) + LogicalSize(8) + PhysicalSize(8) + SeqID(8) + Flags(8)
-	FooterEntrySize = 48
+	// Wire format: Hash(8) + Pos(8) + LogicalSize(8) + PhysicalSize(8) + SeqID(8) + Flags(8) + KeyLen(2) + Pad(6)
+	FooterEntrySize = 56
 
 	// SegmentFooterHeaderSize is the header before entries.
 	// Wire format: SegmentID(8) + CTime(8)
@@ -170,19 +170,18 @@ const (
 )
 
 // FooterEntry represents a single blob's metadata in the segment footer.
-// This is the persistent index entry format.
+// This is the persistent index entry format used for disaster recovery.
 //
-// BRIDGE: Wire format matches metadata.BlobRecord exactly for backward compatibility.
-// The struct layout differs (we embed Header capabilities) but serialization is identical.
-//
-// TODO(future): Consider embedding record.Header directly once we change the wire format.
+// NOTE: This is only used for segment file footers. The RAM index uses lean
+// index.Item (24 bytes), and bitcask persistence uses index.SegmentManifest.
 type FooterEntry struct {
 	Hash         uint64 // Key hash (xxhash)
 	Pos          int64  // Byte offset within segment (to record header)
 	LogicalSize  int64  // Original uncompressed value size
-	PhysicalSize int64  // On-disk size (possibly compressed)
+	PhysicalSize int64  // On-disk size of value (possibly compressed)
 	SeqID        uint64 // Monotonic sequence ID for ordering
 	Flags        uint64 // Compression, status, checksum (same layout as Header.Flags)
+	KeyLen       uint16 // Key length in bytes (for computing total record size)
 }
 
 // SegmentFooter contains metadata for all blobs in a segment.
@@ -222,13 +221,13 @@ func (e *FooterEntry) Compression() compression.Codex {
 }
 
 // SetCompression sets the compression codec in flags.
-func (e *FooterEntry) SetCompression(c uint8) {
+func (e *FooterEntry) SetCompression(c compression.Codex) {
 	e.Flags = (e.Flags &^ FlagCompressionMask) | (uint64(c) << FlagCompressionShift)
 }
 
 // IsCompressed returns true if compression is enabled.
 func (e *FooterEntry) IsCompressed() bool {
-	return e.Compression() != 0
+	return e.Compression() != compression.CodexNone
 }
 
 // IsDeleted returns true if the deleted flag is set.
@@ -277,7 +276,7 @@ func (e *FooterEntry) CompressionRatio() float64 {
 // --- FooterEntry Serialization ---
 
 // AppendFooterEntry appends an encoded FooterEntry to dst.
-// Wire format (48 bytes): Hash(8) + Pos(8) + LogicalSize(8) + PhysicalSize(8) + SeqID(8) + Flags(8)
+// Wire format (56 bytes): Hash(8) + Pos(8) + LogicalSize(8) + PhysicalSize(8) + SeqID(8) + Flags(8) + KeyLen(2) + Pad(6)
 func AppendFooterEntry(dst []byte, e FooterEntry) []byte {
 	dst = binary.LittleEndian.AppendUint64(dst, e.Hash)
 	dst = binary.LittleEndian.AppendUint64(dst, uint64(e.Pos))
@@ -285,6 +284,8 @@ func AppendFooterEntry(dst []byte, e FooterEntry) []byte {
 	dst = binary.LittleEndian.AppendUint64(dst, uint64(e.PhysicalSize))
 	dst = binary.LittleEndian.AppendUint64(dst, e.SeqID)
 	dst = binary.LittleEndian.AppendUint64(dst, e.Flags)
+	dst = binary.LittleEndian.AppendUint16(dst, e.KeyLen)
+	dst = append(dst, 0, 0, 0, 0, 0, 0) // 6 bytes padding for alignment
 	return dst
 }
 
@@ -300,6 +301,8 @@ func DecodeFooterEntry(src []byte) (FooterEntry, error) {
 		PhysicalSize: int64(binary.LittleEndian.Uint64(src[24:32])),
 		SeqID:        binary.LittleEndian.Uint64(src[32:40]),
 		Flags:        binary.LittleEndian.Uint64(src[40:48]),
+		KeyLen:       binary.LittleEndian.Uint16(src[48:50]),
+		// Bytes 50-55 are padding, ignored on decode
 	}, nil
 }
 
@@ -429,9 +432,9 @@ func roundToPage(size int64) int64 {
 //
 // BRIDGE: Matches metadata.ReadSegmentFooterFromFile for backward compatibility.
 func ReadSegmentFooterFromFile(
-		file interface {
-	ReadAt([]byte, int64) (int, error)
-}, fileSize int64, segmentID int64,
+	file interface {
+		ReadAt([]byte, int64) (int, error)
+	}, fileSize int64, segmentID int64,
 ) (SegmentFooter, int64, error) {
 	if fileSize < int64(LegacyFooterSize) {
 		return SegmentFooter{}, 0, errors.New("record: file too small for footer")

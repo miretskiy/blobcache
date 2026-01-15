@@ -31,6 +31,10 @@ type CompressionConfig struct {
 
 type KeyHasherFn func(b []byte) uint64
 
+// MaxSegmentSize is the maximum allowed segment size (4GB).
+// This limit is imposed by using uint32 for offsets in index.Item.
+const MaxSegmentSize int64 = 1 << 32 // 4GB
+
 // config holds internal configuration
 type config struct {
 	Path      string
@@ -121,7 +125,14 @@ func WithVerifyOnRead(enabled bool) Option {
 }
 
 func WithSegmentSize(size int64) Option {
-	return funcOpt(func(c *config) { c.SegmentSize = size })
+	return funcOpt(func(c *config) {
+		if size > MaxSegmentSize {
+			log.Warn("SegmentSize exceeds maximum, clamping to 4GB",
+				"requested", size, "max", MaxSegmentSize)
+			size = MaxSegmentSize
+		}
+		c.SegmentSize = size
+	})
 }
 
 func WithLargeWriteThreshold(size int64) Option {

@@ -35,7 +35,7 @@ func TestCache_DegradedMode_FlushWriteError(t *testing.T) {
 	// Write enough to trigger flush
 	value := make([]byte, 1024)
 	for i := 0; i < 3; i++ {
-		cache.Put(fmt.Appendf(nil, "key-%d", i), value)
+		require.NoError(t, cache.Put(fmt.Appendf(nil, "key-%d", i), value))
 	}
 
 	// Drain to ensure flush completes (and fails)
@@ -47,7 +47,7 @@ func TestCache_DegradedMode_FlushWriteError(t *testing.T) {
 
 	// Subsequent Puts should still work (memory-only)
 	for i := 10; i < 20; i++ {
-		cache.Put(fmt.Appendf(nil, "key-%d", i), value)
+		require.NoError(t, cache.Put(fmt.Appendf(nil, "key-%d", i), value))
 	}
 
 	// Verify data still accessible from memtable
@@ -80,7 +80,7 @@ func TestCache_DegradedMode_IndexError(t *testing.T) {
 	// Trigger flush
 	value := make([]byte, 1024)
 	for i := 0; i < 3; i++ {
-		cache.Put(fmt.Appendf(nil, "key-%d", i), value)
+		require.NoError(t, cache.Put(fmt.Appendf(nil, "key-%d", i), value))
 	}
 	cache.Drain()
 
@@ -89,7 +89,7 @@ func TestCache_DegradedMode_IndexError(t *testing.T) {
 	require.ErrorIs(t, cache.BGError(), errInjected)
 
 	// Cache still works in memory
-	cache.Put([]byte("new-key"), value)
+	require.NoError(t, cache.Put([]byte("new-key"), value))
 	data, found := readAll(t, cache, []byte("new-key"))
 	require.True(t, found)
 	require.Equal(t, value, data)
@@ -117,10 +117,10 @@ func TestCache_DegradedMode_MemtableEviction(t *testing.T) {
 
 	// Fill and rotate 6 memtables (to fill files list - default MaxInflightSlabs=6)
 	for i := 0; i < 12; i++ {
-		cache.Put(fmt.Appendf(nil, "key-%d", i), value)
+		require.NoError(t, cache.Put(fmt.Appendf(nil, "key-%d", i), value))
 		if (i+1)%2 == 0 {
 			// Every 2 Puts triggers rotation (512*2 > 1KB buffer)
-			cache.Put(fmt.Appendf(nil, "trigger-%d", i), make([]byte, 100))
+			require.NoError(t, cache.Put(fmt.Appendf(nil, "trigger-%d", i), make([]byte, 100)))
 		}
 	}
 
@@ -133,9 +133,9 @@ func TestCache_DegradedMode_MemtableEviction(t *testing.T) {
 
 	// Trigger more rotations (should drop oldest)
 	for i := 20; i < 30; i++ {
-		cache.Put(fmt.Appendf(nil, "new-key-%d", i), value)
+		require.NoError(t, cache.Put(fmt.Appendf(nil, "new-key-%d", i), value))
 		if (i+1)%2 == 0 {
-			cache.Put(fmt.Appendf(nil, "new-trigger-%d", i), make([]byte, 100))
+			require.NoError(t, cache.Put(fmt.Appendf(nil, "new-trigger-%d", i), make([]byte, 100)))
 		}
 	}
 
@@ -174,7 +174,7 @@ func TestCache_DegradedMode_EvictionError(t *testing.T) {
 
 	// Fill to trigger eviction
 	for i := 0; i < 7; i++ {
-		cache.Put(fmt.Appendf(nil, "key-%d", i), value)
+		require.NoError(t, cache.Put(fmt.Appendf(nil, "key-%d", i), value))
 	}
 	cache.Drain()
 
@@ -186,7 +186,7 @@ func TestCache_DegradedMode_EvictionError(t *testing.T) {
 	require.ErrorIs(t, cache.BGError(), errInjected)
 
 	// Cache still works
-	cache.Put([]byte("after-error"), value)
+	require.NoError(t, cache.Put([]byte("after-error"), value))
 	data, found := readAll(t, cache, []byte("after-error"))
 	require.True(t, found)
 	require.Equal(t, value, data)
@@ -211,16 +211,16 @@ func TestCache_DegradedMode_DrainDuringDegraded(t *testing.T) {
 
 	// Write enough to trigger flush
 	value := make([]byte, 1024)
-	cache.Put([]byte("key-1"), value)
-	cache.Put([]byte("key-2"), value) // Triggers rotation
+	require.NoError(t, cache.Put([]byte("key-1"), value))
+	require.NoError(t, cache.Put([]byte("key-2"), value)) // Triggers rotation
 
 	// Drain will fail and set degraded mode
 	cache.Drain()
 	require.NotNil(t, cache.BGError())
 
 	// Add more data while degraded
-	cache.Put([]byte("key-3"), value)
-	cache.Put([]byte("key-4"), value)
+	require.NoError(t, cache.Put([]byte("key-3"), value))
+	require.NoError(t, cache.Put([]byte("key-4"), value))
 
 	// Calling Drain() again while degraded should not block or panic
 	cache.Drain() // Should return immediately (no-op)
@@ -243,7 +243,7 @@ func TestCache_Close_WithoutDrain(t *testing.T) {
 	// Write data but DON'T drain
 	value := make([]byte, 512)
 	for i := 0; i < 10; i++ {
-		cache.Put(fmt.Appendf(nil, "key-%d", i), value)
+		require.NoError(t, cache.Put(fmt.Appendf(nil, "key-%d", i), value))
 	}
 
 	// Close without drain should succeed (data may be lost)

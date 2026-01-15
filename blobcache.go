@@ -15,9 +15,12 @@ import (
 	"github.com/miretskiy/blobcache/bloom"
 	"github.com/miretskiy/blobcache/internal/index"
 	"github.com/miretskiy/blobcache/internal/sys"
+	"github.com/zeebo/xxh3"
 )
 
-type Key = uint64
+// Key is the 128-bit hash of a blob key.
+// Lo is used for bloom filter; full 128-bit for index to avoid collisions.
+type Key = xxh3.Uint128
 
 const (
 	// evictionHysteresis is the target fraction of MaxSize to evict to.
@@ -131,7 +134,7 @@ func New(path string, opts ...Option) (*Cache, error) {
 	if err := idx.ForEachSegment(func(m index.SegmentManifest) bool {
 		for _, item := range m.Items {
 			if !item.IsDeleted() {
-				filter.Add(item.Hash)
+				filter.Add(item.Key)                 // Full 128-bit key
 				totalSize += int64(item.PhysicalLen) // Track on-disk size
 			}
 		}
@@ -244,9 +247,9 @@ func checkOrInitialize(cfg config) (*index.DurableIndex, error) {
 // search attempts to locate the blob in RAM (returning data) or Disk (returning r).
 // It acts as the Single Source of Truth for Bloom metrics (Hits vs Ghosts).
 func (c *Cache) search(key []byte) (data []byte, r io.Reader, rel Releaser, ok bool) {
-	h := c.KeyHasher(key)
+	h := xxh3.Hash128(key)
 
-	// 1. Bloom Filter Gate
+	// 1. Bloom Filter Gate (full 128-bit key)
 	if !c.bloom.Load().Test(h) {
 		return nil, nil, Releaser{}, false
 	}
@@ -258,7 +261,7 @@ func (c *Cache) search(key []byte) (data []byte, r io.Reader, rel Releaser, ok b
 	}
 
 	// 3. Disk Hit (Storage)
-	entry, found := c.index.DeprecatedGetByHash(h)
+	entry, found := c.index.Get(h)
 	if !found {
 		// BLOOM GHOST: Bloom said yes, Index said no.
 		c.bloom.ghosts.Add(1)
@@ -271,8 +274,8 @@ func (c *Cache) search(key []byte) (data []byte, r io.Reader, rel Releaser, ok b
 		return nil, nil, Releaser{}, false
 	}
 
-	// 5. Read from disk
-	diskReader, diskReleaser, err := c.storage.ReadBlob(entry)
+	// 5. Read from disk (with key verification for collision detection)
+	diskReader, diskReleaser, err := c.storage.ReadBlob(entry, key)
 	if err != nil {
 		diskReleaser.Release()
 		c.handleStorageError(h, entry, err)
@@ -340,31 +343,42 @@ func (c *Cache) Get(key []byte) ([]byte, bool) {
 	return c.Append(key, nil)
 }
 
-func (c *Cache) Put(key []byte, value []byte) {
-	h := c.KeyHasher(key)
+// ErrEmptyKey is returned when Put is called with an empty key.
+var ErrEmptyKey = errors.New("blobcache: empty key not allowed")
+
+func (c *Cache) Put(key []byte, value []byte) error {
+	if len(key) == 0 {
+		return ErrEmptyKey
+	}
+	h := xxh3.Hash128(key)
 	c.bloom.Load().Add(h)
-	c.putWithRetry(h, value, nil)
+	c.putWithRetry(h, key, value, nil)
+	return nil
 }
 
-func (c *Cache) PutChecksummed(key []byte, value []byte, checksum uint32) {
-	h := c.KeyHasher(key)
+func (c *Cache) PutChecksummed(key []byte, value []byte, checksum uint32) error {
+	if len(key) == 0 {
+		return ErrEmptyKey
+	}
+	h := xxh3.Hash128(key)
 	c.bloom.Load().Add(h)
-	c.putWithRetry(h, value, &checksum)
+	c.putWithRetry(h, key, value, &checksum)
+	return nil
 }
 
 // putWithRetry handles the zombie writer resurrection protocol.
 // If a write is rejected (seqID too old due to slab rotation), we check
 // if a newer version already exists. If so, we return success (idempotent).
 // If not, we acquire a fresh seqID and retry.
-func (c *Cache) putWithRetry(h Key, value []byte, checksum *uint32) {
+func (c *Cache) putWithRetry(h Key, keyBytes, value []byte, checksum *uint32) {
 	seqID := c.nextSeq()
 
 	for {
 		var err error
 		if checksum != nil {
-			err = c.memTable.PutChecksummed(seqID, h, value, *checksum)
+			err = c.memTable.PutChecksummed(seqID, h, keyBytes, value, *checksum)
 		} else {
-			err = c.memTable.Put(seqID, h, value)
+			err = c.memTable.Put(seqID, h, keyBytes, value)
 		}
 
 		if err == nil {
@@ -379,7 +393,7 @@ func (c *Cache) putWithRetry(h Key, value []byte, checksum *uint32) {
 		// Zombie Investigation: Check if a version exists in the global index.
 		// If it does, we "succeeded" (last write wins, our data is obsolete).
 		// Note: SeqID is not stored in RAM index, so we just check existence.
-		if _, found := c.index.DeprecatedGetByHash(h); found {
+		if _, found := c.index.Get(h); found {
 			return
 		}
 
@@ -439,7 +453,7 @@ func (c *Cache) rebuildBloom() error {
 	newFilter := bloom.New(uint(c.BloomEstimatedKeys), c.BloomFPRate)
 
 	var stopRecording func()
-	var consumeRecording func(bloom.HashConsumer)
+	var consumeRecording func(bloom.KeyConsumer)
 
 	if oldFilter := c.bloom.Load(); oldFilter != nil {
 		stopRecording, consumeRecording = oldFilter.RecordAdditions()
@@ -448,7 +462,7 @@ func (c *Cache) rebuildBloom() error {
 	err := c.index.ForEachSegment(func(m index.SegmentManifest) bool {
 		for _, item := range m.Items {
 			if !item.IsDeleted() {
-				newFilter.AddHash(item.Hash)
+				newFilter.AddHash(item.Key)
 			}
 		}
 		return true

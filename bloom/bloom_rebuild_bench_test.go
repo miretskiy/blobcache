@@ -32,7 +32,7 @@ func Benchmark_BloomRebuild(b *testing.B) {
 					mixedHash := id * 0x9e3779b97f4a7c15
 
 					items[k] = index.Item{
-						Hash:        mixedHash,
+						Key:         index.Key{Lo: mixedHash, Hi: 0},
 						Offset:      uint32(id % 1000),
 						PhysicalLen: 1024,
 					}
@@ -53,12 +53,12 @@ func Benchmark_BloomRebuild(b *testing.B) {
 				// It's all in RAM and pointer-stable, so it's the fastest way
 				// to populate the filter.
 				idx.ForEachBlob(func(v index.Item) bool {
-					filter.AddHash(v.Hash) // Use AddHash to skip internal mixer if already mixed
+					filter.AddHash(v.Key) // Full 128-bit key
 					return true
 				})
 
 				// Tiny sanity check (not enough to skew bench)
-				if !filter.Test(uint64(0) * 0x9e3779b97f4a7c15) {
+				if !filter.Test(Key{Lo: 0, Hi: 0}) {
 					b.Fatal("Bloom lookup failed")
 				}
 			}

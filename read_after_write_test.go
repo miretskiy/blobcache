@@ -23,7 +23,7 @@ func TestCache_ReadAfterWrite(t *testing.T) {
 		key := fmt.Appendf(nil, "key-%d", i)
 		value := fmt.Appendf(nil, "value-%d-data", i)
 
-		cache.Put(key, value)
+		require.NoError(t, cache.Put(key, value))
 
 		// Immediately read back (should come from memtable, NOT disk)
 		result, found := readAll(t, cache, key)
@@ -67,7 +67,7 @@ func TestCache_UpdateInMemtable(t *testing.T) {
 	key := []byte("test-key")
 
 	// Write initial value
-	cache.Put(key, []byte("value-v1"))
+	require.NoError(t, cache.Put(key, []byte("value-v1")))
 
 	// Read back
 	result, found := readAll(t, cache, key)
@@ -75,7 +75,7 @@ func TestCache_UpdateInMemtable(t *testing.T) {
 	require.Equal(t, []byte("value-v1"), result)
 
 	// Update value (should overwrite in active skipmap)
-	cache.Put(key, []byte("value-v2"))
+	require.NoError(t, cache.Put(key, []byte("value-v2")))
 
 	// Read back updated value
 	result, found = readAll(t, cache, key)

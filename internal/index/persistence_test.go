@@ -21,7 +21,7 @@ func TestPersistence(t *testing.T) {
 		count := int(itemsPerChunk) + 5
 		items := make([]Item, count)
 		for i := 0; i < count; i++ {
-			items[i] = Item{Hash: uint64(i), SegmentID: segID, PhysicalLen: 100}
+			items[i] = Item{Key: Key{Lo: uint64(i)}, SegmentID: segID, PhysicalLen: 100}
 		}
 
 		err := p.writeBatch(segID, items)
@@ -39,9 +39,9 @@ func TestPersistence(t *testing.T) {
 	})
 
 	t.Run("PrefixIsolation", func(t *testing.T) {
-		err := p.writeBatch(200, []Item{{Hash: 200, SegmentID: 200}})
+		err := p.writeBatch(200, []Item{{Key: Key{Lo: 200}, SegmentID: 200}})
 		require.NoError(t, err)
-		err = p.writeBatch(300, []Item{{Hash: 300, SegmentID: 300}})
+		err = p.writeBatch(300, []Item{{Key: Key{Lo: 300}, SegmentID: 300}})
 		require.NoError(t, err)
 
 		seen300 := false
@@ -97,7 +97,7 @@ func TestDeleteRecordsFromSegment_Collapse(t *testing.T) {
 	require.NoError(t, err)
 	defer os.RemoveAll(path)
 
-	// Override global limit for this test: header(12) + 10 items * 24 bytes = 252 bytes
+	// Override global limit for this test: header(12) + 10 items * 32 bytes = 332 bytes
 	defer testingSetMaxChunkSize(uint64(ManifestHeaderSize) + 10*ItemSize)()
 
 	p, err := newPersistence(path)
@@ -110,7 +110,7 @@ func TestDeleteRecordsFromSegment_Collapse(t *testing.T) {
 	totalBlobs := 25
 	items := make([]Item, totalBlobs)
 	for i := 0; i < totalBlobs; i++ {
-		items[i] = Item{Hash: uint64(i + 1), SegmentID: segID}
+		items[i] = Item{Key: Key{Lo: uint64(i + 1)}, SegmentID: segID}
 	}
 
 	err = p.writeBatch(segID, items)
@@ -125,9 +125,9 @@ func TestDeleteRecordsFromSegment_Collapse(t *testing.T) {
 	assert.Equal(t, 3, count, "Initial write failed to create 3 chunks")
 
 	// Delete 20 blobs, leaving 5
-	toDelete := make(map[uint64]struct{})
+	toDelete := make(map[Key]struct{})
 	for i := 1; i <= 20; i++ {
-		toDelete[uint64(i)] = struct{}{}
+		toDelete[Key{Lo: uint64(i)}] = struct{}{}
 	}
 
 	err = p.DeleteRecordsFromSegment(segID, toDelete)
@@ -156,16 +156,16 @@ func TestDurableIndex(t *testing.T) {
 
 	var segID uint32 = 1
 	items := []Item{
-		{Hash: 100, SegmentID: segID, Offset: 0, PhysicalLen: 100},
-		{Hash: 200, SegmentID: segID, Offset: 100, PhysicalLen: 200},
-		{Hash: 300, SegmentID: segID, Offset: 300, PhysicalLen: 150},
+		{Key: Key{Lo: 100}, SegmentID: segID, Offset: 0, PhysicalLen: 100},
+		{Key: Key{Lo: 200}, SegmentID: segID, Offset: 100, PhysicalLen: 200},
+		{Key: Key{Lo: 300}, SegmentID: segID, Offset: 300, PhysicalLen: 150},
 	}
 
 	err = idx.IngestBatch(segID, items)
 	require.NoError(t, err)
 
 	// Verify in-memory lookup
-	item, ok := idx.DeprecatedGetByHash(200)
+	item, ok := idx.Get(Key{Lo: 200})
 	require.True(t, ok)
 	require.Equal(t, uint32(200), item.PhysicalLen)
 	require.Equal(t, segID, item.SegmentID)
@@ -181,7 +181,7 @@ func TestDurableIndex(t *testing.T) {
 
 	// Verify data survived
 	require.Equal(t, 3, idx2.Len())
-	item, ok = idx2.DeprecatedGetByHash(200)
+	item, ok = idx2.Get(Key{Lo: 200})
 	require.True(t, ok)
 	require.Equal(t, uint32(200), item.PhysicalLen)
 }

@@ -25,7 +25,7 @@ func TestCache_SegmentMode(t *testing.T) {
 		for j := range value {
 			value[j] = byte((i + j) % 256)
 		}
-		cache.Put(key, value)
+		require.NoError(t, cache.Put(key, value))
 	}
 	cache.Drain()
 
@@ -67,7 +67,7 @@ func TestCache_SegmentModeWithDirectIO(t *testing.T) {
 		for j := range value {
 			value[j] = byte(j % 256)
 		}
-		cache.Put(key, value)
+		require.NoError(t, cache.Put(key, value))
 	}
 
 	cache.Drain()

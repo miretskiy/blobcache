@@ -371,15 +371,18 @@ SEGMENT METADATA BLOCK (N * 4KB Aligned)
 +-----------------------------------------------------------+
 | Segment Header (SegmentID, CTime)               [16 bytes]|
 +-----------------------------------------------------------+
-| Footer Entry 0 (48 bytes each):                           |
-|   - Hash         (8B)  Key hash (xxhash)                  |
+| Footer Entry 0 (64 bytes each):                           |
+|   - Hash         (8B)  Key hash Lo (XXH3 128-bit lower)   |
+|   - HashHi       (8B)  Key hash Hi (XXH3 128-bit upper)   |
 |   - Pos          (8B)  Byte offset in segment             |
 |   - LogicalSize  (8B)  Uncompressed size                  |
 |   - PhysicalSize (8B)  Compressed size on disk            |
 |   - SeqID        (8B)  Monotonic sequence ID              |
 |   - Flags        (8B)  Compression, deleted, CRC32        |
+|   - KeyLen       (2B)  Original key length                |
+|   - Reserved     (6B)  Alignment padding                  |
 +-----------------------------------------------------------+
-| Footer Entry 1 ...                              [48 bytes]|
+| Footer Entry 1 ...                              [64 bytes]|
 +-----------------------------------------------------------+
 | Alignment Padding (Zeros to 4KB boundary)       [Variable]|
 +-----------------------------------------------------------+
@@ -390,7 +393,7 @@ SEGMENT METADATA BLOCK (N * 4KB Aligned)
 +-----------------------------------------------------------+
 ```
 
-Each **Footer Entry** (48 bytes) provides sufficient metadata for index reconstruction without scanning record headers.
+Each **Footer Entry** (64 bytes) provides sufficient metadata for index reconstruction without scanning record headers.
 
 ### 6.3 Direct I/O & The Latency Paradox
 BlobCache utilizes `O_DIRECT`. This introduces the **Direct I/O Paradox**: By choosing the slowest physical path to the disk (bypassing the Page Cache), we achieve the highest possible application throughput.
@@ -549,16 +552,28 @@ Furthermore, these metrics provide high-fidelity, real-time observability into c
 Traditional LSM-trees check a separate filter for every file ($O(N)$). BlobCache uses one **Unified Bloom Filter** ($O(1)$). A miss costs $\approx 1ns$ regardless of cache size.
 
 ```text
-KEY: "blob_77"
+KEY: "blob_77"  →  XXH3-128: {Hi: 0x..., Lo: 0x...}
 |
-+--[ Hash 1 ]--+
-|              |    One 64-Byte "Block" (1 CPU Cache Line)
-+--[ Hash 2 ]--|--> +-----------------------------------+
-|              |    | ..1..0..1..1..0..0..1..1..0..1.. |
-+--[ Hash 3 ]--+    +-----------------------------------+
+| Hi → Block Selection (bits.Mul64 for uniform distribution)
+|
++--[ Probe 1 ]--+
+|               |    One 64-Byte "Block" (1 CPU Cache Line)
++--[ Probe 2 ]--|--> +-----------------------------------+
+|               |    | ..1..0..1..1..0..0..1..1..0..1.. |
++--[ Probe 3 ]--+    +-----------------------------------+
+        ^
+        |
+    Lo → Probe Pattern (independent entropy)
 ```
 
-### 8.2 False Positive Decay
+### 8.2 Full 128-bit Entropy: Avoiding the "32-bit Funnel"
+The filter uses **full 128-bit XXH3 hashes** to prevent correlated failures at scale:
+* **Block Selection (`k.Hi`):** The upper 64 bits select which cache line block to probe using `bits.Mul64(k.Hi, numBlocks)` for uniform distribution.
+* **Probe Pattern (`k.Lo`):** The lower 64 bits generate the bit positions within the block.
+
+This design prevents the "32-bit funnel" bug where truncating hashes causes correlated collisions. With 32-bit hashes, the birthday paradox reaches 50% collision probability at just 77K items. At 250M items, truncated hashes cause both block selection AND probe pattern to collide for different keys—a catastrophic false positive scenario that full 128-bit keys eliminate.
+
+### 8.3 False Positive Decay
 Standard Bloom filters cannot handle deletions. As Sieve evicts blobs, the filter decays with "ghost" entries.
 1. **Proactive Tracking:** Rebuilds when ghosts exceed 10%.
 2. **Reactive Monitoring:** Rebuilds if Observed FPR spikes.

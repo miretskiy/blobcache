@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestRecovery_CorruptIndex(t *testing.T) {
@@ -28,7 +30,7 @@ func TestRecovery_CorruptIndex(t *testing.T) {
 	}
 
 	for key, value := range testData {
-		cache.Put([]byte(key), value)
+		require.NoError(t, cache.Put([]byte(key), value))
 	}
 	cache.Drain()
 
@@ -88,7 +90,7 @@ func TestRecovery_CorruptSegment(t *testing.T) {
 	}
 
 	for key, value := range testData {
-		cache.Put([]byte(key), value)
+		require.NoError(t, cache.Put([]byte(key), value))
 		cache.Drain() // Force each key into a separate segment
 	}
 
@@ -191,7 +193,7 @@ func TestRecovery_InvalidSegmentID(t *testing.T) {
 		t.Fatalf("failed to create cache: %v", err)
 	}
 
-	cache.Put([]byte("key1"), []byte("value1"))
+	require.NoError(t, cache.Put([]byte("key1"), []byte("value1")))
 	cache.Drain()
 
 	if err := cache.Close(); err != nil {

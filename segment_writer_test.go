@@ -11,6 +11,7 @@ import (
 	"github.com/miretskiy/blobcache/base"
 	"github.com/miretskiy/blobcache/internal/index"
 	"github.com/miretskiy/blobcache/internal/record"
+	"github.com/miretskiy/blobcache/internal/xmap"
 	"github.com/stretchr/testify/require"
 )
 
@@ -125,8 +126,8 @@ func TestSegmentWriter_FullCycle(t *testing.T) {
 		slab1.WriteAt(data1, 0)
 		slab1Len := int64(len(data1))
 
-		entries1 := []record.FooterEntry{{
-			Hash:        101,
+		entries1 := []record.Inode{{
+			Key:         record.Key{Lo: 101},
 			Pos:         0,
 			LogicalSize: slab1Len,
 		}}
@@ -140,8 +141,8 @@ func TestSegmentWriter_FullCycle(t *testing.T) {
 		slab2.WriteAt(data2, 0)
 		slab2Len := int64(len(data2))
 
-		entries2 := []record.FooterEntry{{
-			Hash:        202,
+		entries2 := []record.Inode{{
+			Key:         record.Key{Lo: 202},
 			Pos:         0,
 			LogicalSize: slab2Len,
 		}}
@@ -157,7 +158,7 @@ func TestSegmentWriter_FullCycle(t *testing.T) {
 		defer f.Close()
 
 		info, _ := f.Stat()
-		footer, _, err := record.ReadSegmentFooterFromFile(f, info.Size(), int64(segID))
+		footer, _, err := record.ReadSegmentEnvelopeFromFile(f, info.Size(), int64(segID))
 		require.NoError(t, err)
 
 		// Verify Pos rounding (critical for Direct I/O reads)
@@ -193,8 +194,9 @@ func TestMemTable_Integration_Rotation(t *testing.T) {
 	}
 
 	for i := 0; i < blobCount; i++ {
-		key := Key(i)
-		require.NoError(t, mt.Put(uint64(i+1), key, data))
+		key := xmap.Key{Lo: uint64(i), Hi: 0}
+		keyBytes := []byte("test-key")
+		require.NoError(t, mt.Put(uint64(i+1), key, keyBytes, data))
 	}
 
 	mt.Drain()

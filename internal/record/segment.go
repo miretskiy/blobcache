@@ -7,7 +7,11 @@ import (
 
 	"github.com/miretskiy/blobcache/base"
 	"github.com/miretskiy/blobcache/compression"
+	"github.com/zeebo/xxh3"
 )
+
+// Key is the 128-bit XXH3 hash of a blob key.
+type Key = xxh3.Uint128
 
 // Segment file constants.
 const (
@@ -140,42 +144,41 @@ func AppendTrailer(dst []byte, t Trailer) []byte {
 //
 // These types are used for:
 // 1. Segment footer serialization (written when segment closes)
-// 2. Persistent index storage in bitcask (segmentID -> SegmentFooter)
+// 2. Persistent index storage in bitcask (segmentID -> SegmentEnvelope)
 // 3. Recovery (rebuilding index from segment footers)
 //
-// TODO(future): Consider removing FooterEntry in favor of scanning record.Header
+// TODO(future): Consider removing Inode in favor of scanning record.Header
 // directly from segment files. This would eliminate the need for a separate
 // footer format and simplify the codebase.
 //
-// TODO(future): Add min/max SeqID to SegmentFooter for efficient range queries
+// TODO(future): Add min/max SeqID to SegmentEnvelope for efficient range queries
 // and compaction decisions.
 
-// Footer serialization constants.
+// Envelope serialization constants.
 const (
-	// FooterEntrySize is the encoded size of a single FooterEntry.
-	// Wire format: Hash(8) + Pos(8) + LogicalSize(8) + PhysicalSize(8) + SeqID(8) + Flags(8) + KeyLen(2) + Pad(6)
-	FooterEntrySize = 56
+	// InodeSize is the encoded size of a single Inode (64 bytes).
+	// Wire format: Key.Lo(8) + Key.Hi(8) + Pos(8) + LogicalSize(8) + PhysicalSize(8) + SeqID(8) + Flags(8) + KeyLen(2) + Pad(6)
+	InodeSize = 64
 
-	// SegmentFooterHeaderSize is the header before entries.
+	// SegmentEnvelopeHeaderSize is the header before entries (16 bytes).
 	// Wire format: SegmentID(8) + CTime(8)
-	SegmentFooterHeaderSize = 16
+	SegmentEnvelopeHeaderSize = 16
 
-	// LegacyFooterSize is the legacy 20-byte footer at segment end.
-	// Wire format: RecordDataLen(8) + Checksum(4) + Magic(8)
-	LegacyFooterSize = 20
+	// TailSize is the 20-byte tail at the end of segment files.
+	// Wire format: EnvelopeDataLen(8) + Checksum(4) + Magic(8)
+	TailSize = 20
 
-	// LegacySegmentMagic identifies legacy segment footer format.
-	// BRIDGE: This matches metadata.segmentMagic for backward compatibility.
-	LegacySegmentMagic = 0xB10BCA4EB10BCA4E
+	// TailMagic identifies a valid segment tail.
+	TailMagic = 0xB10BCA4EB10BCA4E
 )
 
-// FooterEntry represents a single blob's metadata in the segment footer.
-// This is the persistent index entry format used for disaster recovery.
+// Inode represents a single blob's location and metadata within a segment.
+// Like a Unix inode, it indexes content by its hash rather than by name.
 //
-// NOTE: This is only used for segment file footers. The RAM index uses lean
-// index.Item (24 bytes), and bitcask persistence uses index.SegmentManifest.
-type FooterEntry struct {
-	Hash         uint64 // Key hash (xxhash)
+// Used in segment file envelopes for O(1) index recovery on startup.
+// The in-memory index uses the leaner index.Item (32 bytes) for hot paths.
+type Inode struct {
+	Key          Key    // 128-bit XXH3 content hash
 	Pos          int64  // Byte offset within segment (to record header)
 	LogicalSize  int64  // Original uncompressed value size
 	PhysicalSize int64  // On-disk size of value (possibly compressed)
@@ -184,101 +187,96 @@ type FooterEntry struct {
 	KeyLen       uint16 // Key length in bytes (for computing total record size)
 }
 
-// SegmentFooter contains metadata for all blobs in a segment.
-// Used for persistent index storage and recovery.
-//
-// BRIDGE: Wire format matches metadata.SegmentRecord for backward compatibility.
+// SegmentEnvelope is the index manifest for a single segment file.
+// Written at segment close, it enables O(1) index reconstruction on recovery.
 //
 // TODO(future): Add MinSeqID, MaxSeqID for efficient compaction decisions.
 // TODO(future): Add BlobCount, TotalBytes for statistics without iterating.
-type SegmentFooter struct {
+type SegmentEnvelope struct {
 	SegmentID int64
 	CTime     int64 // Unix timestamp (seconds)
-	Entries   []FooterEntry
+	Entries   []Inode
 
-	// IndexKey is the bitcask key for this record (not serialized).
-	// BRIDGE: Used by persistence layer for deletion tracking.
-	// Populated when reading from bitcask, nil when creating new records.
+	// IndexKey is the persistence layer key (not serialized to segment files).
+	// Populated when reading from persistent index, nil for new envelopes.
 	IndexKey []byte
 }
 
-// LegacySegmentTail is the 20-byte structure at the very end of segment files.
-// It allows locating the SegmentFooter data.
-//
-// BRIDGE: Matches metadata.SegmentFooter for backward compatibility.
-type LegacySegmentTail struct {
-	DataLen  int64  // Length of the SegmentFooter data (not including padding)
-	Checksum uint32 // CRC32 of the SegmentFooter data
+// SegmentTail is the fixed 20-byte structure at the end of every segment file.
+// It provides the offset and checksum needed to locate the SegmentEnvelope.
+type SegmentTail struct {
+	DataLen  int64  // Length of the SegmentEnvelope data (not including padding)
+	Checksum uint32 // CRC32 of the SegmentEnvelope data
 }
 
-// --- FooterEntry Methods ---
-// These mirror the methods on record.Header for flag manipulation.
-// BRIDGE: Maintains API compatibility with metadata.BlobRecord.
+// --- Inode Methods ---
+// Flag accessors mirror record.Header for consistency across the codebase.
 
 // Compression returns the compression codec from flags.
-func (e *FooterEntry) Compression() compression.Codex {
+func (e *Inode) Compression() compression.Codex {
 	return compression.Codex((e.Flags & FlagCompressionMask) >> FlagCompressionShift)
 }
 
 // SetCompression sets the compression codec in flags.
-func (e *FooterEntry) SetCompression(c compression.Codex) {
+func (e *Inode) SetCompression(c compression.Codex) {
 	e.Flags = (e.Flags &^ FlagCompressionMask) | (uint64(c) << FlagCompressionShift)
 }
 
 // IsCompressed returns true if compression is enabled.
-func (e *FooterEntry) IsCompressed() bool {
+func (e *Inode) IsCompressed() bool {
 	return e.Compression() != compression.CodexNone
 }
 
 // IsDeleted returns true if the deleted flag is set.
-func (e *FooterEntry) IsDeleted() bool {
+func (e *Inode) IsDeleted() bool {
 	return (e.Flags & FlagDeleted) != 0
 }
 
 // SetDeleted sets the deleted flag.
-func (e *FooterEntry) SetDeleted() {
+func (e *Inode) SetDeleted() {
 	e.Flags |= FlagDeleted
 }
 
 // Checksum returns the CRC32 checksum from flags.
-func (e *FooterEntry) Checksum() uint32 {
+func (e *Inode) Checksum() uint32 {
 	return uint32(e.Flags & FlagCRCMask)
 }
 
 // HasChecksum returns true if checksum is valid (InvalidCRC flag is clear).
-func (e *FooterEntry) HasChecksum() bool {
+func (e *Inode) HasChecksum() bool {
 	return (e.Flags & FlagInvalidCRC) == 0
 }
 
 // Errno returns the error code from flags.
-func (e *FooterEntry) Errno() base.BlobErrno {
+func (e *Inode) Errno() base.BlobErrno {
 	return base.BlobErrno((e.Flags & FlagErrnoMask) >> FlagErrnoShift)
 }
 
 // SetErrno sets the error code in flags.
-func (e *FooterEntry) SetErrno(errno base.BlobErrno) {
+func (e *Inode) SetErrno(errno base.BlobErrno) {
 	e.Flags = (e.Flags &^ FlagErrnoMask) | (uint64(errno&0x1F) << FlagErrnoShift)
 }
 
 // HasError returns true if the entry has a non-zero error code.
-func (e *FooterEntry) HasError() bool {
+func (e *Inode) HasError() bool {
 	return e.Errno() != base.ErrNone
 }
 
 // CompressionRatio returns physical/logical size ratio.
-func (e *FooterEntry) CompressionRatio() float64 {
+func (e *Inode) CompressionRatio() float64 {
 	if e.LogicalSize == 0 {
 		return 0
 	}
 	return float64(e.PhysicalSize) / float64(e.LogicalSize)
 }
 
-// --- FooterEntry Serialization ---
+// --- Inode Serialization ---
 
-// AppendFooterEntry appends an encoded FooterEntry to dst.
-// Wire format (56 bytes): Hash(8) + Pos(8) + LogicalSize(8) + PhysicalSize(8) + SeqID(8) + Flags(8) + KeyLen(2) + Pad(6)
-func AppendFooterEntry(dst []byte, e FooterEntry) []byte {
-	dst = binary.LittleEndian.AppendUint64(dst, e.Hash)
+// AppendInode appends an encoded Inode to dst.
+// Wire format (64 bytes): Key.Lo(8) + Key.Hi(8) + Pos(8) + LogicalSize(8) + PhysicalSize(8) + SeqID(8) + Flags(8) + KeyLen(2) + Pad(6)
+func AppendInode(dst []byte, e Inode) []byte {
+	dst = binary.LittleEndian.AppendUint64(dst, e.Key.Lo)
+	dst = binary.LittleEndian.AppendUint64(dst, e.Key.Hi)
 	dst = binary.LittleEndian.AppendUint64(dst, uint64(e.Pos))
 	dst = binary.LittleEndian.AppendUint64(dst, uint64(e.LogicalSize))
 	dst = binary.LittleEndian.AppendUint64(dst, uint64(e.PhysicalSize))
@@ -289,114 +287,115 @@ func AppendFooterEntry(dst []byte, e FooterEntry) []byte {
 	return dst
 }
 
-// DecodeFooterEntry decodes a FooterEntry from src.
-func DecodeFooterEntry(src []byte) (FooterEntry, error) {
-	if len(src) < FooterEntrySize {
-		return FooterEntry{}, ErrBufferTooSmall
+// DecodeInode decodes an Inode from src.
+func DecodeInode(src []byte) (Inode, error) {
+	if len(src) < InodeSize {
+		return Inode{}, ErrBufferTooSmall
 	}
-	return FooterEntry{
-		Hash:         binary.LittleEndian.Uint64(src[0:8]),
-		Pos:          int64(binary.LittleEndian.Uint64(src[8:16])),
-		LogicalSize:  int64(binary.LittleEndian.Uint64(src[16:24])),
-		PhysicalSize: int64(binary.LittleEndian.Uint64(src[24:32])),
-		SeqID:        binary.LittleEndian.Uint64(src[32:40]),
-		Flags:        binary.LittleEndian.Uint64(src[40:48]),
-		KeyLen:       binary.LittleEndian.Uint16(src[48:50]),
-		// Bytes 50-55 are padding, ignored on decode
+	return Inode{
+		Key: Key{
+			Lo: binary.LittleEndian.Uint64(src[0:8]),
+			Hi: binary.LittleEndian.Uint64(src[8:16]),
+		},
+		Pos:          int64(binary.LittleEndian.Uint64(src[16:24])),
+		LogicalSize:  int64(binary.LittleEndian.Uint64(src[24:32])),
+		PhysicalSize: int64(binary.LittleEndian.Uint64(src[32:40])),
+		SeqID:        binary.LittleEndian.Uint64(src[40:48]),
+		Flags:        binary.LittleEndian.Uint64(src[48:56]),
+		KeyLen:       binary.LittleEndian.Uint16(src[56:58]),
+		// Bytes 58-63 are padding, ignored on decode
 	}, nil
 }
 
-// --- SegmentFooter Serialization ---
+// --- SegmentEnvelope Serialization ---
 
-// AppendSegmentFooter appends an encoded SegmentFooter to dst.
+// AppendSegmentEnvelope appends an encoded SegmentEnvelope to dst.
 // Wire format: SegmentID(8) + CTime(8) + [Entries...]
-func AppendSegmentFooter(dst []byte, sf SegmentFooter) []byte {
+func AppendSegmentEnvelope(dst []byte, sf SegmentEnvelope) []byte {
 	dst = binary.LittleEndian.AppendUint64(dst, uint64(sf.SegmentID))
 	dst = binary.LittleEndian.AppendUint64(dst, uint64(sf.CTime))
 	for i := range sf.Entries {
-		dst = AppendFooterEntry(dst, sf.Entries[i])
+		dst = AppendInode(dst, sf.Entries[i])
 	}
 	return dst
 }
 
-// DecodeSegmentFooter decodes a SegmentFooter from src.
-func DecodeSegmentFooter(src []byte) (SegmentFooter, error) {
-	if len(src) < SegmentFooterHeaderSize {
-		return SegmentFooter{}, ErrBufferTooSmall
+// DecodeSegmentEnvelope decodes a SegmentEnvelope from src.
+func DecodeSegmentEnvelope(src []byte) (SegmentEnvelope, error) {
+	if len(src) < SegmentEnvelopeHeaderSize {
+		return SegmentEnvelope{}, ErrBufferTooSmall
 	}
 
 	segmentID := int64(binary.LittleEndian.Uint64(src[0:8]))
 	ctime := int64(binary.LittleEndian.Uint64(src[8:16]))
 
-	entriesData := src[SegmentFooterHeaderSize:]
-	if len(entriesData)%FooterEntrySize != 0 {
-		return SegmentFooter{}, errors.New("record: invalid segment footer size")
+	entriesData := src[SegmentEnvelopeHeaderSize:]
+	if len(entriesData)%InodeSize != 0 {
+		return SegmentEnvelope{}, errors.New("record: invalid segment envelope size")
 	}
 
-	numEntries := len(entriesData) / FooterEntrySize
-	entries := make([]FooterEntry, numEntries)
+	numEntries := len(entriesData) / InodeSize
+	entries := make([]Inode, numEntries)
 	for i := 0; i < numEntries; i++ {
-		offset := i * FooterEntrySize
-		e, err := DecodeFooterEntry(entriesData[offset : offset+FooterEntrySize])
+		offset := i * InodeSize
+		e, err := DecodeInode(entriesData[offset : offset+InodeSize])
 		if err != nil {
-			return SegmentFooter{}, err
+			return SegmentEnvelope{}, err
 		}
 		entries[i] = e
 	}
 
-	return SegmentFooter{
+	return SegmentEnvelope{
 		SegmentID: segmentID,
 		CTime:     ctime,
 		Entries:   entries,
 	}, nil
 }
 
-// --- Legacy Segment File Footer ---
+// --- Segment Tail ---
 // These functions handle the 20-byte tail at the end of segment files.
 
-// DecodeLegacySegmentTail decodes the 20-byte tail from segment file end.
-func DecodeLegacySegmentTail(src []byte) (LegacySegmentTail, error) {
-	if len(src) < LegacyFooterSize {
-		return LegacySegmentTail{}, ErrBufferTooSmall
+// DecodeSegmentTail decodes the 20-byte tail from segment file end.
+func DecodeSegmentTail(src []byte) (SegmentTail, error) {
+	if len(src) < TailSize {
+		return SegmentTail{}, ErrBufferTooSmall
 	}
 
 	dataLen := int64(binary.LittleEndian.Uint64(src[0:8]))
 	checksum := binary.LittleEndian.Uint32(src[8:12])
 	magic := binary.LittleEndian.Uint64(src[12:20])
 
-	if magic != LegacySegmentMagic {
-		return LegacySegmentTail{}, errors.New("record: invalid segment tail magic")
+	if magic != TailMagic {
+		return SegmentTail{}, errors.New("record: invalid segment tail magic")
 	}
 
-	return LegacySegmentTail{
+	return SegmentTail{
 		DataLen:  dataLen,
 		Checksum: checksum,
 	}, nil
 }
 
-// AppendLegacySegmentTail appends the 20-byte tail.
-func AppendLegacySegmentTail(dst []byte, tail LegacySegmentTail) []byte {
+// AppendSegmentTail appends the 20-byte tail.
+func AppendSegmentTail(dst []byte, tail SegmentTail) []byte {
 	dst = binary.LittleEndian.AppendUint64(dst, uint64(tail.DataLen))
 	dst = binary.LittleEndian.AppendUint32(dst, tail.Checksum)
-	dst = binary.LittleEndian.AppendUint64(dst, LegacySegmentMagic)
+	dst = binary.LittleEndian.AppendUint64(dst, TailMagic)
 	return dst
 }
 
 // --- Helper Functions ---
 
-// SegmentFooterPhysicalSize returns the 4KB-aligned size needed for a segment footer.
-func SegmentFooterPhysicalSize(numEntries int) int64 {
-	logicalSize := int64(SegmentFooterHeaderSize + (numEntries * FooterEntrySize) + LegacyFooterSize)
+// SegmentEnvelopePhysicalSize returns the 4KB-aligned size needed for a segment envelope.
+func SegmentEnvelopePhysicalSize(numEntries int) int64 {
+	logicalSize := int64(SegmentEnvelopeHeaderSize + (numEntries * InodeSize) + TailSize)
 	return roundToPage(logicalSize)
 }
 
-// AppendSegmentFooterWithTail serializes a SegmentFooter with CRC and legacy tail into a
-// 4KB-aligned buffer. Structure: [SegmentFooter][Alignment Gap (Zeros)][LegacyTail]
-//
-// BRIDGE: Matches metadata.AppendSegmentRecordWithFooter for backward compatibility.
-func AppendSegmentFooterWithTail(buf []byte, sf SegmentFooter) []byte {
-	recordDataSize := SegmentFooterHeaderSize + (len(sf.Entries) * FooterEntrySize)
-	logicalSize := int64(recordDataSize + LegacyFooterSize)
+// AppendSegmentEnvelopeWithTail serializes a SegmentEnvelope with CRC and tail into a
+// 4KB-aligned buffer. Structure: [SegmentEnvelope][Alignment Gap (Zeros)][Tail]
+func AppendSegmentEnvelopeWithTail(buf []byte, sf SegmentEnvelope) []byte {
+	envelopeDataSize := SegmentEnvelopeHeaderSize + (len(sf.Entries) * InodeSize)
+	logicalSize := int64(envelopeDataSize + TailSize)
 	physicalSize := roundToPage(logicalSize)
 
 	// 1. Prepare the buffer.
@@ -407,17 +406,17 @@ func AppendSegmentFooterWithTail(buf []byte, sf SegmentFooter) []byte {
 		clear(buf)
 	}
 
-	// 2. Serialize footer at the VERY START of the physical block.
-	_ = AppendSegmentFooter(buf[:0], sf)
+	// 2. Serialize envelope at the VERY START of the physical block.
+	_ = AppendSegmentEnvelope(buf[:0], sf)
 
-	// 3. Compute Checksum of the record data ONLY.
-	checksum := crc32.ChecksumIEEE(buf[:recordDataSize])
+	// 3. Compute checksum of the envelope data ONLY.
+	checksum := crc32.ChecksumIEEE(buf[:envelopeDataSize])
 
-	// 4. Place Legacy Tail at the VERY END of the physical block.
-	tailOffset := physicalSize - int64(LegacyFooterSize)
-	binary.LittleEndian.PutUint64(buf[tailOffset:tailOffset+8], uint64(recordDataSize))
+	// 4. Place tail at the VERY END of the physical block.
+	tailOffset := physicalSize - int64(TailSize)
+	binary.LittleEndian.PutUint64(buf[tailOffset:tailOffset+8], uint64(envelopeDataSize))
 	binary.LittleEndian.PutUint32(buf[tailOffset+8:tailOffset+12], checksum)
-	binary.LittleEndian.PutUint64(buf[tailOffset+12:tailOffset+20], LegacySegmentMagic)
+	binary.LittleEndian.PutUint64(buf[tailOffset+12:tailOffset+20], TailMagic)
 
 	return buf
 }
@@ -427,60 +426,60 @@ func roundToPage(size int64) int64 {
 	return (size + pageSize - 1) &^ (pageSize - 1)
 }
 
-// ReadSegmentFooterFromFile reads and validates segment footer from file.
-// Returns the SegmentFooter, the metadata block start offset, and any error.
-//
-// BRIDGE: Matches metadata.ReadSegmentFooterFromFile for backward compatibility.
-func ReadSegmentFooterFromFile(
+// ReadSegmentEnvelopeFromFile reads and validates a segment envelope from file.
+// Returns the SegmentEnvelope, the envelope block start offset, and any error.
+func ReadSegmentEnvelopeFromFile(
 	file interface {
 		ReadAt([]byte, int64) (int, error)
-	}, fileSize int64, segmentID int64,
-) (SegmentFooter, int64, error) {
-	if fileSize < int64(LegacyFooterSize) {
-		return SegmentFooter{}, 0, errors.New("record: file too small for footer")
+	},
+	fileSize int64,
+	segmentID int64,
+) (SegmentEnvelope, int64, error) {
+	if fileSize < int64(TailSize) {
+		return SegmentEnvelope{}, 0, errors.New("record: file too small for tail")
 	}
 
-	// 1. Read legacy tail from the end
-	tailBuf := make([]byte, LegacyFooterSize)
-	tailPos := fileSize - int64(LegacyFooterSize)
+	// 1. Read tail from the end
+	tailBuf := make([]byte, TailSize)
+	tailPos := fileSize - int64(TailSize)
 	if _, err := file.ReadAt(tailBuf, tailPos); err != nil {
-		return SegmentFooter{}, 0, errors.New("record: failed to read footer: " + err.Error())
+		return SegmentEnvelope{}, 0, errors.New("record: failed to read tail: " + err.Error())
 	}
 
-	tail, err := DecodeLegacySegmentTail(tailBuf)
+	tail, err := DecodeSegmentTail(tailBuf)
 	if err != nil {
-		return SegmentFooter{}, 0, errors.New("record: invalid footer: " + err.Error())
+		return SegmentEnvelope{}, 0, errors.New("record: invalid tail: " + err.Error())
 	}
 
-	// 2. Calculate the start of the entire Aligned Metadata Block
-	physicalSize := roundToPage(tail.DataLen + int64(LegacyFooterSize))
-	metadataBlockStart := fileSize - physicalSize
+	// 2. Calculate the start of the entire aligned envelope block
+	physicalSize := roundToPage(tail.DataLen + int64(TailSize))
+	envelopeBlockStart := fileSize - physicalSize
 
-	if metadataBlockStart < 0 {
-		return SegmentFooter{}, 0, errors.New("record: invalid metadata block geometry")
+	if envelopeBlockStart < 0 {
+		return SegmentEnvelope{}, 0, errors.New("record: invalid envelope block geometry")
 	}
 
-	// 3. Read segment footer from the START of the physical block
-	footerBuf := make([]byte, tail.DataLen)
-	if _, err := file.ReadAt(footerBuf, metadataBlockStart); err != nil {
-		return SegmentFooter{}, 0, errors.New("record: failed to read segment footer: " + err.Error())
+	// 3. Read envelope from the START of the physical block
+	envelopeBuf := make([]byte, tail.DataLen)
+	if _, err := file.ReadAt(envelopeBuf, envelopeBlockStart); err != nil {
+		return SegmentEnvelope{}, 0, errors.New("record: failed to read envelope: " + err.Error())
 	}
 
 	// 4. Validate checksum
-	computedChecksum := crc32.ChecksumIEEE(footerBuf)
+	computedChecksum := crc32.ChecksumIEEE(envelopeBuf)
 	if computedChecksum != tail.Checksum {
-		return SegmentFooter{}, 0, errors.New("record: checksum mismatch")
+		return SegmentEnvelope{}, 0, errors.New("record: checksum mismatch")
 	}
 
 	// 5. Decode
-	footer, err := DecodeSegmentFooter(footerBuf)
+	envelope, err := DecodeSegmentEnvelope(envelopeBuf)
 	if err != nil {
-		return SegmentFooter{}, 0, errors.New("record: segment footer validation failed: " + err.Error())
+		return SegmentEnvelope{}, 0, errors.New("record: envelope decode failed: " + err.Error())
 	}
 
-	if segmentID != -1 && footer.SegmentID != segmentID {
-		return SegmentFooter{}, 0, errors.New("record: segment ID mismatch")
+	if segmentID != -1 && envelope.SegmentID != segmentID {
+		return SegmentEnvelope{}, 0, errors.New("record: segment ID mismatch")
 	}
 
-	return footer, metadataBlockStart, nil
+	return envelope, envelopeBlockStart, nil
 }

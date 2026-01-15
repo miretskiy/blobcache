@@ -25,7 +25,7 @@ type SegmentWriter struct {
 	file       *os.File
 	currentPos int64
 	pool       poolProvider
-	entries    []record.FooterEntry // Full entries for segment footer
+	entries    []record.Inode // Full entries for segment footer
 	syncData   bool
 }
 
@@ -65,9 +65,9 @@ func NewSegmentWriter(
 // 'data' MUST be 4KB-aligned (via MmapBuffer.AlignedBytes()) or the write
 // will fail with EINVAL on Linux systems.
 // Returns lean index.Item entries with absolute positions for index updates.
-// The full FooterEntry data is kept internally for the segment footer.
+// The full Inode data is kept internally for the segment footer.
 func (sw *SegmentWriter) WriteSlab(
-	data []byte, entries []record.FooterEntry,
+	data []byte, entries []record.Inode,
 ) ([]index.Item, error) {
 	if len(data) == 0 {
 		return nil, nil
@@ -112,7 +112,7 @@ func (sw *SegmentWriter) WriteSlab(
 		// PhysicalLen = header + key + value (total record size on disk)
 		physicalLen := uint32(record.HeaderSize) + uint32(entry.KeyLen) + uint32(entry.PhysicalSize)
 		item := index.Item{
-			Hash:        entry.Hash,
+			Key:         entry.Key, // Full 128-bit XXH3 hash
 			SegmentID:   sw.id,
 			Offset:      uint32(absolutePos),
 			PhysicalLen: physicalLen,
@@ -133,21 +133,21 @@ func (sw *SegmentWriter) Close() error {
 	}
 
 	// 1. Construct the immutable Segment Footer
-	sf := record.SegmentFooter{
+	sf := record.SegmentEnvelope{
 		Entries:   sw.entries,
-		SegmentID: int64(sw.id), // SegmentFooter uses int64 for disk format
+		SegmentID: int64(sw.id), // SegmentEnvelope uses int64 for disk format
 		CTime:     time.Now().Unix(),
 	}
 
 	// 2. Serialize Footer into an Aligned Buffer.
 	// We use the slabPool to satisfy O_DIRECT alignment and avoid GC pressure.
-	physicalMetaSize := record.SegmentFooterPhysicalSize(len(sw.entries))
+	physicalMetaSize := record.SegmentEnvelopePhysicalSize(len(sw.entries))
 	tmpBuf := sw.pool.AcquireAligned(physicalMetaSize)
 	defer tmpBuf.Unpin()
 
-	// AppendSegmentFooterWithTail ensures the 20-byte legacy tail is pinned
-	// to the absolute end of the 4KB-aligned block.
-	paddedMetadata := record.AppendSegmentFooterWithTail(tmpBuf.Bytes(), sf)
+	// AppendSegmentEnvelopeWithTail places the 20-byte tail at the absolute
+	// end of the 4KB-aligned block.
+	paddedMetadata := record.AppendSegmentEnvelopeWithTail(tmpBuf.Bytes(), sf)
 
 	// 3. Final hardware write for the metadata block.
 	if _, err := sw.file.WriteAt(paddedMetadata, sw.currentPos); err != nil {
@@ -156,9 +156,9 @@ func (sw *SegmentWriter) Close() error {
 	}
 	finalSize := sw.currentPos + int64(len(paddedMetadata))
 
-	// 4. Truncate to actual size so footer is at file end.
-	// fallocate pre-allocates more space; ReadSegmentFooterFromFile expects
-	// the footer at fileSize - footerSize.
+	// 4. Truncate to actual size so envelope is at file end.
+	// fallocate pre-allocates more space; ReadSegmentEnvelopeFromFile expects
+	// the tail at fileSize - TailSize.
 	if err := sw.file.Truncate(finalSize); err != nil {
 		_ = sw.file.Close()
 		return fmt.Errorf("failed to truncate segment: %w", err)

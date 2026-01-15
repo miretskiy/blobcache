@@ -9,7 +9,7 @@ import (
 
 	"github.com/miretskiy/blobcache/compression"
 	"github.com/miretskiy/blobcache/internal/record"
-	"github.com/zhangyunhao116/skipmap"
+	"github.com/miretskiy/blobcache/internal/xmap"
 )
 
 const (
@@ -106,7 +106,7 @@ func (mt *MemTable) newActiveSlab(size int) *ActiveSlab {
 	as := &ActiveSlab{
 		SharedSlab: SharedSlab{
 			buf:   buf,
-			index: skipmap.NewUint64[SlabEntry](),
+			index: xmap.New[SlabEntry, xmap.Pad32](xmap.WithShardShift(4)), // 16 shards for slab index
 		},
 		writesDone: newSignal(),
 	}
@@ -148,48 +148,55 @@ func (mt *MemTable) maybeCompress(src []byte) BufferHandle {
 
 // --- Write Logic ---
 
-func (mt *MemTable) Put(seqID uint64, key Key, value []byte) error {
-	return mt.putWithChecksum(seqID, key, value, nil)
+func (mt *MemTable) Put(seqID uint64, hash Key, keyBytes, value []byte) error {
+	return mt.putWithChecksum(seqID, hash, keyBytes, value, nil)
 }
 
-func (mt *MemTable) PutChecksummed(seqID uint64, key Key, value []byte, checksum uint32) error {
-	return mt.putWithChecksum(seqID, key, value, &checksum)
+func (mt *MemTable) PutChecksummed(seqID uint64, hash Key, keyBytes, value []byte, checksum uint32) error {
+	return mt.putWithChecksum(seqID, hash, keyBytes, value, &checksum)
 }
 
-func (mt *MemTable) putWithChecksum(seqID uint64, key Key, value []byte, checksum *uint32) error {
+func (mt *MemTable) putWithChecksum(seqID uint64, hash Key, keyBytes, value []byte, checksum *uint32) error {
 	if int64(len(value)) > mt.LargeWriteThreshold {
-		return mt.putLarge(seqID, key, value, checksum)
+		return mt.putLarge(seqID, hash, keyBytes, value, checksum)
 	}
-	return mt.putActive(seqID, key, value, checksum)
+	return mt.putActive(seqID, hash, keyBytes, value, checksum)
 }
 
-func (mt *MemTable) putLarge(seqID uint64, key Key, value []byte, checksum *uint32) error {
+func (mt *MemTable) putLarge(seqID uint64, hash Key, keyBytes, value []byte, checksum *uint32) error {
 	// 1. Compress in caller's goroutine (distributed compression)
 	compressed := mt.maybeCompress(value)
 	defer compressed.Release()
 
-	// 2. Bypass lock for large writes, allocate slab for header + data
-	var as *ActiveSlab
-	valueSize := len(value)
+	// 2. Determine on-disk value bytes
+	valueBytes := value
+	codec := compression.CodexNone
 	if !compressed.IsZero() {
-		valueSize = len(compressed.Bytes())
+		valueBytes = compressed.Bytes()
+		codec = mt.Compression.Codec
 	}
-	slabSize := record.HeaderSize + valueSize
-	as = mt.newActiveSlab(slabSize)
 
-	// 3. Build slab entry (embeds record.Header)
-	entry := makeSlabEntry(seqID, 0, value, compressed.Bytes(), mt.Compression.Codec, mt.Resilience.ChecksumHasher, checksum)
+	// 3. Build record with key + value
+	rec := record.NewRecord(seqID, keyBytes, valueBytes, int64(len(value)))
+	rec.SetCompression(codec)
 
-	// 4. Write header + value
-	as.buf.WriteAt(record.AppendHeader(nil, entry.Header), 0)
-	if compressed.IsZero() {
-		as.buf.WriteAt(value, int64(record.HeaderSize))
-	} else {
-		as.buf.WriteAt(compressed.Bytes(), int64(record.HeaderSize))
+	// Override CRC if caller provided one (must be computed over key+value)
+	if checksum != nil {
+		rec.SetCRC(*checksum)
 	}
-	as.wPos = int64(slabSize)
 
-	as.index.Store(key, entry)
+	// 4. Allocate slab just for this record
+	as := mt.newActiveSlab(rec.EncodedSize())
+
+	// 5. Write record using Append (updates wPos)
+	offset := as.Append(record.AppendRecord(nil, rec))
+
+	// 6. Create SlabEntry for index lookup
+	entry := SlabEntry{
+		Header: rec.Header,
+		Pos:    offset,
+	}
+	as.index.Put(hash, entry)
 	as.currentMaxSeq = seqID
 
 	if !mt.IsDegraded() {
@@ -201,15 +208,15 @@ func (mt *MemTable) putLarge(seqID uint64, key Key, value []byte, checksum *uint
 	return nil
 }
 
-func (mt *MemTable) putActive(seqID uint64, key Key, value []byte, checksum *uint32) error {
+func (mt *MemTable) putActive(seqID uint64, hash Key, keyBytes, value []byte, checksum *uint32) error {
 	// 1. Compress before lock (parallel compression) - only on first call
 	c := mt.maybeCompress(value)
 	defer c.Release()
-	return mt.putActiveCompressed(seqID, key, value, checksum, c)
+	return mt.putActiveCompressed(seqID, hash, keyBytes, value, checksum, c)
 }
 
 func (mt *MemTable) putActiveCompressed(
-	seqID uint64, key Key, value []byte, checksum *uint32, compressed BufferHandle,
+	seqID uint64, hash Key, keyBytes, value []byte, checksum *uint32, compressed BufferHandle,
 ) error {
 	mt.mu.Lock()
 
@@ -226,25 +233,35 @@ func (mt *MemTable) putActiveCompressed(
 		wait := mt.mu.activeReady
 		mt.mu.Unlock()
 		<-wait
-		return mt.putActiveCompressed(seqID, key, value, checksum, compressed)
+		return mt.putActiveCompressed(seqID, hash, keyBytes, value, checksum, compressed)
+	}
+
+	// 3. Determine on-disk value bytes and build record
+	valueBytes := value
+	codec := compression.CodexNone
+	if !compressed.IsZero() {
+		valueBytes = compressed.Bytes()
+		codec = mt.Compression.Codec
+	}
+
+	rec := record.NewRecord(seqID, keyBytes, valueBytes, int64(len(value)))
+	rec.SetCompression(codec)
+	if checksum != nil {
+		rec.SetCRC(*checksum)
 	}
 
 	active := mt.mu.active
-	valueSize := int64(len(value))
-	if !compressed.IsZero() {
-		valueSize = int64(len(compressed.Bytes()))
-	}
-	writeSize := int64(record.HeaderSize) + valueSize
+	writeSize := int64(rec.EncodedSize())
 
-	// 3. Check Capacity & Rotate
-	if active.wPos+writeSize > int64(active.buf.Cap()) {
+	// 4. Check Capacity & Rotate
+	if active.wPos+writeSize > active.Cap() {
 		rotateUnlocked := mt.prepareRotationLocked()
 		mt.mu.Unlock()
 		rotateUnlocked()
-		return mt.putActiveCompressed(seqID, key, value, checksum, compressed)
+		return mt.putActiveCompressed(seqID, hash, keyBytes, value, checksum, compressed)
 	}
 
-	// 4. Reservation
+	// 5. Reservation (under lock)
 	active.pendingWrites.Add(1)
 	wPos := active.wPos
 	active.wPos += writeSize
@@ -256,26 +273,26 @@ func (mt *MemTable) putActiveCompressed(
 
 	mt.mu.Unlock()
 
-	// 5. Build slab entry and write header + value
-	entry := makeSlabEntry(seqID, wPos, value, compressed.Bytes(), mt.Compression.Codec, mt.Resilience.ChecksumHasher, checksum)
-	active.buf.WriteAt(record.AppendHeader(nil, entry.Header), wPos)
-	if compressed.IsZero() {
-		active.buf.WriteAt(value, wPos+int64(record.HeaderSize))
-	} else {
-		active.buf.WriteAt(compressed.Bytes(), wPos+int64(record.HeaderSize))
+	// 6. Write record to reserved region (outside lock)
+	active.WriteAt(record.AppendRecord(nil, rec), wPos)
+
+	// 7. Create SlabEntry for index lookup
+	entry := SlabEntry{
+		Header: rec.Header,
+		Pos:    wPos,
 	}
 
-	// 6. Concurrency Guard: Prevent "Check-Then-Act" race.
+	// 8. Concurrency Guard: Prevent "Check-Then-Act" race.
 	// Two threads updating the same key could both read stale state and
 	// the slower (older) write could overwrite the faster (newer) one.
-	shard := key & indexShardMask
+	shard := hash.Lo & indexShardMask
 	mt.indexLocks[shard].Lock()
-	if existing, ok := active.index.Load(key); !ok || seqID > existing.SeqID {
-		active.index.Store(key, entry)
+	if existing, ok := active.index.Get(hash); !ok || seqID > existing.SeqID {
+		active.index.Put(hash, entry)
 	}
 	mt.indexLocks[shard].Unlock()
 
-	// 7. Complete
+	// 9. Complete
 	if active.pendingWrites.Add(-1) == 0 {
 		if active.retired.Load() {
 			active.writesDone.Close()
@@ -358,48 +375,6 @@ func (mt *MemTable) Drain() {
 	mt.flushWg.Wait()
 }
 
-// makeSlabEntry creates a SlabEntry with embedded record.Header.
-// The Header.Magic is set for disk writes; KeyLen is 0 (key bytes not stored yet).
-func makeSlabEntry(
-	seqID uint64, offset int64, original []byte, compressed []byte, codec compression.Codex,
-	hasher Hasher, checksum *uint32,
-) SlabEntry {
-	// Determine sizes based on whether compression was applied
-	logicalSize := int64(len(original))
-	physicalSize := logicalSize
-	if compressed != nil {
-		physicalSize = int64(len(compressed))
-	} else {
-		codec = compression.CodexNone
-	}
-
-	entry := SlabEntry{
-		Header: record.Header{
-			Magic:        record.RecordMagic,
-			Flags:        record.FlagInvalidCRC, // Will be cleared if checksum is set
-			SeqID:        seqID,
-			KeyLen:       0, // TODO: set when we start storing keys
-			PhysicalSize: physicalSize,
-			LogicalSize:  logicalSize,
-		},
-		Pos: offset,
-	}
-
-	// Set compression codec in flags
-	entry.SetCompression(codec)
-
-	// Checksum is computed on ORIGINAL data (before compression)
-	// This allows verification after decompression
-	if checksum != nil {
-		entry.SetCRC(*checksum)
-	} else if hasher != nil {
-		h := hasher()
-		h.Write(original)
-		entry.SetCRC(h.Sum32())
-	}
-	return entry
-}
-
 func (mt *MemTable) sendToFlusher(as *ActiveSlab) {
 	mt.flushWg.Add(1)
 	ticket := as.PurchaseTicket()
@@ -455,11 +430,11 @@ func (mt *MemTable) processFlush(as *ActiveSlab, writer *SegmentWriter) (*Segmen
 		}
 	}
 
-	// 1. Collect entries and convert to record.FooterEntry for WriteSlab
-	var entries []record.FooterEntry
-	as.index.Range(func(hash uint64, e SlabEntry) bool {
-		entries = append(entries, record.FooterEntry{
-			Hash:         hash,
+	// 1. Collect entries and convert to record.Inode for WriteSlab
+	var entries []record.Inode
+	as.index.ForEach(func(key xmap.Key, e SlabEntry, _ *xmap.Pad32) bool {
+		entries = append(entries, record.Inode{
+			Key:          key, // Full 128-bit XXH3 hash
 			Pos:          e.Pos,
 			LogicalSize:  e.LogicalSize,
 			PhysicalSize: e.PhysicalSize,
@@ -471,7 +446,7 @@ func (mt *MemTable) processFlush(as *ActiveSlab, writer *SegmentWriter) (*Segmen
 	})
 
 	// 2. Sort by Physical Position (Offset) for linear I/O
-	slices.SortFunc(entries, func(a, b record.FooterEntry) int {
+	slices.SortFunc(entries, func(a, b record.Inode) int {
 		return int(a.Pos - b.Pos)
 	})
 

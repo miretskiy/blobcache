@@ -1,12 +1,7 @@
 // Package index provides a GC-optimized in-memory index for blob metadata.
 //
-// The index uses a sharded arena-backed design where maps store uint32 indices
-// into pre-allocated slices, eliminating heap pointers entirely. This makes
-// the data structures "scan-free" from the GC's perspective, dramatically
-// reducing pause times at scale (millions of entries).
-//
-// Eviction uses the SIEVE/Clock algorithm with byte-based targets and a
-// hybrid strategy (random greedy for small targets, proportional fair for large).
+// The index uses xmap for sharded concurrent access, with a custom ShardState
+// that holds arena-backed nodes for the SIEVE eviction algorithm.
 //
 // Design Philosophy: RAM stores only "coordinates" (24 bytes per item).
 // Full metadata (SeqID, LogicalSize, compression) lives on disk in record.Header
@@ -15,9 +10,11 @@ package index
 
 import (
 	"math/rand"
+	"sync/atomic"
 
 	"github.com/miretskiy/blobcache/base"
 	"github.com/miretskiy/blobcache/compression"
+	"github.com/miretskiy/blobcache/internal/xmap"
 )
 
 // Public constants that callers may need to reference.
@@ -36,24 +33,24 @@ const (
 	smallTargetThreshold = 64 * 1024 // Switch point for eviction strategy
 )
 
-// Key is the 128-bit hash of a blob key.
-// Defined as an array (not slice) for GC optimization - no heap pointer.
-type Key [16]byte
+// Key is the 128-bit XXH3 hash of a blob key.
+// Alias to xmap.Key for consistency across the codebase.
+type Key = xmap.Key
 
 // Item holds the minimum coordinates needed to locate a blob on disk.
-// This "lean" design (24 bytes) enables 1TB capacity with ~18GB RAM (4KB blobs).
+// This design (32 bytes) enables 1TB capacity with ~24GB RAM (4KB blobs).
 //
-// Layout (24 bytes, 8-byte aligned):
+// Layout (32 bytes, 8-byte aligned):
 //
-//	Hash        uint64 // 8B: Back-reference for eviction/map deletes
-//	SegmentID   uint32 // 4B: Supports 4 billion segments
-//	Offset      uint32 // 4B: Supports 4GB segment files
-//	PhysicalLen uint32 // 4B: Supports 4GB blobs
-//	Flags       uint32 // 4B: Deleted, errno, compression (alignment freebie)
+//	Key         Key    // 16B: 128-bit XXH3 hash - back-reference for eviction/map deletes
+//	SegmentID   uint32 //  4B: Supports 4 billion segments
+//	Offset      uint32 //  4B: Supports 4GB segment files
+//	PhysicalLen uint32 //  4B: Supports 4GB blobs
+//	Flags       uint32 //  4B: Deleted, errno, compression (alignment freebie)
 //
 // Full metadata (SeqID, LogicalSize) is read from disk Header on Get().
 type Item struct {
-	Hash        uint64 // Key hash (xxhash) - back-reference for eviction
+	Key         Key    // 128-bit XXH3 hash - back-reference for eviction
 	SegmentID   uint32 // Which segment file contains this blob
 	Offset      uint32 // Byte offset within segment (to record header)
 	PhysicalLen uint32 // On-disk size in bytes (header + key + value)
@@ -114,50 +111,93 @@ func (item *Item) IsCompressed() bool {
 	return item.Compression() != compression.CodexNone
 }
 
+// ShardState is the "Extra" payload stored in each xmap shard.
+// It holds the arena and SIEVE algorithm state for eviction.
+//
+// Size breakdown:
+//   - nodes []node:    24 bytes (slice header)
+//   - freeHead uint32:  4 bytes
+//   - hand uint32:      4 bytes
+//   - head uint32:      4 bytes
+//   - compiler padding: 4 bytes (alignment)
+//   - _:               56 bytes (explicit padding)
+//   - Total:           96 bytes
+//
+// Combined with xmap.Shard base (32 bytes), total = 128 bytes (2 cache lines).
+type ShardState struct {
+	nodes    []node   // Arena: Contiguous memory, no pointers
+	freeHead uint32   // Free List: Stack head
+	hand     uint32   // Sieve Cursor: Current position
+	head     uint32   // Circular List Head: Newest item
+	_        [56]byte // Padding to make Shard 128 bytes (2 cache lines)
+}
+
+// node is an arena-backed entry with no heap pointers.
+// Uses uint32 indices instead of pointers for GC optimization.
+type node struct {
+	key     Key           // Back-reference for eviction callbacks
+	item    Item          // Lean blob coordinates (24 bytes)
+	next    uint32        // Index in 'nodes' slice (circular list)
+	prev    uint32        // Index in 'nodes' slice (circular list)
+	visited atomic.Uint32 // SIEVE algorithm: 0=cold, 1=hot
+}
+
 // BlobIndex is the main entry point for the in-memory index.
-// It distributes entries across 256 shards for concurrent access.
+// It uses xmap for sharding with custom ShardState for eviction.
 type BlobIndex struct {
-	shards [ShardCount]shard
+	lookup *xmap.Map[uint32, ShardState]
 }
 
 // New creates a new index with the given initial capacity hint.
 // The capacity is distributed across shards for pre-allocation.
 func New(initialCapacity int) *BlobIndex {
-	bi := &BlobIndex{}
+	bi := &BlobIndex{
+		lookup: xmap.New[uint32, ShardState](
+			xmap.WithShardShift(8), // 256 shards
+			xmap.WithInitialCapacity(initialCapacity),
+		),
+	}
+
+	// Initialize arena for each shard
 	shardCap := initialCapacity / ShardCount
 	if shardCap < 1 {
 		shardCap = 1
 	}
-
-	for i := 0; i < ShardCount; i++ {
-		bi.shards[i].init(shardCap)
+	for i := range ShardCount {
+		s := bi.lookup.ShardAt(i)
+		s.Lock()
+		s.Extra.nodes = make([]node, 0, shardCap)
+		s.Extra.freeHead = nullIdx
+		s.Extra.hand = nullIdx
+		s.Extra.head = nullIdx
+		s.Unlock()
 	}
+
 	return bi
 }
 
 // Get returns the item for the given key and marks it as visited (hot).
 // Uses RLock + atomic store to minimize contention on the hot path.
 func (idx *BlobIndex) Get(k Key) (Item, bool) {
-	shardIdx := k[0] // XXHash3 is uniform, first byte is sufficient
-	s := &idx.shards[shardIdx]
+	s := idx.lookup.Shard(k)
 
-	s.mu.RLock()
+	s.RLock()
 	// Optimization: No defer in hot path to save ~5-10ns
 
-	i, ok := s.items[k]
+	i, ok := s.Items[k]
 	if !ok {
-		s.mu.RUnlock()
+		s.RUnlock()
 		return Item{}, false
 	}
 
 	// Hot path optimization: check before set.
 	// If already visited, avoid atomic write to prevent cache line invalidation.
-	if s.nodes[i].visited.Load() == 0 {
-		s.nodes[i].visited.Store(1)
+	if s.Extra.nodes[i].visited.Load() == 0 {
+		s.Extra.nodes[i].visited.Store(1)
 	}
 
-	val := s.nodes[i].item
-	s.mu.RUnlock()
+	val := s.Extra.nodes[i].item
+	s.RUnlock()
 
 	return val, true
 }
@@ -166,47 +206,45 @@ func (idx *BlobIndex) Get(k Key) (Item, bool) {
 // It is "pure storage": it NEVER evicts. If capacity is needed, the arena grows.
 // Eviction is driven externally by EvictBatch.
 func (idx *BlobIndex) Put(k Key, val Item) {
-	shardIdx := k[0]
-	s := &idx.shards[shardIdx]
+	s := idx.lookup.Shard(k)
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.Lock()
+	defer s.Unlock()
 
 	// Update existing?
-	if i, ok := s.items[k]; ok {
-		s.nodes[i].item = val
-		s.nodes[i].visited.Store(1) // Keep hot on update
+	if i, ok := s.Items[k]; ok {
+		s.Extra.nodes[i].item = val
+		s.Extra.nodes[i].visited.Store(1) // Keep hot on update
 		return
 	}
 
 	// Alloc from free list or append to arena
-	newIdx := s.alloc()
+	newIdx := allocNode(&s.Extra)
 
-	s.nodes[newIdx] = node{
+	s.Extra.nodes[newIdx] = node{
 		key:  k,
 		item: val,
 		// visited is zero-initialized (cold) by default
 	}
-	s.items[k] = newIdx
-	s.link(newIdx)
+	s.Items[k] = newIdx
+	linkNode(&s.Extra, newIdx)
 }
 
 // Delete removes an item explicitly.
 // Returns true if the item existed and was removed.
 func (idx *BlobIndex) Delete(k Key) bool {
-	shardIdx := k[0]
-	s := &idx.shards[shardIdx]
+	s := idx.lookup.Shard(k)
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.Lock()
+	defer s.Unlock()
 
-	i, ok := s.items[k]
+	i, ok := s.Items[k]
 	if !ok {
 		return false
 	}
 
-	delete(s.items, k)
-	s.free(i)
+	delete(s.Items, k)
+	freeNode(&s.Extra, i)
 	return true
 }
 
@@ -228,13 +266,16 @@ func (idx *BlobIndex) EvictBatch(targetBytes int64) []Item {
 	if targetBytes < smallTargetThreshold {
 		// Small target: Random Greedy - pick random start, evict until target met
 		startShard := rand.Intn(ShardCount)
-		for i := 0; i < ShardCount && freedTotal < targetBytes; i++ {
+		for i := range ShardCount {
+			if freedTotal >= targetBytes {
+				break
+			}
 			shardID := (startShard + i) % ShardCount
-			s := &idx.shards[shardID]
+			s := idx.lookup.ShardAt(shardID)
 
-			s.mu.Lock()
-			freedTotal += s.evictUpTo(targetBytes-freedTotal, &evicted, maxEvictPerLock)
-			s.mu.Unlock()
+			s.Lock()
+			freedTotal += evictUpTo(&s.Extra, s.Items, targetBytes-freedTotal, &evicted, maxEvictPerLock)
+			s.Unlock()
 		}
 	} else {
 		// Large target: Proportional Fairness - each shard pays fair share
@@ -243,16 +284,16 @@ func (idx *BlobIndex) EvictBatch(targetBytes int64) []Item {
 			quotaPerShard = 1
 		}
 
-		for i := 0; i < ShardCount; i++ {
+		for i := range ShardCount {
 			// Safety valve: stop if massively overshot due to large items
 			if freedTotal >= targetBytes*overshootFactor {
 				break
 			}
 
-			s := &idx.shards[i]
-			s.mu.Lock()
-			freedTotal += s.evictUpTo(quotaPerShard, &evicted, maxEvictPerLock)
-			s.mu.Unlock()
+			s := idx.lookup.ShardAt(i)
+			s.Lock()
+			freedTotal += evictUpTo(&s.Extra, s.Items, quotaPerShard, &evicted, maxEvictPerLock)
+			s.Unlock()
 		}
 	}
 
@@ -261,13 +302,7 @@ func (idx *BlobIndex) EvictBatch(targetBytes int64) []Item {
 
 // Len returns the total number of items across all shards.
 func (idx *BlobIndex) Len() int {
-	total := 0
-	for i := 0; i < ShardCount; i++ {
-		idx.shards[i].mu.RLock()
-		total += len(idx.shards[i].items)
-		idx.shards[i].mu.RUnlock()
-	}
-	return total
+	return idx.lookup.Len()
 }
 
 // Stats holds statistics about the index state.
@@ -281,28 +316,150 @@ type Stats struct {
 
 // Stats returns statistics about the index state.
 func (idx *BlobIndex) Stats() Stats {
-	var s Stats
-	s.Shards = ShardCount
+	var st Stats
+	st.Shards = ShardCount
 
-	for i := 0; i < ShardCount; i++ {
-		idx.shards[i].mu.RLock()
-		s.Items += len(idx.shards[i].items)
-		s.ArenaNodes += len(idx.shards[i].nodes)
+	for i := range ShardCount {
+		s := idx.lookup.ShardAt(i)
+		s.RLock()
+		st.Items += len(s.Items)
+		st.ArenaNodes += len(s.Extra.nodes)
 
 		// Count free list nodes
-		freeIdx := idx.shards[i].freeHead
+		freeIdx := s.Extra.freeHead
 		for freeIdx != nullIdx {
-			s.FreeNodes++
-			freeIdx = idx.shards[i].nodes[freeIdx].next
+			st.FreeNodes++
+			freeIdx = s.Extra.nodes[freeIdx].next
 		}
-		idx.shards[i].mu.RUnlock()
+		s.RUnlock()
 	}
 
 	// Estimate memory: node size * arena nodes + map overhead
 	// node = Key(16) + Item(24) + next(4) + prev(4) + visited(4) = 52 bytes
 	const nodeSize = 16 + 24 + 4 + 4 + 4
 	const mapEntryOverhead = 32 // approximate per-entry map overhead
-	s.MemoryEst = int64(s.ArenaNodes)*nodeSize + int64(s.Items)*mapEntryOverhead
+	st.MemoryEst = int64(st.ArenaNodes)*nodeSize + int64(st.Items)*mapEntryOverhead
 
-	return s
+	return st
+}
+
+// --- Arena helpers (operate on ShardState) ---
+
+// allocNode returns an index for a new node.
+// Reuses from free list if available, otherwise appends to arena.
+func allocNode(state *ShardState) uint32 {
+	if state.freeHead != nullIdx {
+		idx := state.freeHead
+		state.freeHead = state.nodes[idx].next // Pop from stack
+		return idx
+	}
+	state.nodes = append(state.nodes, node{})
+	return uint32(len(state.nodes) - 1)
+}
+
+// freeNode pushes an index onto the free list after unlinking from circular list.
+func freeNode(state *ShardState, idx uint32) {
+	unlinkNode(state, idx)
+	state.nodes[idx].next = state.freeHead // Push to free stack
+	state.freeHead = idx
+}
+
+// linkNode adds idx to the circular list at head position (newest).
+// Tail is always head.prev in a circular list.
+func linkNode(state *ShardState, idx uint32) {
+	if state.head == nullIdx {
+		// First item: circular self-reference
+		state.head = idx
+		state.nodes[idx].next = idx
+		state.nodes[idx].prev = idx
+		state.hand = idx
+		return
+	}
+
+	// Insert between tail (head.prev) and head
+	head := state.head
+	tail := state.nodes[head].prev
+
+	state.nodes[idx].next = head
+	state.nodes[idx].prev = tail
+	state.nodes[head].prev = idx
+	state.nodes[tail].next = idx
+
+	state.head = idx
+}
+
+// unlinkNode removes idx from the circular list.
+func unlinkNode(state *ShardState, idx uint32) {
+	next := state.nodes[idx].next
+	prev := state.nodes[idx].prev
+
+	if next == idx {
+		// Only one item in list (points to itself)
+		state.head = nullIdx
+		state.hand = nullIdx
+		return
+	}
+
+	// Stitch neighbors together
+	state.nodes[prev].next = next
+	state.nodes[next].prev = prev
+
+	// Update head if we removed it
+	if state.head == idx {
+		state.head = next
+	}
+
+	// Update hand if it was on the victim
+	if state.hand == idx {
+		state.hand = next
+	}
+}
+
+// runSieve finds a victim using the Clock/SIEVE algorithm.
+// Assumes the list is NOT empty. Returns the victim's arena index.
+func runSieve(state *ShardState) uint32 {
+	if state.head == nullIdx {
+		return nullIdx
+	}
+	if state.hand == nullIdx {
+		state.hand = state.head
+	}
+
+	for {
+		curr := state.hand
+		state.hand = state.nodes[curr].next // Advance immediately (circular - always safe)
+
+		if state.nodes[curr].visited.Load() == 1 {
+			// Give second chance: clear visited bit and continue
+			state.nodes[curr].visited.Store(0)
+			continue
+		}
+
+		// Found cold victim
+		return curr
+	}
+}
+
+// evictUpTo runs eviction inside the lock, returning bytes freed.
+// Limits work to maxCount items to bound lock hold time.
+func evictUpTo(state *ShardState, items map[Key]uint32, quotaBytes int64, dst *[]Item, maxCount int) int64 {
+	var localFreed int64
+	var count int
+
+	for count < maxCount && localFreed < quotaBytes {
+		if state.head == nullIdx {
+			break
+		}
+
+		victimIdx := runSieve(state)
+		item := state.nodes[victimIdx].item
+
+		*dst = append(*dst, item)
+		localFreed += int64(item.PhysicalLen)
+		count++
+
+		delete(items, state.nodes[victimIdx].key)
+		freeNode(state, victimIdx)
+	}
+	return localFreed
 }

@@ -216,3 +216,91 @@ func VerifyCRC(key, value []byte, expected uint32) error {
 	}
 	return nil
 }
+
+// =============================================================================
+// Record - Unified Header + Key + Value
+// =============================================================================
+
+// Record represents a complete on-disk record: header + key + value.
+// Use AppendRecord for serialization and DecodeRecord for deserialization.
+type Record struct {
+	Header
+	Key   []byte // Original key bytes (hashed to 128-bit XXH3 for index lookup)
+	Value []byte // Value bytes (possibly compressed; PhysicalSize bytes on disk)
+}
+
+// EncodedSize returns the total bytes needed to serialize this record.
+func (r *Record) EncodedSize() int {
+	return HeaderSize + len(r.Key) + len(r.Value)
+}
+
+// NewRecord creates a Record with header fields populated from key/value.
+// logicalSize is the original uncompressed value size (same as len(value) if uncompressed).
+// The CRC is computed over key+value and stored in the header.
+func NewRecord(seqID uint64, key, value []byte, logicalSize int64) Record {
+	r := Record{
+		Header: Header{
+			Magic:        RecordMagic,
+			Flags:        FlagInvalidCRC, // Will be cleared by SetCRC
+			SeqID:        seqID,
+			KeyLen:       uint16(len(key)),
+			PhysicalSize: int64(len(value)),
+			LogicalSize:  logicalSize,
+		},
+		Key:   key,
+		Value: value,
+	}
+	r.SetCRC(ComputeCRC(key, value))
+	return r
+}
+
+// AppendRecord appends the full record (header + key + value) to dst.
+// The Header.KeyLen and Header.PhysicalSize must already be set correctly.
+func AppendRecord(dst []byte, r Record) []byte {
+	dst = AppendHeader(dst, r.Header)
+	dst = append(dst, r.Key...)
+	dst = append(dst, r.Value...)
+	return dst
+}
+
+// DecodeRecord decodes a record from src.
+// If verifyCRC is true and the header has a valid CRC, validates the checksum.
+// Returns ErrCRCMismatch if checksum validation fails.
+func DecodeRecord(src []byte, verifyCRC bool) (Record, error) {
+	hdr, err := DecodeHeader(src)
+	if err != nil {
+		return Record{}, err
+	}
+
+	if !hdr.IsValid() {
+		if hdr.IsHole() {
+			return Record{}, ErrHole
+		}
+		return Record{}, ErrInvalidMagic
+	}
+
+	totalSize := hdr.TotalSize()
+	if len(src) < totalSize {
+		return Record{}, ErrBufferTooSmall
+	}
+
+	keyStart := HeaderSize
+	keyEnd := keyStart + int(hdr.KeyLen)
+	valueEnd := keyEnd + int(hdr.PhysicalSize)
+
+	key := src[keyStart:keyEnd]
+	value := src[keyEnd:valueEnd]
+
+	// Verify CRC if requested and header has valid CRC
+	if verifyCRC && hdr.HasValidCRC() {
+		if err := VerifyCRC(key, value, hdr.CRC()); err != nil {
+			return Record{}, err
+		}
+	}
+
+	return Record{
+		Header: hdr,
+		Key:    key,
+		Value:  value,
+	}, nil
+}

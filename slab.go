@@ -7,7 +7,7 @@ import (
 	"github.com/miretskiy/blobcache/base"
 	"github.com/miretskiy/blobcache/compression"
 	"github.com/miretskiy/blobcache/internal/record"
-	"github.com/zhangyunhao116/skipmap"
+	"github.com/miretskiy/blobcache/internal/xmap"
 )
 
 // SlabEntry is stored in the slab's in-memory index.
@@ -20,7 +20,7 @@ type SlabEntry struct {
 // SharedSlab represents a populated chunk of memory and its index.
 type SharedSlab struct {
 	buf   *MmapBuffer
-	index *skipmap.Uint64Map[SlabEntry]
+	index *xmap.Map[SlabEntry, xmap.Pad32]
 }
 
 // Releaser is a zero-allocation handle for releasing a read lock or buffer.
@@ -49,7 +49,7 @@ func (r *Releaser) Release() {
 // the returned data and promptly release it via Releaser.
 func (s *SharedSlab) Acquire(key Key) ([]byte, Releaser, bool, base.BlobErrno) {
 	// 1. Lock-free lookup
-	rec, ok := s.index.Load(key)
+	rec, ok := s.index.Get(key)
 	if !ok {
 		return nil, Releaser{}, false, base.ErrNone
 	}
@@ -68,8 +68,8 @@ func (s *SharedSlab) Acquire(key Key) ([]byte, Releaser, bool, base.BlobErrno) {
 		return nil, Releaser{}, false, base.ErrNone
 	}
 
-	// 4. Get Physical Data (skip past header to value bytes)
-	valueStart := rec.Pos + int64(record.HeaderSize)
+	// 4. Get Physical Data (skip past header and key to value bytes)
+	valueStart := rec.Pos + int64(record.HeaderSize) + int64(rec.KeyLen)
 	physicalData := s.buf.raw[valueStart : valueStart+rec.PhysicalSize]
 	releaser := Releaser{slab: s}
 
@@ -116,6 +116,28 @@ type ActiveSlab struct {
 	// Used during rotation to set maxSealedSeq in MemTable.
 	// Accessed only under MemTable.mu.Lock, so no atomics needed.
 	currentMaxSeq uint64
+}
+
+// Append writes data at the current write position and advances wPos.
+// Returns the offset where data was written.
+// Use this for single-writer scenarios (e.g., putLarge).
+// For concurrent writes, use Reserve() under lock then WriteAt() outside lock.
+func (as *ActiveSlab) Append(data []byte) int64 {
+	offset := as.wPos
+	as.buf.WriteAt(data, offset)
+	as.wPos += int64(len(data))
+	return offset
+}
+
+// WriteAt writes data at the specified offset.
+// Use this for writing to pre-reserved regions in concurrent scenarios.
+func (as *ActiveSlab) WriteAt(data []byte, offset int64) {
+	as.buf.WriteAt(data, offset)
+}
+
+// Cap returns the capacity of the underlying buffer.
+func (as *ActiveSlab) Cap() int64 {
+	return int64(as.buf.Cap())
 }
 
 type FlushTicket struct {

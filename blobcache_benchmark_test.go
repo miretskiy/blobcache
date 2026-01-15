@@ -107,7 +107,9 @@ func BenchmarkBlobCache(b *testing.B) {
 	for i := 0; i < WarmupKeys; i++ {
 		blobSize := 1024 * 1024
 		k := fastFormatKey(make([]byte, 32), "key-", uint64(i))
-		cache.Put(k, entropy[:blobSize])
+		if err := cache.Put(k, entropy[:blobSize]); err != nil {
+			b.Fatal(err)
+		}
 		warmupBytes += int64(blobSize)
 	}
 	cache.Drain()
@@ -161,7 +163,9 @@ func BenchmarkBlobCache(b *testing.B) {
 					k := fastFormatKey(keyBuf, "key-", id)
 					blobSize := blobSizeLo + rng.IntN(blobSizeHiRng)
 					offset := rng.IntN(len(entropy) - blobSize)
-					cache.Put(k, entropy[offset:offset+blobSize])
+					if err := cache.Put(k, entropy[offset:offset+blobSize]); err != nil {
+						b.Fatal(err)
+					}
 					totalWriteBytes.Add(int64(blobSize))
 					localPut.RecordValue(time.Since(start).Nanoseconds())
 					dataWritten = true // Exit inner loop, count this iteration
@@ -366,7 +370,7 @@ func BenchmarkEviction_SieveVictimSelection(b *testing.B) {
 		blobSize := uint32(100_000 + rng.IntN(1_900_000))
 
 		batch = append(batch, index.Item{
-			Hash:        uint64(i),
+			Key:         index.Key{Lo: uint64(i), Hi: 0},
 			Offset:      currentSegSize,
 			PhysicalLen: blobSize,
 		})
@@ -392,7 +396,7 @@ func BenchmarkEviction_SieveVictimSelection(b *testing.B) {
 
 	// Mark some as visited to exercise Sieve skipping logic
 	for i := 0; i < b.N; i += 7 {
-		idx.DeprecatedGetByHash(uint64(i))
+		idx.Get(index.Key{Lo: uint64(i), Hi: 0})
 	}
 
 	b.Logf("Index populated: %d entries across %d segments", b.N, currentSegID)

@@ -48,7 +48,9 @@ func (s *Storage) Close() error {
 //
 // The lean Item only stores coordinates; full metadata (LogicalSize, Checksum) is
 // read from the on-disk record.Header.
-func (s *Storage) ReadBlob(e index.Item) (io.Reader, Releaser, error) {
+//
+// expectedKey is used to verify the stored key matches (detects 128-bit hash collisions).
+func (s *Storage) ReadBlob(e index.Item, expectedKey []byte) (io.Reader, Releaser, error) {
 	sf, err := s.getSegmentFile(e.SegmentID)
 	if err != nil {
 		return nil, Releaser{}, fmt.Errorf("storage: segment %d not found: %w", e.SegmentID, err)
@@ -65,6 +67,20 @@ func (s *Storage) ReadBlob(e index.Item) (io.Reader, Releaser, error) {
 	hdr, err := record.DecodeHeader(headerBuf)
 	if err != nil {
 		return nil, Releaser{}, fmt.Errorf("storage: invalid header: %w", err)
+	}
+
+	// Key verification: detect 128-bit hash collisions (birthday paradox, ~10^-22 probability).
+	// Records must have keys stored - reject records without keys.
+	if hdr.KeyLen == 0 {
+		return nil, Releaser{}, fmt.Errorf("storage: record has no key (KeyLen=0)")
+	}
+	storedKey := make([]byte, hdr.KeyLen)
+	keyPos := int64(e.Offset) + int64(record.HeaderSize)
+	if _, err := sf.file.ReadAt(storedKey, keyPos); err != nil {
+		return nil, Releaser{}, fmt.Errorf("storage: failed to read key: %w", err)
+	}
+	if !bytes.Equal(storedKey, expectedKey) {
+		return nil, Releaser{}, record.ErrKeyMismatch
 	}
 
 	// 1. Kernel Hinting (Hybrid I/O)
@@ -107,7 +123,7 @@ func (s *Storage) ReadBlob(e index.Item) (io.Reader, Releaser, error) {
 
 	// 3. Optional Integrity Layer
 	// Checksum is computed on ORIGINAL (uncompressed) data.
-	if s.Resilience.VerifyOnRead && hdr.HasValidCRC() {
+	if s.Resilience.VerifyOnRead && hdr.HasValidCRC() && s.Resilience.ChecksumHasher != nil {
 		reader = newChecksumVerifyingReader(reader, s.Resilience.ChecksumHasher, hdr.CRC())
 	}
 

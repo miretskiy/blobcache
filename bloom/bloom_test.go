@@ -8,18 +8,29 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// testKey creates a simple deterministic Key from an integer.
+func testKey(n int) Key {
+	return Key{Lo: uint64(n), Hi: 0}
+}
+
+// testKeyU64 creates a Key from a uint64 (used for random/mixed hashes).
+func testKeyU64(h uint64) Key {
+	// Use the same mixing pattern: Lo gets the hash, Hi gets a rotated/mixed version
+	return Key{Lo: h, Hi: h ^ (h >> 33)}
+}
+
 func TestBloom_AddTest(t *testing.T) {
 	filter := New(1000, 0.01)
 
-	filter.Add(123)
+	filter.Add(testKey(123))
 
 	// Test should return true
-	if !filter.Test(123) {
+	if !filter.Test(testKey(123)) {
 		t.Error("Test returned false for added key")
 	}
 
 	// Non-existent key should mostly return false
-	if filter.Test(321) {
+	if filter.Test(testKey(321)) {
 		// Could be false positive (acceptable)
 		t.Log("False positive (expected occasionally)")
 	}
@@ -39,20 +50,20 @@ func TestBloom_FalsePositiveRate(t *testing.T) {
 	pcg := rand.NewPCG(42, 100)
 	rng := rand.New(pcg)
 
-	addedKeys := make([]uint64, n)
-	exists := make(map[uint64]struct{}, n)
+	addedKeys := make([]Key, n)
+	exists := make(map[Key]struct{}, n)
 
 	for i := 0; i < n; i++ {
-		h := rng.Uint64()
-		addedKeys[i] = h
-		exists[h] = struct{}{}
-		filter.Add(h)
+		k := testKeyU64(rng.Uint64())
+		addedKeys[i] = k
+		exists[k] = struct{}{}
+		filter.Add(k)
 	}
 
 	// 1. Verify No False Negatives
-	for _, h := range addedKeys {
-		if !filter.Test(h) {
-			t.Fatalf("CRITICAL: False Negative detected at key %d", h)
+	for _, k := range addedKeys {
+		if !filter.Test(k) {
+			t.Fatalf("CRITICAL: False Negative detected at key %v", k)
 		}
 	}
 
@@ -61,14 +72,14 @@ func TestBloom_FalsePositiveRate(t *testing.T) {
 	checkSize := 100000
 
 	for i := 0; i < checkSize; i++ {
-		h := rng.Uint64()
+		k := testKeyU64(rng.Uint64())
 
 		// Ensure this random key wasn't actually in our 'added' set
-		if _, ok := exists[h]; ok {
+		if _, ok := exists[k]; ok {
 			continue
 		}
 
-		if filter.Test(h) {
+		if filter.Test(k) {
 			falsePositives++
 		}
 	}
@@ -89,12 +100,12 @@ func TestBloom_Deterministic(t *testing.T) {
 	filter := New(1000, 0.01)
 
 	// Put multiple times
-	filter.Add(123)
-	filter.Add(123)
-	filter.Add(123)
+	filter.Add(testKey(123))
+	filter.Add(testKey(123))
+	filter.Add(testKey(123))
 
 	// Should still work
-	if !filter.Test(123) {
+	if !filter.Test(testKey(123)) {
 		t.Error("Test failed after multiple Put calls")
 	}
 }
@@ -108,7 +119,7 @@ func TestBloom_ConcurrentAdd(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			for i := 0; i < 1000; i++ {
-				filter.Add(uint64(1000*id + i))
+				filter.Add(testKey(1000*id + i))
 			}
 		}(g)
 	}
@@ -119,7 +130,7 @@ func TestBloom_ConcurrentAdd(t *testing.T) {
 	missing := 0
 	for g := 0; g < 10; g++ {
 		for i := 0; i < 1000; i++ {
-			if !filter.Test(uint64(1000*g + i)) {
+			if !filter.Test(testKey(1000*g + i)) {
 				missing++
 			}
 		}
@@ -135,7 +146,7 @@ func TestBloom_ConcurrentMixed(t *testing.T) {
 
 	// Pre-populate
 	for i := 0; i < 5000; i++ {
-		filter.Add(uint64(i))
+		filter.Add(testKey(i))
 	}
 
 	// Concurrent readers and writers
@@ -147,7 +158,7 @@ func TestBloom_ConcurrentMixed(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < 10000; j++ {
-				filter.Test(uint64(j))
+				filter.Test(testKey(j))
 			}
 		}()
 	}
@@ -158,7 +169,7 @@ func TestBloom_ConcurrentMixed(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			for j := 0; j < 1000; j++ {
-				filter.Add(uint64(j))
+				filter.Add(testKey(j))
 			}
 		}(i)
 	}
@@ -175,7 +186,7 @@ func BenchmarkAdd(b *testing.B) {
 	filter := New(1000000, 0.01)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		filter.Add(uint64(i))
+		filter.Add(testKey(i))
 	}
 }
 
@@ -183,7 +194,7 @@ func BenchmarkTestParallel(b *testing.B) {
 	// Create filter sized for 1M keys, populate with 10K (1% full - realistic)
 	filter := New(1000000, 0.01)
 	for i := 0; i < 10000; i++ {
-		filter.Add(uint64(i))
+		filter.Add(testKey(i))
 	}
 
 	b.ResetTimer()
@@ -191,7 +202,7 @@ func BenchmarkTestParallel(b *testing.B) {
 		i := 0
 		for pb.Next() {
 			// Test keys not in filter (should be rejected by bloom)
-			filter.Test(uint64(i + 2000000))
+			filter.Test(testKey(i + 2000000))
 			i++
 		}
 	})
@@ -203,18 +214,18 @@ func TestRecordAdditions_StopPreventsRecording(t *testing.T) {
 	stop, consume := filter.RecordAdditions()
 
 	// Add while recording
-	filter.Add(123)
+	filter.Add(testKey(123))
 
 	// Stop
 	stop()
 
-	filter.Add(321)
+	filter.Add(testKey(321))
 
 	// Replay
 	newFilter := New(1000, 0.01)
 	consume(newFilter.AddHash)
 
 	// Only first key should be in new filter
-	require.True(t, newFilter.Test(123))
-	require.False(t, newFilter.Test(321))
+	require.True(t, newFilter.Test(testKey(123)))
+	require.False(t, newFilter.Test(testKey(321)))
 }

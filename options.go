@@ -4,7 +4,6 @@ import (
 	"hash"
 	"hash/crc32"
 
-	"github.com/cespare/xxhash/v2"
 	"github.com/miretskiy/blobcache/compression"
 	"github.com/miretskiy/blobcache/internal/sys"
 )
@@ -29,18 +28,15 @@ type CompressionConfig struct {
 	MinSize int64             // Don't compress blobs smaller than this (default: 512)
 }
 
-type KeyHasherFn func(b []byte) uint64
-
 // MaxSegmentSize is the maximum allowed segment size (4GB).
 // This limit is imposed by using uint32 for offsets in index.Item.
 const MaxSegmentSize int64 = 1 << 32 // 4GB
 
 // config holds internal configuration
 type config struct {
-	Path      string
-	MaxSize   int64
-	KeyHasher KeyHasherFn
-	Shards    int
+	Path    string
+	MaxSize int64
+	Shards  int
 
 	// --- Slab Configuration ---
 	WriteBufferSize  int64 // Size of one memory slab
@@ -139,10 +135,6 @@ func WithLargeWriteThreshold(size int64) Option {
 	return funcOpt(func(c *config) { c.LargeWriteThreshold = size })
 }
 
-func WithKeyHasher(hasher KeyHasherFn) Option {
-	return funcOpt(func(c *config) { c.KeyHasher = hasher })
-}
-
 func WithFlushConcurrency(n int) Option {
 	return funcOpt(func(c *config) { c.FlushConcurrency = n })
 }
@@ -182,7 +174,6 @@ func defaultConfig(path string) config {
 	return config{
 		Path:                path,
 		MaxSize:             0,
-		KeyHasher:           func(b []byte) uint64 { return xxhash.Sum64(b) },
 		Shards:              0,
 		WriteBufferSize:     128 << 20, // 128MB
 		LargeWriteThreshold: 4 << 20,

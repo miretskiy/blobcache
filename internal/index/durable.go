@@ -1,24 +1,11 @@
 package index
 
 import (
-	"encoding/binary"
 	"errors"
 	"fmt"
 
 	"github.com/miretskiy/blobcache/base"
 )
-
-// KeyFromHash converts a uint64 hash to a 128-bit Key.
-// The hash is placed in the low 8 bytes with zeros in the high 8 bytes.
-// This provides backward compatibility during the transition to 128-bit hashes.
-//
-// NOTE: k[0] must be uniformly distributed for good shard distribution.
-// XXHash3's output is uniform, so the first byte of the hash works well.
-func KeyFromHash(hash uint64) Key {
-	var k Key
-	binary.LittleEndian.PutUint64(k[0:8], hash)
-	return k
-}
 
 // DurableIndex wraps BlobIndex with Bitcask persistence.
 // It provides durable storage for blob metadata while leveraging the
@@ -45,8 +32,7 @@ func Open(basePath string, initialCapacity int) (*DurableIndex, error) {
 	err = p.scanAll(func(m SegmentManifest) bool {
 		for _, item := range m.Items {
 			if !item.IsDeleted() {
-				k := KeyFromHash(item.Hash)
-				idx.Put(k, item)
+				idx.Put(item.Key, item)
 			}
 		}
 		return true
@@ -59,28 +45,19 @@ func Open(basePath string, initialCapacity int) (*DurableIndex, error) {
 	return idx, nil
 }
 
-// DeprecatedGetByHash looks up an item by its uint64 hash.
-// Deprecated: This is a bridge method for 64-bit hash compatibility.
-// Will be removed when transitioning to 128-bit hashes.
-func (idx *DurableIndex) DeprecatedGetByHash(hash uint64) (Item, bool) {
-	return idx.Get(KeyFromHash(hash))
-}
-
 // SetBlobErrno marks a blob with an error code in the in-memory index.
 // This is a RAM-only operation; the error is not persisted to disk.
-func (idx *DurableIndex) SetBlobErrno(hash uint64, errno base.BlobErrno) {
-	k := KeyFromHash(hash)
-	shardIdx := k[0]
-	s := &idx.shards[shardIdx]
+func (idx *DurableIndex) SetBlobErrno(key Key, errno base.BlobErrno) {
+	s := idx.lookup.Shard(key)
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.Lock()
+	defer s.Unlock()
 
-	i, ok := s.items[k]
+	i, ok := s.Items[key]
 	if !ok {
 		return
 	}
-	s.nodes[i].item.SetErrno(errno)
+	s.Extra.nodes[i].item.SetErrno(errno)
 }
 
 // GetSegmentManifest retrieves the metadata for a specific segment.
@@ -114,8 +91,7 @@ func (idx *DurableIndex) IngestBatch(segID uint32, items []Item) error {
 	}
 
 	for _, item := range items {
-		k := KeyFromHash(item.Hash)
-		idx.Put(k, item)
+		idx.Put(item.Key, item)
 	}
 	return nil
 }
@@ -139,8 +115,7 @@ func (idx *DurableIndex) DeleteSegment(segmentID uint32) error {
 			panic(fmt.Sprintf("scanSegment(%d) returned entries for segment %d", segmentID, m.SegmentID))
 		}
 		for _, item := range m.Items {
-			k := KeyFromHash(item.Hash)
-			idx.Delete(k)
+			idx.Delete(item.Key)
 		}
 		if len(m.IndexKey) > 0 {
 			keys = append(keys, m.IndexKey)
@@ -171,8 +146,7 @@ func (idx *DurableIndex) DeleteBlobs(items ...Item) error {
 
 	// Fast Path: Immediate RAM removal
 	for _, item := range items {
-		k := KeyFromHash(item.Hash)
-		idx.Delete(k)
+		idx.Delete(item.Key)
 	}
 
 	// Durable Path: Synchronous Bitcask sync
@@ -186,12 +160,12 @@ func (idx *DurableIndex) flushDeletions(items []Item) error {
 	}
 
 	// Group by SegmentID
-	bySegment := make(map[uint32]map[uint64]struct{})
+	bySegment := make(map[uint32]map[Key]struct{})
 	for _, item := range items {
 		if _, ok := bySegment[item.SegmentID]; !ok {
-			bySegment[item.SegmentID] = make(map[uint64]struct{})
+			bySegment[item.SegmentID] = make(map[Key]struct{})
 		}
-		bySegment[item.SegmentID][item.Hash] = struct{}{}
+		bySegment[item.SegmentID][item.Key] = struct{}{}
 	}
 
 	var errs []error
@@ -211,16 +185,16 @@ func (idx *DurableIndex) Close() error {
 
 // ForEachBlob iterates over all blobs currently in the memory index.
 func (idx *DurableIndex) ForEachBlob(fn func(Item) bool) {
-	for i := 0; i < ShardCount; i++ {
-		s := &idx.shards[i]
-		s.mu.RLock()
-		for _, nodeIdx := range s.items {
-			if !fn(s.nodes[nodeIdx].item) {
-				s.mu.RUnlock()
+	for i := range ShardCount {
+		s := idx.lookup.ShardAt(i)
+		s.RLock()
+		for _, nodeIdx := range s.Items {
+			if !fn(s.Extra.nodes[nodeIdx].item) {
+				s.RUnlock()
 				return
 			}
 		}
-		s.mu.RUnlock()
+		s.RUnlock()
 	}
 }
 

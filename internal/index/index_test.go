@@ -1,7 +1,7 @@
 package index
 
 import (
-	"encoding/binary"
+	"fmt"
 	"math/rand"
 	"runtime"
 	"sync"
@@ -25,13 +25,7 @@ type Indexer interface {
 }
 
 func makeTestKey(i int) Key {
-	var k Key
-	b := make([]byte, 8)
-	binary.LittleEndian.PutUint64(b, uint64(i))
-	h := xxh3.Hash128(b)
-	binary.LittleEndian.PutUint64(k[0:8], h.Lo)
-	binary.LittleEndian.PutUint64(k[8:16], h.Hi)
-	return k
+	return xxh3.Hash128(fmt.Appendf(nil, "key-%d", i))
 }
 
 func makeItem(segmentID uint32, physLen uint32) Item {
@@ -74,7 +68,7 @@ func newOldIndex() *oldIndex {
 }
 
 func (idx *oldIndex) Put(key Key, item Item) {
-	k64 := binary.LittleEndian.Uint64(key[:8])
+	k64 := key.Lo
 
 	if n, ok := idx.blobs.Load(k64); ok {
 		n.entry = item
@@ -99,7 +93,7 @@ func (idx *oldIndex) Put(key Key, item Item) {
 }
 
 func (idx *oldIndex) Get(key Key) (Item, bool) {
-	k64 := binary.LittleEndian.Uint64(key[:8])
+	k64 := key.Lo
 
 	if n, ok := idx.blobs.Load(k64); ok {
 		return n.entry, true
@@ -150,9 +144,10 @@ func TestArenaReuse(t *testing.T) {
 	getArenaSize := func() int {
 		total := 0
 		for i := 0; i < ShardCount; i++ {
-			idx.shards[i].mu.RLock()
-			total += len(idx.shards[i].nodes)
-			idx.shards[i].mu.RUnlock()
+			s := idx.lookup.ShardAt(i)
+			s.RLock()
+			total += len(s.Extra.nodes)
+			s.RUnlock()
 		}
 		return total
 	}
@@ -181,10 +176,11 @@ func TestEviction_ClockLogic(t *testing.T) {
 	idx := New(100)
 
 	// Find 3 keys that hash to Shard 0 for deterministic testing
+	// With 256 shards, shard 0 is k.Lo & 0xFF == 0
 	var keys []Key
 	for i := 0; len(keys) < 3; i++ {
 		k := makeTestKey(i)
-		if k[0] == 0 {
+		if k.Lo&0xFF == 0 {
 			keys = append(keys, k)
 		}
 	}

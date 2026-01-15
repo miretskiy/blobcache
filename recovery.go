@@ -68,12 +68,12 @@ func RecoverIndex(path string, opts ...Option) (*Cache, error) {
 				continue
 			}
 
-			// Convert FooterEntry to lean Items for index
+			// Convert Inode to lean Items for index
 			items := make([]index.Item, len(segment.Entries))
 			for i, e := range segment.Entries {
 				physicalLen := uint32(record.HeaderSize) + uint32(e.KeyLen) + uint32(e.PhysicalSize)
 				items[i] = index.Item{
-					Hash:        e.Hash,
+					Key:         e.Key, // Full 128-bit XXH3 hash
 					SegmentID:   segmentID,
 					Offset:      uint32(e.Pos),
 					PhysicalLen: physicalLen,
@@ -138,21 +138,21 @@ func RecoverIndex(path string, opts ...Option) (*Cache, error) {
 }
 
 // readSegmentFooter reads and validates a segment file's footer
-// Returns the SegmentFooter if valid, or an error if corrupt/incomplete
-func readSegmentFooter(path string, segmentID uint32) (record.SegmentFooter, error) {
+// Returns the SegmentEnvelope if valid, or an error if corrupt/incomplete
+func readSegmentFooter(path string, segmentID uint32) (record.SegmentEnvelope, error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return record.SegmentFooter{}, err
+		return record.SegmentEnvelope{}, err
 	}
 	defer file.Close()
 
 	stat, err := file.Stat()
 	if err != nil {
-		return record.SegmentFooter{}, err
+		return record.SegmentEnvelope{}, err
 	}
 
-	// ReadSegmentFooterFromFile uses int64 for backward compat with existing segments
-	segment, _, err := record.ReadSegmentFooterFromFile(file, stat.Size(), int64(segmentID))
+	// ReadSegmentEnvelopeFromFile uses int64 segmentID for backward compatibility
+	segment, _, err := record.ReadSegmentEnvelopeFromFile(file, stat.Size(), int64(segmentID))
 	return segment, err
 }
 

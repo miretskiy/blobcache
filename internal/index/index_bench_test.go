@@ -28,7 +28,7 @@ func Benchmark_IndexLookup(b *testing.B) {
 				// Mix the hash to simulate xxHash entropy
 				h := uint64(i) * 0x9e3779b97f4a7c15
 				items[i] = Item{
-					Hash:        h,
+					Key:         Key{Lo: h, Hi: 0},
 					Offset:      uint32(i * 1024),
 					PhysicalLen: 1024,
 				}
@@ -54,7 +54,7 @@ func Benchmark_IndexLookup(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				// Re-mix to find the actual key
 				h := uint64(i%numKeys) * 0x9e3779b97f4a7c15
-				val, ok := idx.DeprecatedGetByHash(h)
+				val, ok := idx.Get(Key{Lo: h, Hi: 0})
 				if !ok {
 					b.Fatalf("Lookup failed for hash %d", h)
 				}

@@ -12,9 +12,9 @@ import (
 
 // Persistence format constants.
 const (
-	// ItemSize is the serialized size of a lean Item (24 bytes).
-	// Wire format: Hash(8) + SegmentID(4) + Offset(4) + PhysicalLen(4) + Flags(4)
-	ItemSize = 24
+	// ItemSize is the serialized size of an Item (32 bytes).
+	// Wire format: Key.Lo(8) + Key.Hi(8) + SegmentID(4) + Offset(4) + PhysicalLen(4) + Flags(4)
+	ItemSize = 32
 
 	// ManifestHeaderSize is the header before items.
 	// Wire format: SegmentID(4) + CTime(8)
@@ -67,7 +67,8 @@ func newPersistence(basePath string) (*persistence, error) {
 
 // AppendItem appends an encoded Item to dst.
 func AppendItem(dst []byte, item Item) []byte {
-	dst = binary.LittleEndian.AppendUint64(dst, item.Hash)
+	dst = binary.LittleEndian.AppendUint64(dst, item.Key.Lo)
+	dst = binary.LittleEndian.AppendUint64(dst, item.Key.Hi)
 	dst = binary.LittleEndian.AppendUint32(dst, item.SegmentID)
 	dst = binary.LittleEndian.AppendUint32(dst, item.Offset)
 	dst = binary.LittleEndian.AppendUint32(dst, item.PhysicalLen)
@@ -81,11 +82,14 @@ func DecodeItem(src []byte) (Item, error) {
 		return Item{}, errors.New("buffer too small for Item")
 	}
 	return Item{
-		Hash:        binary.LittleEndian.Uint64(src[0:8]),
-		SegmentID:   binary.LittleEndian.Uint32(src[8:12]),
-		Offset:      binary.LittleEndian.Uint32(src[12:16]),
-		PhysicalLen: binary.LittleEndian.Uint32(src[16:20]),
-		Flags:       binary.LittleEndian.Uint32(src[20:24]),
+		Key: Key{
+			Lo: binary.LittleEndian.Uint64(src[0:8]),
+			Hi: binary.LittleEndian.Uint64(src[8:16]),
+		},
+		SegmentID:   binary.LittleEndian.Uint32(src[16:20]),
+		Offset:      binary.LittleEndian.Uint32(src[20:24]),
+		PhysicalLen: binary.LittleEndian.Uint32(src[24:28]),
+		Flags:       binary.LittleEndian.Uint32(src[28:32]),
 	}, nil
 }
 
@@ -133,7 +137,7 @@ func DecodeManifest(src []byte) (SegmentManifest, error) {
 
 // --- Persistence Operations ---
 
-func (p *persistence) DeleteRecordsFromSegment(segID uint32, hashes map[uint64]struct{}) error {
+func (p *persistence) DeleteRecordsFromSegment(segID uint32, keys map[Key]struct{}) error {
 	var liveItems []Item
 	var originalKeys [][]byte
 	var cTime int64
@@ -147,7 +151,7 @@ func (p *persistence) DeleteRecordsFromSegment(segID uint32, hashes map[uint64]s
 
 		for _, item := range m.Items {
 			// If it's NOT in our deletion set AND wasn't already deleted, keep it
-			if _, deleted := hashes[item.Hash]; !deleted && !item.IsDeleted() {
+			if _, deleted := keys[item.Key]; !deleted && !item.IsDeleted() {
 				liveItems = append(liveItems, item)
 			}
 		}

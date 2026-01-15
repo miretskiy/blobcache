@@ -9,7 +9,10 @@ import (
 
 	"github.com/miretskiy/blobcache/base"
 	"github.com/miretskiy/blobcache/compression"
+	"github.com/miretskiy/blobcache/internal/index"
+	"github.com/miretskiy/blobcache/internal/record"
 	"github.com/stretchr/testify/require"
+	"github.com/zeebo/xxh3"
 )
 
 // Helper to read all bytes from Get()
@@ -27,7 +30,7 @@ func TestCache_PutGet_Basic(t *testing.T) {
 	value := []byte("test-value")
 
 	// Standard Put
-	cache.Put(key, value)
+	require.NoError(t, cache.Put(key, value))
 
 	// Flush memtable to disk to test the full IO path (Index + Storage)
 	cache.Drain()
@@ -35,6 +38,149 @@ func TestCache_PutGet_Basic(t *testing.T) {
 	retrieved, found := readAll(t, cache, key)
 	require.True(t, found)
 	require.Equal(t, value, retrieved)
+}
+
+func TestCache_Put_EmptyKeyRejected(t *testing.T) {
+	tmpDir := t.TempDir()
+	cache, err := New(tmpDir)
+	require.NoError(t, err)
+	defer cache.Close()
+
+	// Empty key should return error
+	err = cache.Put([]byte{}, []byte("value"))
+	require.ErrorIs(t, err, ErrEmptyKey)
+
+	// Nil key should also return error
+	err = cache.Put(nil, []byte("value"))
+	require.ErrorIs(t, err, ErrEmptyKey)
+
+	// PutChecksummed should also reject empty keys
+	err = cache.PutChecksummed([]byte{}, []byte("value"), 0)
+	require.ErrorIs(t, err, ErrEmptyKey)
+}
+
+func TestCache_Put_EmptyValueAllowed(t *testing.T) {
+	tmpDir := t.TempDir()
+	cache, err := New(tmpDir, WithMaxCachedSlabs(0)) // Force disk path
+	require.NoError(t, err)
+	defer cache.Close()
+
+	// Empty slice value is allowed
+	err = cache.Put([]byte("key-empty-slice"), []byte{})
+	require.NoError(t, err)
+
+	// Nil value is allowed
+	err = cache.Put([]byte("key-nil-value"), nil)
+	require.NoError(t, err)
+
+	// Flush to disk and verify round-trip
+	cache.Drain()
+
+	// Empty slice should read back as empty
+	retrieved, found := readAll(t, cache, []byte("key-empty-slice"))
+	require.True(t, found)
+	require.Empty(t, retrieved)
+
+	// Nil value should read back as empty
+	retrieved, found = readAll(t, cache, []byte("key-nil-value"))
+	require.True(t, found)
+	require.Empty(t, retrieved)
+}
+
+func TestCache_PutChecksummed_CorrectChecksum(t *testing.T) {
+	tmpDir := t.TempDir()
+	cache, err := New(tmpDir,
+		WithMaxCachedSlabs(0), // Force disk path
+		WithChecksum(),        // Enable checksum hasher
+		WithVerifyOnRead(true),
+	)
+	require.NoError(t, err)
+	defer cache.Close()
+
+	key := []byte("checksum-key")
+	value := []byte("checksum-value")
+	// Note: checksumVerifyingReader verifies just the value stream,
+	// so the CRC should be computed over value only (not key+value).
+	correctCRC := record.ComputeCRC(nil, value)
+
+	err = cache.PutChecksummed(key, value, correctCRC)
+	require.NoError(t, err)
+
+	cache.Drain()
+
+	// Should read back successfully with correct checksum
+	retrieved, found := readAll(t, cache, key)
+	require.True(t, found)
+	require.Equal(t, value, retrieved)
+}
+
+func TestCache_PutChecksummed_IncorrectChecksum(t *testing.T) {
+	tmpDir := t.TempDir()
+	cache, err := New(tmpDir,
+		WithMaxCachedSlabs(0), // Force disk path
+		WithChecksum(),        // Enable checksum hasher
+		WithVerifyOnRead(true),
+	)
+	require.NoError(t, err)
+	defer cache.Close()
+
+	key := []byte("bad-checksum-key")
+	value := []byte("bad-checksum-value")
+	incorrectCRC := uint32(0xDEADBEEF) // Wrong checksum
+
+	err = cache.PutChecksummed(key, value, incorrectCRC)
+	require.NoError(t, err) // Put succeeds (checksum stored as-is)
+
+	cache.Drain()
+
+	// Read should fail - data appears missing due to CRC mismatch
+	_, found := cache.Get(key)
+	require.False(t, found, "should not find blob with incorrect checksum")
+}
+
+func TestCache_KeyCollisionDetection(t *testing.T) {
+	tmpDir := t.TempDir()
+	cache, err := New(tmpDir, WithMaxCachedSlabs(0)) // Force disk path
+	require.NoError(t, err)
+	defer cache.Close()
+
+	key := []byte("collision-key")
+	value := []byte("collision-value")
+	h := xxh3.Hash128(key)
+
+	err = cache.Put(key, value)
+	require.NoError(t, err)
+	cache.Drain()
+
+	// Find the entry in the index to get the segment file and offset
+	entry, found := cache.index.Get(index.Key(h))
+	require.True(t, found, "entry should exist in index")
+
+	// Close cache to release file handles
+	require.NoError(t, cache.Close())
+
+	// Corrupt the key bytes in the segment file.
+	// Record layout: [Header:35B][Key][Value]
+	// Key starts at offset + HeaderSize
+	segPath := fmt.Sprintf("%s/segments/0000/%d.seg", tmpDir, entry.SegmentID)
+	segFile, err := os.OpenFile(segPath, os.O_RDWR, 0644)
+	require.NoError(t, err)
+
+	keyOffset := int64(entry.Offset) + int64(record.HeaderSize)
+	// Write different key bytes (same length to keep record valid)
+	corruptedKey := []byte("CORRUPTED-KEY") // Different key that would "collide"
+	_, err = segFile.WriteAt(corruptedKey[:len(key)], keyOffset)
+	require.NoError(t, err)
+	require.NoError(t, segFile.Close())
+
+	// Reopen cache and try to read - should fail with key mismatch
+	cache2, err := New(tmpDir, WithMaxCachedSlabs(0))
+	require.NoError(t, err)
+	defer cache2.Close()
+
+	// Get should fail because stored key doesn't match requested key
+	_, found = cache2.Get(key)
+	require.False(t, found, "should not find blob with mismatched key (simulated collision)")
 }
 
 func TestCache_SelfHealing_OnCorruption(t *testing.T) {
@@ -46,13 +192,13 @@ func TestCache_SelfHealing_OnCorruption(t *testing.T) {
 
 	key := []byte("healing-key")
 	value := []byte("precious-data")
-	h := cache.KeyHasher(key)
+	h := xxh3.Hash128(key)
 
-	cache.Put(key, value)
+	require.NoError(t, cache.Put(key, value))
 	cache.Drain()
 
 	// 1. Manually corrupt the storage by deleting the segment file
-	entry, ok := cache.index.DeprecatedGetByHash(h)
+	entry, ok := cache.index.Get(index.Key(h))
 	require.True(t, ok)
 
 	// Use shard-aware path helper
@@ -67,7 +213,7 @@ func TestCache_SelfHealing_OnCorruption(t *testing.T) {
 	require.False(t, found, "Get should return false after storage failure")
 
 	// 3. Verify blob is marked as corrupt but still in index
-	entry, inIndex := cache.index.DeprecatedGetByHash(h)
+	entry, inIndex := cache.index.Get(index.Key(h))
 	require.True(t, inIndex, "Index entry should still exist")
 	require.True(t, entry.HasError(), "Blob should be marked as corrupt")
 	require.NotEqual(t, base.ErrNone, entry.Errno(), "Errno should be set")
@@ -85,7 +231,7 @@ func TestCache_BloomGhostTracking(t *testing.T) {
 
 	// 1. Manually inject a key into the Bloom filter that isn't in the index
 	key := []byte("ghost-key")
-	h := cache.KeyHasher(key)
+	h := xxh3.Hash128(key)
 	cache.bloom.Load().AddHash(h)
 
 	// 2. Perform Get. Bloom says YES, Index says NO.
@@ -110,7 +256,7 @@ func TestCache_Eviction_Headroom(t *testing.T) {
 	// Put enough data to trigger eviction (30KB > 20KB limit)
 	for i := 0; i < 30; i++ {
 		key := fmt.Appendf(nil, "key-%d", i)
-		cache.Put(key, make([]byte, 1024))
+		require.NoError(t, cache.Put(key, make([]byte, 1024)))
 	}
 	cache.Drain()
 
@@ -143,12 +289,12 @@ func TestCache_HolePunching_Physical(t *testing.T) {
 	// Write a large blob (> 4KB block size)
 	val := make([]byte, 8192)
 	key := []byte("big-blob")
-	cache.Put(key, val)
+	require.NoError(t, cache.Put(key, val))
 	cache.Drain()
 
 	// Get entry info
-	h := cache.KeyHasher(key)
-	entry, ok := cache.index.DeprecatedGetByHash(h)
+	h := xxh3.Hash128(key)
+	entry, ok := cache.index.Get(index.Key(h))
 	require.True(t, ok)
 
 	segmentPath := getSegmentPath(tmpDir, cache.Shards, entry.SegmentID)
@@ -199,7 +345,9 @@ func BenchmarkCache_Get_WithBloom(b *testing.B) {
 	defer cache.Close()
 
 	key := []byte("bench-key")
-	cache.Put(key, make([]byte, 1024))
+	if err := cache.Put(key, make([]byte, 1024)); err != nil {
+		b.Fatal(err)
+	}
 	cache.Drain()
 
 	b.ResetTimer()
@@ -225,7 +373,7 @@ func TestCache_Compression_Zstd(t *testing.T) {
 	key := []byte("compressed-key")
 
 	// Write compressed
-	cache.Put(key, original)
+	require.NoError(t, cache.Put(key, original))
 	cache.Drain()
 
 	// Read back and verify
@@ -234,8 +382,8 @@ func TestCache_Compression_Zstd(t *testing.T) {
 	require.Equal(t, original, result, "decompressed data should match original")
 
 	// Verify compression metadata is correct
-	h := cache.KeyHasher(key)
-	entry, ok := cache.index.DeprecatedGetByHash(h)
+	h := xxh3.Hash128(key)
+	entry, ok := cache.index.Get(index.Key(h))
 	require.True(t, ok)
 
 	// PhysicalLen is total record size (header + key + value)
@@ -265,7 +413,7 @@ func TestCache_Compression_IncompressibleData(t *testing.T) {
 	}
 	key := []byte("incompressible-key")
 
-	cache.Put(key, original)
+	require.NoError(t, cache.Put(key, original))
 	cache.Drain()
 
 	// Read back and verify
@@ -274,8 +422,8 @@ func TestCache_Compression_IncompressibleData(t *testing.T) {
 	require.Equal(t, original, result, "data should match original")
 
 	// Check entry exists and verify compression flag
-	h := cache.KeyHasher(key)
-	entry, ok := cache.index.DeprecatedGetByHash(h)
+	h := xxh3.Hash128(key)
+	entry, ok := cache.index.Get(index.Key(h))
 	require.True(t, ok)
 
 	t.Logf("PhysicalLen: %d, IsCompressed: %v", entry.PhysicalLen, entry.IsCompressed())
@@ -298,7 +446,7 @@ func TestCache_Compression_SmallBlob_NoCompress(t *testing.T) {
 	original := []byte("small data under threshold")
 	key := []byte("small-key")
 
-	cache.Put(key, original)
+	require.NoError(t, cache.Put(key, original))
 	cache.Drain()
 
 	// Read back and verify
@@ -307,8 +455,8 @@ func TestCache_Compression_SmallBlob_NoCompress(t *testing.T) {
 	require.Equal(t, original, result)
 
 	// Verify it was NOT compressed due to size threshold
-	h := cache.KeyHasher(key)
-	entry, ok := cache.index.DeprecatedGetByHash(h)
+	h := xxh3.Hash128(key)
+	entry, ok := cache.index.Get(index.Key(h))
 	require.True(t, ok)
 
 	require.False(t, entry.IsCompressed(), "small blob should not be compressed")
@@ -328,7 +476,7 @@ func TestCache_Compression_MinSizeZero_NoRestriction(t *testing.T) {
 	original := bytes.Repeat([]byte("x"), 50) // Only 50 bytes
 	key := []byte("tiny-key")
 
-	cache.Put(key, original)
+	require.NoError(t, cache.Put(key, original))
 	cache.Drain()
 
 	// Read back and verify
@@ -337,8 +485,8 @@ func TestCache_Compression_MinSizeZero_NoRestriction(t *testing.T) {
 	require.Equal(t, original, result)
 
 	// Verify it WAS compressed despite being small (MinSize=0 disables restriction)
-	h := cache.KeyHasher(key)
-	entry, ok := cache.index.DeprecatedGetByHash(h)
+	h := xxh3.Hash128(key)
+	entry, ok := cache.index.Get(index.Key(h))
 	require.True(t, ok)
 
 	t.Logf("PhysicalLen: %d, IsCompressed: %v", entry.PhysicalLen, entry.IsCompressed())
@@ -362,7 +510,7 @@ func TestCache_Compression_ReadFromLibrarian(t *testing.T) {
 	original := bytes.Repeat([]byte("librarian_test_"), 500)
 	key := []byte("librarian-key")
 
-	cache.Put(key, original)
+	require.NoError(t, cache.Put(key, original))
 	// DON'T drain - read from Librarian (RAM)
 
 	result, found := cache.Get(key)
@@ -384,15 +532,15 @@ func TestCache_Compression_LZ4(t *testing.T) {
 	original := bytes.Repeat([]byte("LZ4_TEST_DATA_"), 5000) // 70KB of repeated text
 	key := []byte("lz4-key")
 
-	cache.Put(key, original)
+	require.NoError(t, cache.Put(key, original))
 	cache.Drain()
 
 	result, found := cache.Get(key)
 	require.True(t, found)
 	require.Equal(t, original, result)
 
-	h := cache.KeyHasher(key)
-	entry, ok := cache.index.DeprecatedGetByHash(h)
+	h := xxh3.Hash128(key)
+	entry, ok := cache.index.Get(index.Key(h))
 	require.True(t, ok)
 
 	t.Logf("PhysicalLen: %d, IsCompressed: %v", entry.PhysicalLen, entry.IsCompressed())

@@ -27,7 +27,7 @@ func TestApproxSize_UpdatedAfterEviction(t *testing.T) {
 
 	for i := 0; i < 6; i++ {
 		data := make([]byte, 1024)
-		cache.Put([]byte{byte(i)}, data)
+		require.NoError(t, cache.Put([]byte{byte(i)}, data))
 	}
 	cache.Drain() // Wait for flush to disk
 
@@ -60,7 +60,7 @@ func TestApproxSize_NoRepeatEviction(t *testing.T) {
 	// Add 6KB (triggers eviction, should evict to ~5KB)
 	for i := 0; i < 6; i++ {
 		data := make([]byte, 1024)
-		cache.Put([]byte{byte(i)}, data)
+		require.NoError(t, cache.Put([]byte{byte(i)}, data))
 	}
 	cache.Drain()
 
@@ -78,7 +78,7 @@ func TestApproxSize_NoRepeatEviction(t *testing.T) {
 
 	// Add small write (should NOT trigger eviction since we're under limit)
 	data := make([]byte, 100)
-	cache.Put([]byte{100}, data)
+	require.NoError(t, cache.Put([]byte{100}, data))
 	cache.Drain()
 
 	// Give time for any incorrect eviction to trigger

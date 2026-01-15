@@ -2,13 +2,27 @@ package bloom
 
 import (
 	"math"
+	"math/bits"
 	"sync"
 	"sync/atomic"
+
+	"github.com/miretskiy/blobcache/internal/xmap"
 )
+
+// Key is a 128-bit XXH3 hash.
+// Alias to xmap.Key for consistency across the codebase.
+type Key = xmap.Key
 
 // Filter is a lock-free bloom filter using atomic operations.
 // Optimized for AWS Nitro instances by pinning all probes for a key to a single
 // 64-byte cache line, reducing memory latency by ~6x.
+//
+// Key design: Uses full 128-bit XXH3 hashes to avoid the "32-bit funnel" bug:
+//   - k.Hi selects the 64-byte block (via bits.Mul64 for uniform distribution)
+//   - k.Lo generates the probe pattern (independent entropy source)
+//
+// This prevents correlated failures where both block selection AND probe pattern
+// collide for different keys, which happens at scale with truncated hashes.
 type Filter struct {
 	data      []uint32 // Bit vector (accessed atomically)
 	m         uint     // Filter size in bits (aligned to 512)
@@ -21,21 +35,21 @@ type Filter struct {
 // recording is a fast structure to record bloom filter
 // additions while the bloom filter is being rebuilt.
 type recording struct {
-	primary  []uint64
+	primary  []Key
 	cursor   atomic.Uint64
 	mu       sync.Mutex
-	overflow []uint64
+	overflow []Key
 }
 
-func (r *recording) Add(h uint64) {
+func (r *recording) Add(k Key) {
 	// 1. GUARANTEED RECORDING: Using atomic reservation
 	idx := r.cursor.Add(1) - 1
 	if idx < uint64(len(r.primary)) {
-		r.primary[idx] = h
+		r.primary[idx] = k
 	} else {
 		// Emergency overflow to guarantee NO FALSE NEGATIVES
 		r.mu.Lock()
-		r.overflow = append(r.overflow, h)
+		r.overflow = append(r.overflow, k)
 		r.mu.Unlock()
 	}
 }
@@ -68,27 +82,28 @@ func New(estimatedKeys uint, fpRate float64) *Filter {
 }
 
 // Add inserts a key into the bloom filter (lock-free, concurrent-safe).
-func (f *Filter) Add(h uint64) {
+func (f *Filter) Add(k Key) {
 	if rec := f.recording.Load(); rec != nil {
-		rec.Add(h)
+		rec.Add(k)
 	}
-	f.AddHash(h)
+	f.AddHash(k)
 }
 
 // AddHash inserts specified hash into this filter using RocksDB-style local probing.
-func (f *Filter) AddHash(h uint64) {
-	// Level 1: Pick the 64-byte block.
-	// We use the "Fast Range" method: (h32 * numBlocks) >> 32.
-	// This provides a more uniform distribution than a simple modulo (%)
-	// for smaller key ranges.
-	h32 := uint32(h)
-	blockIdx := uint32((uint64(h32) * uint64(f.numBlocks)) >> 32)
-	baseIdx := blockIdx << 4
+// Uses full 128-bit entropy: Hi for block selection, Lo for probe pattern.
+func (f *Filter) AddHash(k Key) {
+	// Level 1: Pick the 64-byte block using Hi bits.
+	// bits.Mul64(x, y) returns (hi, lo) where hi*2^64 + lo = x*y.
+	// We want floor(k.Hi * numBlocks / 2^64), which is the hi result.
+	// This gives uniform distribution across [0, numBlocks) range.
+	blockIdx, _ := bits.Mul64(k.Hi, uint64(f.numBlocks))
+	baseIdx := uint32(blockIdx) << 4
 
-	// Level 2: Local Probes.
-	// We use the RocksDB technique: a single 32-bit value provides the seed and the delta.
-	// 'delta' is a bit-rotation of the hash to ensure independent stepping.
-	delta := (h32 >> 17) | (h32 << 15)
+	// Level 2: Local Probes using Lo bits.
+	// We use the RocksDB technique: Lo provides the seed, delta provides stepping.
+	// 'delta' is a bit-rotation to ensure independent stepping per probe.
+	h32 := uint32(k.Lo)
+	delta := uint32(k.Lo>>17) | uint32(k.Lo<<15)
 
 	for i := uint(0); i < f.k; i++ {
 		// Bit position 0-511 inside the block
@@ -113,12 +128,15 @@ func (f *Filter) AddHash(h uint64) {
 }
 
 // Test checks if a key might be in the set (lock-free).
-func (f *Filter) Test(h uint64) bool {
-	h32 := uint32(h)
-	blockIdx := uint32((uint64(h32) * uint64(f.numBlocks)) >> 32)
-	baseIdx := blockIdx << 4
+func (f *Filter) Test(k Key) bool {
+	// Block selection using Hi (same as AddHash)
+	blockIdx, _ := bits.Mul64(k.Hi, uint64(f.numBlocks))
+	baseIdx := uint32(blockIdx) << 4
 
-	delta := (h32 >> 17) | (h32 << 15)
+	// Probe pattern using Lo (same as AddHash)
+	h32 := uint32(k.Lo)
+	delta := uint32(k.Lo>>17) | uint32(k.Lo<<15)
+
 	for i := uint(0); i < f.k; i++ {
 		bitInBlock := h32 & 511
 		idx := baseIdx + (bitInBlock >> 5)
@@ -133,24 +151,24 @@ func (f *Filter) Test(h uint64) bool {
 	return true
 }
 
-type HashConsumer func(h uint64)
+type KeyConsumer func(k Key)
 
-// RecordAdditions arranges for this filter to record all added hashes until
+// RecordAdditions arranges for this filter to record all added keys until
 // stopRecording or consumeRecording function is invoked.
 func (f *Filter) RecordAdditions() (
 	stopRecording func(),
-	consumeRecording func(consumer HashConsumer),
+	consumeRecording func(consumer KeyConsumer),
 ) {
-	// Pre-allocate 256k slots (2MB). This is "large" for 8KB blobs.
+	// Pre-allocate 256k slots (4MB for 128-bit keys). This is "large" for 8KB blobs.
 	r := &recording{
-		primary: make([]uint64, 256*1024),
+		primary: make([]Key, 256*1024),
 	}
 	f.recording.Store(r)
 
 	stopRecording = func() {
 		f.recording.Store(nil)
 	}
-	consumeRecording = func(fn HashConsumer) {
+	consumeRecording = func(fn KeyConsumer) {
 		// 1. Drain Primary
 		count := min(len(r.primary), int(r.cursor.Load()))
 		for i := range count {
@@ -159,8 +177,8 @@ func (f *Filter) RecordAdditions() (
 
 		// 2. Drain Overflow
 		r.mu.Lock()
-		for _, h := range r.overflow {
-			fn(h)
+		for _, k := range r.overflow {
+			fn(k)
 		}
 		r.mu.Unlock()
 	}

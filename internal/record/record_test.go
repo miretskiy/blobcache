@@ -269,3 +269,148 @@ func TestRoundtripRecord(t *testing.T) {
 	// Verify CRC
 	require.NoError(t, VerifyCRC(readKey, readValue, decoded.CRC()))
 }
+
+// =============================================================================
+// Record Struct Tests
+// =============================================================================
+
+func TestNewRecord(t *testing.T) {
+	key := []byte("test-key")
+	value := []byte("test-value-data")
+	seqID := uint64(12345)
+
+	rec := NewRecord(seqID, key, value, int64(len(value)))
+
+	require.Equal(t, RecordMagic, rec.Magic)
+	require.Equal(t, seqID, rec.SeqID)
+	require.Equal(t, uint16(len(key)), rec.KeyLen)
+	require.Equal(t, int64(len(value)), rec.PhysicalSize)
+	require.Equal(t, int64(len(value)), rec.LogicalSize)
+	require.True(t, rec.HasValidCRC())
+	require.Equal(t, ComputeCRC(key, value), rec.CRC())
+	require.Equal(t, key, rec.Key)
+	require.Equal(t, value, rec.Value)
+}
+
+func TestNewRecord_Compressed(t *testing.T) {
+	key := []byte("test-key")
+	original := []byte("this is uncompressed data that would normally be larger")
+	compressed := []byte("compressed")
+	seqID := uint64(999)
+
+	// logicalSize is the original size, value is compressed
+	rec := NewRecord(seqID, key, compressed, int64(len(original)))
+
+	require.Equal(t, int64(len(compressed)), rec.PhysicalSize)
+	require.Equal(t, int64(len(original)), rec.LogicalSize)
+	// CRC is computed over key + compressed value (what's on disk)
+	require.Equal(t, ComputeCRC(key, compressed), rec.CRC())
+}
+
+func TestRecord_EncodedSize(t *testing.T) {
+	rec := Record{
+		Header: Header{KeyLen: 10, PhysicalSize: 100},
+		Key:    make([]byte, 10),
+		Value:  make([]byte, 100),
+	}
+	require.Equal(t, HeaderSize+10+100, rec.EncodedSize())
+}
+
+func TestAppendRecord_DecodeRecord_RoundTrip(t *testing.T) {
+	key := []byte("round-trip-key")
+	value := []byte("round-trip-value-data-here")
+	seqID := uint64(42)
+
+	// Create record
+	rec := NewRecord(seqID, key, value, int64(len(value)))
+
+	// Serialize
+	buf := AppendRecord(nil, rec)
+	require.Equal(t, rec.EncodedSize(), len(buf))
+
+	// Deserialize with CRC verification
+	decoded, err := DecodeRecord(buf, true)
+	require.NoError(t, err)
+
+	require.Equal(t, rec.Magic, decoded.Magic)
+	require.Equal(t, rec.SeqID, decoded.SeqID)
+	require.Equal(t, rec.KeyLen, decoded.KeyLen)
+	require.Equal(t, rec.PhysicalSize, decoded.PhysicalSize)
+	require.Equal(t, rec.LogicalSize, decoded.LogicalSize)
+	require.Equal(t, rec.CRC(), decoded.CRC())
+	require.Equal(t, key, decoded.Key)
+	require.Equal(t, value, decoded.Value)
+}
+
+func TestDecodeRecord_CRCMismatch(t *testing.T) {
+	key := []byte("key")
+	value := []byte("value")
+	rec := NewRecord(1, key, value, int64(len(value)))
+
+	buf := AppendRecord(nil, rec)
+
+	// Corrupt a byte in the value
+	buf[len(buf)-1] ^= 0xFF
+
+	// Should fail CRC check
+	_, err := DecodeRecord(buf, true)
+	require.ErrorIs(t, err, ErrCRCMismatch)
+
+	// Should succeed without CRC check (returns corrupted data)
+	decoded, err := DecodeRecord(buf, false)
+	require.NoError(t, err)
+	require.NotEqual(t, value, decoded.Value)
+}
+
+func TestDecodeRecord_InvalidMagic(t *testing.T) {
+	buf := make([]byte, HeaderSize+10)
+	buf[0] = 0x42 // Invalid magic
+
+	_, err := DecodeRecord(buf, false)
+	require.ErrorIs(t, err, ErrInvalidMagic)
+}
+
+func TestDecodeRecord_Hole(t *testing.T) {
+	buf := make([]byte, HeaderSize+10)
+	buf[0] = HoleMagic
+
+	_, err := DecodeRecord(buf, false)
+	require.ErrorIs(t, err, ErrHole)
+}
+
+func TestDecodeRecord_BufferTooSmall(t *testing.T) {
+	// Buffer smaller than header
+	_, err := DecodeRecord(make([]byte, HeaderSize-1), false)
+	require.ErrorIs(t, err, ErrBufferTooSmall)
+
+	// Buffer smaller than header + payload
+	rec := NewRecord(1, []byte("key"), []byte("value"), 5)
+	buf := AppendRecord(nil, rec)
+
+	// Truncate buffer
+	_, err = DecodeRecord(buf[:len(buf)-3], false)
+	require.ErrorIs(t, err, ErrBufferTooSmall)
+}
+
+func TestDecodeRecord_NoCRCSet(t *testing.T) {
+	// Create record without CRC
+	rec := Record{
+		Header: Header{
+			Magic:        RecordMagic,
+			Flags:        FlagInvalidCRC, // CRC not set
+			SeqID:        1,
+			KeyLen:       3,
+			PhysicalSize: 5,
+			LogicalSize:  5,
+		},
+		Key:   []byte("key"),
+		Value: []byte("value"),
+	}
+
+	buf := AppendRecord(nil, rec)
+
+	// Should succeed even with verifyCRC=true because HasValidCRC() is false
+	decoded, err := DecodeRecord(buf, true)
+	require.NoError(t, err)
+	require.False(t, decoded.HasValidCRC())
+}

@@ -135,8 +135,7 @@ Each shard maintains a circular doubly-linked list of nodes using arena indices 
 
 ```go
 type node struct {
-    key     Key              // Back-reference for eviction callbacks
-    item    Item             // Blob metadata (embeds record.Header)
+    item    Item             // Blob coordinates including Key (32 bytes)
     next    uint32           // Arena index (not pointer!)
     prev    uint32           // Arena index (not pointer!)
     visited atomic.Uint32    // 0=cold (evictable), 1=hot (skip)
@@ -182,9 +181,9 @@ STEP 3: POST-EVICTION
 
 ### 4.4 Memory Requirements (Index Overhead)
 
-The primary constraint on blobcache capacity is the **Item Count**, not the total storage size. The In-Memory Index requires a fixed amount of RAM (~85 bytes) for every object stored to maintain O(1) lookup speeds.
+The primary constraint on blobcache capacity is the **Item Count**, not the total storage size. The In-Memory Index requires a fixed amount of RAM (~76 bytes) for every object stored to maintain O(1) lookup speeds.
 
-**The Constant:** Allocated memory grows at a linear rate of **~85 MB per 1 Million Items**.
+**The Constant:** Allocated memory grows at a linear rate of **~76 MB per 1 Million Items**.
 
 #### Index Memory vs. Storage Capacity
 
@@ -192,46 +191,48 @@ This table correlates the Index RAM Overhead (RSS) with the amount of disk space
 
 | Item Count | Index RAM Overhead | Storage @ 4KB (Tiny) | Storage @ 64KB (Avg) | Storage @ 128KB (Mod) |
 |------------|-------------------|----------------------|----------------------|-----------------------|
-| 1 Million | 85 MB | 4 GB | 64 GB | 128 GB |
-| 10 Million | 850 MB | 40 GB | 640 GB | 1.28 TB |
-| 50 Million | 4.3 GB | 200 GB | 3.2 TB | 6.4 TB |
-| 100 Million | 8.5 GB | 400 GB | 6.4 TB | 12.8 TB |
-| 250 Million | 21.3 GB | 1 TB | 16 TB | 32 TB |
+| 1 Million | 76 MB | 4 GB | 64 GB | 128 GB |
+| 10 Million | 760 MB | 40 GB | 640 GB | 1.28 TB |
+| 50 Million | 3.8 GB | 200 GB | 3.2 TB | 6.4 TB |
+| 100 Million | 7.6 GB | 400 GB | 6.4 TB | 12.8 TB |
+| 250 Million | 19 GB | 1 TB | 16 TB | 32 TB |
 
 #### Workload Analysis
 
 **RAM-Bound Workload (Tiny Blobs):**
 - If you store 4 KB blobs, a 1 TB drive holds ~250 Million items.
-- **Result:** You will need 21.3 GB of RAM just for the index.
+- **Result:** You will need ~19 GB of RAM just for the index.
 - **Constraint:** You will run out of RAM before you run out of Disk.
 
 **Disk-Bound Workload (Moderate Blobs):**
 - If you store 128 KB blobs, a 1 TB drive holds only ~8 Million items.
-- **Result:** You only need ~680 MB of RAM for the index.
+- **Result:** You only need ~608 MB of RAM for the index.
 - **Constraint:** You will run out of Disk long before you feel any memory pressure.
 
 #### Calculating Your Requirement
 
 To estimate the memory overhead for your specific workload:
 
-$$\text{Index RAM (MB)} \approx \frac{\text{Disk Capacity (MB)}}{\text{Avg Blob Size (MB)}} \times 0.000085$$
+$$\text{Index RAM (MB)} \approx \frac{\text{Disk Capacity (MB)}}{\text{Avg Blob Size (MB)}} \times 0.000076$$
 
 **Example:**
 - Disk: 4 TB
 - Blob Size: 128 KB
 - Items: 4,000,000 MB / 0.128 MB ≈ 31.25 Million
-- Required Index RAM: 31.25 × 85 MB ≈ **2.6 GB**
+- Required Index RAM: 31.25 × 76 MB ≈ **2.4 GB**
 
 #### Per-Entry Memory Breakdown
 
 | Component | Size | Notes |
 |-----------|------|-------|
-| `index.Item` | 32 bytes | Hash (16B) + SegmentID (4B) + Offset (4B) + PhysicalLen (4B) + Flags (4B) |
-| Arena node overhead | 21 bytes | Circular list indices (8B) + visited flag (4B) + alignment |
-| Map entry overhead | ~32 bytes | Go map bucket overhead |
-| **Total per entry** | ~85 bytes | |
+| `index.Item` | 32 bytes | Key (16B) + SegmentID (4B) + Offset (4B) + PhysicalLen (4B) + Flags (4B) |
+| Arena node overhead | 12 bytes | next (4B) + prev (4B) + visited (4B) |
+| Map entry overhead | ~32 bytes | Key (16B) + uint32 (4B) + bucket overhead (~12B) |
+| **Total per entry** | ~76 bytes | Note: Key is stored twice (Item + map) - 16B redundancy |
 
 **GC Benefit:** Near-zero scan time (no heap pointers in arena design).
+
+> **Future Optimization:** The Key stored in `Item` is redundant with the map key, adding 16 bytes of overhead per entry. A future refactor could store the Key only in the `node` struct (for eviction) and reduce `Item` to 16-byte coordinates, saving ~11% memory.
 
 ### 4.5 Start up and Crash Recovery
 `NewIndex` performs a **Persistence Scan**:

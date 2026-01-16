@@ -87,6 +87,37 @@ func TestCache_Put_EmptyValueAllowed(t *testing.T) {
 	require.Empty(t, retrieved)
 }
 
+func TestCache_Put_LargeBlob(t *testing.T) {
+	// Tests the putLarge code path.
+	// Regression test: newActiveSlab must account for BlockHeaderSize reservation,
+	// otherwise Alloc() would overflow the buffer (masked by allocateRaw's +4KB headroom).
+	tmpDir := t.TempDir()
+	cache, err := New(tmpDir,
+		WithWriteBufferSize(16*1024),           // 16KB buffer
+		WithLargeWriteThreshold(1024),          // 1KB threshold triggers putLarge
+		WithMaxCachedSlabs(0),                  // Force disk path
+		WithCompression(compression.CodexNone), // No compression for predictable size
+	)
+	require.NoError(t, err)
+	defer cache.Close()
+
+	key := []byte("large-key")
+	// Value must be larger than LargeWriteThreshold to trigger putLarge
+	value := make([]byte, 2048) // 2KB value - larger than 1KB threshold
+	for i := range value {
+		value[i] = byte(i % 256)
+	}
+
+	require.NoError(t, cache.Put(key, value))
+
+	// Flush to disk and verify round-trip
+	cache.Drain()
+
+	retrieved, found := readAll(t, cache, key)
+	require.True(t, found)
+	require.Equal(t, value, retrieved)
+}
+
 func TestCache_PutChecksummed_CorrectChecksum(t *testing.T) {
 	tmpDir := t.TempDir()
 	cache, err := New(tmpDir,

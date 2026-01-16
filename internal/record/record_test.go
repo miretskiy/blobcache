@@ -137,91 +137,27 @@ func TestVerifyCRC(t *testing.T) {
 	require.ErrorIs(t, VerifyCRC(key, value, crc+1), ErrCRCMismatch)
 }
 
-func TestTrailerEncodeDecode(t *testing.T) {
-	tr := Trailer{
-		Magic:          uint64(FileMagic),
-		EnvelopeOffset: 4096,
-		EnvelopeSize:   1024,
-		SealMagic:      SealMagic,
-		Reserved:       0,
-	}
-
-	// Encode
-	buf := make([]byte, TrailerSize)
-	n, err := tr.Encode(buf)
-	require.NoError(t, err)
-	require.Equal(t, TrailerSize, n)
-
-	// Decode
-	decoded, err := DecodeTrailer(buf)
-	require.NoError(t, err)
-	require.Equal(t, tr, decoded)
-}
-
-func TestTrailerSealed(t *testing.T) {
-	sealed := Trailer{SealMagic: SealMagic}
-	require.True(t, sealed.IsSealed())
-
-	unsealed := Trailer{SealMagic: 0}
-	require.False(t, unsealed.IsSealed())
-}
-
-func TestTrailerHasEnvelope(t *testing.T) {
-	withEnv := Trailer{EnvelopeOffset: 100, EnvelopeSize: 50}
-	require.True(t, withEnv.HasEnvelope())
-
-	noEnv := Trailer{EnvelopeOffset: 0, EnvelopeSize: 0}
-	require.False(t, noEnv.HasEnvelope())
-
-	partialEnv := Trailer{EnvelopeOffset: 100, EnvelopeSize: 0}
-	require.False(t, partialEnv.HasEnvelope())
-}
-
-func TestTrailerValid(t *testing.T) {
-	valid := Trailer{Magic: uint64(FileMagic)}
-	require.NoError(t, valid.Valid())
-
-	invalid := Trailer{Magic: 0xBADBAD}
-	require.ErrorIs(t, invalid.Valid(), ErrInvalidTrailer)
-}
-
-func TestFileHeader(t *testing.T) {
+func TestBlockHeader(t *testing.T) {
 	// Verify constant matches expected encoding
-	require.Len(t, FileHeaderBytes, FileHeaderSize)
+	require.Len(t, BlockHeaderBytes, BlockHeaderSize)
 
-	err := ValidFileHeader(FileHeaderBytes[:])
+	err := ValidateBlockHeader(BlockHeaderBytes[:])
 	require.NoError(t, err)
 
 	// Invalid magic
-	badMagic := make([]byte, FileHeaderSize)
-	copy(badMagic, FileHeaderBytes[:])
+	badMagic := make([]byte, BlockHeaderSize)
+	copy(badMagic, BlockHeaderBytes[:])
 	badMagic[0] = 0xFF
-	require.ErrorIs(t, ValidFileHeader(badMagic), ErrInvalidFileMagic)
+	require.ErrorIs(t, ValidateBlockHeader(badMagic), ErrInvalidBlockMagic)
 
 	// Invalid version
-	badVersion := make([]byte, FileHeaderSize)
-	copy(badVersion, FileHeaderBytes[:])
+	badVersion := make([]byte, BlockHeaderSize)
+	copy(badVersion, BlockHeaderBytes[:])
 	badVersion[4] = 0xFF
-	require.ErrorIs(t, ValidFileHeader(badVersion), ErrInvalidVersion)
+	require.ErrorIs(t, ValidateBlockHeader(badVersion), ErrInvalidVersion)
 
 	// Too small
-	require.ErrorIs(t, ValidFileHeader([]byte{1, 2, 3}), ErrBufferTooSmall)
-}
-
-func TestAppendTrailer(t *testing.T) {
-	tr := Trailer{
-		Magic:          uint64(FileMagic),
-		EnvelopeOffset: 8192,
-		EnvelopeSize:   2048,
-		SealMagic:      SealMagic,
-	}
-
-	buf := AppendTrailer(nil, tr)
-	require.Len(t, buf, TrailerSize)
-
-	decoded, err := DecodeTrailer(buf)
-	require.NoError(t, err)
-	require.Equal(t, tr, decoded)
+	require.ErrorIs(t, ValidateBlockHeader([]byte{1, 2, 3}), ErrBufferTooSmall)
 }
 
 func TestRoundtripRecord(t *testing.T) {

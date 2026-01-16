@@ -28,7 +28,7 @@ func TestPersistence(t *testing.T) {
 		require.NoError(t, err)
 
 		chunks := 0
-		err = p.scanSegment(segID, func(m SegmentManifest) bool {
+		err = p.scanSegment(segID, func(m DurableBatch) bool {
 			chunks++
 			require.Equal(t, segID, m.SegmentID)
 			return true
@@ -45,7 +45,7 @@ func TestPersistence(t *testing.T) {
 		require.NoError(t, err)
 
 		seen300 := false
-		err = p.scanSegment(200, func(m SegmentManifest) bool {
+		err = p.scanSegment(200, func(m DurableBatch) bool {
 			if m.SegmentID == 300 {
 				seen300 = true
 			}
@@ -58,7 +58,7 @@ func TestPersistence(t *testing.T) {
 
 	t.Run("ScanAllOrdering", func(t *testing.T) {
 		var ids []uint32
-		err := p.scanAll(func(m SegmentManifest) bool {
+		err := p.scanAll(func(m DurableBatch) bool {
 			// Deduplicate split segments for order checking
 			if len(ids) == 0 || ids[len(ids)-1] != m.SegmentID {
 				ids = append(ids, m.SegmentID)
@@ -72,7 +72,7 @@ func TestPersistence(t *testing.T) {
 
 	t.Run("Delete", func(t *testing.T) {
 		var keyToDelete []byte
-		err := p.scanSegment(200, func(m SegmentManifest) bool {
+		err := p.scanSegment(200, func(m DurableBatch) bool {
 			keyToDelete = m.IndexKey
 			return false
 		})
@@ -83,7 +83,7 @@ func TestPersistence(t *testing.T) {
 		require.NoError(t, err)
 
 		count := 0
-		err = p.scanSegment(200, func(m SegmentManifest) bool {
+		err = p.scanSegment(200, func(m DurableBatch) bool {
 			count++
 			return true
 		})
@@ -118,7 +118,7 @@ func TestDeleteRecordsFromSegment_Collapse(t *testing.T) {
 
 	// Verify initial state
 	count := 0
-	p.scanSegment(segID, func(m SegmentManifest) bool {
+	p.scanSegment(segID, func(m DurableBatch) bool {
 		count++
 		return true
 	})
@@ -136,7 +136,7 @@ func TestDeleteRecordsFromSegment_Collapse(t *testing.T) {
 	// Verify collapse to 1 chunk
 	finalCount := 0
 	totalLive := 0
-	err = p.scanSegment(segID, func(m SegmentManifest) bool {
+	err = p.scanSegment(segID, func(m DurableBatch) bool {
 		finalCount++
 		totalLive += len(m.Items)
 		return true

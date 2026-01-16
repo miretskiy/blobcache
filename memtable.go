@@ -63,7 +63,9 @@ type MemTable struct {
 	wg      sync.WaitGroup // Tracks worker goroutines
 }
 
-func NewMemTable(cfg config, b Batcher, reporter ErrorReporter, pub Publisher, w *wal.WAL) *MemTable {
+func NewMemTable(
+	cfg config, b Batcher, reporter ErrorReporter, pub Publisher, w *wal.WAL,
+) *MemTable {
 	poolCapacity := cfg.MaxCachedSlabs + cfg.MaxInflightSlabs + 2
 
 	mt := &MemTable{
@@ -112,7 +114,10 @@ func (mt *MemTable) newActiveSlab(size int) *ActiveSlab {
 			buf:   buf,
 			index: xmap.New[SlabEntry, xmap.Pad32](xmap.WithShardShift(4)), // 16 shards for slab index
 		},
-		// slabID is 0 until first write sets it
+		// Reserve first 8 bytes for block header (magic + version).
+		// SegmentWriter fills this in before each write, making every slab
+		// a self-describing block that can be validated independently.
+		wPos:       record.BlockHeaderSize,
 		writesDone: newSignal(),
 	}
 
@@ -157,18 +162,24 @@ func (mt *MemTable) Put(seqID uint64, hash Key, keyBytes, value []byte) error {
 	return mt.putWithChecksum(seqID, hash, keyBytes, value, nil)
 }
 
-func (mt *MemTable) PutChecksummed(seqID uint64, hash Key, keyBytes, value []byte, checksum uint32) error {
+func (mt *MemTable) PutChecksummed(
+	seqID uint64, hash Key, keyBytes, value []byte, checksum uint32,
+) error {
 	return mt.putWithChecksum(seqID, hash, keyBytes, value, &checksum)
 }
 
-func (mt *MemTable) putWithChecksum(seqID uint64, hash Key, keyBytes, value []byte, checksum *uint32) error {
+func (mt *MemTable) putWithChecksum(
+	seqID uint64, hash Key, keyBytes, value []byte, checksum *uint32,
+) error {
 	if int64(len(value)) > mt.LargeWriteThreshold {
 		return mt.putLarge(seqID, hash, keyBytes, value, checksum)
 	}
 	return mt.putActive(seqID, hash, keyBytes, value, checksum)
 }
 
-func (mt *MemTable) putLarge(seqID uint64, hash Key, keyBytes, value []byte, checksum *uint32) error {
+func (mt *MemTable) putLarge(
+	seqID uint64, hash Key, keyBytes, value []byte, checksum *uint32,
+) error {
 	// 1. Compress in caller's goroutine (distributed compression)
 	compressed := mt.maybeCompress(value)
 	defer compressed.Release()
@@ -200,8 +211,8 @@ func (mt *MemTable) putLarge(seqID uint64, hash Key, keyBytes, value []byte, che
 		}
 	}
 
-	// 5. Allocate slab just for this record
-	as := mt.newActiveSlab(rec.EncodedSize())
+	// 5. Allocate slab just for this record (plus header reservation)
+	as := mt.newActiveSlab(rec.EncodedSize() + record.BlockHeaderSize)
 
 	// 6. Write record directly (zero-copy)
 	buf, offset := as.Alloc(rec.EncodedSize())
@@ -225,7 +236,9 @@ func (mt *MemTable) putLarge(seqID uint64, hash Key, keyBytes, value []byte, che
 	return nil
 }
 
-func (mt *MemTable) putActive(seqID uint64, hash Key, keyBytes, value []byte, checksum *uint32) error {
+func (mt *MemTable) putActive(
+	seqID uint64, hash Key, keyBytes, value []byte, checksum *uint32,
+) error {
 	// 1. Compress before lock (parallel compression) - only on first call
 	c := mt.maybeCompress(value)
 	defer c.Release()
@@ -483,11 +496,11 @@ func (mt *MemTable) processFlush(as *ActiveSlab, writer *SegmentWriter) (*Segmen
 		}
 	}
 
-	// 1. Collect entries and convert to record.Inode for WriteSlab
-	var entries []record.Inode
+	// 1. Collect entries and convert to record.FooterEntry for WriteSlab
+	var entries []record.FooterEntry
 	var maxSeqID uint64
 	as.index.ForEach(func(key xmap.Key, e SlabEntry, _ *xmap.Pad32) bool {
-		entries = append(entries, record.Inode{
+		entries = append(entries, record.FooterEntry{
 			Key:          key, // Full 128-bit XXH3 hash
 			Pos:          e.Pos,
 			LogicalSize:  e.LogicalSize,
@@ -503,7 +516,7 @@ func (mt *MemTable) processFlush(as *ActiveSlab, writer *SegmentWriter) (*Segmen
 	})
 
 	// 2. Sort by Physical Position (Offset) for linear I/O
-	slices.SortFunc(entries, func(a, b record.Inode) int {
+	slices.SortFunc(entries, func(a, b record.FooterEntry) int {
 		return int(a.Pos - b.Pos)
 	})
 

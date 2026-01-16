@@ -119,24 +119,26 @@ func (item *Item) IsCompressed() bool {
 //   - freeHead uint32:  4 bytes
 //   - hand uint32:      4 bytes
 //   - head uint32:      4 bytes
-//   - compiler padding: 4 bytes (alignment)
-//   - _:               56 bytes (explicit padding)
+//   - _:               60 bytes (explicit padding)
 //   - Total:           96 bytes
 //
 // Combined with xmap.Shard base (32 bytes), total = 128 bytes (2 cache lines).
+// The padding must be 60 bytes (not 56) to avoid implicit compiler padding
+// that would mess up the alignment math.
 type ShardState struct {
 	nodes    []node   // Arena: Contiguous memory, no pointers
 	freeHead uint32   // Free List: Stack head
 	hand     uint32   // Sieve Cursor: Current position
 	head     uint32   // Circular List Head: Newest item
-	_        [56]byte // Padding to make Shard 128 bytes (2 cache lines)
+	_        [60]byte // Padding to make Shard 128 bytes (2 cache lines)
 }
 
 // node is an arena-backed entry with no heap pointers.
 // Uses uint32 indices instead of pointers for GC optimization.
+//
+// Size: 44 bytes = Item(32) + next(4) + prev(4) + visited(4)
 type node struct {
-	key     Key           // Back-reference for eviction callbacks
-	item    Item          // Lean blob coordinates (24 bytes)
+	item    Item          // Blob coordinates including Key for eviction (32 bytes)
 	next    uint32        // Index in 'nodes' slice (circular list)
 	prev    uint32        // Index in 'nodes' slice (circular list)
 	visited atomic.Uint32 // SIEVE algorithm: 0=cold, 1=hot
@@ -205,15 +207,18 @@ func (idx *BlobIndex) Get(k Key) (Item, bool) {
 // Put inserts or updates an item.
 // It is "pure storage": it NEVER evicts. If capacity is needed, the arena grows.
 // Eviction is driven externally by EvictBatch.
-func (idx *BlobIndex) Put(k Key, val Item) {
-	s := idx.lookup.Shard(k)
+//
+// The item's Key field must be set - it serves as both the map key and the
+// back-reference needed for eviction.
+func (idx *BlobIndex) Put(item Item) {
+	s := idx.lookup.Shard(item.Key)
 
 	s.Lock()
 	defer s.Unlock()
 
 	// Update existing?
-	if i, ok := s.Items[k]; ok {
-		s.Extra.nodes[i].item = val
+	if i, ok := s.Items[item.Key]; ok {
+		s.Extra.nodes[i].item = item
 		s.Extra.nodes[i].visited.Store(1) // Keep hot on update
 		return
 	}
@@ -221,12 +226,8 @@ func (idx *BlobIndex) Put(k Key, val Item) {
 	// Alloc from free list or append to arena
 	newIdx := allocNode(&s.Extra)
 
-	s.Extra.nodes[newIdx] = node{
-		key:  k,
-		item: val,
-		// visited is zero-initialized (cold) by default
-	}
-	s.Items[k] = newIdx
+	s.Extra.nodes[newIdx] = node{item: item}
+	s.Items[item.Key] = newIdx
 	linkNode(&s.Extra, newIdx)
 }
 
@@ -335,9 +336,10 @@ func (idx *BlobIndex) Stats() Stats {
 	}
 
 	// Estimate memory: node size * arena nodes + map overhead
-	// node = Key(16) + Item(24) + next(4) + prev(4) + visited(4) = 52 bytes
-	const nodeSize = 16 + 24 + 4 + 4 + 4
-	const mapEntryOverhead = 32 // approximate per-entry map overhead
+	// node = Item(32) + next(4) + prev(4) + visited(4) = 44 bytes
+	// Note: Item.Key (16 bytes) is redundant with map key - future optimization target
+	const nodeSize = 32 + 4 + 4 + 4
+	const mapEntryOverhead = 32 // approximate per-entry map overhead (Key 16 + uint32 4 + bucket ~12)
 	st.MemoryEst = int64(st.ArenaNodes)*nodeSize + int64(st.Items)*mapEntryOverhead
 
 	return st
@@ -442,7 +444,9 @@ func runSieve(state *ShardState) uint32 {
 
 // evictUpTo runs eviction inside the lock, returning bytes freed.
 // Limits work to maxCount items to bound lock hold time.
-func evictUpTo(state *ShardState, items map[Key]uint32, quotaBytes int64, dst *[]Item, maxCount int) int64 {
+func evictUpTo(
+	state *ShardState, items map[Key]uint32, quotaBytes int64, dst *[]Item, maxCount int,
+) int64 {
 	var localFreed int64
 	var count int
 
@@ -458,7 +462,7 @@ func evictUpTo(state *ShardState, items map[Key]uint32, quotaBytes int64, dst *[
 		localFreed += int64(item.PhysicalLen)
 		count++
 
-		delete(items, state.nodes[victimIdx].key)
+		delete(items, state.nodes[victimIdx].item.Key)
 		freeNode(state, victimIdx)
 	}
 	return localFreed

@@ -12,7 +12,7 @@ import (
 
 // ComputeRecoveryCheckpoint returns the highest SeqID across all segment envelopes.
 // WAL entries with SeqID > checkpoint need to be replayed during recovery.
-func ComputeRecoveryCheckpoint(segments []record.SegmentEnvelope) uint64 {
+func ComputeRecoveryCheckpoint(segments []record.SegmentFooter) uint64 {
 	var maxSeqID uint64
 	for _, seg := range segments {
 		if seg.MaxSeqID > maxSeqID {

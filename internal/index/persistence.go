@@ -34,9 +34,9 @@ func testingSetMaxChunkSize(size uint64) func() {
 	}
 }
 
-// SegmentManifest holds lean Items for a segment in persistent storage.
+// DurableBatch holds lean Items for a batch in persistent storage.
 // This is what gets serialized to Bitcask.
-type SegmentManifest struct {
+type DurableBatch struct {
 	SegmentID uint32
 	CTime     int64
 	MaxSeqID  uint64 // Highest SeqID in this segment (WAL recovery checkpoint)
@@ -47,8 +47,8 @@ type SegmentManifest struct {
 	IndexKey []byte
 }
 
-// ScanManifestFn is the callback for scanning segment manifests.
-type ScanManifestFn func(SegmentManifest) bool
+// ScanBatchFn is the callback for scanning segment manifests.
+type ScanBatchFn func(DurableBatch) bool
 
 type persistence struct {
 	db *bitcask.Bitcask
@@ -94,8 +94,8 @@ func DecodeItem(src []byte) (Item, error) {
 	}, nil
 }
 
-// AppendManifest appends an encoded SegmentManifest to dst.
-func AppendManifest(dst []byte, m SegmentManifest) []byte {
+// AppendBatch appends an encoded DurableBatch to dst.
+func AppendBatch(dst []byte, m DurableBatch) []byte {
 	dst = binary.LittleEndian.AppendUint32(dst, m.SegmentID)
 	dst = binary.LittleEndian.AppendUint64(dst, uint64(m.CTime))
 	dst = binary.LittleEndian.AppendUint64(dst, m.MaxSeqID)
@@ -105,10 +105,10 @@ func AppendManifest(dst []byte, m SegmentManifest) []byte {
 	return dst
 }
 
-// DecodeManifest decodes a SegmentManifest from src.
-func DecodeManifest(src []byte) (SegmentManifest, error) {
+// DecodeBatch decodes a DurableBatch from src.
+func DecodeBatch(src []byte) (DurableBatch, error) {
 	if len(src) < ManifestHeaderSize {
-		return SegmentManifest{}, errors.New("buffer too small for manifest header")
+		return DurableBatch{}, errors.New("buffer too small for manifest header")
 	}
 
 	segmentID := binary.LittleEndian.Uint32(src[0:4])
@@ -117,7 +117,7 @@ func DecodeManifest(src []byte) (SegmentManifest, error) {
 
 	itemsData := src[ManifestHeaderSize:]
 	if len(itemsData)%ItemSize != 0 {
-		return SegmentManifest{}, errors.New("invalid manifest size")
+		return DurableBatch{}, errors.New("invalid manifest size")
 	}
 
 	numItems := len(itemsData) / ItemSize
@@ -126,12 +126,12 @@ func DecodeManifest(src []byte) (SegmentManifest, error) {
 		offset := i * ItemSize
 		item, err := DecodeItem(itemsData[offset : offset+ItemSize])
 		if err != nil {
-			return SegmentManifest{}, err
+			return DurableBatch{}, err
 		}
 		items[i] = item
 	}
 
-	return SegmentManifest{
+	return DurableBatch{
 		SegmentID: segmentID,
 		CTime:     ctime,
 		MaxSeqID:  maxSeqID,
@@ -147,7 +147,7 @@ func (p *persistence) DeleteRecordsFromSegment(segID uint32, keys map[Key]struct
 	var cTime int64
 
 	// 1. Flatten and Filter: Collect only what is still alive
-	err := p.scanSegment(segID, func(m SegmentManifest) bool {
+	err := p.scanSegment(segID, func(m DurableBatch) bool {
 		originalKeys = append(originalKeys, m.IndexKey)
 		if cTime == 0 {
 			cTime = m.CTime
@@ -175,14 +175,14 @@ func (p *persistence) DeleteRecordsFromSegment(segID uint32, keys map[Key]struct
 	}
 
 	// 3. Re-Pack: Write back only the live items into the minimum number of chunks
-	currentManifest := SegmentManifest{
+	currentManifest := DurableBatch{
 		SegmentID: segID,
 		CTime:     cTime,
 	}
 
 	// Handle the 'empty segment' case: write one empty tombstone at index 0
 	if len(liveItems) == 0 {
-		data := AppendManifest(nil, currentManifest)
+		data := AppendBatch(nil, currentManifest)
 		return txn.Put(p.makeKey(segID, 0), data)
 	}
 
@@ -192,7 +192,7 @@ func (p *persistence) DeleteRecordsFromSegment(segID uint32, keys map[Key]struct
 	for i := 0; i < len(liveItems); i++ {
 		// Check if adding this item would exceed the limit (and we have items to flush)
 		if uint64(currentSize+ItemSize) > maxChunkSize && len(currentManifest.Items) > 0 {
-			data := AppendManifest(nil, currentManifest)
+			data := AppendBatch(nil, currentManifest)
 			if err := txn.Put(p.makeKey(segID, chunkIdx), data); err != nil {
 				return err
 			}
@@ -206,7 +206,7 @@ func (p *persistence) DeleteRecordsFromSegment(segID uint32, keys map[Key]struct
 
 		// Flush on last item
 		if i == len(liveItems)-1 {
-			data := AppendManifest(nil, currentManifest)
+			data := AppendBatch(nil, currentManifest)
 			if err := txn.Put(p.makeKey(segID, chunkIdx), data); err != nil {
 				return err
 			}
@@ -232,7 +232,7 @@ func (p *persistence) writeBatch(segID uint32, items []Item, maxSeqID uint64) er
 	txn := p.db.Transaction()
 	defer txn.Discard()
 
-	currentManifest := SegmentManifest{
+	currentManifest := DurableBatch{
 		SegmentID: segID,
 		CTime:     time.Now().Unix(),
 		MaxSeqID:  maxSeqID,
@@ -245,7 +245,7 @@ func (p *persistence) writeBatch(segID uint32, items []Item, maxSeqID uint64) er
 		if len(currentManifest.Items) == 0 {
 			return nil
 		}
-		data := AppendManifest(nil, currentManifest)
+		data := AppendBatch(nil, currentManifest)
 		if err := txn.Put(p.makeKey(segID, chunkIdx), data); err != nil {
 			return err
 		}
@@ -274,13 +274,13 @@ func (p *persistence) writeBatch(segID uint32, items []Item, maxSeqID uint64) er
 	return txn.Commit()
 }
 
-func (p *persistence) scanAll(fn ScanManifestFn) error {
+func (p *persistence) scanAll(fn ScanBatchFn) error {
 	return p.db.ForEach(func(key bitcask.Key) error {
 		return p.loadAndInvoke(key, fn)
 	})
 }
 
-func (p *persistence) scanSegment(segID uint32, fn ScanManifestFn) error {
+func (p *persistence) scanSegment(segID uint32, fn ScanBatchFn) error {
 	// Start key: Segment with chunk 0
 	start := p.makeKey(segID, 0)
 
@@ -292,13 +292,13 @@ func (p *persistence) scanSegment(segID uint32, fn ScanManifestFn) error {
 	})
 }
 
-func (p *persistence) loadAndInvoke(key bitcask.Key, fn ScanManifestFn) error {
+func (p *persistence) loadAndInvoke(key bitcask.Key, fn ScanBatchFn) error {
 	buf, err := p.db.Get(key)
 	if err != nil {
 		return fmt.Errorf("failed to get chunk %v: %w", key, err)
 	}
 
-	manifest, err := DecodeManifest(buf)
+	manifest, err := DecodeBatch(buf)
 	if err != nil {
 		return fmt.Errorf("failed to decode chunk %v: %w", key, err)
 	}

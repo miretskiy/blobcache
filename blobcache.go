@@ -171,7 +171,7 @@ func open(cfg config) (*Cache, bool, error) {
 	// Create new bloom filter and figure out how much data on disk from segment meta.
 	var totalSize int64
 	filter := bloom.New(uint(cfg.BloomEstimatedKeys), cfg.BloomFPRate)
-	if err := idx.ForEachSegment(func(m index.SegmentManifest) bool {
+	if err := idx.ForEachSegment(func(m index.DurableBatch) bool {
 		for _, item := range m.Items {
 			if !item.IsDeleted() {
 				filter.Add(item.Key)                 // Full 128-bit key
@@ -526,7 +526,7 @@ func (c *Cache) rebuildBloom() error {
 		stopRecording, consumeRecording = oldFilter.RecordAdditions()
 	}
 
-	err := c.index.ForEachSegment(func(m index.SegmentManifest) bool {
+	err := c.index.ForEachSegment(func(m index.DurableBatch) bool {
 		for _, item := range m.Items {
 			if !item.IsDeleted() {
 				newFilter.AddHash(item.Key)
@@ -639,7 +639,7 @@ func (c *Cache) runWALRecovery() (bool, error) {
 	// Compute checkpoint: max SeqID across all committed segments.
 	// Any WAL file with firstSeqID <= checkpoint has already been flushed.
 	var checkpoint uint64
-	if err := c.index.ForEachSegment(func(m index.SegmentManifest) bool {
+	if err := c.index.ForEachSegment(func(m index.DurableBatch) bool {
 		if m.MaxSeqID > checkpoint {
 			checkpoint = m.MaxSeqID
 		}

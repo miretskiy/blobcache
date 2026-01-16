@@ -29,10 +29,10 @@ func Open(basePath string, initialCapacity int) (*DurableIndex, error) {
 	}
 
 	// Load all persisted items into memory
-	err = p.scanAll(func(m SegmentManifest) bool {
+	err = p.scanAll(func(m DurableBatch) bool {
 		for _, item := range m.Items {
 			if !item.IsDeleted() {
-				idx.Put(item.Key, item)
+				idx.Put(item)
 			}
 		}
 		return true
@@ -63,11 +63,11 @@ func (idx *DurableIndex) SetBlobErrno(key Key, errno base.BlobErrno) {
 // GetSegmentManifest retrieves the metadata for a specific segment.
 // It reconstructs the manifest from fragmented chunks if necessary.
 // Returns (manifest, true) if found, or (zero-value, false) if not.
-func (idx *DurableIndex) GetSegmentManifest(segmentID uint32) (SegmentManifest, bool) {
-	var fullManifest SegmentManifest
+func (idx *DurableIndex) GetSegmentManifest(segmentID uint32) (DurableBatch, bool) {
+	var fullManifest DurableBatch
 	var found bool
 
-	err := idx.segments.scanSegment(segmentID, func(m SegmentManifest) bool {
+	err := idx.segments.scanSegment(segmentID, func(m DurableBatch) bool {
 		if !found {
 			fullManifest = m
 			found = true
@@ -79,7 +79,7 @@ func (idx *DurableIndex) GetSegmentManifest(segmentID uint32) (SegmentManifest, 
 	})
 
 	if err != nil || !found {
-		return SegmentManifest{}, false
+		return DurableBatch{}, false
 	}
 	return fullManifest, true
 }
@@ -91,7 +91,7 @@ func (idx *DurableIndex) IngestBatch(segID uint32, items []Item, maxSeqID uint64
 	}
 
 	for _, item := range items {
-		idx.Put(item.Key, item)
+		idx.Put(item)
 	}
 	return nil
 }
@@ -110,7 +110,7 @@ func (idx *DurableIndex) Evict() (Item, error) {
 func (idx *DurableIndex) DeleteSegment(segmentID uint32) error {
 	var keys [][]byte
 
-	err := idx.segments.scanSegment(segmentID, func(m SegmentManifest) bool {
+	err := idx.segments.scanSegment(segmentID, func(m DurableBatch) bool {
 		if m.SegmentID != segmentID {
 			panic(fmt.Sprintf("scanSegment(%d) returned entries for segment %d", segmentID, m.SegmentID))
 		}
@@ -199,7 +199,7 @@ func (idx *DurableIndex) ForEachBlob(fn func(Item) bool) {
 }
 
 // ForEachSegment iterates over all segment manifests stored on disk.
-func (idx *DurableIndex) ForEachSegment(fn ScanManifestFn) error {
+func (idx *DurableIndex) ForEachSegment(fn ScanBatchFn) error {
 	return idx.segments.scanAll(fn)
 }
 
@@ -216,7 +216,7 @@ func (idx *DurableIndex) DurableStats() DurableStats {
 	}
 
 	// Count segments from disk
-	_ = idx.ForEachSegment(func(SegmentManifest) bool {
+	_ = idx.ForEachSegment(func(DurableBatch) bool {
 		stats.SegmentCount++
 		return true
 	})

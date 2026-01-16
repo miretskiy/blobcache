@@ -9,9 +9,7 @@
 package xmap
 
 import (
-	"fmt"
 	"sync"
-	"unsafe"
 
 	"github.com/zeebo/xxh3"
 )
@@ -69,18 +67,11 @@ func WithInitialCapacity(n int) Option {
 }
 
 // New creates a new Map with the given options.
-// Panics if Shard[V, E] is not properly aligned to 64 bytes.
+//
+// IMPORTANT: Callers must ensure Shard[V, E] is properly aligned to 64 bytes
+// by running VerifyAlignment[V, E]() in their test suite. Misalignment causes
+// false sharing (performance hit), not crashes.
 func New[V any, E any](opts ...Option) *Map[V, E] {
-	// Runtime Alignment Check
-	var s Shard[V, E]
-	size := unsafe.Sizeof(s)
-
-	if size%64 != 0 {
-		panic(fmt.Sprintf("xmap: Shard type misaligned! Total size is %d bytes. "+
-			"Must be multiple of 64 to prevent false sharing. "+
-			"Adjust padding in your Extra type '%T'.", size, s.Extra))
-	}
-
 	o := options{shardShift: 2} // Default: 4 shards
 	for _, opt := range opts {
 		opt(&o)

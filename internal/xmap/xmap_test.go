@@ -10,27 +10,26 @@ import (
 	"github.com/zeebo/xxh3"
 )
 
-// TestShardAlignment verifies the runtime alignment check works.
+// TestShardAlignment verifies the alignment check helper works.
 func TestShardAlignment(t *testing.T) {
 	// Pad32 should produce a 64-byte aligned shard
 	size := unsafe.Sizeof(Shard[int, Pad32]{})
 	require.Equal(t, uintptr(64), size, "Shard[int, Pad32] should be 64 bytes")
 
-	// Creating a map with Pad32 should not panic
+	// VerifyAlignment should pass for properly padded types
+	require.NoError(t, VerifyAlignment[int, Pad32]())
+
+	// Creating a map with Pad32 should work
 	m := New[int, Pad32]()
 	require.NotNil(t, m)
 }
 
-func TestShardAlignment_Panic(t *testing.T) {
-	// An empty Extra type without padding should panic
-	defer func() {
-		r := recover()
-		require.NotNil(t, r, "expected panic for misaligned shard")
-		require.Contains(t, r.(string), "misaligned")
-	}()
-
-	// struct{} is 0 bytes, so Shard base (32) is not 64-aligned
-	_ = New[int, struct{}]()
+func TestShardAlignment_Misaligned(t *testing.T) {
+	// struct{} is 0 bytes, so Shard base (32) is not 64-aligned.
+	// VerifyAlignment should return an error (not panic at runtime).
+	err := VerifyAlignment[int, struct{}]()
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "not a multiple of 64")
 }
 
 func TestMap_BasicOperations(t *testing.T) {

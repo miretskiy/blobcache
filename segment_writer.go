@@ -20,12 +20,16 @@ type poolProvider interface {
 // SegmentWriter manages long-running, sequential writes to a large segment file.
 // It ingests multiple MemTable slabs (e.g., 128MB each) and accumulates
 // footer entries until the segment is full or explicitly sealed.
+//
+// Each slab written becomes a self-describing "block" with its own header
+// (magic + version). This provides resilience: if corruption occurs mid-file,
+// recovery tools can scan for magic bytes to re-sync.
 type SegmentWriter struct {
 	id         uint32
 	file       *os.File
 	currentPos int64
 	pool       poolProvider
-	entries    []record.Inode // Full entries for segment footer
+	entries    []record.FooterEntry // Full entries for segment footer
 	syncData   bool
 }
 
@@ -53,6 +57,9 @@ func NewSegmentWriter(
 		log.Error("warning: fallocate failed", "segID", id, "err", err)
 	}
 
+	// No header written here - each slab carries its own block header.
+	// WriteSlab fills in the reserved header bytes before writing.
+
 	return &SegmentWriter{
 		id:       id,
 		file:     f,
@@ -64,30 +71,36 @@ func NewSegmentWriter(
 // WriteSlab appends a memory-aligned slab of data to the segment.
 // 'data' MUST be 4KB-aligned (via MmapBuffer.AlignedBytes()) or the write
 // will fail with EINVAL on Linux systems.
+//
+// The first 8 bytes of data are reserved for the block header (magic + version).
+// This method fills in those bytes before writing, making each slab a
+// self-describing block.
+//
 // Returns lean index.Item entries with absolute positions for index updates.
-// The full Inode data is kept internally for the segment footer.
+// The full FooterEntry data is kept internally for the segment footer.
 func (sw *SegmentWriter) WriteSlab(
-	data []byte, entries []record.Inode,
+	data []byte, entries []record.FooterEntry,
 ) ([]index.Item, error) {
 	if len(data) == 0 {
 		return nil, nil
 	}
 
-	// If some previous operation left us unaligned, we must fail fast.
+	// Safety: verify alignment constraints for O_DIRECT
 	if sw.currentPos%4096 != 0 {
 		return nil, fmt.Errorf("segment offset %d is not 4KB-aligned; O_DIRECT write will fail", sw.currentPos)
 	}
-
-	// Safety check for alignment (abstracted helper)
 	if !sys.IsAligned(data) {
 		return nil, fmt.Errorf("buffer address %p is not hardware-aligned", &data[0])
 	}
 
-	// 1. Capture the start of this block in the file
-	slabStart := sw.currentPos
+	// 1. Fill in block header (first 8 bytes are reserved by MemTable)
+	copy(data[:record.BlockHeaderSize], record.BlockHeaderBytes[:])
 
-	// 2. Write the bytes to disk at the absolute offset
-	if _, err := sw.file.WriteAt(data, slabStart); err != nil {
+	// 2. Capture the start of this block in the file
+	blockStart := sw.currentPos
+
+	// 3. Write the bytes to disk
+	if _, err := sw.file.WriteAt(data, blockStart); err != nil {
 		return nil, err
 	}
 
@@ -97,22 +110,23 @@ func (sw *SegmentWriter) WriteSlab(
 		}
 	}
 
-	// 3. Advance the global file pointer by the size of the data written
+	// 4. Advance file position
 	sw.currentPos += int64(len(data))
 
-	// 4. Transform to absolute positions and store full entries for footer
+	// 5. Transform to absolute positions and store full entries for footer
+	// Entry positions are already relative to data start (after header reservation),
+	// so absolute position = blockStart + entry.Pos
 	items := make([]index.Item, 0, len(entries))
 	for i := range entries {
 		entry := entries[i]
-		absolutePos := entry.Pos + slabStart
+		absolutePos := entry.Pos + blockStart
 		entry.Pos = absolutePos
 		sw.entries = append(sw.entries, entry)
 
 		// Create lean Item for index (coordinates only)
-		// PhysicalLen = header + key + value (total record size on disk)
 		physicalLen := uint32(record.HeaderSize) + uint32(entry.KeyLen) + uint32(entry.PhysicalSize)
 		item := index.Item{
-			Key:         entry.Key, // Full 128-bit XXH3 hash
+			Key:         entry.Key,
 			SegmentID:   sw.id,
 			Offset:      uint32(absolutePos),
 			PhysicalLen: physicalLen,
@@ -148,7 +162,7 @@ func (sw *SegmentWriter) Close() error {
 	}
 
 	// 2. Construct the immutable Segment Footer
-	sf := record.SegmentEnvelope{
+	sf := record.SegmentFooter{
 		SegmentID:   int64(sw.id),
 		CTime:       time.Now().Unix(),
 		MinSeqID:    minSeq,
@@ -159,13 +173,13 @@ func (sw *SegmentWriter) Close() error {
 
 	// 3. Serialize Footer into an Aligned Buffer.
 	// We use the slabPool to satisfy O_DIRECT alignment and avoid GC pressure.
-	physicalMetaSize := record.SegmentEnvelopePhysicalSize(len(sw.entries))
+	physicalMetaSize := record.SegmentFooterAlignedSize(len(sw.entries))
 	tmpBuf := sw.pool.AcquireAligned(physicalMetaSize)
 	defer tmpBuf.Unpin()
 
-	// AppendSegmentEnvelopeWithTail places the 20-byte tail at the absolute
+	// AppendFooterBlock places the 20-byte tail at the absolute
 	// end of the 4KB-aligned block.
-	paddedMetadata := record.AppendSegmentEnvelopeWithTail(tmpBuf.Bytes(), sf)
+	paddedMetadata := record.AppendFooterBlock(tmpBuf.Bytes(), sf)
 
 	// 4. Final hardware write for the metadata block.
 	if _, err := sw.file.WriteAt(paddedMetadata, sw.currentPos); err != nil {
@@ -175,7 +189,7 @@ func (sw *SegmentWriter) Close() error {
 	finalSize := sw.currentPos + int64(len(paddedMetadata))
 
 	// 5. Truncate to actual size so envelope is at file end.
-	// fallocate pre-allocates more space; ReadSegmentEnvelopeFromFile expects
+	// fallocate pre-allocates more space; ReadFooterBlock expects
 	// the tail at fileSize - TailSize.
 	if err := sw.file.Truncate(finalSize); err != nil {
 		_ = sw.file.Close()

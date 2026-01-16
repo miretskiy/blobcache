@@ -149,9 +149,9 @@ func roundToPage(size int64) int64 {
 	return (size + pageSize - 1) & ^(pageSize - 1)
 }
 
-// allocateRaw mmaps requested size. Returns raw bytes.
+// allocateRaw mmaps requested size (rounded up to page boundary). Returns raw bytes.
 func allocateRaw(size int64) []byte {
-	data, err := unix.Mmap(-1, 0, int(roundToPage(size+4096)),
+	data, err := unix.Mmap(-1, 0, int(roundToPage(size)),
 		unix.PROT_READ|unix.PROT_WRITE,
 		unix.MAP_ANON|unix.MAP_PRIVATE)
 	if err != nil {

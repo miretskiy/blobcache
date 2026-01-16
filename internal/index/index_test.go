@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/miretskiy/blobcache/internal/xmap"
 	"github.com/stretchr/testify/require"
 	"github.com/zeebo/xxh3"
 	"github.com/zhangyunhao116/skipmap"
@@ -21,15 +22,16 @@ import (
 // Indexer is the common interface for benchmarking old vs new implementations.
 type Indexer interface {
 	Get(Key) (Item, bool)
-	Put(Key, Item)
+	Put(Item)
 }
 
 func makeTestKey(i int) Key {
 	return xxh3.Hash128(fmt.Appendf(nil, "key-%d", i))
 }
 
-func makeItem(segmentID uint32, physLen uint32) Item {
+func makeItem(key Key, segmentID uint32, physLen uint32) Item {
 	return Item{
+		Key:         key,
 		SegmentID:   segmentID,
 		PhysicalLen: physLen,
 	}
@@ -67,8 +69,8 @@ func newOldIndex() *oldIndex {
 	}
 }
 
-func (idx *oldIndex) Put(key Key, item Item) {
-	k64 := key.Lo
+func (idx *oldIndex) Put(item Item) {
+	k64 := item.Key.Lo
 
 	if n, ok := idx.blobs.Load(k64); ok {
 		n.entry = item
@@ -102,26 +104,38 @@ func (idx *oldIndex) Get(key Key) (Item, bool) {
 }
 
 // -----------------------------------------------------------------------------
+// Alignment Tests (Validates struct layout at test time, not runtime)
+// -----------------------------------------------------------------------------
+
+func TestIndex_Alignment(t *testing.T) {
+	// This guarantees the layout is correct forever.
+	// If someone messes up ShardState padding, 'go test' fails immediately.
+	if err := xmap.VerifyAlignment[uint32, ShardState](); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// -----------------------------------------------------------------------------
 // Functional Correctness Tests
 // -----------------------------------------------------------------------------
 
 func TestBasicCRUD(t *testing.T) {
 	idx := New(1024)
 	k1 := makeTestKey(1)
-	item1 := makeItem(1, 50)
+	item1 := makeItem(k1, 1, 50)
 	item1.Offset = 100
 
 	// Put & Get
-	idx.Put(k1, item1)
+	idx.Put(item1)
 	got, found := idx.Get(k1)
 	require.True(t, found, "Key should be found after Put")
 	require.Equal(t, item1.SegmentID, got.SegmentID)
 	require.Equal(t, item1.Offset, got.Offset)
 
 	// Update
-	item2 := makeItem(2, 60)
+	item2 := makeItem(k1, 2, 60)
 	item2.Offset = 200
-	idx.Put(k1, item2)
+	idx.Put(item2)
 	got, _ = idx.Get(k1)
 	require.Equal(t, uint32(2), got.SegmentID, "Update failed: SegmentID should change")
 
@@ -138,7 +152,8 @@ func TestArenaReuse(t *testing.T) {
 
 	// Fill
 	for i := 0; i < count; i++ {
-		idx.Put(makeTestKey(i), makeItem(uint32(i), 10))
+		k := makeTestKey(i)
+		idx.Put(makeItem(k, uint32(i), 10))
 	}
 
 	getArenaSize := func() int {
@@ -161,7 +176,8 @@ func TestArenaReuse(t *testing.T) {
 
 	// Refill
 	for i := 0; i < count; i++ {
-		idx.Put(makeTestKey(i), makeItem(uint32(i), 20))
+		k := makeTestKey(i)
+		idx.Put(makeItem(k, uint32(i), 20))
 	}
 
 	finalSize := getArenaSize()
@@ -189,9 +205,9 @@ func TestEviction_ClockLogic(t *testing.T) {
 	// Insert A, B, C (Initially Cold)
 	// After inserts: list is C(head) <-> B <-> A <-> C (circular)
 	// hand stays at A (first insert)
-	idx.Put(A, makeItem(1, 100))
-	idx.Put(B, makeItem(2, 100))
-	idx.Put(C, makeItem(3, 100))
+	idx.Put(makeItem(A, 1, 100))
+	idx.Put(makeItem(B, 2, 100))
+	idx.Put(makeItem(C, 3, 100))
 
 	// Access A (Mark Hot)
 	idx.Get(A)
@@ -217,7 +233,8 @@ func TestEviction_SizeBased(t *testing.T) {
 
 	// Insert 100KB
 	for i := 0; i < count; i++ {
-		idx.Put(makeTestKey(i), makeItem(uint32(i), itemSize))
+		k := makeTestKey(i)
+		idx.Put(makeItem(k, uint32(i), itemSize))
 	}
 
 	// Request eviction of 50KB
@@ -238,7 +255,8 @@ func TestLen(t *testing.T) {
 	require.Equal(t, 0, idx.Len())
 
 	for i := 0; i < 50; i++ {
-		idx.Put(makeTestKey(i), makeItem(uint32(i), 100))
+		k := makeTestKey(i)
+		idx.Put(makeItem(k, uint32(i), 100))
 	}
 	require.Equal(t, 50, idx.Len())
 
@@ -249,7 +267,8 @@ func TestLen(t *testing.T) {
 func TestStats(t *testing.T) {
 	idx := New(100)
 	for i := 0; i < 100; i++ {
-		idx.Put(makeTestKey(i), makeItem(uint32(i), 100))
+		k := makeTestKey(i)
+		idx.Put(makeItem(k, uint32(i), 100))
 	}
 
 	stats := idx.Stats()
@@ -288,7 +307,7 @@ func TestConcurrency_Correctness(t *testing.T) {
 			r := rand.New(rand.NewSource(int64(id)))
 			for opsCount.Add(1) <= numOps {
 				k := makeTestKey(r.Intn(keySpace))
-				idx.Put(k, makeItem(uint32(id), 100))
+				idx.Put(makeItem(k, uint32(id), 100))
 				if r.Intn(100) == 0 {
 					runtime.Gosched()
 				}
@@ -348,7 +367,7 @@ func BenchmarkGC_Comparison(b *testing.B) {
 				defer wg.Done()
 				for i := 0; i < chunk; i++ {
 					k := makeTestKey(offset + i)
-					idx.Put(k, makeItem(uint32(offset+i), 100))
+					idx.Put(makeItem(k, uint32(offset+i), 100))
 				}
 			}(w * chunk)
 		}
@@ -386,7 +405,7 @@ func BenchmarkGC_Comparison(b *testing.B) {
 				defer wg.Done()
 				for i := 0; i < chunk; i++ {
 					k := makeTestKey(offset + i)
-					idx.Put(k, makeItem(uint32(offset+i), 100))
+					idx.Put(makeItem(k, uint32(offset+i), 100))
 				}
 			}(w * chunk)
 		}
@@ -419,7 +438,8 @@ func benchThroughput(b *testing.B, idx Indexer, keySpace int) {
 
 	// Pre-populate
 	for i := 0; i < keySpace; i++ {
-		idx.Put(makeTestKey(i), makeItem(0, 100))
+		k := makeTestKey(i)
+		idx.Put(makeItem(k, 0, 100))
 	}
 
 	b.ResetTimer()
@@ -430,7 +450,7 @@ func benchThroughput(b *testing.B, idx Indexer, keySpace int) {
 			if r.Float32() < 0.90 {
 				idx.Get(k)
 			} else {
-				idx.Put(k, makeItem(0, 100))
+				idx.Put(makeItem(k, 0, 100))
 			}
 		}
 	})

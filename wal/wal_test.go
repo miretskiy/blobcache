@@ -462,7 +462,7 @@ func TestWAL_RecoverMultipleFiles(t *testing.T) {
 func TestComputeRecoveryCheckpoint(t *testing.T) {
 	tests := []struct {
 		name     string
-		segments []record.SegmentEnvelope
+		segments []record.SegmentFooter
 		want     uint64
 	}{
 		{
@@ -472,14 +472,14 @@ func TestComputeRecoveryCheckpoint(t *testing.T) {
 		},
 		{
 			name: "single segment",
-			segments: []record.SegmentEnvelope{
+			segments: []record.SegmentFooter{
 				{MaxSeqID: 100},
 			},
 			want: 100,
 		},
 		{
 			name: "multiple segments",
-			segments: []record.SegmentEnvelope{
+			segments: []record.SegmentFooter{
 				{MaxSeqID: 100},
 				{MaxSeqID: 500},
 				{MaxSeqID: 250},

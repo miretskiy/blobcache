@@ -672,3 +672,214 @@ The `WithCacheAfterRead` option provides a mechanism to promote cold data into t
                v
        [ Return to User ]
 ```
+
+---
+
+## 12. Write-Ahead Log (WAL)
+
+BlobCache supports an optional Write-Ahead Log that transforms the cache into a crash-consistent Content Addressable Storage (CAS) system. When enabled, every Put operation is durably recorded before the caller returns, guaranteeing that data survives process crashes and system restarts.
+
+### 12.1 When to Use WAL
+
+WAL is appropriate for workloads requiring durability guarantees beyond the default behavior:
+
+- **CAS Mode**: When using BlobCache as Content Addressable Storage where data loss is unacceptable
+- **Strong Durability**: When every Put must be durable before returning to the caller
+- **Delete Support**: WAL enables explicit Delete operations with crash-consistent tombstones
+
+Without WAL, BlobCache operates as a high-performance cache where data in the MemTable may be lost on crash (data already flushed to segments is always durable).
+
+### 12.2 Group Commit Architecture
+
+WAL uses a group commit strategy that amortizes the cost of `fsync` across multiple concurrent writers:
+
+```text
+CONCURRENT WRITERS                    LEADER ELECTION
+      |                                     |
+      v                                     v
++-------------+    +-------------+    +-----------+
+| Writer A    |--->| pending     |--->| writerBusy|
+| Writer B    |    | []*request  |    | (atomic)  |
+| Writer C    |    +-------------+    +-----------+
++-------------+          |                  |
+      |                  v                  |
+      |         +----------------+          |
+      |         | Leader flushes |<---------+
+      |         | entire batch   |
+      |         +----------------+
+      |                  |
+      v                  v
++-------------+    +-------------+
+| sync.Cond   |    | writev()    |
+| Wait()      |    | fdatasync() |
++-------------+    +-------------+
+      |                  |
+      v                  v
++----------------------------------+
+|    All writers in batch return   |
++----------------------------------+
+```
+
+**Key Implementation Details:**
+
+1. **Double-Buffered Queues (Ping-Pong)**: Two pre-allocated slices (`pending` and `flushing`) are swapped atomically, eliminating allocation during the hot path
+2. **Leader Election**: A single `writerBusy` atomic bool ensures only one goroutine performs I/O at a time
+3. **sync.Cond Signaling**: Waiters use `sync.Cond` instead of per-request channels, reducing allocation overhead
+4. **net.Buffers (writev)**: All records are encoded into `net.Buffers` for gathered I/O, reducing syscall overhead from N writes to ~1 writev call
+
+### 12.3 WAL File Format
+
+WAL entries use the **unified `record.Record` format** (35-byte header + key + value), enabling shared encoding/decoding code with segment files.
+
+**File Layout:**
+
+```text
++-----------------------------------------------------------+
+| File Header (32 bytes)                                    |
+|   Magic: "BLOBWAL1" (8 bytes)                             |
+|   Version: 1 (4 bytes)                                    |
+|   CreatedAt: UnixNano (8 bytes)                           |
+|   Flags: Reserved (4 bytes)                               |
+|   HeaderCRC: CRC32 (4 bytes)                              |
+|   Padding (4 bytes)                                       |
++-----------------------------------------------------------+
+| Record 1 (35-byte header + key + value)                   |
++-----------------------------------------------------------+
+| Record 2 ...                                              |
++-----------------------------------------------------------+
+| Record N                                                  |
++-----------------------------------------------------------+
+```
+
+**File Naming:**
+
+WAL files are named by the **first SeqID** written to them, using 20-digit zero-padding:
+- `wal-00001736489723456789.log` (covers SeqID 1736489723456789 through rotation)
+
+This naming scheme provides:
+- Natural ordering for recovery (files sort by sequence)
+- 1:1 pairing with MemTable slabs (each slab rotation creates a new WAL file)
+- Simple cleanup (delete WAL file when corresponding slab is flushed to segment)
+
+### 12.4 Crash-Only Initialization
+
+BlobCache uses "crash-only" initialization for WAL recovery. Rather than maintaining complex state about partially-recovered data, the system fully recovers WAL entries, flushes them to segments, and then restarts cleanly:
+
+```text
+New() {
+    for attempt := 1; attempt <= 2; attempt++ {
+        cache, recovered := open()
+
+        if !recovered {
+            return cache  // Clean start
+        }
+
+        // WAL recovery happened - close and restart fresh
+        cache.Close()
+    }
+
+    // If WAL still exists after 2 attempts, something is wrong
+    return error("WAL files still present")
+}
+```
+
+**Recovery Flow:**
+
+1. **Scan Segments**: Compute `checkpoint = max(segment.MaxSeqID)` across all committed segments
+2. **Filter WAL Files**: For each WAL file, if `firstSeqID <= checkpoint`, delete it (already flushed)
+3. **Replay Records**: For uncommitted WAL files, replay each record through `ReplayRecord()`
+4. **Flush After Each File**: Trigger a flush after replaying each WAL file, ensuring 1:1 slab/WAL correspondence
+5. **Close and Restart**: After recovery, close the cache and restart for a clean state
+
+This two-attempt loop guarantees:
+- No "mixed mode" initialization with partially-recovered state
+- Simple, predictable behavior after any crash scenario
+- WAL files are deleted through the normal flush path
+
+### 12.5 Write Path Integration
+
+WAL writes happen **before** slab allocation, ensuring clean failure handling:
+
+```text
+Put(key, value) {
+    // 1. Build record (outside lock - pure computation)
+    rec := record.NewRecord(seqID, key, value, ...)
+
+    // 2. WAL write (outside lock - I/O)
+    // If this fails, no state has been modified
+    if wal != nil && !IsDegraded() {
+        if err := wal.Write(rec); err != nil {
+            ReportError(err)  // Enter degraded mode
+            return err
+        }
+    }
+
+    // 3. Slab allocation and write (may retry on rotation)
+    return writeToSlab(rec)
+}
+```
+
+**Key Ordering Guarantees:**
+
+1. **Record Building**: Happens before acquiring any locks (parallel compression)
+2. **WAL Write**: Blocks until `fdatasync` completes (durability guarantee)
+3. **Slab Allocation**: Only happens after WAL success (no orphaned slab data)
+4. **Degraded Mode**: WAL failure triggers degraded mode; subsequent writes skip WAL
+
+### 12.6 WAL File Lifecycle
+
+WAL files are deleted through the normal flush path, not during recovery:
+
+```text
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│  WAL File   │     │ ActiveSlab  │     │  Segment    │
+│  (SeqID X)  │     │ (slabID=X)  │     │  (flushed)  │
+└──────┬──────┘     └──────┬──────┘     └──────┬──────┘
+       │                   │                   │
+       │   1. Records      │                   │
+       │   written to      │                   │
+       │   both WAL        │                   │
+       │   and slab        │                   │
+       │                   │                   │
+       │              2. Slab rotates          │
+       │                   │                   │
+       │              3. Flush worker          │
+       │                   │ writes segment    │
+       │                   ├──────────────────>│
+       │                   │                   │
+       │              4. Index updated         │
+       │                   │                   │
+       │<──────────────────┤                   │
+       │   5. WAL file     │                   │
+       │   deleted         │                   │
+       │                   │                   │
+```
+
+This design ensures:
+- WAL files are only deleted after data is durably in a segment
+- No explicit coordination needed during recovery
+- Simple crash semantics: WAL files exist = data needs recovery
+
+### 12.7 Performance Characteristics
+
+| Scenario | Impact | Notes |
+|----------|--------|-------|
+| High concurrency (100+ writers) | ~5-10% throughput reduction | fsync cost amortized across batch |
+| Single writer | ~50% throughput reduction | fsync per write (no batching) |
+| Batch writes | Minimal impact | Single fsync per batch |
+| Recovery time | O(WAL size) | Linear scan, ~1 second per 256MB |
+
+**Configuration:**
+
+```go
+// Enable WAL with default settings (fdatasync after each batch)
+cache, _ := blobcache.New(path, blobcache.WithWAL())
+
+// Full durability (fsync - includes metadata)
+cache, _ := blobcache.New(path, blobcache.WithWAL(), blobcache.WithWALSyncMode(wal.SyncFull))
+
+// Testing only (no sync)
+cache, _ := blobcache.New(path, blobcache.WithWAL(), blobcache.WithWALSyncMode(wal.SyncNone))
+```
+
+---

@@ -2,6 +2,7 @@ package wal
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -47,7 +48,7 @@ func (w *WAL) recoverFile(path string, applyFn func(record.Record) error) error 
 		recHeaderBuf := make([]byte, record.HeaderSize)
 		_, err := io.ReadFull(reader, recHeaderBuf)
 		if err != nil {
-			if err == io.EOF || err == io.ErrUnexpectedEOF {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 				break // Clean end of file (or partial write at end)
 			}
 			break // Other error, stop reading

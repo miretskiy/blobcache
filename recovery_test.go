@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/miretskiy/blobcache/wal"
+	"github.com/miretskiy/blobcache/internal/wal"
 	"github.com/stretchr/testify/require"
 )
 

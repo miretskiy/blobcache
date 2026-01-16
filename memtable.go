@@ -9,8 +9,8 @@ import (
 
 	"github.com/miretskiy/blobcache/compression"
 	"github.com/miretskiy/blobcache/internal/record"
+	"github.com/miretskiy/blobcache/internal/wal"
 	"github.com/miretskiy/blobcache/internal/xmap"
-	"github.com/miretskiy/blobcache/wal"
 )
 
 const (

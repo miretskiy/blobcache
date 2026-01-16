@@ -6,7 +6,7 @@ import (
 
 	"github.com/miretskiy/blobcache/compression"
 	"github.com/miretskiy/blobcache/internal/sys"
-	"github.com/miretskiy/blobcache/wal"
+	"github.com/miretskiy/blobcache/internal/wal"
 )
 
 // IOConfig holds I/O strategy settings
@@ -31,8 +31,8 @@ type CompressionConfig struct {
 
 // WALConfig holds write-ahead log settings
 type WALConfig struct {
-	Enabled  bool         // Enable WAL for durability (default: false)
-	SyncMode wal.SyncMode // Sync mode for WAL writes (default: SyncData)
+	Enabled bool // Enable WAL for durability (default: false)
+	wal.Config
 }
 
 // MaxSegmentSize is the maximum allowed segment size (4GB).
@@ -193,6 +193,13 @@ func WithWALSyncMode(mode wal.SyncMode) Option {
 	return funcOpt(func(c *config) { c.WAL.SyncMode = mode })
 }
 
+// WithWALDir configures the wal to use different directory from the
+// cache directory.  Allows splitting WAL, possibly into dedicated disk.
+// By default, creates "wal" subdirectory under the cache directory.
+func WithWALDir(dir string) Option {
+	return funcOpt(func(c *config) { c.WAL.Dir = dir })
+}
+
 func defaultConfig(path string) config {
 	return config{
 		Path:                path,
@@ -218,8 +225,8 @@ func defaultConfig(path string) config {
 			MinSize: 512, // Don't compress small blobs
 		},
 		WAL: WALConfig{
-			Enabled:  false,        // Disabled by default (ephemeral cache mode)
-			SyncMode: wal.SyncData, // fdatasync for durability when enabled
+			Enabled: false,                              // Disabled by default (ephemeral cache mode)
+			Config:  wal.Config{SyncMode: wal.SyncData}, // fdatasync for durability when enabled
 		},
 	}
 }

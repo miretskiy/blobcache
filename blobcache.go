@@ -16,7 +16,7 @@ import (
 	"github.com/miretskiy/blobcache/internal/index"
 	"github.com/miretskiy/blobcache/internal/record"
 	"github.com/miretskiy/blobcache/internal/sys"
-	"github.com/miretskiy/blobcache/wal"
+	"github.com/miretskiy/blobcache/internal/wal"
 	"github.com/zeebo/xxh3"
 )
 
@@ -592,14 +592,10 @@ func (c *Cache) maybeTriggerBloomRebuild() error {
 // initWAL opens the WAL for writing.
 // WAL files are named by the first SeqID written to them, so no pre-initialization needed.
 func (c *Cache) initWAL() (*wal.WAL, error) {
-	walDir := filepath.Join(c.Path, "wal")
-
-	cfg := wal.Config{
-		Dir:      walDir,
-		SyncMode: c.config.WAL.SyncMode,
+	if c.WAL.Dir == "" {
+		c.WAL.Dir = filepath.Join(c.Path, "wal")
 	}
-
-	return wal.Open(cfg)
+	return wal.Open(c.WAL.Config)
 }
 
 // cacheReplayer implements wal.Replayer, wrapping Cache for WAL recovery.

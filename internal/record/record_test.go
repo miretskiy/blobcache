@@ -342,6 +342,36 @@ func TestAppendRecord_DecodeRecord_RoundTrip(t *testing.T) {
 	require.Equal(t, value, decoded.Value)
 }
 
+func TestRecord_EncodeTo(t *testing.T) {
+	key := []byte("encode-to-key")
+	value := []byte("encode-to-value-data")
+	seqID := uint64(999)
+
+	rec := NewRecord(seqID, key, value, int64(len(value)))
+
+	// Pre-allocate buffer of exact size
+	buf := make([]byte, rec.EncodedSize())
+	rec.EncodeTo(buf)
+
+	// Verify it matches AppendRecord output
+	appendBuf := AppendRecord(nil, rec)
+	require.Equal(t, appendBuf, buf)
+
+	// Verify round-trip
+	decoded, err := DecodeRecord(buf, true)
+	require.NoError(t, err)
+	require.Equal(t, key, decoded.Key)
+	require.Equal(t, value, decoded.Value)
+}
+
+func TestRecord_EncodeTo_BufferTooSmall(t *testing.T) {
+	rec := NewRecord(1, []byte("key"), []byte("value"), 5)
+
+	// Buffer smaller than needed - should panic
+	buf := make([]byte, rec.EncodedSize()-1)
+	require.Panics(t, func() { rec.EncodeTo(buf) })
+}
+
 func TestDecodeRecord_CRCMismatch(t *testing.T) {
 	key := []byte("key")
 	value := []byte("value")

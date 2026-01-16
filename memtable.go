@@ -188,8 +188,9 @@ func (mt *MemTable) putLarge(seqID uint64, hash Key, keyBytes, value []byte, che
 	// 4. Allocate slab just for this record
 	as := mt.newActiveSlab(rec.EncodedSize())
 
-	// 5. Write record using Append (updates wPos)
-	offset := as.Append(record.AppendRecord(nil, rec))
+	// 5. Write record directly (zero-copy)
+	buf, offset := as.Alloc(rec.EncodedSize())
+	rec.EncodeTo(buf)
 
 	// 6. Create SlabEntry for index lookup
 	entry := SlabEntry{
@@ -251,20 +252,19 @@ func (mt *MemTable) putActiveCompressed(
 	}
 
 	active := mt.mu.active
-	writeSize := int64(rec.EncodedSize())
+	writeSize := rec.EncodedSize()
 
-	// 4. Check Capacity & Rotate
-	if active.wPos+writeSize > active.Cap() {
+	// 4. Allocate space (under lock) - combines capacity check and reservation
+	buf, wPos := active.Alloc(writeSize)
+	if buf == nil {
 		rotateUnlocked := mt.prepareRotationLocked()
 		mt.mu.Unlock()
 		rotateUnlocked()
 		return mt.putActiveCompressed(seqID, hash, keyBytes, value, checksum, compressed)
 	}
 
-	// 5. Reservation (under lock)
+	// 5. Track pending write (after successful allocation)
 	active.pendingWrites.Add(1)
-	wPos := active.wPos
-	active.wPos += writeSize
 
 	// Track highest seqID in this slab for rotation handoff
 	if seqID > active.currentMaxSeq {
@@ -273,8 +273,8 @@ func (mt *MemTable) putActiveCompressed(
 
 	mt.mu.Unlock()
 
-	// 6. Write record to reserved region (outside lock)
-	active.WriteAt(record.AppendRecord(nil, rec), wPos)
+	// 6. Write record directly to reserved region (zero-copy, outside lock)
+	rec.EncodeTo(buf)
 
 	// 7. Create SlabEntry for index lookup
 	entry := SlabEntry{

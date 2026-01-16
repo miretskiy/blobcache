@@ -102,8 +102,6 @@ func (s *SharedSlab) ProtectedView(key Key, fn func(data []byte)) (bool, base.Bl
 	return true, base.ErrNone
 }
 
-// --- Write Access Safety ---
-
 type ActiveSlab struct {
 	SharedSlab
 	wPos       int64
@@ -118,26 +116,21 @@ type ActiveSlab struct {
 	currentMaxSeq uint64
 }
 
-// Append writes data at the current write position and advances wPos.
-// Returns the offset where data was written.
-// Use this for single-writer scenarios (e.g., putLarge).
-// For concurrent writes, use Reserve() under lock then WriteAt() outside lock.
-func (as *ActiveSlab) Append(data []byte) int64 {
-	offset := as.wPos
-	as.buf.WriteAt(data, offset)
-	as.wPos += int64(len(data))
-	return offset
-}
-
-// WriteAt writes data at the specified offset.
-// Use this for writing to pre-reserved regions in concurrent scenarios.
-func (as *ActiveSlab) WriteAt(data []byte, offset int64) {
-	as.buf.WriteAt(data, offset)
-}
-
-// Cap returns the capacity of the underlying buffer.
-func (as *ActiveSlab) Cap() int64 {
-	return int64(as.buf.Cap())
+// Alloc reserves n bytes in the slab.
+// Returns:
+//   - buf: A slice window into the reserved memory (safe to write to).
+//   - offset: The absolute offset of the start of the buffer (for the Index).
+//
+// If there isn't enough capacity, it returns nil, 0.
+// The caller should use EncodeTo methods to write directly into buf.
+func (as *ActiveSlab) Alloc(n int) (buf []byte, offset int64) {
+	offset = as.wPos
+	end := offset + int64(n)
+	if end > int64(as.buf.Cap()) {
+		return nil, 0
+	}
+	as.wPos = end
+	return as.buf.raw[offset:end], offset
 }
 
 type FlushTicket struct {

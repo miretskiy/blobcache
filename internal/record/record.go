@@ -263,6 +263,26 @@ func AppendRecord(dst []byte, r Record) []byte {
 	return dst
 }
 
+// EncodeTo writes the full record directly into dst using copy (zero-allocation).
+// Panics if dst is smaller than EncodedSize().
+func (r *Record) EncodeTo(dst []byte) {
+	// Bounds check via slice - panics if too small
+	dst = dst[:r.EncodedSize()]
+
+	// Header (inline to avoid function call overhead)
+	dst[offMagic] = r.Magic
+	binary.LittleEndian.PutUint64(dst[offFlags:], r.Flags)
+	binary.LittleEndian.PutUint64(dst[offSeqID:], r.SeqID)
+	binary.LittleEndian.PutUint16(dst[offKeyLen:], r.KeyLen)
+	binary.LittleEndian.PutUint64(dst[offPhysicalSize:], uint64(r.PhysicalSize))
+	binary.LittleEndian.PutUint64(dst[offLogicalSize:], uint64(r.LogicalSize))
+
+	// Key + Value
+	keyEnd := HeaderSize + len(r.Key)
+	copy(dst[HeaderSize:keyEnd], r.Key)
+	copy(dst[keyEnd:], r.Value)
+}
+
 // DecodeRecord decodes a record from src.
 // If verifyCRC is true and the header has a valid CRC, validates the checksum.
 // Returns ErrCRCMismatch if checksum validation fails.

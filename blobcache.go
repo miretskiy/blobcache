@@ -14,7 +14,9 @@ import (
 	"github.com/miretskiy/blobcache/base"
 	"github.com/miretskiy/blobcache/bloom"
 	"github.com/miretskiy/blobcache/internal/index"
+	"github.com/miretskiy/blobcache/internal/record"
 	"github.com/miretskiy/blobcache/internal/sys"
+	"github.com/miretskiy/blobcache/wal"
 	"github.com/zeebo/xxh3"
 )
 
@@ -32,6 +34,7 @@ type Cache struct {
 	config
 	index   *index.DurableIndex
 	storage *Storage
+	wal     *wal.WAL // nil if WAL disabled
 	bloom   struct {
 		atomic.Pointer[bloom.Filter]
 		hits        atomic.Uint64             // Bloom filter said "yes"
@@ -115,17 +118,54 @@ func (c *Cache) BGError() error {
 	return nil
 }
 
-// New creates a Cache at the specified path with optional configuration
+// New creates a Cache at the specified path with optional configuration.
+// Uses "crash-only" initialization: if WAL recovery is needed, we recover,
+// flush to segments, close, and re-open cleanly. This ensures the cache
+// always starts in a consistent state without "mixed mode" initialization.
 func New(path string, opts ...Option) (*Cache, error) {
 	cfg := defaultConfig(path)
 	for _, opt := range opts {
 		opt.apply(&cfg)
 	}
 
+	// Iterative open with hard limit of 2 attempts:
+	// - Attempt 1: If WAL exists, recover it, flush to segments, close, restart
+	// - Attempt 2: Should be clean (no WAL). If WAL still exists, fail.
+	const maxAttempts = 2
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		c, recovered, err := open(cfg)
+		if err != nil {
+			return nil, err
+		}
+
+		if !recovered {
+			// Clean open - no WAL recovery needed
+			return c, nil
+		}
+
+		// WAL recovery happened - close and restart fresh
+		log.Info("WAL recovery completed, restarting for clean state", "attempt", attempt)
+		if closeErr := c.Close(); closeErr != nil {
+			return nil, fmt.Errorf("close after recovery: %w", closeErr)
+		}
+
+		// Safety check: on second attempt, WAL should be gone
+		if attempt == maxAttempts-1 {
+			// Next iteration is the last - if we still have WAL files, that's a bug
+			continue
+		}
+	}
+
+	return nil, fmt.Errorf("WAL files still present after %d recovery attempts (bug?)", maxAttempts)
+}
+
+// open is the internal initialization function.
+// Returns (cache, recovered, error) where recovered=true means WAL recovery happened.
+func open(cfg config) (*Cache, bool, error) {
 	// Ensure directory structure exists and validate configuration
 	idx, err := checkOrInitialize(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("initialization failed: %w", err)
+		return nil, false, fmt.Errorf("initialization failed: %w", err)
 	}
 
 	// Create new bloom filter and figure out how much data on disk from segment meta.
@@ -140,7 +180,7 @@ func New(path string, opts ...Option) (*Cache, error) {
 		}
 		return true
 	}); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	c := &Cache{
@@ -149,6 +189,15 @@ func New(path string, opts ...Option) (*Cache, error) {
 		storage:         NewStorage(cfg, idx),
 		evictionTrigger: make(chan struct{}, 1),
 		stopCh:          make(chan struct{}),
+	}
+
+	// Initialize WAL if enabled
+	if cfg.WAL.Enabled {
+		w, walErr := c.initWAL()
+		if walErr != nil {
+			return nil, false, fmt.Errorf("WAL initialization failed: %w", walErr)
+		}
+		c.wal = w
 	}
 
 	// Initialize sequence counter with current nanosecond timestamp.
@@ -162,10 +211,22 @@ func New(path string, opts ...Option) (*Cache, error) {
 	c.bloom.Store(filter)
 	c.approxSize.Store(totalSize)
 	c.Knobs = cfg.knobs
-	c.memTable = NewMemTable(c.config, c, c, c.librarian)
+	c.memTable = NewMemTable(c.config, c, c, c.librarian, c.wal)
 	c.memTable.Knobs = c.Knobs
 
-	return c, nil
+	// Run WAL recovery after memtable is initialized
+	var recovered bool
+	if c.wal != nil {
+		var recoveryErr error
+		recovered, recoveryErr = c.runWALRecovery()
+		if recoveryErr != nil {
+			// Close what we've opened so far
+			c.wal.Close()
+			return nil, false, fmt.Errorf("WAL recovery failed: %w", recoveryErr)
+		}
+	}
+
+	return c, recovered, nil
 }
 
 // Start begins background operations (eviction worker).
@@ -195,8 +256,14 @@ func (c *Cache) Close() error {
 
 	c.wg.Wait()
 
-	// Collect all close errors
+	// Collect all close errors (WAL may be nil if disabled)
+	var walErr error
+	if c.wal != nil {
+		walErr = c.wal.Close()
+	}
+
 	return errors.Join(
+		walErr,
 		c.storage.Close(),
 		c.index.Close(),
 	)
@@ -403,12 +470,12 @@ func (c *Cache) putWithRetry(h Key, keyBytes, value []byte, checksum *uint32) {
 }
 
 type Batcher interface {
-	PutBatch(segID uint32, items []index.Item) error
+	PutBatch(segID uint32, items []index.Item, maxSeqID uint64) error
 }
 
-func (c *Cache) PutBatch(segID uint32, items []index.Item) error {
+func (c *Cache) PutBatch(segID uint32, items []index.Item, maxSeqID uint64) error {
 	// Phase 1: Ingest into Index
-	if err := c.index.IngestBatch(segID, items); err != nil {
+	if err := c.index.IngestBatch(segID, items, maxSeqID); err != nil {
 		return err
 	}
 
@@ -520,6 +587,80 @@ func (c *Cache) maybeTriggerBloomRebuild() error {
 		return c.rebuildBloom()
 	}
 	return nil
+}
+
+// initWAL opens the WAL for writing.
+// WAL files are named by the first SeqID written to them, so no pre-initialization needed.
+func (c *Cache) initWAL() (*wal.WAL, error) {
+	walDir := filepath.Join(c.Path, "wal")
+
+	cfg := wal.Config{
+		Dir:      walDir,
+		SyncMode: c.config.WAL.SyncMode,
+	}
+
+	return wal.Open(cfg)
+}
+
+// cacheReplayer implements wal.Replayer, wrapping Cache for WAL recovery.
+type cacheReplayer struct {
+	cache *Cache
+}
+
+func (r *cacheReplayer) ReplayRecord(rec record.Record) error {
+	// Update bloom filter
+	h := xxh3.Hash128(rec.Key)
+	r.cache.bloom.Load().Add(h)
+
+	if rec.IsDeleted() {
+		// Tombstone - for now we just skip (future: implement Delete)
+		return nil
+	}
+
+	// Replay the Put directly:
+	// - Use original SeqID (not new sequence)
+	// - Use original CRC (already verified during WAL read)
+	// - Bypass compression (value is already in final form)
+	// - Write record as-is to slab
+	return r.cache.memTable.ReplayRecord(h, rec)
+}
+
+func (r *cacheReplayer) Flush() {
+	r.cache.memTable.Flush()
+}
+
+func (r *cacheReplayer) Drain() {
+	r.cache.memTable.Drain()
+}
+
+// runWALRecovery replays uncommitted WAL entries into the memtable.
+// Returns (recovered, error) where recovered=true if any WAL files were replayed.
+func (c *Cache) runWALRecovery() (bool, error) {
+	// Compute checkpoint: max SeqID across all committed segments.
+	// Any WAL file with firstSeqID <= checkpoint has already been flushed.
+	var checkpoint uint64
+	if err := c.index.ForEachSegment(func(m index.SegmentManifest) bool {
+		if m.MaxSeqID > checkpoint {
+			checkpoint = m.MaxSeqID
+		}
+		return true
+	}); err != nil {
+		return false, fmt.Errorf("scan segments: %w", err)
+	}
+
+	// isCommitted returns true if the WAL file's data is already in a segment.
+	// Since each WAL file contains a contiguous range [firstSeqID, maxSeqID],
+	// if firstSeqID <= checkpoint, all its data was already flushed.
+	isCommitted := func(firstSeqID uint64) bool {
+		return firstSeqID <= checkpoint
+	}
+
+	replayer := &cacheReplayer{cache: c}
+	recovered, err := c.wal.Recover(replayer, isCommitted)
+	if err != nil {
+		return false, err
+	}
+	return recovered, nil
 }
 
 // evictionWorker handles eviction requests and periodic compaction

@@ -110,6 +110,12 @@ type ActiveSlab struct {
 	pendingWrites atomic.Int64
 	retired       atomic.Bool
 
+	// slabID is the first SeqID written to this slab.
+	// WAL files are named by this ID (wal-{slabID}.log), enabling 1:1 pairing
+	// between slabs and WAL files. Set on first write, 0 means no writes yet.
+	// Used for WAL.DeleteFile() after segment flush.
+	slabID uint64
+
 	// currentMaxSeq tracks the highest SeqID written to this slab.
 	// Used during rotation to set maxSealedSeq in MemTable.
 	// Accessed only under MemTable.mu.Lock, so no atomics needed.

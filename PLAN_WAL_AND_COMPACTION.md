@@ -235,41 +235,54 @@ The WAL transforms blobcache from a cache with size-based eviction into a CAS sy
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 1.3 WAL Entry Format
+### 1.3 WAL Entry Format (Unified with Segments)
+
+WAL entries use the **same `record.Record` format** as segment files. This enables:
+- Shared encoding/decoding code
+- Consistent tooling for debugging and recovery
+- Simpler testing (one format to verify)
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                    WAL ENTRY FORMAT                             │
+│           (Same as record.Record - 35-byte header)              │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
 │  ┌──────────────────────────────────────────────────────────┐  │
-│  │ Header (24 bytes)                                         │  │
-│  │  ├─ EntryType    (1 byte)   : PUT=0x01, DELETE=0x02      │  │
-│  │  ├─ Flags        (1 byte)   : Reserved for future use     │  │
-│  │  ├─ KeyLen       (2 bytes)  : Length of key              │  │
-│  │  ├─ ValueLen     (4 bytes)  : Length of value (0 for DEL)│  │
+│  │ Header (35 bytes) - record.Header                         │  │
+│  │  ├─ Magic        (1 byte)   : 0xBB=valid, 0x00=hole      │  │
+│  │  ├─ Flags        (8 bytes)  : Compression, CRC, Deleted  │  │
+│  │  │     └─ Bits 31-0: CRC32 of key+value                  │  │
+│  │  │     └─ Bit 33:    FlagDeleted (tombstone)             │  │
+│  │  │     └─ Bits 63-60: Compression codec                  │  │
 │  │  ├─ SeqID        (8 bytes)  : Monotonic sequence ID      │  │
-│  │  └─ KeyHash      (8 bytes)  : xxhash64 of key            │  │
+│  │  ├─ KeyLen       (2 bytes)  : Length of key              │  │
+│  │  ├─ PhysicalSize (8 bytes)  : Value size on disk         │  │
+│  │  └─ LogicalSize  (8 bytes)  : Uncompressed value size    │  │
 │  └──────────────────────────────────────────────────────────┘  │
 │  ┌──────────────────────────────────────────────────────────┐  │
 │  │ Payload                                                   │  │
-│  │  ├─ Key          (KeyLen bytes)                          │  │
-│  │  └─ Value        (ValueLen bytes, omitted for DELETE)    │  │
-│  └──────────────────────────────────────────────────────────┘  │
-│  ┌──────────────────────────────────────────────────────────┐  │
-│  │ Footer (4 bytes)                                          │  │
-│  │  └─ CRC32        (4 bytes)  : CRC32 of header + payload  │  │
+│  │  ├─ Key          (KeyLen bytes) : Original key bytes     │  │
+│  │  └─ Value        (PhysicalSize bytes, empty for DELETE)  │  │
 │  └──────────────────────────────────────────────────────────┘  │
 │                                                                 │
-│  Total: 28 + KeyLen + ValueLen bytes per entry                 │
+│  Total: 35 + KeyLen + PhysicalSize bytes per entry             │
+│                                                                 │
+│  DELETE entries:                                                │
+│  • FlagDeleted set in Flags                                    │
+│  • PhysicalSize = 0 (no value payload)                         │
+│  • LogicalSize = 0                                             │
 │                                                                 │
 │  SeqID enables:                                                 │
-│  • WAL rotation: Know which sequences are committed             │
-│  • Recovery dedup: Skip replaying already-persisted entries     │
+│  • WAL recovery checkpoint: max(segment.MaxSeqID)              │
+│  • Recovery rule: only replay if seqID > checkpoint            │
 │  • Ordering: Guarantee "latest wins" semantics                  │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+**Key Insight**: Using the unified format means WAL entries can be read with `record.DecodeRecord()`
+and written with `record.AppendRecord()`. No separate WAL-specific serialization needed.
 
 ### 1.4 WAL File Layout
 
@@ -306,36 +319,464 @@ The WAL transforms blobcache from a cache with size-based eviction into a CAS sy
 
 ### 1.5 Implementation Steps
 
-#### Step 1: Core WAL Types (`wal/types.go`)
+#### Step 1: Core WAL Types (`wal/wal.go`)
+
+Since we use the unified record format, WAL needs minimal type definitions:
 
 ```go
 package wal
 
-// EntryType identifies the operation type
-type EntryType byte
+import (
+    "os"
+    "sync"
+    "sync/atomic"
 
-const (
-    EntryTypePut    EntryType = 0x01
-    EntryTypeDelete EntryType = 0x02
+    "github.com/miretskiy/blobcache/internal/record"
 )
 
-// Entry represents a single WAL entry
-type Entry struct {
-    Type    EntryType
-    SeqID   uint64   // Monotonic sequence ID (from Phase 0)
-    KeyHash uint64   // xxhash64 of key
-    Key     []byte
-    Value   []byte   // nil for DELETE
+// Config configures WAL behavior.
+type Config struct {
+    Dir           string        // Directory for WAL files
+    MaxFileSize   int64         // Max size per WAL file before rotation (default: 64MB)
+    SyncMode      SyncMode      // fdatasync, fsync, or none
+    GroupCommitNS int64         // Max nanoseconds to wait for group commit (default: 1ms)
 }
 
-// request is the internal ticket for group commit
+type SyncMode int
+
+const (
+    SyncNone     SyncMode = iota // No sync (testing only)
+    SyncData                     // fdatasync (metadata not synced)
+    SyncFull                     // fsync (full durability)
+)
+
+// request is the internal ticket for group commit.
+// Each Put/Delete caller creates one and waits on done channel.
 type request struct {
-    entry Entry
-    done  bool
-    err   error
+    rec  record.Record // Unified record format
+    done chan error    // Signaled when batch is synced
+}
+
+// WAL implements write-ahead logging with group commit.
+type WAL struct {
+    cfg Config
+
+    mu         sync.Mutex
+    file       *os.File
+    fileSize   int64
+    fileSeqNum uint64 // WAL file sequence number for rotation
+
+    // Double-buffered pending queues (ping-pong)
+    pending  []*request
+    flushing []*request
+
+    // Leader election: only one goroutine writes at a time
+    writerBusy atomic.Bool
+
+    // Metrics
+    writtenBytes  atomic.Int64
+    writtenBlobs  atomic.Int64
+    syncCount     atomic.Int64
+    groupCommits  atomic.Int64
 }
 ```
 
+#### Step 2: Group Commit Manager (`wal/group_commit.go`)
+
+```go
+// Write adds a record to the WAL and blocks until the batch is synced.
+// Multiple concurrent callers will batch together for a single fsync.
+func (w *WAL) Write(rec record.Record) error {
+    // Create request ticket
+    req := &request{
+        rec:  rec,
+        done: make(chan error, 1),
+    }
+
+    // Add to pending queue (under lock)
+    w.mu.Lock()
+    w.pending = append(w.pending, req)
+    pendingCount := len(w.pending)
+    w.mu.Unlock()
+
+    // Try to become the leader (only one goroutine writes)
+    if w.writerBusy.CompareAndSwap(false, true) {
+        // We are the leader - flush the batch
+        w.flushBatch()
+        w.writerBusy.Store(false)
+    }
+
+    // Wait for our batch to complete (leader will signal us)
+    return <-req.done
+}
+
+// flushBatch writes all pending requests to disk with a single sync.
+// Called by the leader goroutine only.
+func (w *WAL) flushBatch() {
+    // Swap pending and flushing queues (under lock)
+    w.mu.Lock()
+    if len(w.pending) == 0 {
+        w.mu.Unlock()
+        return
+    }
+    w.pending, w.flushing = w.flushing[:0], w.pending
+    w.mu.Unlock()
+
+    // Check if we need to rotate
+    if err := w.maybeRotate(); err != nil {
+        w.signalBatch(err)
+        return
+    }
+
+    // Build scatter-gather buffers (net.Buffers)
+    var totalSize int64
+    buffers := make(net.Buffers, 0, len(w.flushing))
+    for _, req := range w.flushing {
+        encoded := record.AppendRecord(nil, req.rec)
+        buffers = append(buffers, encoded)
+        totalSize += int64(len(encoded))
+    }
+
+    // Write all buffers with writev (single syscall)
+    n, err := buffers.WriteTo(w.file)
+    if err != nil {
+        w.signalBatch(err)
+        return
+    }
+    w.fileSize += n
+
+    // Sync to disk
+    if err := w.sync(); err != nil {
+        w.signalBatch(err)
+        return
+    }
+
+    // Update metrics
+    w.writtenBytes.Add(totalSize)
+    w.writtenBlobs.Add(int64(len(w.flushing)))
+    w.syncCount.Add(1)
+    w.groupCommits.Add(1)
+
+    // Signal all waiters in the batch
+    w.signalBatch(nil)
+}
+
+func (w *WAL) signalBatch(err error) {
+    for _, req := range w.flushing {
+        req.done <- err
+    }
+}
+
+func (w *WAL) sync() error {
+    switch w.cfg.SyncMode {
+    case SyncData:
+        return sys.Fdatasync(w.file)
+    case SyncFull:
+        return w.file.Sync()
+    default:
+        return nil
+    }
+}
+```
+
+#### Step 3: WAL Rotation (`wal/rotation.go`)
+
+```go
+// maybeRotate creates a new WAL file if current exceeds MaxFileSize.
+func (w *WAL) maybeRotate() error {
+    if w.file != nil && w.fileSize < w.cfg.MaxFileSize {
+        return nil
+    }
+
+    // Close current file (if any)
+    if w.file != nil {
+        if err := w.sync(); err != nil {
+            return fmt.Errorf("sync before rotate: %w", err)
+        }
+        if err := w.file.Close(); err != nil {
+            return fmt.Errorf("close WAL: %w", err)
+        }
+    }
+
+    // Create new WAL file
+    w.fileSeqNum++
+    path := filepath.Join(w.cfg.Dir, fmt.Sprintf("wal-%08d.log", w.fileSeqNum))
+
+    f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+    if err != nil {
+        return fmt.Errorf("create WAL: %w", err)
+    }
+
+    // Write file header
+    hdr := walFileHeader{
+        Magic:     WALMagic,
+        Version:   1,
+        CreatedAt: time.Now().UnixNano(),
+    }
+    if _, err := hdr.WriteTo(f); err != nil {
+        f.Close()
+        return fmt.Errorf("write WAL header: %w", err)
+    }
+
+    w.file = f
+    w.fileSize = WALHeaderSize
+    return nil
+}
+```
+
+#### Step 4: Recovery Checkpoint Logic (`wal/recovery.go`)
+
+```go
+// RecoveryCheckpoint computes the recovery checkpoint from segment metadata.
+// Only WAL entries with SeqID > checkpoint need to be replayed.
+func ComputeRecoveryCheckpoint(segments []record.SegmentEnvelope) uint64 {
+    var maxSeqID uint64
+    for _, seg := range segments {
+        if seg.MaxSeqID > maxSeqID {
+            maxSeqID = seg.MaxSeqID
+        }
+    }
+    return maxSeqID
+}
+
+// Recover replays WAL entries that were not persisted to segments.
+// Returns the number of entries replayed.
+func (w *WAL) Recover(checkpoint uint64, applyFn func(record.Record) error) (int, error) {
+    // Find all WAL files
+    files, err := w.listWALFiles()
+    if err != nil {
+        return 0, err
+    }
+
+    var replayed int
+    for _, path := range files {
+        n, err := w.recoverFile(path, checkpoint, applyFn)
+        if err != nil {
+            return replayed, fmt.Errorf("recover %s: %w", path, err)
+        }
+        replayed += n
+    }
+
+    return replayed, nil
+}
+
+// recoverFile replays a single WAL file.
+func (w *WAL) recoverFile(path string, checkpoint uint64, applyFn func(record.Record) error) (int, error) {
+    f, err := os.Open(path)
+    if err != nil {
+        return 0, err
+    }
+    defer f.Close()
+
+    // Validate header
+    hdr, err := readWALHeader(f)
+    if err != nil {
+        return 0, fmt.Errorf("invalid WAL header: %w", err)
+    }
+
+    var replayed int
+    reader := bufio.NewReader(f)
+
+    for {
+        // Read record header first
+        headerBuf := make([]byte, record.HeaderSize)
+        if _, err := io.ReadFull(reader, headerBuf); err != nil {
+            if err == io.EOF {
+                break // Clean EOF
+            }
+            return replayed, fmt.Errorf("read header: %w", err)
+        }
+
+        hdr, err := record.DecodeHeader(headerBuf)
+        if err != nil {
+            // Corruption or incomplete write - stop recovery here
+            log.Warn("WAL recovery stopped at corruption", "path", path, "err", err)
+            break
+        }
+
+        // Read payload
+        payloadBuf := make([]byte, hdr.PayloadSize())
+        if _, err := io.ReadFull(reader, payloadBuf); err != nil {
+            log.Warn("WAL recovery stopped at incomplete record", "path", path)
+            break
+        }
+
+        // Decode full record
+        fullBuf := append(headerBuf, payloadBuf...)
+        rec, err := record.DecodeRecord(fullBuf, true) // Verify CRC
+        if err != nil {
+            log.Warn("WAL recovery CRC mismatch", "path", path, "err", err)
+            break
+        }
+
+        // Skip if already persisted to segments
+        if rec.SeqID <= checkpoint {
+            continue
+        }
+
+        // Apply the record (Put or Delete based on FlagDeleted)
+        if err := applyFn(rec); err != nil {
+            return replayed, fmt.Errorf("apply record seqID=%d: %w", rec.SeqID, err)
+        }
+        replayed++
+    }
+
+    return replayed, nil
+}
+```
+
+#### Step 5: Integration with Cache (`blobcache.go` changes)
+
+```go
+// Put writes a key-value pair, optionally through WAL.
+func (c *Cache) Put(key, value []byte) error {
+    seqID := c.nextSeq()
+    hash := hashKey(key)
+
+    // If WAL enabled, write to WAL first (durable)
+    if c.wal != nil {
+        rec := record.NewRecord(seqID, key, value, int64(len(value)))
+        if err := c.wal.Write(rec); err != nil {
+            return fmt.Errorf("WAL write: %w", err)
+        }
+    }
+
+    // Then write to MemTable (in-memory, eventually flushed to segments)
+    return c.putWithRetry(seqID, hash, key, value)
+}
+
+// Delete marks a key as deleted (tombstone).
+// Only available when WAL is enabled (CAS mode).
+func (c *Cache) Delete(key []byte) error {
+    if c.wal == nil {
+        return ErrDeleteRequiresWAL
+    }
+
+    seqID := c.nextSeq()
+    hash := hashKey(key)
+
+    // Create tombstone record
+    rec := record.Record{
+        Header: record.Header{
+            Magic:        record.RecordMagic,
+            Flags:        record.FlagDeleted, // Tombstone marker
+            SeqID:        seqID,
+            KeyLen:       uint16(len(key)),
+            PhysicalSize: 0, // No value for deletes
+            LogicalSize:  0,
+        },
+        Key:   key,
+        Value: nil,
+    }
+    rec.SetCRC(record.ComputeCRC(key, nil))
+
+    // Write tombstone to WAL
+    if err := c.wal.Write(rec); err != nil {
+        return fmt.Errorf("WAL write tombstone: %w", err)
+    }
+
+    // Update index to mark as deleted
+    return c.index.Delete(hash, seqID)
+}
+
+// Open with WAL recovery
+func Open(dir string, opts ...Option) (*Cache, error) {
+    // ... existing open logic ...
+
+    // If WAL enabled, recover
+    if c.wal != nil {
+        // Compute checkpoint from segment envelopes
+        envelopes, err := c.loadSegmentEnvelopes()
+        if err != nil {
+            return nil, fmt.Errorf("load segment envelopes: %w", err)
+        }
+        checkpoint := wal.ComputeRecoveryCheckpoint(envelopes)
+
+        // Replay WAL entries above checkpoint
+        replayed, err := c.wal.Recover(checkpoint, func(rec record.Record) error {
+            if rec.IsDeleted() {
+                return c.index.Delete(hashKey(rec.Key), rec.SeqID)
+            }
+            return c.putWithRetry(rec.SeqID, hashKey(rec.Key), rec.Key, rec.Value)
+        })
+        if err != nil {
+            return nil, fmt.Errorf("WAL recovery: %w", err)
+        }
+        log.Info("WAL recovery complete", "replayed", replayed, "checkpoint", checkpoint)
+    }
+
+    return c, nil
+}
+```
+
+#### Step 6: WAL Truncation (`wal/truncate.go`)
+
+```go
+// Truncate removes WAL files whose entries are fully persisted to segments.
+// Called after segment flush completes.
+func (w *WAL) Truncate(checkpoint uint64) error {
+    files, err := w.listWALFiles()
+    if err != nil {
+        return err
+    }
+
+    for _, path := range files {
+        // Check if all entries in this file are below checkpoint
+        maxSeq, err := w.scanMaxSeqID(path)
+        if err != nil {
+            log.Warn("cannot scan WAL file", "path", path, "err", err)
+            continue
+        }
+
+        // Safe to delete if all entries are persisted
+        if maxSeq <= checkpoint {
+            if err := os.Remove(path); err != nil {
+                log.Warn("cannot remove WAL file", "path", path, "err", err)
+            } else {
+                log.Info("truncated WAL file", "path", path, "maxSeq", maxSeq)
+            }
+        }
+    }
+
+    return nil
+}
+
+// scanMaxSeqID finds the highest SeqID in a WAL file.
+func (w *WAL) scanMaxSeqID(path string) (uint64, error) {
+    f, err := os.Open(path)
+    if err != nil {
+        return 0, err
+    }
+    defer f.Close()
+
+    // Skip header
+    if _, err := f.Seek(WALHeaderSize, io.SeekStart); err != nil {
+        return 0, err
+    }
+
+    var maxSeq uint64
+    headerBuf := make([]byte, record.HeaderSize)
+
+    for {
+        if _, err := io.ReadFull(f, headerBuf); err != nil {
+            break
+        }
+        hdr, err := record.DecodeHeader(headerBuf)
+        if err != nil {
+            break
+        }
+        if hdr.SeqID > maxSeq {
+            maxSeq = hdr.SeqID
+        }
+        // Skip payload
+        if _, err := f.Seek(int64(hdr.PayloadSize()), io.SeekCurrent); err != nil {
+            break
+        }
+    }
+
+    return maxSeq, nil
+}
+```
 
 ### 1.6 Testing Strategy
 

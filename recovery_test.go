@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/miretskiy/blobcache/wal"
 	"github.com/stretchr/testify/require"
 )
 
@@ -220,4 +221,202 @@ func TestRecovery_InvalidSegmentID(t *testing.T) {
 	if _, found := recovered.Get([]byte("key1")); !found {
 		t.Error("key1 not found after recovery")
 	}
+}
+
+// TestWAL_FileLifecycle verifies WAL files are created during Put and
+// deleted after segment flush completes.
+func TestWAL_FileLifecycle(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	cache, err := New(tmpDir,
+		WithWAL(),
+		WithWALSyncMode(wal.SyncNone), // Fast tests
+		WithSegmentSize(0),
+	)
+	require.NoError(t, err)
+
+	walDir := filepath.Join(tmpDir, "wal")
+
+	// Initially no WAL files
+	walFiles, _ := filepath.Glob(filepath.Join(walDir, "wal-*.log"))
+	require.Empty(t, walFiles, "expected no WAL files initially")
+
+	// Write data - creates WAL file
+	require.NoError(t, cache.Put([]byte("key1"), []byte("value1")))
+
+	walFiles, _ = filepath.Glob(filepath.Join(walDir, "wal-*.log"))
+	require.Len(t, walFiles, 1, "expected 1 WAL file after Put")
+
+	// Flush and drain - WAL file should be deleted
+	cache.Drain()
+
+	walFiles, _ = filepath.Glob(filepath.Join(walDir, "wal-*.log"))
+	require.Empty(t, walFiles, "expected WAL file deleted after flush")
+
+	require.NoError(t, cache.Close())
+}
+
+// TestWAL_RecoveryAfterCrash simulates a crash before flush and verifies
+// data is recovered from WAL on restart.
+func TestWAL_RecoveryAfterCrash(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// First session: write data but don't flush (simulate crash)
+	cache, err := New(tmpDir,
+		WithWAL(),
+		WithWALSyncMode(wal.SyncNone),
+		WithSegmentSize(0),
+	)
+	require.NoError(t, err)
+
+	testData := map[string][]byte{
+		"key1": []byte("value1-wal-test"),
+		"key2": []byte("value2-wal-test"),
+		"key3": []byte("value3-wal-test"),
+	}
+
+	for key, value := range testData {
+		require.NoError(t, cache.Put([]byte(key), value))
+	}
+
+	// Close WAL to ensure data is written but DON'T flush to segment
+	// This simulates a crash where memtable wasn't flushed
+	cache.wal.Close()
+
+	// Verify WAL file exists (data not flushed to segment)
+	walDir := filepath.Join(tmpDir, "wal")
+	walFiles, _ := filepath.Glob(filepath.Join(walDir, "wal-*.log"))
+	require.NotEmpty(t, walFiles, "expected WAL file to exist")
+
+	// Force close without proper cleanup (simulate crash)
+	cache.memTable.Close()
+	cache.librarian.Close()
+	cache.memTable.ClosePools()
+	cache.storage.Close()
+	cache.index.Close()
+
+	// Second session: recovery should restore data from WAL
+	recovered, err := New(tmpDir,
+		WithWAL(),
+		WithWALSyncMode(wal.SyncNone),
+		WithSegmentSize(0),
+	)
+	require.NoError(t, err)
+	defer recovered.Close()
+
+	// Verify all data is recovered
+	for key, expectedValue := range testData {
+		actualValue, found := recovered.Get([]byte(key))
+		require.True(t, found, "key %q not found after recovery", key)
+		require.Equal(t, expectedValue, actualValue, "value mismatch for key %q", key)
+	}
+
+	// WAL files should be gone after recovery (replayed and flushed)
+	recovered.Drain()
+	walFiles, _ = filepath.Glob(filepath.Join(walDir, "wal-*.log"))
+	require.Empty(t, walFiles, "expected WAL files cleaned up after recovery")
+}
+
+// TestWAL_CommittedFilesCleanedUp verifies that already-committed WAL files
+// are deleted during recovery without replaying.
+func TestWAL_CommittedFilesCleanedUp(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Write data and flush to segment (normal operation)
+	cache, err := New(tmpDir,
+		WithWAL(),
+		WithWALSyncMode(wal.SyncNone),
+		WithSegmentSize(0),
+	)
+	require.NoError(t, err)
+
+	require.NoError(t, cache.Put([]byte("key1"), []byte("value1")))
+	cache.Drain() // Flush to segment, WAL file deleted
+
+	// Create a second batch that will also be flushed
+	require.NoError(t, cache.Put([]byte("key2"), []byte("value2")))
+	cache.Drain()
+
+	// Close properly
+	require.NoError(t, cache.Close())
+
+	// No WAL files should remain
+	walDir := filepath.Join(tmpDir, "wal")
+	walFiles, _ := filepath.Glob(filepath.Join(walDir, "wal-*.log"))
+	require.Empty(t, walFiles, "expected no WAL files after clean shutdown")
+
+	// Reopen - should work with no WAL files to replay
+	recovered, err := New(tmpDir,
+		WithWAL(),
+		WithWALSyncMode(wal.SyncNone),
+		WithSegmentSize(0),
+	)
+	require.NoError(t, err)
+	defer recovered.Close()
+
+	// Data should still be accessible from segments
+	val, found := recovered.Get([]byte("key1"))
+	require.True(t, found)
+	require.Equal(t, []byte("value1"), val)
+
+	val, found = recovered.Get([]byte("key2"))
+	require.True(t, found)
+	require.Equal(t, []byte("value2"), val)
+}
+
+// TestWAL_MultipleSlabRecovery tests recovery with multiple WAL files (rotations).
+func TestWAL_MultipleSlabRecovery(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Use small buffer to force rotations
+	cache, err := New(tmpDir,
+		WithWAL(),
+		WithWALSyncMode(wal.SyncNone),
+		WithWriteBufferSize(4096), // Small buffer to force rotations
+		WithSegmentSize(0),
+	)
+	require.NoError(t, err)
+
+	// Write enough data to trigger multiple slab rotations
+	testData := make(map[string][]byte)
+	for i := 0; i < 50; i++ {
+		key := []byte(bytes.Repeat([]byte("k"), 20+i))
+		value := []byte(bytes.Repeat([]byte("v"), 100))
+		testData[string(key)] = value
+		require.NoError(t, cache.Put(key, value))
+	}
+
+	// Close WAL without flushing (simulate crash)
+	cache.wal.Close()
+
+	walDir := filepath.Join(tmpDir, "wal")
+
+	// Force close
+	cache.memTable.Close()
+	cache.librarian.Close()
+	cache.memTable.ClosePools()
+	cache.storage.Close()
+	cache.index.Close()
+
+	// Recover
+	recovered, err := New(tmpDir,
+		WithWAL(),
+		WithWALSyncMode(wal.SyncNone),
+		WithWriteBufferSize(4096),
+		WithSegmentSize(0),
+	)
+	require.NoError(t, err)
+	defer recovered.Close()
+
+	// Verify all data recovered
+	for key, expectedValue := range testData {
+		actualValue, found := recovered.Get([]byte(key))
+		require.True(t, found, "key not found after recovery")
+		require.Equal(t, expectedValue, actualValue)
+	}
+
+	// WAL files should be cleaned up
+	recovered.Drain()
+	walFiles, _ := filepath.Glob(filepath.Join(walDir, "wal-*.log"))
+	require.Empty(t, walFiles, "expected WAL files cleaned up after recovery")
 }

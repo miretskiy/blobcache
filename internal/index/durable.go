@@ -85,8 +85,8 @@ func (idx *DurableIndex) GetSegmentManifest(segmentID uint32) (SegmentManifest, 
 }
 
 // IngestBatch writes a batch of items for a segment to both RAM and disk.
-func (idx *DurableIndex) IngestBatch(segID uint32, items []Item) error {
-	if err := idx.segments.writeBatch(segID, items); err != nil {
+func (idx *DurableIndex) IngestBatch(segID uint32, items []Item, maxSeqID uint64) error {
+	if err := idx.segments.writeBatch(segID, items, maxSeqID); err != nil {
 		return err
 	}
 

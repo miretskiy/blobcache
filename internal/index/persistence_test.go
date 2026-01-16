@@ -24,7 +24,7 @@ func TestPersistence(t *testing.T) {
 			items[i] = Item{Key: Key{Lo: uint64(i)}, SegmentID: segID, PhysicalLen: 100}
 		}
 
-		err := p.writeBatch(segID, items)
+		err := p.writeBatch(segID, items, 0)
 		require.NoError(t, err)
 
 		chunks := 0
@@ -39,9 +39,9 @@ func TestPersistence(t *testing.T) {
 	})
 
 	t.Run("PrefixIsolation", func(t *testing.T) {
-		err := p.writeBatch(200, []Item{{Key: Key{Lo: 200}, SegmentID: 200}})
+		err := p.writeBatch(200, []Item{{Key: Key{Lo: 200}, SegmentID: 200}}, 0)
 		require.NoError(t, err)
-		err = p.writeBatch(300, []Item{{Key: Key{Lo: 300}, SegmentID: 300}})
+		err = p.writeBatch(300, []Item{{Key: Key{Lo: 300}, SegmentID: 300}}, 0)
 		require.NoError(t, err)
 
 		seen300 := false
@@ -113,7 +113,7 @@ func TestDeleteRecordsFromSegment_Collapse(t *testing.T) {
 		items[i] = Item{Key: Key{Lo: uint64(i + 1)}, SegmentID: segID}
 	}
 
-	err = p.writeBatch(segID, items)
+	err = p.writeBatch(segID, items, 0)
 	require.NoError(t, err)
 
 	// Verify initial state
@@ -161,7 +161,7 @@ func TestDurableIndex(t *testing.T) {
 		{Key: Key{Lo: 300}, SegmentID: segID, Offset: 300, PhysicalLen: 150},
 	}
 
-	err = idx.IngestBatch(segID, items)
+	err = idx.IngestBatch(segID, items, 0)
 	require.NoError(t, err)
 
 	// Verify in-memory lookup

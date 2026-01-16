@@ -49,14 +49,14 @@ func (tp *TrackedPool) Teardown() {
 	tp.extraRegions = nil
 }
 
-// MockBatcher implements: PutBatch(segID uint32, items []index.Item) error
+// MockBatcher implements the Batcher interface for testing.
 type MockBatcher struct {
 	mu      sync.Mutex
 	Batches map[uint32][]index.Item
 	Count   int
 }
 
-func (m *MockBatcher) PutBatch(segID uint32, items []index.Item) error {
+func (m *MockBatcher) PutBatch(segID uint32, items []index.Item, _ uint64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.Batches == nil {
@@ -182,7 +182,7 @@ func TestMemTable_Integration_Rotation(t *testing.T) {
 	mb := &MockBatcher{}
 	mh := &MockHealthReporter{}
 
-	mt := NewMemTable(cfg, mb, mh, &mockLibrarian{})
+	mt := NewMemTable(cfg, mb, mh, &mockLibrarian{}, nil)
 	defer mt.Close()
 
 	// Ingest blobs to force rotation across multiple 1MB segments.

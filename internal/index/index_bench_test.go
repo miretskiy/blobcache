@@ -16,10 +16,16 @@ func Benchmark_IndexLookup(b *testing.B) {
 	for _, numKeys := range sizes {
 		b.Run(fmt.Sprintf("Keys-%dK", numKeys>>10), func(b *testing.B) {
 			b.StopTimer()
-			tmpDir, _ := os.MkdirTemp("", "bench-index-lookup-*")
+			tmpDir, err := os.MkdirTemp("", "bench-index-lookup-*")
+			if err != nil {
+				b.Fatal(err)
+			}
 			defer os.RemoveAll(tmpDir)
 
-			idx, _ := Open(tmpDir, numKeys)
+			idx, err := Open(tmpDir, numKeys)
+			if err != nil {
+				b.Fatal(err)
+			}
 			defer idx.Close()
 
 			// Prepare Batch
@@ -43,7 +49,7 @@ func Benchmark_IndexLookup(b *testing.B) {
 				if end > numKeys {
 					end = numKeys
 				}
-				if err := idx.IngestBatch(uint32(i/batchSize), items[i:end]); err != nil {
+				if err := idx.IngestBatch(uint32(i/batchSize), items[i:end], 0); err != nil {
 					b.Fatal(err)
 				}
 			}

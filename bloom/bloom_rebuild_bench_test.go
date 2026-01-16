@@ -16,10 +16,16 @@ func Benchmark_BloomRebuild(b *testing.B) {
 	for _, numKeys := range sizes {
 		b.Run(fmt.Sprintf("%dK-Keys", numKeys>>10), func(b *testing.B) {
 			// Setup: Create index
-			tmpDir, _ := os.MkdirTemp("", "bloom-rebuild-*")
+			tmpDir, err := os.MkdirTemp("", "bloom-rebuild-*")
+			if err != nil {
+				b.Fatal(err)
+			}
 			defer os.RemoveAll(tmpDir)
 
-			idx, _ := index.Open(tmpDir, numKeys)
+			idx, err := index.Open(tmpDir, numKeys)
+			if err != nil {
+				b.Fatal(err)
+			}
 			defer idx.Close()
 
 			// Populate with "Mixed" hashes to simulate real entropy
@@ -37,7 +43,9 @@ func Benchmark_BloomRebuild(b *testing.B) {
 						PhysicalLen: 1024,
 					}
 				}
-				_ = idx.IngestBatch(uint32(i/batchSize), items)
+				if err := idx.IngestBatch(uint32(i/batchSize), items, 0); err != nil {
+					b.Fatal(err)
+				}
 			}
 
 			// Pre-calculate filter specs

@@ -3,6 +3,7 @@ package record
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"hash/crc32"
 
 	"github.com/miretskiy/blobcache/base"
@@ -160,9 +161,9 @@ const (
 	// Wire format: Key.Lo(8) + Key.Hi(8) + Pos(8) + LogicalSize(8) + PhysicalSize(8) + SeqID(8) + Flags(8) + KeyLen(2) + Pad(6)
 	InodeSize = 64
 
-	// SegmentEnvelopeHeaderSize is the header before entries (16 bytes).
-	// Wire format: SegmentID(8) + CTime(8)
-	SegmentEnvelopeHeaderSize = 16
+	// SegmentEnvelopeHeaderSize is the header before entries (40 bytes).
+	// Wire format: SegmentID(8) + CTime(8) + MinSeqID(8) + MaxSeqID(8) + RecordCount(8)
+	SegmentEnvelopeHeaderSize = 40
 
 	// TailSize is the 20-byte tail at the end of segment files.
 	// Wire format: EnvelopeDataLen(8) + Checksum(4) + Magic(8)
@@ -189,13 +190,13 @@ type Inode struct {
 
 // SegmentEnvelope is the index manifest for a single segment file.
 // Written at segment close, it enables O(1) index reconstruction on recovery.
-//
-// TODO(future): Add MinSeqID, MaxSeqID for efficient compaction decisions.
-// TODO(future): Add BlobCount, TotalBytes for statistics without iterating.
 type SegmentEnvelope struct {
-	SegmentID int64
-	CTime     int64 // Unix timestamp (seconds)
-	Entries   []Inode
+	SegmentID   int64
+	CTime       int64  // Unix timestamp (seconds)
+	MinSeqID    uint64 // Lowest SeqID in this segment (compaction decisions)
+	MaxSeqID    uint64 // Highest SeqID in this segment (WAL recovery checkpoint)
+	RecordCount int64  // Number of records (validation: must match len(Entries))
+	Entries     []Inode
 
 	// IndexKey is the persistence layer key (not serialized to segment files).
 	// Populated when reading from persistent index, nil for new envelopes.
@@ -310,10 +311,13 @@ func DecodeInode(src []byte) (Inode, error) {
 // --- SegmentEnvelope Serialization ---
 
 // AppendSegmentEnvelope appends an encoded SegmentEnvelope to dst.
-// Wire format: SegmentID(8) + CTime(8) + [Entries...]
+// Wire format: SegmentID(8) + CTime(8) + MinSeqID(8) + MaxSeqID(8) + RecordCount(8) + [Entries...]
 func AppendSegmentEnvelope(dst []byte, sf SegmentEnvelope) []byte {
 	dst = binary.LittleEndian.AppendUint64(dst, uint64(sf.SegmentID))
 	dst = binary.LittleEndian.AppendUint64(dst, uint64(sf.CTime))
+	dst = binary.LittleEndian.AppendUint64(dst, sf.MinSeqID)
+	dst = binary.LittleEndian.AppendUint64(dst, sf.MaxSeqID)
+	dst = binary.LittleEndian.AppendUint64(dst, uint64(len(sf.Entries))) // RecordCount
 	for i := range sf.Entries {
 		dst = AppendInode(dst, sf.Entries[i])
 	}
@@ -328,6 +332,9 @@ func DecodeSegmentEnvelope(src []byte) (SegmentEnvelope, error) {
 
 	segmentID := int64(binary.LittleEndian.Uint64(src[0:8]))
 	ctime := int64(binary.LittleEndian.Uint64(src[8:16]))
+	minSeqID := binary.LittleEndian.Uint64(src[16:24])
+	maxSeqID := binary.LittleEndian.Uint64(src[24:32])
+	recordCount := int64(binary.LittleEndian.Uint64(src[32:40]))
 
 	entriesData := src[SegmentEnvelopeHeaderSize:]
 	if len(entriesData)%InodeSize != 0 {
@@ -335,6 +342,10 @@ func DecodeSegmentEnvelope(src []byte) (SegmentEnvelope, error) {
 	}
 
 	numEntries := len(entriesData) / InodeSize
+	if int64(numEntries) != recordCount {
+		return SegmentEnvelope{}, fmt.Errorf("record: record count mismatch: header=%d, actual=%d", recordCount, numEntries)
+	}
+
 	entries := make([]Inode, numEntries)
 	for i := 0; i < numEntries; i++ {
 		offset := i * InodeSize
@@ -346,9 +357,12 @@ func DecodeSegmentEnvelope(src []byte) (SegmentEnvelope, error) {
 	}
 
 	return SegmentEnvelope{
-		SegmentID: segmentID,
-		CTime:     ctime,
-		Entries:   entries,
+		SegmentID:   segmentID,
+		CTime:       ctime,
+		MinSeqID:    minSeqID,
+		MaxSeqID:    maxSeqID,
+		RecordCount: recordCount,
+		Entries:     entries,
 	}, nil
 }
 

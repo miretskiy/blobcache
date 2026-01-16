@@ -83,7 +83,8 @@ func RecoverIndex(path string, opts ...Option) (*Cache, error) {
 
 			// USE THE LOWER LEVEL PRIMITIVE:
 			// IngestBatch directly updates the Skipmap/Sieve metadata.
-			if err := recoveryIdx.IngestBatch(segmentID, items); err != nil {
+			// Use MaxSeqID from segment envelope
+			if err := recoveryIdx.IngestBatch(segmentID, items, segment.MaxSeqID); err != nil {
 				recoveryIdx.Close()
 				return nil, fmt.Errorf("recovery ingestion failed for seg %d: %w", segmentID, err)
 			}
@@ -115,7 +116,7 @@ func RecoverIndex(path string, opts ...Option) (*Cache, error) {
 	}
 	c.librarian = NewLibrarian(cfg.MaxCachedSlabs, c)
 	c.Knobs = cfg.knobs
-	c.memTable = NewMemTable(c.config, c, c, c.librarian)
+	c.memTable = NewMemTable(c.config, c, c, c.librarian, nil) // No WAL during recovery
 	c.memTable.Knobs = c.Knobs
 
 	// Build Bloom Filter synchronously

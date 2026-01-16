@@ -17,8 +17,8 @@ const (
 	ItemSize = 32
 
 	// ManifestHeaderSize is the header before items.
-	// Wire format: SegmentID(4) + CTime(8)
-	ManifestHeaderSize = 12
+	// Wire format: SegmentID(4) + CTime(8) + MaxSeqID(8)
+	ManifestHeaderSize = 20
 )
 
 // maxChunkSize is the maximum size for a Bitcask value (default 256KB).
@@ -39,6 +39,7 @@ func testingSetMaxChunkSize(size uint64) func() {
 type SegmentManifest struct {
 	SegmentID uint32
 	CTime     int64
+	MaxSeqID  uint64 // Highest SeqID in this segment (WAL recovery checkpoint)
 	Items     []Item
 
 	// IndexKey is the bitcask key for this record (not serialized).
@@ -97,6 +98,7 @@ func DecodeItem(src []byte) (Item, error) {
 func AppendManifest(dst []byte, m SegmentManifest) []byte {
 	dst = binary.LittleEndian.AppendUint32(dst, m.SegmentID)
 	dst = binary.LittleEndian.AppendUint64(dst, uint64(m.CTime))
+	dst = binary.LittleEndian.AppendUint64(dst, m.MaxSeqID)
 	for i := range m.Items {
 		dst = AppendItem(dst, m.Items[i])
 	}
@@ -111,6 +113,7 @@ func DecodeManifest(src []byte) (SegmentManifest, error) {
 
 	segmentID := binary.LittleEndian.Uint32(src[0:4])
 	ctime := int64(binary.LittleEndian.Uint64(src[4:12]))
+	maxSeqID := binary.LittleEndian.Uint64(src[12:20])
 
 	itemsData := src[ManifestHeaderSize:]
 	if len(itemsData)%ItemSize != 0 {
@@ -131,6 +134,7 @@ func DecodeManifest(src []byte) (SegmentManifest, error) {
 	return SegmentManifest{
 		SegmentID: segmentID,
 		CTime:     ctime,
+		MaxSeqID:  maxSeqID,
 		Items:     items,
 	}, nil
 }
@@ -220,7 +224,7 @@ func (p *persistence) makeKey(segID uint32, chunkIdx uint32) []byte {
 	return key
 }
 
-func (p *persistence) writeBatch(segID uint32, items []Item) error {
+func (p *persistence) writeBatch(segID uint32, items []Item, maxSeqID uint64) error {
 	if len(items) == 0 {
 		return nil
 	}
@@ -231,6 +235,7 @@ func (p *persistence) writeBatch(segID uint32, items []Item) error {
 	currentManifest := SegmentManifest{
 		SegmentID: segID,
 		CTime:     time.Now().Unix(),
+		MaxSeqID:  maxSeqID,
 	}
 
 	var chunkIdx uint32

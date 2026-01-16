@@ -19,7 +19,7 @@ func TestMemTable_LifecycleGuard(t *testing.T) {
 
 	mb := &MockBatcher{}
 	mh := &MockHealthReporter{}
-	mt := NewMemTable(cfg, mb, mh, nil)
+	mt := NewMemTable(cfg, mb, mh, nil, nil)
 	defer mt.Close()
 
 	// Write with seqID=100
@@ -52,7 +52,7 @@ func TestMemTable_ConcurrencyGuard(t *testing.T) {
 
 	mb := &MockBatcher{}
 	mh := &MockHealthReporter{}
-	mt := NewMemTable(cfg, mb, mh, nil)
+	mt := NewMemTable(cfg, mb, mh, nil, nil)
 	defer mt.Close()
 
 	key := xmap.Key{Lo: 12345, Hi: 0}
@@ -90,7 +90,7 @@ func TestMemTable_ConcurrentWritesSameKey(t *testing.T) {
 
 	mb := &MockBatcher{}
 	mh := &MockHealthReporter{}
-	mt := NewMemTable(cfg, mb, mh, nil)
+	mt := NewMemTable(cfg, mb, mh, nil, nil)
 	defer mt.Close()
 
 	key := xmap.Key{Lo: 99999, Hi: 0}
@@ -139,7 +139,7 @@ func TestMemTable_RotationUpdatesMaxSealedSeq(t *testing.T) {
 
 	mb := &MockBatcher{}
 	mh := &MockHealthReporter{}
-	mt := NewMemTable(cfg, mb, mh, nil)
+	mt := NewMemTable(cfg, mb, mh, nil, nil)
 	defer mt.Close()
 
 	// Write some data with increasing seqIDs

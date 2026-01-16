@@ -6,6 +6,7 @@ import (
 
 	"github.com/miretskiy/blobcache/compression"
 	"github.com/miretskiy/blobcache/internal/sys"
+	"github.com/miretskiy/blobcache/wal"
 )
 
 // IOConfig holds I/O strategy settings
@@ -26,6 +27,12 @@ type CompressionConfig struct {
 	Codec   compression.Codex // Compression algorithm (None, Zstd, LZ4, S2)
 	Level   compression.Level // Compression level (Default, Speed, Best)
 	MinSize int64             // Don't compress blobs smaller than this (default: 512)
+}
+
+// WALConfig holds write-ahead log settings
+type WALConfig struct {
+	Enabled  bool         // Enable WAL for durability (default: false)
+	SyncMode wal.SyncMode // Sync mode for WAL writes (default: SyncData)
 }
 
 // MaxSegmentSize is the maximum allowed segment size (4GB).
@@ -51,6 +58,7 @@ type config struct {
 	IO                  IOConfig
 	Resilience          ResilienceConfig
 	Compression         CompressionConfig
+	WAL                 WALConfig
 
 	knobs *TestingKnobs
 }
@@ -170,6 +178,21 @@ func WithTestingKnobs(knobs *TestingKnobs) Option {
 	return funcOpt(func(c *config) { c.knobs = knobs })
 }
 
+// WithWAL enables the write-ahead log for durability.
+// When enabled, all writes are logged to WAL before being acknowledged.
+// This transforms blobcache from an ephemeral cache into durable storage.
+func WithWAL() Option {
+	return funcOpt(func(c *config) { c.WAL.Enabled = true })
+}
+
+// WithWALSyncMode sets the sync mode for WAL writes.
+// SyncData (default): fdatasync - syncs data but not metadata
+// SyncFull: fsync - full durability
+// SyncNone: no sync - for testing only
+func WithWALSyncMode(mode wal.SyncMode) Option {
+	return funcOpt(func(c *config) { c.WAL.SyncMode = mode })
+}
+
 func defaultConfig(path string) config {
 	return config{
 		Path:                path,
@@ -193,6 +216,10 @@ func defaultConfig(path string) config {
 			Codec:   compression.CodexNone, // Disabled by default
 			Level:   compression.CompressionDefault,
 			MinSize: 512, // Don't compress small blobs
+		},
+		WAL: WALConfig{
+			Enabled:  false,        // Disabled by default (ephemeral cache mode)
+			SyncMode: wal.SyncData, // fdatasync for durability when enabled
 		},
 	}
 }

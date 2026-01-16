@@ -132,14 +132,32 @@ func (sw *SegmentWriter) Close() error {
 		return nil
 	}
 
-	// 1. Construct the immutable Segment Footer
-	sf := record.SegmentEnvelope{
-		Entries:   sw.entries,
-		SegmentID: int64(sw.id), // SegmentEnvelope uses int64 for disk format
-		CTime:     time.Now().Unix(),
+	// 1. Compute min/max SeqID from entries
+	var minSeq, maxSeq uint64
+	if len(sw.entries) > 0 {
+		minSeq = sw.entries[0].SeqID
+		maxSeq = sw.entries[0].SeqID
+		for i := 1; i < len(sw.entries); i++ {
+			if sw.entries[i].SeqID < minSeq {
+				minSeq = sw.entries[i].SeqID
+			}
+			if sw.entries[i].SeqID > maxSeq {
+				maxSeq = sw.entries[i].SeqID
+			}
+		}
 	}
 
-	// 2. Serialize Footer into an Aligned Buffer.
+	// 2. Construct the immutable Segment Footer
+	sf := record.SegmentEnvelope{
+		SegmentID:   int64(sw.id),
+		CTime:       time.Now().Unix(),
+		MinSeqID:    minSeq,
+		MaxSeqID:    maxSeq,
+		RecordCount: int64(len(sw.entries)),
+		Entries:     sw.entries,
+	}
+
+	// 3. Serialize Footer into an Aligned Buffer.
 	// We use the slabPool to satisfy O_DIRECT alignment and avoid GC pressure.
 	physicalMetaSize := record.SegmentEnvelopePhysicalSize(len(sw.entries))
 	tmpBuf := sw.pool.AcquireAligned(physicalMetaSize)
@@ -149,14 +167,14 @@ func (sw *SegmentWriter) Close() error {
 	// end of the 4KB-aligned block.
 	paddedMetadata := record.AppendSegmentEnvelopeWithTail(tmpBuf.Bytes(), sf)
 
-	// 3. Final hardware write for the metadata block.
+	// 4. Final hardware write for the metadata block.
 	if _, err := sw.file.WriteAt(paddedMetadata, sw.currentPos); err != nil {
 		_ = sw.file.Close()
 		return fmt.Errorf("failed to write segment metadata: %w", err)
 	}
 	finalSize := sw.currentPos + int64(len(paddedMetadata))
 
-	// 4. Truncate to actual size so envelope is at file end.
+	// 5. Truncate to actual size so envelope is at file end.
 	// fallocate pre-allocates more space; ReadSegmentEnvelopeFromFile expects
 	// the tail at fileSize - TailSize.
 	if err := sw.file.Truncate(finalSize); err != nil {
@@ -164,7 +182,7 @@ func (sw *SegmentWriter) Close() error {
 		return fmt.Errorf("failed to truncate segment: %w", err)
 	}
 
-	// 5. Persistence Handshake.
+	// 6. Persistence Handshake.
 	// fdatasync uses F_FULLFSYNC on Darwin to ensure it clears the drive cache.
 	if sw.syncData {
 		if err := sys.Fdatasync(sw.file); err != nil {

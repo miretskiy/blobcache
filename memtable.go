@@ -10,6 +10,7 @@ import (
 	"github.com/miretskiy/blobcache/compression"
 	"github.com/miretskiy/blobcache/internal/record"
 	"github.com/miretskiy/blobcache/internal/xmap"
+	"github.com/miretskiy/blobcache/wal"
 )
 
 const (
@@ -37,6 +38,7 @@ type MemTable struct {
 	slabPool   *MmapPool
 	footerPool *MmapPool
 	publisher  Publisher
+	wal        *wal.WAL // nil if WAL disabled
 
 	mu struct {
 		sync.Mutex
@@ -61,7 +63,7 @@ type MemTable struct {
 	wg      sync.WaitGroup // Tracks worker goroutines
 }
 
-func NewMemTable(cfg config, b Batcher, reporter ErrorReporter, pub Publisher) *MemTable {
+func NewMemTable(cfg config, b Batcher, reporter ErrorReporter, pub Publisher, w *wal.WAL) *MemTable {
 	poolCapacity := cfg.MaxCachedSlabs + cfg.MaxInflightSlabs + 2
 
 	mt := &MemTable{
@@ -69,6 +71,7 @@ func NewMemTable(cfg config, b Batcher, reporter ErrorReporter, pub Publisher) *
 		Batcher:       b,
 		ErrorReporter: reporter,
 		publisher:     pub,
+		wal:           w, // nil if WAL disabled
 		slabPool:      NewMmapPool("slab", cfg.WriteBufferSize, cfg.LargeWriteThreshold, poolCapacity),
 		footerPool:    NewMmapPool("footer", 256<<10, 0, cfg.MaxInflightSlabs+1),
 		flushCh:       make(chan FlushTicket, cfg.MaxInflightSlabs),
@@ -90,6 +93,7 @@ func NewMemTable(cfg config, b Batcher, reporter ErrorReporter, pub Publisher) *
 
 // newActiveSlab allocates memory, initializes the struct, and publishes it.
 // WARNING: Can block on slabPool.Acquire(). Do not call while holding mt.mu!
+// Note: slabID is set on first write (it's the first SeqID written to this slab).
 func (mt *MemTable) newActiveSlab(size int) *ActiveSlab {
 	buf := func() *MmapBuffer {
 		if size > 0 {
@@ -108,6 +112,7 @@ func (mt *MemTable) newActiveSlab(size int) *ActiveSlab {
 			buf:   buf,
 			index: xmap.New[SlabEntry, xmap.Pad32](xmap.WithShardShift(4)), // 16 shards for slab index
 		},
+		// slabID is 0 until first write sets it
 		writesDone: newSignal(),
 	}
 
@@ -185,19 +190,30 @@ func (mt *MemTable) putLarge(seqID uint64, hash Key, keyBytes, value []byte, che
 		rec.SetCRC(*checksum)
 	}
 
-	// 4. Allocate slab just for this record
+	// 4. WAL Write BEFORE slab allocation (blocks until synced for durability)
+	// If WAL fails, we haven't touched any state - clean early exit.
+	// Skip WAL in degraded mode (degraded mode does everything except actual I/O).
+	if mt.wal != nil && !mt.IsDegraded() {
+		if err := mt.wal.Write(rec); err != nil {
+			mt.ReportError(fmt.Errorf("wal write: %w", err)) // Enter degraded mode
+			return err
+		}
+	}
+
+	// 5. Allocate slab just for this record
 	as := mt.newActiveSlab(rec.EncodedSize())
 
-	// 5. Write record directly (zero-copy)
+	// 6. Write record directly (zero-copy)
 	buf, offset := as.Alloc(rec.EncodedSize())
 	rec.EncodeTo(buf)
 
-	// 6. Create SlabEntry for index lookup
+	// 7. Create SlabEntry for index lookup
 	entry := SlabEntry{
 		Header: rec.Header,
 		Pos:    offset,
 	}
 	as.index.Put(hash, entry)
+	as.slabID = seqID // Large writes have dedicated slab, seqID is the slabID
 	as.currentMaxSeq = seqID
 
 	if !mt.IsDegraded() {
@@ -219,6 +235,37 @@ func (mt *MemTable) putActive(seqID uint64, hash Key, keyBytes, value []byte, ch
 func (mt *MemTable) putActiveCompressed(
 	seqID uint64, hash Key, keyBytes, value []byte, checksum *uint32, compressed BufferHandle,
 ) error {
+	// 1. Build record BEFORE lock (pure computation, no lock needed)
+	valueBytes := value
+	codec := compression.CodexNone
+	if !compressed.IsZero() {
+		valueBytes = compressed.Bytes()
+		codec = mt.Compression.Codec
+	}
+
+	rec := record.NewRecord(seqID, keyBytes, valueBytes, int64(len(value)))
+	rec.SetCompression(codec)
+	if checksum != nil {
+		rec.SetCRC(*checksum)
+	}
+
+	// 2. WAL Write BEFORE slab allocation (blocks until synced for durability)
+	// If WAL fails, we haven't touched the slab - clean early exit.
+	// Skip WAL in degraded mode (degraded mode does everything except actual I/O).
+	if mt.wal != nil && !mt.IsDegraded() {
+		if err := mt.wal.Write(rec); err != nil {
+			mt.ReportError(fmt.Errorf("wal write: %w", err)) // Enter degraded mode
+			return err
+		}
+	}
+
+	// 3. Write to slab (may retry on rotation)
+	return mt.writeToSlab(seqID, hash, rec)
+}
+
+// writeToSlab handles slab allocation, index update, and pending write tracking.
+// Separated from putActiveCompressed to keep WAL write outside the retry loop.
+func (mt *MemTable) writeToSlab(seqID uint64, hash Key, rec record.Record) error {
 	mt.mu.Lock()
 
 	// 1. Lifecycle Guard: Reject writes older than already-sealed data.
@@ -234,37 +281,28 @@ func (mt *MemTable) putActiveCompressed(
 		wait := mt.mu.activeReady
 		mt.mu.Unlock()
 		<-wait
-		return mt.putActiveCompressed(seqID, hash, keyBytes, value, checksum, compressed)
-	}
-
-	// 3. Determine on-disk value bytes and build record
-	valueBytes := value
-	codec := compression.CodexNone
-	if !compressed.IsZero() {
-		valueBytes = compressed.Bytes()
-		codec = mt.Compression.Codec
-	}
-
-	rec := record.NewRecord(seqID, keyBytes, valueBytes, int64(len(value)))
-	rec.SetCompression(codec)
-	if checksum != nil {
-		rec.SetCRC(*checksum)
+		return mt.writeToSlab(seqID, hash, rec) // Retry
 	}
 
 	active := mt.mu.active
 	writeSize := rec.EncodedSize()
 
-	// 4. Allocate space (under lock) - combines capacity check and reservation
+	// 3. Allocate space (under lock) - combines capacity check and reservation
 	buf, wPos := active.Alloc(writeSize)
 	if buf == nil {
 		rotateUnlocked := mt.prepareRotationLocked()
 		mt.mu.Unlock()
 		rotateUnlocked()
-		return mt.putActiveCompressed(seqID, hash, keyBytes, value, checksum, compressed)
+		return mt.writeToSlab(seqID, hash, rec) // Retry
 	}
 
-	// 5. Track pending write (after successful allocation)
+	// 4. Track pending write (after successful allocation)
 	active.pendingWrites.Add(1)
+
+	// Set slabID on first write (used for WAL file naming/deletion)
+	if active.slabID == 0 {
+		active.slabID = seqID
+	}
 
 	// Track highest seqID in this slab for rotation handoff
 	if seqID > active.currentMaxSeq {
@@ -273,16 +311,16 @@ func (mt *MemTable) putActiveCompressed(
 
 	mt.mu.Unlock()
 
-	// 6. Write record directly to reserved region (zero-copy, outside lock)
+	// 5. Write record directly to reserved region (zero-copy, outside lock)
 	rec.EncodeTo(buf)
 
-	// 7. Create SlabEntry for index lookup
+	// 6. Create SlabEntry for index lookup
 	entry := SlabEntry{
 		Header: rec.Header,
 		Pos:    wPos,
 	}
 
-	// 8. Concurrency Guard: Prevent "Check-Then-Act" race.
+	// 7. Concurrency Guard: Prevent "Check-Then-Act" race.
 	// Two threads updating the same key could both read stale state and
 	// the slower (older) write could overwrite the faster (newer) one.
 	shard := hash.Lo & indexShardMask
@@ -292,7 +330,7 @@ func (mt *MemTable) putActiveCompressed(
 	}
 	mt.indexLocks[shard].Unlock()
 
-	// 9. Complete
+	// 8. Complete pending write tracking
 	if active.pendingWrites.Add(-1) == 0 {
 		if active.retired.Load() {
 			active.writesDone.Close()
@@ -346,7 +384,18 @@ func (mt *MemTable) prepareRotationLocked() func() {
 		// This is done unlocked to prevent holding the mutex during allocation wait.
 		newSlab := mt.newActiveSlab(0)
 
-		// E. Install NEW slab and Clear Barrier
+		// E. Rotate WAL file
+		// At this point, all WAL writes for the old slab are complete
+		// (we waited for pending writes above), so it's safe to close
+		// the old WAL file. The next write will create a new WAL file
+		// named by its SeqID.
+		if mt.wal != nil {
+			if err := mt.wal.Rotate(); err != nil {
+				mt.ReportError(fmt.Errorf("wal rotate: %w", err))
+			}
+		}
+
+		// F. Install NEW slab and Clear Barrier
 		mt.mu.Lock()
 		mt.mu.active = newSlab
 		close(mt.mu.activeReady)
@@ -355,23 +404,27 @@ func (mt *MemTable) prepareRotationLocked() func() {
 	}
 }
 
-func (mt *MemTable) Drain() {
+// Flush triggers a rotation of the current slab (sends to flusher).
+// Does not wait for the flush to complete - use Drain() for that.
+// Implements wal.Replayer interface for recovery.
+func (mt *MemTable) Flush() {
 	if mt.IsDegraded() {
 		return
 	}
 
 	mt.mu.Lock()
 	if mt.mu.active != nil && mt.mu.active.wPos > 0 {
-		// Use the same rotation logic to flush the current buffer.
 		rotateUnlocked := mt.prepareRotationLocked()
 		mt.mu.Unlock()
-
 		rotateUnlocked()
 	} else {
 		mt.mu.Unlock()
 	}
+}
 
-	// Wait for ALL in-flight flushes to complete.
+// Drain triggers a flush and waits for ALL in-flight flushes to complete.
+func (mt *MemTable) Drain() {
+	mt.Flush()
 	mt.flushWg.Wait()
 }
 
@@ -432,6 +485,7 @@ func (mt *MemTable) processFlush(as *ActiveSlab, writer *SegmentWriter) (*Segmen
 
 	// 1. Collect entries and convert to record.Inode for WriteSlab
 	var entries []record.Inode
+	var maxSeqID uint64
 	as.index.ForEach(func(key xmap.Key, e SlabEntry, _ *xmap.Pad32) bool {
 		entries = append(entries, record.Inode{
 			Key:          key, // Full 128-bit XXH3 hash
@@ -442,6 +496,9 @@ func (mt *MemTable) processFlush(as *ActiveSlab, writer *SegmentWriter) (*Segmen
 			Flags:        e.Flags,
 			KeyLen:       e.KeyLen, // From embedded record.Header
 		})
+		if e.SeqID > maxSeqID {
+			maxSeqID = e.SeqID
+		}
 		return true
 	})
 
@@ -463,9 +520,18 @@ func (mt *MemTable) processFlush(as *ActiveSlab, writer *SegmentWriter) (*Segmen
 		}
 	}
 
-	// 4. Update Index
-	if err := mt.PutBatch(writer.id, absoluteEntries); err != nil {
+	// 4. Update Index (with maxSeqID for WAL recovery checkpoint)
+	if err := mt.PutBatch(writer.id, absoluteEntries, maxSeqID); err != nil {
 		return writer, fmt.Errorf("index update failed: %w", err)
+	}
+
+	// 5. Delete WAL file now that slab is durably flushed to segment
+	// slabID is the first SeqID written to this slab (WAL file name)
+	if mt.wal != nil && as.slabID != 0 {
+		if err := mt.wal.DeleteFile(as.slabID); err != nil {
+			// Log but don't fail - WAL file will be cleaned up on next recovery
+			log.Warn("failed to delete WAL file", "slabID", as.slabID, "error", err)
+		}
 	}
 
 	if writer.CurrentPos() >= mt.SegmentSize {
@@ -500,4 +566,34 @@ func (mt *MemTable) Close() {
 func (mt *MemTable) ClosePools() {
 	mt.slabPool.Close()
 	mt.footerPool.Close()
+}
+
+// ReplayRecord is called during WAL recovery to replay a record as-is.
+// MUST only be called during initialization (no concurrent writers).
+// Bypasses compression and CRC computation - record is written verbatim.
+func (mt *MemTable) ReplayRecord(hash Key, rec record.Record) error {
+	active := mt.mu.active
+	writeSize := rec.EncodedSize()
+
+	// Simple rotation if needed (no concurrency, no backpressure)
+	buf, wPos := active.Alloc(writeSize)
+	if buf == nil {
+		mt.mu.active = mt.newActiveSlab(0)
+		active = mt.mu.active
+		buf, wPos = active.Alloc(writeSize)
+	}
+
+	// Set slabID on first write - enables WAL file deletion after flush
+	if active.slabID == 0 {
+		active.slabID = rec.SeqID
+	}
+
+	rec.EncodeTo(buf)
+
+	if rec.SeqID > active.currentMaxSeq {
+		active.currentMaxSeq = rec.SeqID
+	}
+
+	active.index.Put(hash, SlabEntry{Header: rec.Header, Pos: wPos})
+	return nil
 }

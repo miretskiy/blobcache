@@ -64,7 +64,7 @@ type MemTable struct {
 }
 
 func NewMemTable(
-	cfg config, b Batcher, reporter ErrorReporter, pub Publisher, w *wal.WAL,
+		cfg config, b Batcher, reporter ErrorReporter, pub Publisher, w *wal.WAL,
 ) *MemTable {
 	poolCapacity := cfg.MaxCachedSlabs + cfg.MaxInflightSlabs + 2
 
@@ -163,13 +163,13 @@ func (mt *MemTable) Put(seqID uint64, hash Key, keyBytes, value []byte) error {
 }
 
 func (mt *MemTable) PutChecksummed(
-	seqID uint64, hash Key, keyBytes, value []byte, checksum uint32,
+		seqID uint64, hash Key, keyBytes, value []byte, checksum uint32,
 ) error {
 	return mt.putWithChecksum(seqID, hash, keyBytes, value, &checksum)
 }
 
 func (mt *MemTable) putWithChecksum(
-	seqID uint64, hash Key, keyBytes, value []byte, checksum *uint32,
+		seqID uint64, hash Key, keyBytes, value []byte, checksum *uint32,
 ) error {
 	if int64(len(value)) > mt.LargeWriteThreshold {
 		return mt.putLarge(seqID, hash, keyBytes, value, checksum)
@@ -178,7 +178,7 @@ func (mt *MemTable) putWithChecksum(
 }
 
 func (mt *MemTable) putLarge(
-	seqID uint64, hash Key, keyBytes, value []byte, checksum *uint32,
+		seqID uint64, hash Key, keyBytes, value []byte, checksum *uint32,
 ) error {
 	// 1. Compress in caller's goroutine (distributed compression)
 	compressed := mt.maybeCompress(value)
@@ -224,8 +224,9 @@ func (mt *MemTable) putLarge(
 		Pos:    offset,
 	}
 	as.index.Put(hash, entry)
-	as.slabID = seqID // Large writes have dedicated slab, seqID is the slabID
 	as.currentMaxSeq = seqID
+	// walFileID stays 0: large writes share WAL file with active slab.
+	// WAL file is deleted when the active slab rotates and gets flushed.
 
 	if !mt.IsDegraded() {
 		mt.sendToFlusher(as) // Acquires its own reference via PurchaseTicket
@@ -237,7 +238,7 @@ func (mt *MemTable) putLarge(
 }
 
 func (mt *MemTable) putActive(
-	seqID uint64, hash Key, keyBytes, value []byte, checksum *uint32,
+		seqID uint64, hash Key, keyBytes, value []byte, checksum *uint32,
 ) error {
 	// 1. Compress before lock (parallel compression) - only on first call
 	c := mt.maybeCompress(value)
@@ -246,7 +247,7 @@ func (mt *MemTable) putActive(
 }
 
 func (mt *MemTable) putActiveCompressed(
-	seqID uint64, hash Key, keyBytes, value []byte, checksum *uint32, compressed BufferHandle,
+		seqID uint64, hash Key, keyBytes, value []byte, checksum *uint32, compressed BufferHandle,
 ) error {
 	// 1. Build record BEFORE lock (pure computation, no lock needed)
 	valueBytes := value
@@ -262,22 +263,13 @@ func (mt *MemTable) putActiveCompressed(
 		rec.SetCRC(*checksum)
 	}
 
-	// 2. WAL Write BEFORE slab allocation (blocks until synced for durability)
-	// If WAL fails, we haven't touched the slab - clean early exit.
-	// Skip WAL in degraded mode (degraded mode does everything except actual I/O).
-	if mt.wal != nil && !mt.IsDegraded() {
-		if err := mt.wal.Write(rec); err != nil {
-			mt.ReportError(fmt.Errorf("wal write: %w", err)) // Enter degraded mode
-			return err
-		}
-	}
-
-	// 3. Write to slab (may retry on rotation)
+	// 2. Reserve space in slab, then WAL write, then fill (Reserve-First pattern)
 	return mt.writeToSlab(seqID, hash, rec)
 }
 
-// writeToSlab handles slab allocation, index update, and pending write tracking.
-// Separated from putActiveCompressed to keep WAL write outside the retry loop.
+// writeToSlab handles the Reserve-First write pattern: Reserve → WAL → Fill.
+// This prevents the "Spillover Bug" where a record written to WAL file N could
+// land in slab N+1 after rotation, causing data loss when WAL file N is deleted.
 func (mt *MemTable) writeToSlab(seqID uint64, hash Key, rec record.Record) error {
 	mt.mu.Lock()
 
@@ -312,11 +304,6 @@ func (mt *MemTable) writeToSlab(seqID uint64, hash Key, rec record.Record) error
 	// 4. Track pending write (after successful allocation)
 	active.pendingWrites.Add(1)
 
-	// Set slabID on first write (used for WAL file naming/deletion)
-	if active.slabID == 0 {
-		active.slabID = seqID
-	}
-
 	// Track highest seqID in this slab for rotation handoff
 	if seqID > active.currentMaxSeq {
 		active.currentMaxSeq = seqID
@@ -324,10 +311,21 @@ func (mt *MemTable) writeToSlab(seqID uint64, hash Key, rec record.Record) error
 
 	mt.mu.Unlock()
 
-	// 5. Write record directly to reserved region (zero-copy, outside lock)
+	// 5. WAL Write (AFTER reservation, BEFORE fill - Reserve-First pattern)
+	// This prevents the "Spillover Bug" where a record written to WAL file N
+	// lands in slab N+1 after rotation, causing data loss when WAL N is deleted.
+	if mt.wal != nil && !mt.IsDegraded() {
+		if err := mt.wal.Write(rec); err != nil {
+			active.pendingWrites.Add(-1)
+			mt.ReportError(fmt.Errorf("wal write: %w", err))
+			return err
+		}
+	}
+
+	// 6. Write record directly to reserved region (zero-copy, outside lock)
 	rec.EncodeTo(buf)
 
-	// 6. Create SlabEntry for index lookup
+	// 7. Create SlabEntry for index lookup
 	entry := SlabEntry{
 		Header: rec.Header,
 		Pos:    wPos,
@@ -397,15 +395,16 @@ func (mt *MemTable) prepareRotationLocked() func() {
 		// This is done unlocked to prevent holding the mutex during allocation wait.
 		newSlab := mt.newActiveSlab(0)
 
-		// E. Rotate WAL file
-		// At this point, all WAL writes for the old slab are complete
-		// (we waited for pending writes above), so it's safe to close
-		// the old WAL file. The next write will create a new WAL file
-		// named by its SeqID.
+		// E. Rotate WAL file (treated as a control packet in the data stream).
+		// EnqueueRotation is serialized with Write() calls, ensuring all writes
+		// before this point go to the old file. Returns the closedFileID for
+		// later deletion when the slab is flushed.
 		if mt.wal != nil {
-			if err := mt.wal.Rotate(); err != nil {
+			closedFileID, err := mt.wal.EnqueueRotation()
+			if err != nil {
 				mt.ReportError(fmt.Errorf("wal rotate: %w", err))
 			}
+			old.walFileID = closedFileID
 		}
 
 		// F. Install NEW slab and Clear Barrier
@@ -539,11 +538,10 @@ func (mt *MemTable) processFlush(as *ActiveSlab, writer *SegmentWriter) (*Segmen
 	}
 
 	// 5. Delete WAL file now that slab is durably flushed to segment
-	// slabID is the first SeqID written to this slab (WAL file name)
-	if mt.wal != nil && as.slabID != 0 {
-		if err := mt.wal.DeleteFile(as.slabID); err != nil {
+	if mt.wal != nil && as.walFileID != 0 {
+		if err := mt.wal.DeleteFile(as.walFileID); err != nil {
 			// Log but don't fail - WAL file will be cleaned up on next recovery
-			log.Warn("failed to delete WAL file", "slabID", as.slabID, "error", err)
+			log.Warn("failed to delete WAL file", "walFileID", as.walFileID, "error", err)
 		}
 	}
 
@@ -594,11 +592,6 @@ func (mt *MemTable) ReplayRecord(hash Key, rec record.Record) error {
 		mt.mu.active = mt.newActiveSlab(0)
 		active = mt.mu.active
 		buf, wPos = active.Alloc(writeSize)
-	}
-
-	// Set slabID on first write - enables WAL file deletion after flush
-	if active.slabID == 0 {
-		active.slabID = rec.SeqID
 	}
 
 	rec.EncodeTo(buf)

@@ -14,6 +14,10 @@ import (
 // Darwin's fadvise equivalent (F_RDAHEAD) is less capable than Linux.
 const UseFadvise = false
 
+// RequiresAlignment indicates whether O_DIRECT requires 4KB-aligned buffers.
+// Darwin's F_NOCACHE does not enforce strict alignment like Linux O_DIRECT.
+const RequiresAlignment = false
+
 // Fdatasync syncs file data to disk
 // Darwin doesn't have fdatasync, so we use F_FULLFSYNC which ensures
 // data reaches physical disk (not just drive cache)

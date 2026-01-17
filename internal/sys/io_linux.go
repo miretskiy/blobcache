@@ -12,6 +12,10 @@ import (
 // UseFadvise indicates whether fadvise is effective on this platform.
 const UseFadvise = true
 
+// RequiresAlignment indicates whether O_DIRECT requires 4KB-aligned buffers.
+// Linux O_DIRECT requires aligned memory, offset, and size.
+const RequiresAlignment = true
+
 // Fdatasync syncs file data to disk without syncing metadata
 // Uses fdatasync(2) on Linux for better performance than fsync
 func Fdatasync(f *os.File) error {

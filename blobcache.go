@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -89,6 +90,9 @@ func (c *Cache) IsDegraded() bool {
 
 func (c *Cache) ReportError(err error) {
 	if c.bgError.CompareAndSwap(nil, &err) {
+		if c.DegradedMode == DegradedPanic {
+			panic(fmt.Sprintf("blobcache: degraded mode triggered: %v\n\nStack trace:\n%s", err, debug.Stack()))
+		}
 		log.Error("entering degraded mode (memory-only)", "error", err)
 	}
 }

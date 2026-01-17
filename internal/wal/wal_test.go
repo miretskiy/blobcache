@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/miretskiy/blobcache/internal/record"
+	"github.com/miretskiy/blobcache/internal/sys"
 	"github.com/stretchr/testify/require"
 )
 
@@ -124,7 +125,8 @@ func TestWAL_RecoverSkipsCommittedFiles(t *testing.T) {
 
 	rec := record.NewRecord(100, []byte("key1"), []byte("value1"), 6)
 	require.NoError(t, w.Write(rec))
-	require.NoError(t, w.Rotate())
+	_, err = w.EnqueueRotation()
+	require.NoError(t, err)
 
 	// Write records with SeqID 200 to second file
 	rec = record.NewRecord(200, []byte("key2"), []byte("value2"), 6)
@@ -164,7 +166,8 @@ func TestWAL_Rotate(t *testing.T) {
 	require.Equal(t, uint64(100), w.CurrentFirstID())
 
 	// Rotate (closes current file)
-	require.NoError(t, w.Rotate())
+	_, err = w.EnqueueRotation()
+	require.NoError(t, err)
 	require.Equal(t, uint64(0), w.CurrentFirstID()) // Reset until next write
 
 	// Write to new slab with SeqID 200
@@ -173,7 +176,8 @@ func TestWAL_Rotate(t *testing.T) {
 	require.Equal(t, uint64(200), w.CurrentFirstID())
 
 	// Rotate again
-	require.NoError(t, w.Rotate())
+	_, err = w.EnqueueRotation()
+	require.NoError(t, err)
 
 	// Write to new slab with SeqID 300
 	rec3 := record.NewRecord(300, []byte("key3"), []byte("value3"), 6)
@@ -235,7 +239,8 @@ func TestWAL_DeleteFile(t *testing.T) {
 	require.NoError(t, w.Write(rec))
 
 	// Rotate
-	require.NoError(t, w.Rotate())
+	_, err = w.EnqueueRotation()
+	require.NoError(t, err)
 
 	// Write with SeqID 200 (file named wal-0000000000000200.log)
 	rec2 := record.NewRecord(200, []byte("key2"), []byte("value2"), 6)
@@ -430,7 +435,8 @@ func TestWAL_RecoverMultipleFiles(t *testing.T) {
 
 	rec1 := record.NewRecord(100, []byte("key1"), []byte("value1"), 6)
 	require.NoError(t, w.Write(rec1))
-	require.NoError(t, w.Rotate())
+	_, err = w.EnqueueRotation()
+	require.NoError(t, err)
 
 	rec2 := record.NewRecord(200, []byte("key2"), []byte("value2"), 6)
 	require.NoError(t, w.Write(rec2))
@@ -589,7 +595,8 @@ func TestWAL_ListWALFiles(t *testing.T) {
 		rec := record.NewRecord(seqID, []byte("key"), []byte("value"), 5)
 		require.NoError(t, w.Write(rec))
 		if i < len(seqIDs)-1 {
-			require.NoError(t, w.Rotate())
+			_, err = w.EnqueueRotation()
+			require.NoError(t, err)
 		}
 	}
 	require.NoError(t, w.Close())
@@ -602,4 +609,450 @@ func TestWAL_ListWALFiles(t *testing.T) {
 	firstIDs, err := w2.ListWALFiles()
 	require.NoError(t, err)
 	require.Equal(t, seqIDs, firstIDs)
+}
+
+// TestWAL_BatchSplitting verifies that large batches are correctly split into
+// multiple chunks when they exceed the staging buffer capacity.
+func TestWAL_BatchSplitting(t *testing.T) {
+	dir := t.TempDir()
+	cfg := DefaultConfig(dir)
+	cfg.SyncMode = SyncNone
+	cfg.MaxBatchSize = 8192 // Small buffer (8KB) to force splitting
+
+	w, err := Open(cfg)
+	require.NoError(t, err)
+
+	// Create many records that will exceed the 8KB buffer
+	// Each record: 35 byte header + key + value
+	// With 100-byte values, each record is ~140 bytes
+	// 100 records = ~14KB, should require multiple chunks
+	numRecords := 100
+	records := make([]record.Record, numRecords)
+	for i := 0; i < numRecords; i++ {
+		key := []byte("key")
+		value := make([]byte, 100)
+		for j := range value {
+			value[j] = byte(i)
+		}
+		records[i] = record.NewRecord(uint64(i+1), key, value, 6)
+	}
+
+	// Write all records
+	for _, rec := range records {
+		require.NoError(t, w.Write(rec))
+	}
+	require.NoError(t, w.Close())
+
+	// Recover and verify all records
+	w2, err := Open(cfg)
+	require.NoError(t, err)
+	defer w2.Close()
+
+	replayer := &testReplayer{}
+	recovered, err := w2.Recover(replayer, nil)
+	require.NoError(t, err)
+	require.True(t, recovered)
+	require.Len(t, replayer.records, numRecords)
+
+	// Verify each record's content
+	for i, rec := range replayer.records {
+		require.Equal(t, records[i].SeqID, rec.SeqID, "SeqID mismatch at %d", i)
+		require.Equal(t, records[i].Key, rec.Key, "Key mismatch at %d", i)
+		require.Equal(t, records[i].Value, rec.Value, "Value mismatch at %d", i)
+	}
+}
+
+// TestWAL_OversizedRecord verifies that a single record larger than the
+// staging buffer is handled via the slow path (temporary allocation).
+func TestWAL_OversizedRecord(t *testing.T) {
+	dir := t.TempDir()
+	cfg := DefaultConfig(dir)
+	cfg.SyncMode = SyncNone
+	cfg.MaxBatchSize = 4096 // 4KB buffer
+
+	w, err := Open(cfg)
+	require.NoError(t, err)
+
+	// Create a record larger than the buffer (8KB value)
+	largeValue := make([]byte, 8192)
+	for i := range largeValue {
+		largeValue[i] = byte(i % 256)
+	}
+	largeRec := record.NewRecord(1, []byte("bigkey"), largeValue, 6)
+
+	// Write should succeed via slow path
+	require.NoError(t, w.Write(largeRec))
+	require.NoError(t, w.Close())
+
+	// Recover and verify
+	w2, err := Open(cfg)
+	require.NoError(t, err)
+	defer w2.Close()
+
+	replayer := &testReplayer{}
+	recovered, err := w2.Recover(replayer, nil)
+	require.NoError(t, err)
+	require.True(t, recovered)
+	require.Len(t, replayer.records, 1)
+	require.Equal(t, largeRec.SeqID, replayer.records[0].SeqID)
+	require.Equal(t, largeRec.Key, replayer.records[0].Key)
+	require.Equal(t, largeRec.Value, replayer.records[0].Value)
+}
+
+// TestWAL_MixedRecordSizes verifies that a mix of small and oversized records
+// in the same batch are all correctly written and recovered.
+func TestWAL_MixedRecordSizes(t *testing.T) {
+	dir := t.TempDir()
+	cfg := DefaultConfig(dir)
+	cfg.SyncMode = SyncNone
+	cfg.MaxBatchSize = 4096 // 4KB buffer
+
+	w, err := Open(cfg)
+	require.NoError(t, err)
+
+	// Create large values with identifiable patterns BEFORE creating records
+	// (so CRC is computed correctly)
+	largeValue1 := make([]byte, 8192)
+	for i := range largeValue1 {
+		largeValue1[i] = byte(0xAA)
+	}
+	largeValue2 := make([]byte, 6000)
+	for i := range largeValue2 {
+		largeValue2[i] = byte(0xBB)
+	}
+
+	// Mix of small and large records
+	records := []record.Record{
+		record.NewRecord(1, []byte("small1"), []byte("value1"), 6),
+		record.NewRecord(2, []byte("bigkey"), largeValue1, 6),  // Oversized
+		record.NewRecord(3, []byte("small2"), []byte("value2"), 6),
+		record.NewRecord(4, []byte("bigkey2"), largeValue2, 6), // Oversized
+		record.NewRecord(5, []byte("small3"), []byte("value3"), 6),
+	}
+
+	// Write all records
+	for _, rec := range records {
+		require.NoError(t, w.Write(rec))
+	}
+	require.NoError(t, w.Close())
+
+	// Recover and verify
+	w2, err := Open(cfg)
+	require.NoError(t, err)
+	defer w2.Close()
+
+	replayer := &testReplayer{}
+	recovered, err := w2.Recover(replayer, nil)
+	require.NoError(t, err)
+	require.True(t, recovered)
+	require.Len(t, replayer.records, len(records))
+
+	for i, rec := range replayer.records {
+		require.Equal(t, records[i].SeqID, rec.SeqID, "SeqID mismatch at %d", i)
+		require.Equal(t, records[i].Key, rec.Key, "Key mismatch at %d", i)
+		require.Equal(t, records[i].Value, rec.Value, "Value mismatch at %d", i)
+	}
+}
+
+// TestWAL_BatchSplittingWithRotation verifies batch splitting works correctly
+// when rotation commands are interspersed with data.
+func TestWAL_BatchSplittingWithRotation(t *testing.T) {
+	dir := t.TempDir()
+	cfg := DefaultConfig(dir)
+	cfg.SyncMode = SyncNone
+	cfg.MaxBatchSize = 4096 // Small buffer
+
+	w, err := Open(cfg)
+	require.NoError(t, err)
+
+	// Write records, rotate, write more
+	for i := 1; i <= 50; i++ {
+		value := make([]byte, 50)
+		for j := range value {
+			value[j] = byte(i)
+		}
+		rec := record.NewRecord(uint64(i), []byte("key"), value, 6)
+		require.NoError(t, w.Write(rec))
+
+		// Rotate after every 20 records
+		if i%20 == 0 && i < 50 {
+			_, err = w.EnqueueRotation()
+			require.NoError(t, err)
+		}
+	}
+	require.NoError(t, w.Close())
+
+	// Count WAL files
+	files, _ := filepath.Glob(filepath.Join(dir, "wal-*.log"))
+	require.Len(t, files, 3) // Should have 3 files (20, 20, 10 records)
+
+	// Recover and verify all 50 records
+	w2, err := Open(cfg)
+	require.NoError(t, err)
+	defer w2.Close()
+
+	replayer := &testReplayer{}
+	recovered, err := w2.Recover(replayer, nil)
+	require.NoError(t, err)
+	require.True(t, recovered)
+	require.Len(t, replayer.records, 50)
+
+	for i, rec := range replayer.records {
+		require.Equal(t, uint64(i+1), rec.SeqID)
+	}
+}
+
+// TestWAL_Guard_PreventsTimeTravel verifies that the sealed guard prevents
+// writes with sequence IDs that belong to a previous (rotated) file.
+// This protects against "Stale Leader" bugs where an old MemTable tries
+// to write to a newer WAL file.
+func TestWAL_Guard_PreventsTimeTravel(t *testing.T) {
+	dir := t.TempDir()
+	cfg := DefaultConfig(dir)
+	cfg.SyncMode = SyncNone
+
+	w, err := Open(cfg)
+	require.NoError(t, err)
+
+	// 1. Write SeqID 100
+	require.NoError(t, w.Write(record.NewRecord(100, []byte("k"), []byte("v"), 0)))
+
+	// 2. Rotate. This sets w.lastRotatedSeq = 100
+	_, err = w.EnqueueRotation()
+	require.NoError(t, err)
+
+	// 3. Write SeqID 200 (Valid: > 100)
+	require.NoError(t, w.Write(record.NewRecord(200, []byte("k"), []byte("v"), 0)))
+
+	// 4. ATTACK: Attempt to write SeqID 99 (Time Travel)
+	// This should be rejected because 99 <= lastRotatedSeq (100)
+	recOld := record.NewRecord(99, []byte("k"), []byte("v"), 0)
+	err = w.Write(recOld)
+
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrSequenceRegression)
+
+	require.NoError(t, w.Close())
+}
+
+// TestWAL_WriteDirect_Aligned verifies that WriteDirect works with
+// properly aligned and page-sized values.
+func TestWAL_WriteDirect_Aligned(t *testing.T) {
+	dir := t.TempDir()
+	cfg := DefaultConfig(dir)
+	cfg.SyncMode = SyncNone
+
+	w, err := Open(cfg)
+	require.NoError(t, err)
+
+	// Allocate aligned buffer (must be page-sized)
+	valueSize := 4096 * 2 // 8KB - two pages
+	value := sys.AllocAligned(valueSize)
+	defer sys.FreeAligned(value)
+
+	// Fill with pattern
+	for i := range value {
+		value[i] = byte(i % 256)
+	}
+
+	rec := record.NewRecord(1, []byte("big-key"), value, 6)
+	err = w.WriteDirect(rec)
+	require.NoError(t, err)
+
+	// Write another normal record to ensure we can continue
+	rec2 := record.NewRecord(2, []byte("small-key"), []byte("small-value"), 6)
+	require.NoError(t, w.Write(rec2))
+
+	require.NoError(t, w.Close())
+
+	// Recover and verify
+	w2, err := Open(cfg)
+	require.NoError(t, err)
+	defer w2.Close()
+
+	replayer := &testReplayer{}
+	recovered, err := w2.Recover(replayer, nil)
+	require.NoError(t, err)
+	require.True(t, recovered)
+	require.Len(t, replayer.records, 2)
+
+	// Verify the large record
+	require.Equal(t, uint64(1), replayer.records[0].SeqID)
+	require.Equal(t, []byte("big-key"), replayer.records[0].Key)
+	require.Equal(t, valueSize, len(replayer.records[0].Value))
+	for i, b := range replayer.records[0].Value {
+		require.Equal(t, byte(i%256), b, "Value mismatch at offset %d", i)
+	}
+
+	// Verify the small record
+	require.Equal(t, uint64(2), replayer.records[1].SeqID)
+	require.Equal(t, []byte("small-key"), replayer.records[1].Key)
+}
+
+// TestWAL_WriteDirect_UnalignedValue verifies that WriteDirect rejects
+// values that aren't properly aligned.
+func TestWAL_WriteDirect_UnalignedValue(t *testing.T) {
+	if !sys.RequiresAlignment {
+		t.Skip("platform does not enforce alignment")
+	}
+
+	dir := t.TempDir()
+	cfg := DefaultConfig(dir)
+	cfg.SyncMode = SyncNone
+
+	w, err := Open(cfg)
+	require.NoError(t, err)
+	defer w.Close()
+
+	// Allocate aligned buffer then create unaligned slice
+	buf := sys.AllocAligned(8192)
+	defer sys.FreeAligned(buf)
+	unaligned := buf[1:4097] // Not aligned (starts at offset 1)
+
+	rec := record.NewRecord(1, []byte("key"), unaligned, 6)
+	err = w.WriteDirect(rec)
+	require.ErrorIs(t, err, ErrUnalignedValue)
+}
+
+// TestWAL_WriteDirect_NonPageSized verifies that WriteDirect rejects
+// values that aren't a multiple of the page size.
+func TestWAL_WriteDirect_NonPageSized(t *testing.T) {
+	dir := t.TempDir()
+	cfg := DefaultConfig(dir)
+	cfg.SyncMode = SyncNone
+
+	w, err := Open(cfg)
+	require.NoError(t, err)
+	defer w.Close()
+
+	// Allocate aligned buffer but use non-page-sized length
+	buf := sys.AllocAligned(8192)
+	defer sys.FreeAligned(buf)
+	nonPageSized := buf[:4000] // 4000 is not a multiple of 4096
+
+	rec := record.NewRecord(1, []byte("key"), nonPageSized, 6)
+	err = w.WriteDirect(rec)
+	require.ErrorIs(t, err, ErrUnalignedValue)
+}
+
+// TestWAL_WriteDirect_LargeRecord verifies recovery of large records (1MB+).
+func TestWAL_WriteDirect_LargeRecord(t *testing.T) {
+	dir := t.TempDir()
+	cfg := DefaultConfig(dir)
+	cfg.SyncMode = SyncNone
+
+	w, err := Open(cfg)
+	require.NoError(t, err)
+
+	// Allocate a 1MB aligned buffer (256 pages)
+	valueSize := 1 << 20 // 1MB
+	value := sys.AllocAligned(valueSize)
+	defer sys.FreeAligned(value)
+
+	// Fill with deterministic pattern for verification
+	for i := range value {
+		value[i] = byte((i * 7) % 256)
+	}
+
+	rec := record.NewRecord(1, []byte("megabyte-key"), value, 6)
+	err = w.WriteDirect(rec)
+	require.NoError(t, err)
+
+	require.NoError(t, w.Close())
+
+	// Recover and verify the large record
+	w2, err := Open(cfg)
+	require.NoError(t, err)
+	defer w2.Close()
+
+	replayer := &testReplayer{}
+	recovered, err := w2.Recover(replayer, nil)
+	require.NoError(t, err)
+	require.True(t, recovered)
+	require.Len(t, replayer.records, 1)
+
+	// Verify full content
+	require.Equal(t, uint64(1), replayer.records[0].SeqID)
+	require.Equal(t, []byte("megabyte-key"), replayer.records[0].Key)
+	require.Equal(t, valueSize, len(replayer.records[0].Value))
+
+	// Spot-check several positions in the recovered value
+	for _, i := range []int{0, 1000, 100000, 500000, valueSize - 1} {
+		expected := byte((i * 7) % 256)
+		require.Equal(t, expected, replayer.records[0].Value[i],
+			"Value mismatch at offset %d: expected %d, got %d", i, expected, replayer.records[0].Value[i])
+	}
+}
+
+// TestWAL_WriteDirect_MixedWithNormal verifies that WriteDirect works
+// correctly when interspersed with normal Write calls.
+func TestWAL_WriteDirect_MixedWithNormal(t *testing.T) {
+	dir := t.TempDir()
+	cfg := DefaultConfig(dir)
+	cfg.SyncMode = SyncNone
+
+	w, err := Open(cfg)
+	require.NoError(t, err)
+
+	// Write pattern: normal, direct, normal, direct, normal
+	// Normal write 1
+	rec1 := record.NewRecord(1, []byte("k1"), []byte("normal1"), 6)
+	require.NoError(t, w.Write(rec1))
+
+	// Direct write 1
+	val2 := sys.AllocAligned(4096)
+	defer sys.FreeAligned(val2)
+	for i := range val2 {
+		val2[i] = 0xAA
+	}
+	rec2 := record.NewRecord(2, []byte("k2"), val2, 6)
+	require.NoError(t, w.WriteDirect(rec2))
+
+	// Normal write 2
+	rec3 := record.NewRecord(3, []byte("k3"), []byte("normal2"), 6)
+	require.NoError(t, w.Write(rec3))
+
+	// Direct write 2
+	val4 := sys.AllocAligned(8192)
+	defer sys.FreeAligned(val4)
+	for i := range val4 {
+		val4[i] = 0xBB
+	}
+	rec4 := record.NewRecord(4, []byte("k4"), val4, 6)
+	require.NoError(t, w.WriteDirect(rec4))
+
+	// Normal write 3
+	rec5 := record.NewRecord(5, []byte("k5"), []byte("normal3"), 6)
+	require.NoError(t, w.Write(rec5))
+
+	require.NoError(t, w.Close())
+
+	// Recover and verify all 5 records
+	w2, err := Open(cfg)
+	require.NoError(t, err)
+	defer w2.Close()
+
+	replayer := &testReplayer{}
+	recovered, err := w2.Recover(replayer, nil)
+	require.NoError(t, err)
+	require.True(t, recovered)
+	require.Len(t, replayer.records, 5)
+
+	// Verify records in order
+	require.Equal(t, uint64(1), replayer.records[0].SeqID)
+	require.Equal(t, []byte("normal1"), replayer.records[0].Value)
+
+	require.Equal(t, uint64(2), replayer.records[1].SeqID)
+	require.Equal(t, 4096, len(replayer.records[1].Value))
+	require.Equal(t, byte(0xAA), replayer.records[1].Value[0])
+
+	require.Equal(t, uint64(3), replayer.records[2].SeqID)
+	require.Equal(t, []byte("normal2"), replayer.records[2].Value)
+
+	require.Equal(t, uint64(4), replayer.records[3].SeqID)
+	require.Equal(t, 8192, len(replayer.records[3].Value))
+	require.Equal(t, byte(0xBB), replayer.records[3].Value[0])
+
+	require.Equal(t, uint64(5), replayer.records[4].SeqID)
+	require.Equal(t, []byte("normal3"), replayer.records[4].Value)
 }

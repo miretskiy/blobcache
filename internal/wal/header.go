@@ -37,12 +37,19 @@ type FileHeader struct {
 // Encode serializes the header to a 32-byte slice.
 func (h *FileHeader) Encode() []byte {
 	buf := make([]byte, FileHeaderSize)
+	h.EncodeTo(buf)
+	return buf
+}
+
+// EncodeTo serializes the header into the provided buffer.
+// Buffer must be at least FileHeaderSize (32) bytes.
+func (h *FileHeader) EncodeTo(buf []byte) {
+	_ = buf[:FileHeaderSize] // Bounds check hint
 	binary.LittleEndian.PutUint64(buf[0:8], h.Magic)
 	binary.LittleEndian.PutUint32(buf[8:12], h.Version)
 	binary.LittleEndian.PutUint32(buf[12:16], h.Flags)
 	binary.LittleEndian.PutUint64(buf[16:24], uint64(h.CreatedAt))
 	binary.LittleEndian.PutUint64(buf[24:32], h.Reserved)
-	return buf
 }
 
 // DecodeFileHeader reads a FileHeader from src.

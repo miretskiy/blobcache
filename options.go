@@ -9,6 +9,19 @@ import (
 	"github.com/miretskiy/blobcache/internal/wal"
 )
 
+// DegradedMode controls how the cache behaves when entering degraded mode.
+type DegradedMode int
+
+const (
+	// DegradedMemoryOnly continues operating as a memory-only cache (default).
+	// This is the resilient option for production caches.
+	DegradedMemoryOnly DegradedMode = iota
+
+	// DegradedPanic panics with a stack trace when degraded mode is triggered.
+	// Use this for debugging and benchmarking to catch issues immediately.
+	DegradedPanic
+)
+
 // IOConfig holds I/O strategy settings
 type IOConfig struct {
 	FDataSync     bool // Use fdatasync for durability
@@ -59,6 +72,7 @@ type config struct {
 	Resilience          ResilienceConfig
 	Compression         CompressionConfig
 	WAL                 WALConfig
+	DegradedMode        DegradedMode // How to handle degraded mode (default: memory-only)
 
 	knobs *TestingKnobs
 }
@@ -182,7 +196,10 @@ func WithTestingKnobs(knobs *TestingKnobs) Option {
 // When enabled, all writes are logged to WAL before being acknowledged.
 // This transforms blobcache from an ephemeral cache into durable storage.
 func WithWAL() Option {
-	return funcOpt(func(c *config) { c.WAL.Enabled = true })
+	return funcOpt(func(c *config) {
+		c.WAL.Enabled = true
+		c.IO.FDataSync = true // If using wal, not using data sync is lying to yourself.
+	})
 }
 
 // WithWALSyncMode sets the sync mode for WAL writes.
@@ -198,6 +215,13 @@ func WithWALSyncMode(mode wal.SyncMode) Option {
 // By default, creates "wal" subdirectory under the cache directory.
 func WithWALDir(dir string) Option {
 	return funcOpt(func(c *config) { c.WAL.Dir = dir })
+}
+
+// WithDegradedMode controls how the cache handles degraded mode.
+// DegradedMemoryOnly (default): continues operating as memory-only cache
+// DegradedPanic: panics with stack trace (use for debugging/benchmarking)
+func WithDegradedMode(mode DegradedMode) Option {
+	return funcOpt(func(c *config) { c.DegradedMode = mode })
 }
 
 func defaultConfig(path string) config {

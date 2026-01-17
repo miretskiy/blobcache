@@ -270,3 +270,8 @@ func TestCache_Close_ReturnsErrors(t *testing.T) {
 	err = cache.Close()
 	require.NoError(t, err)
 }
+
+// Note: DegradedPanic mode is not tested here because it panics in a goroutine
+// (the flush worker), which can't be caught by require.Panics. The panic is
+// intentional - it's a debug feature for catching issues during benchmarking.
+// Manual verification: run the test with DegradedPanic and observe the stack trace.

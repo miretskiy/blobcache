@@ -2,7 +2,6 @@ package blobcache
 
 import (
 	"bytes"
-	"fmt"
 	"io"
 	"runtime"
 	"sync"
@@ -10,6 +9,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/miretskiy/blobcache/internal/sys"
 )
 
 // --- MmapBuffer: The Physical Slab ---
@@ -64,7 +65,7 @@ func (b *MmapBuffer) AlignedBytes(off int64) []byte {
 	if off <= 0 {
 		return nil
 	}
-	return b.raw[:roundToPage(off)]
+	return b.raw[:sys.RoundToBlock(off)]
 }
 
 func (b *MmapBuffer) Cap() int { return len(b.raw) }
@@ -144,33 +145,11 @@ func (h *MmapHandle) Close() error {
 	return nil
 }
 
-func roundToPage(size int64) int64 {
-	const pageSize = 4096
-	return (size + pageSize - 1) & ^(pageSize - 1)
-}
-
-// allocateRaw mmaps requested size (rounded up to page boundary). Returns raw bytes.
-func allocateRaw(size int64) []byte {
-	data, err := unix.Mmap(-1, 0, int(roundToPage(size)),
-		unix.PROT_READ|unix.PROT_WRITE,
-		unix.MAP_ANON|unix.MAP_PRIVATE)
-	if err != nil {
-		panic(fmt.Sprintf("mmap-pool: failed to allocate %d bytes: %v", size, err))
-	}
-
-	// PRE-WARM: Force physical RAM commitment.
-	for i := 0; i < len(data); i += 4096 {
-		data[i] = 0
-	}
-	return data
-}
-
 // NewMmapBuffer allocates a standalone (unpooled) mmap buffer.
 // It will be Unmapped when Unpin() reduces refCount to 0.
 func NewMmapBuffer(size int64) *MmapBuffer {
-	raw := allocateRaw(size)
 	buf := &MmapBuffer{
-		raw: raw,
+		raw: sys.AllocAligned(int(size)),
 	}
 	buf.refCount.Store(1)
 	buf.leased.Store(true)
@@ -194,9 +173,9 @@ func NewMmapPool(name string, bufferSize int64, headroom int64, capacity int) *M
 		poolSize: bufferSize + headroom,
 		name:     name,
 	}
-	// Pre-fill
+	// Pre-fill with aligned, pre-warmed buffers
 	for i := 0; i < capacity; i++ {
-		p.buffers <- allocateRaw(bufferSize + headroom)
+		p.buffers <- sys.AllocAligned(int(bufferSize + headroom))
 	}
 	return p
 }

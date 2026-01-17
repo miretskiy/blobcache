@@ -1,6 +1,7 @@
 package sys
 
 import (
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -65,6 +66,158 @@ func TestFallocate_FileSize(t *testing.T) {
 	info, err = os.Stat(path)
 	require.NoError(t, err)
 	t.Logf("Final file size (after close): %d", info.Size())
+}
+
+func TestFdatasync(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "fdatasync_test.bin")
+
+	// Test 1: Normal file (buffered I/O)
+	t.Run("BufferedIO", func(t *testing.T) {
+		f, err := os.Create(path)
+		require.NoError(t, err)
+		defer f.Close()
+
+		// Write some data
+		data := []byte("hello fdatasync test")
+		_, err = f.Write(data)
+		require.NoError(t, err)
+
+		// Call Fdatasync - should succeed
+		err = Fdatasync(f)
+		require.NoError(t, err, "Fdatasync should succeed on buffered file")
+	})
+
+	// Test 2: O_DIRECT file
+	t.Run("DirectIO", func(t *testing.T) {
+		directPath := filepath.Join(tmpDir, "fdatasync_direct.bin")
+		f, err := OpenDirect(directPath, true)
+		require.NoError(t, err)
+		defer f.Close()
+
+		// Write aligned data (O_DIRECT requires alignment)
+		data := make([]byte, 4096)
+		for i := range data {
+			data[i] = byte(i % 256)
+		}
+		_, err = f.WriteAt(data, 0)
+		require.NoError(t, err)
+
+		// Call Fdatasync
+		err = Fdatasync(f)
+		require.NoError(t, err, "Fdatasync should succeed on O_DIRECT file")
+	})
+
+	// Test 3: Multiple writes then sync
+	t.Run("MultipleWritesThenSync", func(t *testing.T) {
+		multiPath := filepath.Join(tmpDir, "fdatasync_multi.bin")
+		f, err := os.Create(multiPath)
+		require.NoError(t, err)
+		defer f.Close()
+
+		// Multiple writes
+		for i := 0; i < 100; i++ {
+			_, err = f.Write([]byte("line of data\n"))
+			require.NoError(t, err)
+		}
+
+		// Single Fdatasync at the end
+		err = Fdatasync(f)
+		require.NoError(t, err, "Fdatasync should succeed after multiple writes")
+
+		// Verify file size
+		info, err := f.Stat()
+		require.NoError(t, err)
+		require.Equal(t, int64(100*13), info.Size()) // 13 bytes per line
+	})
+
+	// Test 4: Append mode (similar to WAL)
+	t.Run("AppendMode", func(t *testing.T) {
+		appendPath := filepath.Join(tmpDir, "fdatasync_append.bin")
+
+		// Create initial file
+		f, err := os.Create(appendPath)
+		require.NoError(t, err)
+		f.Write([]byte("initial data\n"))
+		f.Close()
+
+		// Reopen in append mode
+		f, err = os.OpenFile(appendPath, os.O_WRONLY|os.O_APPEND, 0644)
+		require.NoError(t, err)
+		defer f.Close()
+
+		// Append data
+		_, err = f.Write([]byte("appended data\n"))
+		require.NoError(t, err)
+
+		// Fdatasync
+		err = Fdatasync(f)
+		require.NoError(t, err, "Fdatasync should succeed on append-mode file")
+	})
+}
+
+func TestWritev_AppendMode(t *testing.T) {
+	// Test net.Buffers.WriteTo with O_APPEND (WAL pattern)
+	// This mimics what the WAL does for gathered I/O
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "writev_append.bin")
+
+	// Open in append mode (like WAL)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	require.NoError(t, err)
+	defer f.Close()
+
+	// Create multiple buffers (like WAL batch)
+	var buffers net.Buffers
+	for i := 0; i < 100; i++ {
+		buf := make([]byte, 1024) // 1KB per record
+		for j := range buf {
+			buf[j] = byte((i + j) % 256)
+		}
+		buffers = append(buffers, buf)
+	}
+
+	// Write all buffers at once (writev)
+	n, err := buffers.WriteTo(f)
+	require.NoError(t, err, "WriteTo should succeed")
+	require.Equal(t, int64(100*1024), n, "should write all buffers")
+
+	// Fdatasync
+	err = Fdatasync(f)
+	require.NoError(t, err)
+
+	// Verify file size
+	info, err := f.Stat()
+	require.NoError(t, err)
+	require.Equal(t, int64(100*1024), info.Size())
+}
+
+func TestWritev_LargeBatch(t *testing.T) {
+	// Test with large number of buffers (exceeding IOV_MAX)
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "writev_large.bin")
+
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	require.NoError(t, err)
+	defer f.Close()
+
+	// Create 2000 buffers (exceeds IOV_MAX of 1024 on Linux)
+	var buffers net.Buffers
+	for i := 0; i < 2000; i++ {
+		buf := make([]byte, 512)
+		for j := range buf {
+			buf[j] = byte((i + j) % 256)
+		}
+		buffers = append(buffers, buf)
+	}
+
+	// Go's net.Buffers should handle IOV_MAX chunking
+	n, err := buffers.WriteTo(f)
+	require.NoError(t, err, "WriteTo should handle large batch")
+	require.Equal(t, int64(2000*512), n)
+
+	err = Fdatasync(f)
+	require.NoError(t, err)
 }
 
 func TestAlignForHolePunch(t *testing.T) {

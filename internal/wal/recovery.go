@@ -1,7 +1,6 @@
 package wal
 
 import (
-	"bufio"
 	"errors"
 	"fmt"
 	"io"
@@ -9,6 +8,7 @@ import (
 	"path/filepath"
 
 	"github.com/miretskiy/blobcache/internal/record"
+	"github.com/miretskiy/blobcache/internal/sys"
 )
 
 // ComputeRecoveryCheckpoint returns the highest SeqID across all segment envelopes.
@@ -24,12 +24,20 @@ func ComputeRecoveryCheckpoint(segments []record.SegmentFooter) uint64 {
 }
 
 // recoverFile replays all records from a single WAL file.
+// Handles O_DIRECT padding by skipping zero regions to the next 4KB boundary.
 func (w *WAL) recoverFile(path string, applyFn func(record.Record) error) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
+
+	// Get file size for EOF detection
+	stat, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	fileSize := stat.Size()
 
 	// Read and validate header
 	headerBuf := make([]byte, FileHeaderSize)
@@ -40,46 +48,68 @@ func (w *WAL) recoverFile(path string, applyFn func(record.Record) error) error 
 		return fmt.Errorf("invalid header: %w", err)
 	}
 
-	// Buffered reader for efficiency
-	reader := bufio.NewReaderSize(f, 64*1024)
+	pos := int64(FileHeaderSize)
+	recHeaderBuf := make([]byte, record.HeaderSize)
 
-	for {
+	for pos < fileSize {
 		// Read record header
-		recHeaderBuf := make([]byte, record.HeaderSize)
-		_, err := io.ReadFull(reader, recHeaderBuf)
+		n, err := f.ReadAt(recHeaderBuf, pos)
 		if err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-				break // Clean end of file (or partial write at end)
+				break
 			}
-			break // Other error, stop reading
+			break
+		}
+		if n < record.HeaderSize {
+			break
 		}
 
 		hdr, err := record.DecodeHeader(recHeaderBuf)
 		if err != nil || !hdr.IsValid() {
-			break // Corruption or incomplete write - stop here
+			// O_DIRECT padding: skip to next 4KB boundary
+			nextBlock := sys.RoundToBlock(pos + 1)
+			if nextBlock >= fileSize {
+				break
+			}
+			pos = nextBlock
+			continue
 		}
 
-		// Read payload
+		// Read full record (header + payload)
 		payloadSize := hdr.PayloadSize()
-		payloadBuf := make([]byte, payloadSize)
-		if _, err = io.ReadFull(reader, payloadBuf); err != nil {
+		fullSize := record.HeaderSize + payloadSize
+
+		// Sanity check: payload can't exceed remaining file size
+		// (protects against corrupted headers with garbage sizes)
+		if payloadSize < 0 || int64(fullSize) > fileSize-pos {
+			nextBlock := sys.RoundToBlock(pos + 1)
+			if nextBlock >= fileSize {
+				break
+			}
+			pos = nextBlock
+			continue
+		}
+
+		fullBuf := make([]byte, fullSize)
+
+		if _, err = f.ReadAt(fullBuf, pos); err != nil {
 			break // Incomplete record at end of file
 		}
 
-		// Decode full record with CRC verification
-		fullBuf := make([]byte, 0, record.HeaderSize+payloadSize)
-		fullBuf = append(fullBuf, recHeaderBuf...)
-		fullBuf = append(fullBuf, payloadBuf...)
-
+		// Decode with CRC verification
 		rec, err := record.DecodeRecord(fullBuf, true)
 		if err != nil {
-			continue // CRC mismatch - skip and try next record
+			// CRC mismatch - skip to next block boundary
+			pos = sys.RoundToBlock(pos + 1)
+			continue
 		}
 
 		// Apply the record
 		if err := applyFn(rec); err != nil {
 			return fmt.Errorf("apply seqID=%d: %w", rec.SeqID, err)
 		}
+
+		pos += int64(fullSize)
 	}
 
 	return nil
@@ -87,6 +117,7 @@ func (w *WAL) recoverFile(path string, applyFn func(record.Record) error) error 
 
 // ScanMaxSeqID finds the highest SeqID in a WAL file.
 // Used to determine if a WAL file can be safely truncated.
+// Handles O_DIRECT padding by skipping zero regions to the next 4KB boundary.
 func ScanMaxSeqID(path string) (uint64, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -94,29 +125,40 @@ func ScanMaxSeqID(path string) (uint64, error) {
 	}
 	defer f.Close()
 
-	// Skip header
-	if _, err := f.Seek(FileHeaderSize, io.SeekStart); err != nil {
+	// Get file size for EOF detection
+	stat, err := f.Stat()
+	if err != nil {
 		return 0, err
 	}
+	fileSize := stat.Size()
 
 	var maxSeq uint64
 	headerBuf := make([]byte, record.HeaderSize)
+	pos := int64(FileHeaderSize)
 
-	for {
-		if _, err := io.ReadFull(f, headerBuf); err != nil {
+	for pos < fileSize {
+		n, err := f.ReadAt(headerBuf, pos)
+		if err != nil || n < record.HeaderSize {
 			break
 		}
+
 		hdr, err := record.DecodeHeader(headerBuf)
 		if err != nil || !hdr.IsValid() {
-			break
+			// O_DIRECT padding: skip to next 4KB boundary
+			nextBlock := sys.RoundToBlock(pos + 1)
+			if nextBlock >= fileSize {
+				break
+			}
+			pos = nextBlock
+			continue
 		}
+
 		if hdr.SeqID > maxSeq {
 			maxSeq = hdr.SeqID
 		}
-		// Skip payload
-		if _, err := f.Seek(int64(hdr.PayloadSize()), io.SeekCurrent); err != nil {
-			break
-		}
+
+		// Advance past this record
+		pos += int64(record.HeaderSize) + int64(hdr.PayloadSize())
 	}
 
 	return maxSeq, nil

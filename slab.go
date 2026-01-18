@@ -14,7 +14,8 @@ import (
 // Embeds record.Header to access compression/error flags and sizes.
 type SlabEntry struct {
 	record.Header       // Flags, SeqID, PhysicalSize, LogicalSize (Magic/KeyLen unused here)
-	Pos           int64 // Byte offset within slab buffer
+	Pos           int64 // Byte offset within slab buffer (for Librarian reads)
+	WalPos        int64 // Byte offset within WAL file (for footer when WAL enabled)
 }
 
 // SharedSlab represents a populated chunk of memory and its index.

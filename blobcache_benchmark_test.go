@@ -74,7 +74,6 @@ func BenchmarkBlobCache(b *testing.B) {
 	cache, err := New(tmpDir,
 		WithMaxSize(400<<30),
 		WithWriteBufferSize(128<<20),
-		WithSegmentSize(2<<30),
 		WithMaxInflightSlabs(32),
 		WithFlushConcurrency(6),
 		WithDirectIOWrite(directIO),
@@ -228,7 +227,7 @@ func reportLatency(b *testing.B, name string, h *hdrhistogram.Histogram) {
 	b.ReportMetric(float64(p999), prefix+"-p999-ns")
 }
 func startSystemMonitor(
-		ctx context.Context, logicalBytes *atomic.Int64, cachePath string,
+	ctx context.Context, logicalBytes *atomic.Int64, cachePath string,
 ) <-chan SystemMetrics {
 	out := make(chan SystemMetrics, 1)
 	go func() {
@@ -311,9 +310,9 @@ func startSystemMonitor(
 				freeGB := float64(usage.Free) / (1 << 30)
 
 				fmt.Printf("\n[HEARTBEAT %s]\n"+
-						"  MEM:   RSS: %.2fGB\n"+
-						"  DISK:  IO Depth: %.2f | Phys-Write: %.2f GB/s | Free: %.1fGB\n"+
-						"  SIEVE: Phys: %.2fGB | Log: %.2fGB | Ratio: %.2f | Log-TP: %.2f GB/s\n",
+					"  MEM:   RSS: %.2fGB\n"+
+					"  DISK:  IO Depth: %.2f | Phys-Write: %.2f GB/s | Free: %.1fGB\n"+
+					"  SIEVE: Phys: %.2fGB | Log: %.2fGB | Ratio: %.2f | Log-TP: %.2f GB/s\n",
 					time.Now().Format("15:04:05"), rss, currentQD, physTP, freeGB,
 					float64(physicalSize)/(1<<30), float64(logicalSize)/(1<<30),
 					sRatio, logicalTP)

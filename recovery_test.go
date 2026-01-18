@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/miretskiy/blobcache/internal/wal"
+	"github.com/miretskiy/blobcache/internal/sys"
 	"github.com/stretchr/testify/require"
 )
 
@@ -16,7 +16,6 @@ func TestRecovery_CorruptIndex(t *testing.T) {
 
 	// Create cache and write some data
 	cache, err := New(tmpDir,
-		WithSegmentSize(0),
 		WithMaxSize(100<<20),
 	)
 	if err != nil {
@@ -48,7 +47,6 @@ func TestRecovery_CorruptIndex(t *testing.T) {
 
 	// Run recovery
 	recovered, err := RecoverIndex(tmpDir,
-		WithSegmentSize(0),
 		WithMaxSize(100<<20),
 	)
 	if err != nil {
@@ -76,7 +74,6 @@ func TestRecovery_CorruptSegment(t *testing.T) {
 
 	// Create cache and write some data
 	cache, err := New(tmpDir,
-		WithSegmentSize(0),
 		WithMaxSize(100<<20),
 	)
 	if err != nil {
@@ -132,7 +129,6 @@ func TestRecovery_CorruptSegment(t *testing.T) {
 
 	// Run recovery - should remove the corrupt segment
 	recovered, err := RecoverIndex(tmpDir,
-		WithSegmentSize(0),
 		WithMaxSize(100<<20),
 	)
 	if err != nil {
@@ -187,9 +183,7 @@ func TestRecovery_InvalidSegmentID(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	// Create cache and write data
-	cache, err := New(tmpDir,
-		WithSegmentSize(0),
-	)
+	cache, err := New(tmpDir)
 	if err != nil {
 		t.Fatalf("failed to create cache: %v", err)
 	}
@@ -209,9 +203,7 @@ func TestRecovery_InvalidSegmentID(t *testing.T) {
 	}
 
 	// Run recovery - should skip invalid segment
-	recovered, err := RecoverIndex(tmpDir,
-		WithSegmentSize(0),
-	)
+	recovered, err := RecoverIndex(tmpDir)
 	if err != nil {
 		t.Fatalf("recovery failed: %v", err)
 	}
@@ -230,8 +222,7 @@ func TestWAL_FileLifecycle(t *testing.T) {
 
 	cache, err := New(tmpDir,
 		WithWAL(),
-		WithWALSyncMode(wal.SyncNone), // Fast tests
-		WithSegmentSize(0),
+		WithWALFlags(sys.SyncNone), // Fast tests
 	)
 	require.NoError(t, err)
 
@@ -264,8 +255,7 @@ func TestWAL_RecoveryAfterCrash(t *testing.T) {
 	// First session: write data but don't flush (simulate crash)
 	cache, err := New(tmpDir,
 		WithWAL(),
-		WithWALSyncMode(wal.SyncNone),
-		WithSegmentSize(0),
+		WithWALFlags(sys.SyncNone),
 	)
 	require.NoError(t, err)
 
@@ -292,14 +282,13 @@ func TestWAL_RecoveryAfterCrash(t *testing.T) {
 	cache.memTable.Close()
 	cache.librarian.Close()
 	cache.memTable.ClosePools()
-	cache.storage.Close()
+	cache.archivist.Close()
 	cache.index.Close()
 
 	// Second session: recovery should restore data from WAL
 	recovered, err := New(tmpDir,
 		WithWAL(),
-		WithWALSyncMode(wal.SyncNone),
-		WithSegmentSize(0),
+		WithWALFlags(sys.SyncNone),
 	)
 	require.NoError(t, err)
 	defer recovered.Close()
@@ -325,8 +314,7 @@ func TestWAL_CommittedFilesCleanedUp(t *testing.T) {
 	// Write data and flush to segment (normal operation)
 	cache, err := New(tmpDir,
 		WithWAL(),
-		WithWALSyncMode(wal.SyncNone),
-		WithSegmentSize(0),
+		WithWALFlags(sys.SyncNone),
 	)
 	require.NoError(t, err)
 
@@ -348,8 +336,7 @@ func TestWAL_CommittedFilesCleanedUp(t *testing.T) {
 	// Reopen - should work with no WAL files to replay
 	recovered, err := New(tmpDir,
 		WithWAL(),
-		WithWALSyncMode(wal.SyncNone),
-		WithSegmentSize(0),
+		WithWALFlags(sys.SyncNone),
 	)
 	require.NoError(t, err)
 	defer recovered.Close()
@@ -371,9 +358,8 @@ func TestWAL_MultipleSlabRecovery(t *testing.T) {
 	// Use small buffer to force rotations
 	cache, err := New(tmpDir,
 		WithWAL(),
-		WithWALSyncMode(wal.SyncNone),
+		WithWALFlags(sys.SyncNone),
 		WithWriteBufferSize(4096), // Small buffer to force rotations
-		WithSegmentSize(0),
 	)
 	require.NoError(t, err)
 
@@ -395,15 +381,14 @@ func TestWAL_MultipleSlabRecovery(t *testing.T) {
 	cache.memTable.Close()
 	cache.librarian.Close()
 	cache.memTable.ClosePools()
-	cache.storage.Close()
+	cache.archivist.Close()
 	cache.index.Close()
 
 	// Recover
 	recovered, err := New(tmpDir,
 		WithWAL(),
-		WithWALSyncMode(wal.SyncNone),
+		WithWALFlags(sys.SyncNone),
 		WithWriteBufferSize(4096),
-		WithSegmentSize(0),
 	)
 	require.NoError(t, err)
 	defer recovered.Close()

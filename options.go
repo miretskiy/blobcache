@@ -48,10 +48,6 @@ type WALConfig struct {
 	wal.Config
 }
 
-// MaxSegmentSize is the maximum allowed segment size (4GB).
-// This limit is imposed by using uint32 for offsets in index.Item.
-const MaxSegmentSize int64 = 1 << 32 // 4GB
-
 // config holds internal configuration
 type config struct {
 	Path    string
@@ -64,7 +60,6 @@ type config struct {
 	MaxCachedSlabs   int   // Max slabs kept in memory for reading
 
 	LargeWriteThreshold int64
-	SegmentSize         int64
 	FlushConcurrency    int
 	BloomFPRate         float64
 	BloomEstimatedKeys  int
@@ -142,17 +137,6 @@ func WithVerifyOnRead(enabled bool) Option {
 	return funcOpt(func(c *config) { c.Resilience.VerifyOnRead = enabled })
 }
 
-func WithSegmentSize(size int64) Option {
-	return funcOpt(func(c *config) {
-		if size > MaxSegmentSize {
-			log.Warn("SegmentSize exceeds maximum, clamping to 4GB",
-				"requested", size, "max", MaxSegmentSize)
-			size = MaxSegmentSize
-		}
-		c.SegmentSize = size
-	})
-}
-
 func WithLargeWriteThreshold(size int64) Option {
 	return funcOpt(func(c *config) { c.LargeWriteThreshold = size })
 }
@@ -202,19 +186,13 @@ func WithWAL() Option {
 	})
 }
 
-// WithWALSyncMode sets the sync mode for WAL writes.
-// SyncData (default): fdatasync - syncs data but not metadata
-// SyncFull: fsync - full durability
-// SyncNone: no sync - for testing only
-func WithWALSyncMode(mode wal.SyncMode) Option {
-	return funcOpt(func(c *config) { c.WAL.SyncMode = mode })
-}
-
-// WithWALDir configures the wal to use different directory from the
-// cache directory.  Allows splitting WAL, possibly into dedicated disk.
-// By default, creates "wal" subdirectory under the cache directory.
-func WithWALDir(dir string) Option {
-	return funcOpt(func(c *config) { c.WAL.Dir = dir })
+// WithWALFlags sets the file flags for WAL writes.
+// FlDirectIO: bypass OS page cache (default: enabled)
+// FlDSync: fdatasync after writes (default: enabled)
+// FlSync: full fsync after writes
+// Use sys.SyncNone (0) for testing only.
+func WithWALFlags(flags sys.OpenFlag) Option {
+	return funcOpt(func(c *config) { c.WAL.Flags = flags })
 }
 
 // WithDegradedMode controls how the cache handles degraded mode.
@@ -231,7 +209,6 @@ func defaultConfig(path string) config {
 		Shards:              0,
 		WriteBufferSize:     128 << 20, // 128MB
 		LargeWriteThreshold: 4 << 20,
-		SegmentSize:         2 << 30, // 2GB
 		MaxInflightSlabs:    6,
 		MaxCachedSlabs:      8, // Keep ~1GB of recently written data in RAM
 		FlushConcurrency:    6,
@@ -249,8 +226,8 @@ func defaultConfig(path string) config {
 			MinSize: 512, // Don't compress small blobs
 		},
 		WAL: WALConfig{
-			Enabled: false,                              // Disabled by default (ephemeral cache mode)
-			Config:  wal.Config{SyncMode: wal.SyncData}, // fdatasync for durability when enabled
+			Enabled: false,
+			Config:  wal.Config{Flags: sys.FlDirectIO | sys.SyncData},
 		},
 	}
 }

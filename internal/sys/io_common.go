@@ -4,12 +4,88 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
 	"syscall"
-
-	"github.com/ncw/directio"
+	"unsafe"
 )
 
-const mask = directio.BlockSize - 1
+// IsAligned checks if block is aligned in memory for DirectIO.
+func IsAligned(block []byte) bool {
+	if len(block) == 0 {
+		return true
+	}
+	return uintptr(unsafe.Pointer(&block[0]))&uintptr(BlockMask) == 0
+}
+
+// OpenFlag is a bitBlockMask controlling file opening behavior.
+type OpenFlag int
+
+const (
+	// FlDirectIO bypasses the page cache (O_DIRECT on Linux, F_NOCACHE on Darwin).
+	FlDirectIO OpenFlag = 1 << iota
+
+	// FlDSync ensures data is synced before write returns (O_DSYNC on Linux).
+	// On Darwin, this flag triggers explicit Fdatasync after writes.
+	FlDSync
+
+	// FlSync ensures data AND metadata are synced (O_SYNC on Linux).
+	// On Darwin, this flag triggers explicit Sync after writes.
+	FlSync
+)
+
+// Convenience flag combinations for common use cases.
+const (
+	// SyncNone opens without any sync flags (testing only).
+	SyncNone OpenFlag = 0
+
+	// SyncData opens with FlDSync for data durability.
+	SyncData OpenFlag = FlDSync
+
+	// SyncFull opens with FlSync for full durability (data + metadata).
+	SyncFull OpenFlag = FlSync
+)
+
+// ErrAlignment is returned when data is not properly aligned for O_DIRECT.
+var ErrAlignment = errors.New("data buffer not aligned for O_DIRECT")
+
+// SyncFile syncs the file based on flags.
+// On Linux, O_DSYNC/O_SYNC at open time handles sync; on Darwin, explicit calls are needed.
+func SyncFile(f *os.File, flags OpenFlag) error {
+	if !RequiresExplicitSync {
+		return nil
+	}
+	if flags&FlSync != 0 {
+		return f.Sync()
+	}
+	if flags&FlDSync != 0 {
+		return Fdatasync(f)
+	}
+	return nil
+}
+
+// WriteBulkAligned atomically writes aligned data to a new file.
+// data must be 4KB-aligned if FlDirectIO is set.
+func WriteBulkAligned(path string, data []byte, flags OpenFlag) (retErr error) {
+	if flags&FlDirectIO != 0 && !IsAligned(data) {
+		return ErrAlignment
+	}
+
+	f, err := CreateFile(path, flags)
+	if err != nil {
+		return err
+	}
+	defer func() { retErr = errors.Join(retErr, f.Close()) }()
+
+	if err := Fallocate(f, int64(len(data))); err != nil {
+		return err
+	}
+
+	if _, err := f.Write(data); err != nil {
+		return err
+	}
+
+	return SyncFile(f, flags)
+}
 
 type FadviseHint int
 
@@ -25,16 +101,16 @@ type Offset_t int64
 // canPunch is false if there are no complete blocks to punch
 func AlignForHolePunch(offset, length int64) (int64, int64, bool) {
 	// Round offset UP to next block boundary (don't punch into previous blob)
-	alignedOffset := (offset + mask) &^ mask
+	alignedOffset := (offset + BlockMask) &^ BlockMask
 	length -= alignedOffset - offset
 
 	// Skip if blob smaller than one block after adjustment
-	if length < directio.BlockSize {
+	if length < BlockSize {
 		return 0, 0, false
 	}
 
 	// Round length DOWN to block multiple (don't punch into next blob)
-	length &^= mask
+	length &^= BlockMask
 
 	return alignedOffset, length, true
 }

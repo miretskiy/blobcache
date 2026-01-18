@@ -14,26 +14,26 @@ import (
 // Key is the 128-bit XXH3 hash of a blob key.
 type Key = xxh3.Uint128
 
-// Block header constants.
-// Each slab written to a segment file starts with a block header, making it
-// a self-describing unit. This enables resilience (scan for magic to re-sync
-// after corruption) and simplifies the write path (no special-casing for
-// first vs subsequent slabs).
+// File header constants.
+// All blobcache data files (segments, WAL) start with a common file header,
+// making them self-describing units. This enables:
+// - Resilience: scan for magic to re-sync after corruption
+// - Unified format: WAL files can be renamed to segments directly
 const (
-	// BlockHeaderSize is the size of each block header (magic + version).
-	BlockHeaderSize = 8
+	// FileHeaderSize is the size of the file header (magic + version).
+	FileHeaderSize = 8
 
-	// BlockMagic identifies a blobcache segment block.
-	BlockMagic uint32 = 0xB10BC453
+	// FileMagic identifies a blobcache data file.
+	FileMagic uint32 = 0xB10BC453
 
-	// BlockVersion is the current block format version.
-	BlockVersion uint32 = 0x00000001
+	// FileVersion is the current file format version.
+	FileVersion uint32 = 0x00000001
 )
 
-// BlockHeaderBytes is the fixed 8-byte block header (magic + version).
-var BlockHeaderBytes = [BlockHeaderSize]byte{
-	0x53, 0xC4, 0x0B, 0xB1, // BlockMagic (little-endian)
-	0x01, 0x00, 0x00, 0x00, // BlockVersion (little-endian)
+// FileHeaderBytes is the fixed 8-byte file header (magic + version).
+var FileHeaderBytes = [FileHeaderSize]byte{
+	0x53, 0xC4, 0x0B, 0xB1, // FileMagic (little-endian)
+	0x01, 0x00, 0x00, 0x00, // FileVersion (little-endian)
 }
 
 // Segment file format definitions.
@@ -46,24 +46,24 @@ var BlockHeaderBytes = [BlockHeaderSize]byte{
 // only on clean close and enables O(1) index rebuild. If missing (crash),
 // recovery falls back to linear record scanning.
 
-// Segment errors.
+// File header errors.
 var (
-	ErrInvalidBlockMagic = errors.New("segment: invalid block magic")
-	ErrInvalidVersion    = errors.New("segment: unsupported version")
+	ErrInvalidFileMagic = errors.New("record: invalid file magic")
+	ErrInvalidVersion   = errors.New("record: unsupported version")
 )
 
-// ValidateBlockHeader checks if src starts with a valid block header.
-func ValidateBlockHeader(src []byte) error {
-	if len(src) < BlockHeaderSize {
+// ValidateFileHeader checks if src starts with a valid file header.
+func ValidateFileHeader(src []byte) error {
+	if len(src) < FileHeaderSize {
 		return ErrBufferTooSmall
 	}
 	magic := binary.LittleEndian.Uint32(src[0:4])
 	version := binary.LittleEndian.Uint32(src[4:8])
 
-	if magic != BlockMagic {
-		return ErrInvalidBlockMagic
+	if magic != FileMagic {
+		return ErrInvalidFileMagic
 	}
-	if version != BlockVersion {
+	if version != FileVersion {
 		return ErrInvalidVersion
 	}
 	return nil

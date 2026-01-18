@@ -1,9 +1,17 @@
 # BlobCache Design Document
 
 ## 1. Executive Summary
-BlobCache is a specialized storage engine optimized for high-throughput, append-heavy blob workloads (100KB–10MB). By bypassing the kernel’s page cache and implementing a custom user-space memory hierarchy, BlobCache provides predictable performance and maximizes NVMe bandwidth while maintaining a minimal CPU and GC footprint.
+BlobCache is a specialized storage engine optimized for high-throughput, append-heavy blob workloads (100KB–10MB). By bypassing the kernel's page cache and implementing a custom user-space memory hierarchy, BlobCache provides predictable performance and maximizes NVMe bandwidth while maintaining a minimal CPU and GC footprint.
 
 > **Note:** Performance claims such as "sub-millisecond write latencies" are architectural targets based on initial micro-benchmarks. **[TODO: Verify end-to-end write latency under sustained 1GB/s load]**.
+
+### 1.1 Project Ferrum: Unified Log-Structured Architecture
+
+Ferrum eliminates the distinction between a "Log" and a "Segment." Data is serialized to disk exactly once using a single, authoritative binary format.
+
+- **Immutable Segments:** Every persisted file is treated as an immutable block of records.
+- **One-Way Flow:** Data flows MemTable → Disk.
+- **Unified Writer:** The `wal` package is the sole authority for writing data.
 
 ---
 
@@ -234,7 +242,35 @@ $$\text{Index RAM (MB)} \approx \frac{\text{Disk Capacity (MB)}}{\text{Avg Blob 
 
 > **Future Optimization:** The Key stored in `Item` is redundant with the map key, adding 16 bytes of overhead per entry. A future refactor could store the Key only in the `node` struct (for eviction) and reduce `Item` to 16-byte coordinates, saving ~11% memory.
 
-### 4.5 Start up and Crash Recovery
+### 4.5 The Archivist (Segment Store) & Index Semantics
+
+The **Archivist** manages read-only access to persisted segments using a strict Index Item contract:
+
+```go
+type Item struct {
+    Key         Key    // 128-bit XXH3 hash
+    SegmentID   uint32 // File ID
+    Offset      uint32 // Absolute byte offset to the START of the Record (Points to Magic)
+    PhysicalLen uint32 // Total on-disk size: 42 (Header) + KeyLen + PhysSize
+    Flags       uint32 // Status flags
+}
+```
+
+**Critical Semantics:**
+
+- **Offset:** Points strictly to the first byte of the Magic Number (`0xB10BCAFE`). The Archivist does not scan; it seeks directly to coordinates.
+- **PhysicalLen:** Does not include alignment padding. The Index knows exactly where the data ends; no heuristics required.
+- **Zero Magic:** The Archivist trusts the Index for location but verifies the Record for safety (HeaderCRC validation before allocation).
+
+**ReadBlob Safety Protocol:**
+
+1. Seek to `Item.Offset`
+2. Read exactly 42 bytes (Header)
+3. **Verify HeaderCRC** (Crucial: do NOT allocate based on PhysSize if CRC fails)
+4. Allocate buffer of size `KeyLen + PhysicalSize`
+5. Read Key + Value
+
+### 4.6 Start up and Crash Recovery
 `NewIndex` performs a **Persistence Scan**:
 1. It iterates through Bitcask using `scanAll`.
 2. Decodes `SegmentRecord` chunks.
@@ -251,7 +287,7 @@ return true
 })
 ```
 
-### 4.6 Write Ordering and Sequence IDs
+### 4.7 Write Ordering and Sequence IDs
 
 A cache might seem like a system where "eventual consistency" is acceptable—after all, cached data is ephemeral by nature. However, users have a reasonable expectation that updating a key will make the new value visible, not resurrect some old value that was written earlier. When a user calls `Put("config", v2)` to update a configuration blob, subsequent `Get("config")` calls should return `v2`, not `v1` from a previous write that happened to complete out of order.
 
@@ -680,7 +716,31 @@ The `WithCacheAfterRead` option provides a mechanism to promote cold data into t
 
 BlobCache supports an optional Write-Ahead Log that transforms the cache into a crash-consistent Content Addressable Storage (CAS) system. When enabled, every Put operation is durably recorded before the caller returns, guaranteeing that data survives process crashes and system restarts.
 
-### 12.1 When to Use WAL
+### 12.1 The "Sync Switch" Architecture
+
+The engine operates in two modes sharing the same `sys` primitives, optimized for OS differences:
+
+**Cache Mode (Turbo):**
+
+| Aspect | Description |
+|--------|-------------|
+| Ingest | Write to MemTable only |
+| Durability | Memory-only until flush |
+| Linux I/O | `O_DIRECT` (Bulk Dump) |
+| Darwin I/O | `F_NOCACHE` (Bulk Dump) |
+| Flush Action | Bulk Write via `wal.WriteBulk` |
+
+**Durable Mode (Safe):**
+
+| Aspect | Description |
+|--------|-------------|
+| Ingest | Write to MemTable + WAL (Stream) |
+| Durability | Synchronous |
+| Linux I/O | `O_DIRECT \| O_DSYNC` (Stream) |
+| Darwin I/O | `F_NOCACHE` + `F_FULLFSYNC` (Stream) |
+| Flush Action | Rename `wal-active.log` → `segment-N.data` |
+
+### 12.2 When to Use WAL
 
 WAL is appropriate for workloads requiring durability guarantees beyond the default behavior:
 
@@ -690,7 +750,7 @@ WAL is appropriate for workloads requiring durability guarantees beyond the defa
 
 Without WAL, BlobCache operates as a high-performance cache where data in the MemTable may be lost on crash (data already flushed to segments is always durable).
 
-### 12.2 Group Commit Architecture
+### 12.3 Group Commit Architecture
 
 WAL uses a group commit strategy that amortizes the cost of `fsync` across multiple concurrent writers:
 
@@ -728,9 +788,27 @@ CONCURRENT WRITERS                    LEADER ELECTION
 3. **sync.Cond Signaling**: Waiters use `sync.Cond` instead of per-request channels, reducing allocation overhead
 4. **net.Buffers (writev)**: All records are encoded into `net.Buffers` for gathered I/O, reducing syscall overhead from N writes to ~1 writev call
 
-### 12.3 WAL File Format
+### 12.4 WAL File Format & Hardened Record Format (v2)
 
-WAL entries use the **unified `record.Record` format** (35-byte header + key + value), enabling shared encoding/decoding code with segment files.
+WAL entries use the **unified `record.Record` format**, enabling shared encoding/decoding code with segment files. The v2 format introduces a **Header Checksum** to prevent "allocate-on-corrupt-size" panics.
+
+**Record Layout (42 bytes fixed header + variable payload):**
+
+```text
+[Magic:4] [HeaderCRC:4] [Flags:8] [SeqID:8] [KeyLen:2] [PhysSize:8] [LogSize:8] [Key...] [Value...]
+```
+
+| Field | Size | Description |
+|-------|------|-------------|
+| Magic | 4 bytes | `0xB10BCAFE` - identifies valid records |
+| HeaderCRC | 4 bytes | CRC32 IEEE of the following 34 bytes (Flags..LogSize) |
+| Flags | 8 bytes | Compression, status, CRC32 of payload |
+| SeqID | 8 bytes | Monotonic sequence ID |
+| KeyLen | 2 bytes | Key length in bytes |
+| PhysSize | 8 bytes | Physical (on-disk) value size |
+| LogSize | 8 bytes | Logical (uncompressed) value size |
+
+**Safety Invariant:** Readers MUST verify HeaderCRC before trusting PhysSize to allocate memory.
 
 **File Layout:**
 
@@ -744,7 +822,7 @@ WAL entries use the **unified `record.Record` format** (35-byte header + key + v
 |   HeaderCRC: CRC32 (4 bytes)                              |
 |   Padding (4 bytes)                                       |
 +-----------------------------------------------------------+
-| Record 1 (35-byte header + key + value)                   |
+| Record 1 (42-byte header + key + value)                   |
 +-----------------------------------------------------------+
 | Record 2 ...                                              |
 +-----------------------------------------------------------+
@@ -762,7 +840,7 @@ This naming scheme provides:
 - 1:1 pairing with MemTable slabs (each slab rotation creates a new WAL file)
 - Simple cleanup (delete WAL file when corresponding slab is flushed to segment)
 
-### 12.4 Crash-Only Initialization
+### 12.5 Crash-Only Initialization
 
 BlobCache uses "crash-only" initialization for WAL recovery. Rather than maintaining complex state about partially-recovered data, the system fully recovers WAL entries, flushes them to segments, and then restarts cleanly:
 
@@ -797,7 +875,7 @@ This two-attempt loop guarantees:
 - Simple, predictable behavior after any crash scenario
 - WAL files are deleted through the normal flush path
 
-### 12.5 Write Path Integration
+### 12.6 Write Path Integration
 
 WAL writes happen **before** slab allocation, ensuring clean failure handling:
 
@@ -827,7 +905,7 @@ Put(key, value) {
 3. **Slab Allocation**: Only happens after WAL success (no orphaned slab data)
 4. **Degraded Mode**: WAL failure triggers degraded mode; subsequent writes skip WAL
 
-### 12.6 WAL File Lifecycle
+### 12.7 WAL File Lifecycle
 
 WAL files are deleted through the normal flush path, not during recovery:
 
@@ -861,7 +939,7 @@ This design ensures:
 - No explicit coordination needed during recovery
 - Simple crash semantics: WAL files exist = data needs recovery
 
-### 12.7 Performance Characteristics
+### 12.8 Performance Characteristics
 
 | Scenario | Impact | Notes |
 |----------|--------|-------|
@@ -873,14 +951,14 @@ This design ensures:
 **Configuration:**
 
 ```go
-// Enable WAL with default settings (fdatasync after each batch)
+// Enable WAL with default settings (O_DIRECT + fdatasync after each batch)
 cache, _ := blobcache.New(path, blobcache.WithWAL())
 
 // Full durability (fsync - includes metadata)
-cache, _ := blobcache.New(path, blobcache.WithWAL(), blobcache.WithWALSyncMode(wal.SyncFull))
+cache, _ := blobcache.New(path, blobcache.WithWAL(), blobcache.WithWALFlags(sys.FlDirectIO|sys.SyncFull))
 
-// Testing only (no sync)
-cache, _ := blobcache.New(path, blobcache.WithWAL(), blobcache.WithWALSyncMode(wal.SyncNone))
+// Testing only (no sync, no direct I/O)
+cache, _ := blobcache.New(path, blobcache.WithWAL(), blobcache.WithWALFlags(sys.SyncNone))
 ```
 
 ---

@@ -14,7 +14,7 @@ func TestCache_ReadAfterWrite(t *testing.T) {
 	tmpDir, _ := os.MkdirTemp("", "blobcache-test-*")
 	defer os.RemoveAll(tmpDir)
 
-	cache, err := New(tmpDir, WithSegmentSize(0))
+	cache, err := New(tmpDir)
 	require.NoError(t, err)
 	defer cache.Close()
 

@@ -274,13 +274,13 @@ func TestFooterEntry_SeqID(t *testing.T) {
 // Version Rejection Tests ("Time Machine" tests)
 // =============================================================================
 
-func TestBlockHeader_FutureVersionRejected(t *testing.T) {
+func TestFileHeader_FutureVersionRejected(t *testing.T) {
 	// Manually construct a header with Version = 999 (future version)
-	header := make([]byte, BlockHeaderSize)
-	binary.LittleEndian.PutUint32(header[0:4], BlockMagic)
+	header := make([]byte, FileHeaderSize)
+	binary.LittleEndian.PutUint32(header[0:4], FileMagic)
 	binary.LittleEndian.PutUint32(header[4:8], 999) // Future version
 
-	err := ValidateBlockHeader(header)
+	err := ValidateFileHeader(header)
 	require.ErrorIs(t, err, ErrInvalidVersion)
 }
 

@@ -154,7 +154,6 @@ func TestCache_DegradedMode_EvictionError(t *testing.T) {
 
 	cache, err := New(tmpDir,
 		WithMaxSize(5<<10), // 5KB limit
-		WithSegmentSize(0), // Flush on put
 		WithTestingKnobs(&TestingKnobs{
 			InjectEvictErr: func() error {
 				if callCount.Add(1) == 1 {

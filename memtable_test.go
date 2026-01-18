@@ -10,7 +10,6 @@ import (
 
 	"github.com/miretskiy/blobcache/base"
 	"github.com/miretskiy/blobcache/internal/index"
-	"github.com/miretskiy/blobcache/internal/record"
 	"github.com/miretskiy/blobcache/internal/xmap"
 	"github.com/stretchr/testify/require"
 )
@@ -99,100 +98,18 @@ func (m *MockHealthReporter) ReportBlobError(key Key, errno base.BlobErrno) {
 	// No-op for tests
 }
 
-// Helpers
-func testRoundToPage(size int64) int64 {
-	const pageSize = 4096
-	return (size + pageSize - 1) & ^(pageSize - 1)
-}
-
-func TestSegmentWriter_FullCycle(t *testing.T) {
-	tmpDir := t.TempDir()
-	const slabSize = 1024 * 1024
-	const segSize = 4 * 1024 * 1024
-	const segID = uint32(777)
-
-	pool := NewTrackedPool(4, slabSize)
-	defer pool.Teardown()
-
-	path := filepath.Join(tmpDir, "777.seg")
-
-	t.Run("AlignedPhysicalWrites", func(t *testing.T) {
-		sw, err := NewSegmentWriter(segID, path, segSize, pool, false, true)
-		require.NoError(t, err)
-
-		// Each slab reserves first 8 bytes for block header (filled by WriteSlab).
-		// Data starts at offset BlockHeaderSize within the slab buffer.
-		const dataStart = record.BlockHeaderSize
-
-		// Slab 1: reserve header space, write data after it
-		slab1 := pool.Acquire()
-		data1 := []byte("direct-io-block-1")
-		slab1.WriteAt(data1, dataStart)
-		slab1Len := int64(dataStart + len(data1))
-
-		entries1 := []record.FooterEntry{{
-			Key:         record.Key{Lo: 101},
-			Pos:         dataStart, // Position relative to slab start (after header)
-			LogicalSize: int64(len(data1)),
-		}}
-		_, err = sw.WriteSlab(slab1.AlignedBytes(slab1Len), entries1)
-		require.NoError(t, err)
-		slab1.Unpin()
-
-		// Slab 2: same pattern
-		slab2 := pool.Acquire()
-		data2 := []byte("direct-io-block-2")
-		slab2.WriteAt(data2, dataStart)
-		slab2Len := int64(dataStart + len(data2))
-
-		entries2 := []record.FooterEntry{{
-			Key:         record.Key{Lo: 202},
-			Pos:         dataStart,
-			LogicalSize: int64(len(data2)),
-		}}
-		_, err = sw.WriteSlab(slab2.AlignedBytes(slab2Len), entries2)
-		require.NoError(t, err)
-		slab2.Unpin()
-
-		require.NoError(t, sw.Close())
-
-		// Verify block header at offset 0 (first slab's header)
-		f, err := os.Open(path)
-		require.NoError(t, err)
-		defer f.Close()
-
-		headerBuf := make([]byte, record.BlockHeaderSize)
-		_, err = f.ReadAt(headerBuf, 0)
-		require.NoError(t, err)
-		require.NoError(t, record.ValidateBlockHeader(headerBuf), "first block should have valid header")
-
-		// Verify second slab also has block header
-		slab2Start := testRoundToPage(slab1Len)
-		_, err = f.ReadAt(headerBuf, slab2Start)
-		require.NoError(t, err)
-		require.NoError(t, record.ValidateBlockHeader(headerBuf), "second block should have valid header")
-
-		// Verify Footer Recovery
-		info, _ := f.Stat()
-		footer, _, err := record.ReadFooterBlock(f, info.Size(), int64(segID))
-		require.NoError(t, err)
-
-		// Verify positions: slab 2 entry should be at slab2Start + dataStart
-		expectedOffset := slab2Start + dataStart
-		require.Equal(t, expectedOffset, footer.Entries[1].Pos)
-	})
-}
-
 func TestMemTable_Integration_Rotation(t *testing.T) {
 	tmpDir := t.TempDir()
 	cfg := config{
 		Path:             tmpDir,
 		WriteBufferSize:  512 * 1024,
-		SegmentSize:      1024 * 1024,
 		MaxInflightSlabs: 4,
 		FlushConcurrency: 2,
 		Shards:           1,
 	}
+
+	// Create segment directory structure (normally done by checkOrInitialize)
+	require.NoError(t, os.MkdirAll(filepath.Join(tmpDir, "segments", "0000"), 0o755))
 
 	mb := &MockBatcher{}
 	mh := &MockHealthReporter{}
@@ -227,7 +144,7 @@ func TestMemTable_Integration_Rotation(t *testing.T) {
 	// 2. Verify rotation occurred.
 	require.GreaterOrEqual(t, len(mb.Batches), 2, "Should have flushed multiple segments")
 
-	// 3. Verify physical mu exist on disk.
+	// 3. Verify physical segments exist on disk.
 	segCount := 0
 	err := filepath.Walk(tmpDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {

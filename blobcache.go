@@ -33,10 +33,10 @@ const (
 // Cache is a high-performance blob storage with bloom filter optimization
 type Cache struct {
 	config
-	index   *index.DurableIndex
-	storage *Storage
-	wal     *wal.WAL // nil if WAL disabled
-	bloom   struct {
+	index     *index.DurableIndex
+	archivist *Archivist
+	wal       *wal.WAL // nil if WAL disabled
+	bloom     struct {
 		atomic.Pointer[bloom.Filter]
 		hits        atomic.Uint64             // Bloom filter said "yes"
 		ghosts      atomic.Uint64             // Bloom said yes, but index said no.
@@ -190,7 +190,7 @@ func open(cfg config) (*Cache, bool, error) {
 	c := &Cache{
 		config:          cfg,
 		index:           idx,
-		storage:         NewStorage(cfg, idx),
+		archivist:       NewArchivist(cfg, idx),
 		evictionTrigger: make(chan struct{}, 1),
 		stopCh:          make(chan struct{}),
 	}
@@ -268,7 +268,7 @@ func (c *Cache) Close() error {
 
 	return errors.Join(
 		walErr,
-		c.storage.Close(),
+		c.archivist.Close(),
 		c.index.Close(),
 	)
 }
@@ -346,7 +346,7 @@ func (c *Cache) search(key []byte) (data []byte, r io.Reader, rel Releaser, ok b
 	}
 
 	// 5. Read from disk (with key verification for collision detection)
-	diskReader, diskReleaser, err := c.storage.ReadBlob(entry, key)
+	diskReader, diskReleaser, err := c.archivist.ReadBlob(entry, key)
 	if err != nil {
 		diskReleaser.Release()
 		c.handleStorageError(h, entry, err)
@@ -744,7 +744,7 @@ func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
 
 	// 3. RECLAMATION PHASE
 	for _, v := range victims {
-		reclaimed, _ := c.storage.HolePunchBlob(v.SegmentID, v.Offset, v.PhysicalLen)
+		reclaimed, _ := c.archivist.HolePunchBlob(v.SegmentID, v.Offset, v.PhysicalLen)
 		physicallyReclaimed += reclaimed
 	}
 

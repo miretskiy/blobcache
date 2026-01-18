@@ -29,12 +29,6 @@ func Fdatasync(f *os.File) error {
 	return nil
 }
 
-// IsAligned always returns true on Darwin as F_NOCACHE does not
-// enforce the same strict memory-alignment rules as Linux O_DIRECT.
-func IsAligned(_ []byte) bool {
-	return true
-}
-
 // Fallocate pre-allocates disk space for a file
 // Darwin uses F_PREALLOCATE via fcntl
 func Fallocate(f *os.File, size int64) error {
@@ -134,15 +128,20 @@ func Fadvise(fd uintptr, _ Offset_t, _ int64, hint FadviseHint) error {
 	}
 }
 
-// OpenDirect opens specified file for writing.
-// If directIO is true, uses F_NOCACHE to bypass the page cache.
-func OpenDirect(path string, directIO bool) (*os.File, error) {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0644)
+// RequiresExplicitSync indicates whether explicit sync calls are needed for durable writes.
+// On Darwin, F_FULLFSYNC is required after writes to ensure durability.
+const RequiresExplicitSync = true
+
+// CreateFile creates a file for writing with the specified flags.
+// Always uses O_CREATE | O_WRONLY | O_TRUNC. Additional flags:
+//   - FlDirectIO: F_NOCACHE via fcntl (bypass page cache)
+//   - FlDSync/FlSync: ignored at open; caller must use Fdatasync/Sync after writes
+func CreateFile(path string, flags OpenFlag) (*os.File, error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
 		return nil, err
 	}
-	if directIO {
-		// Darwin's equivalent to O_DIRECT (bypassing the Page Cache)
+	if flags&FlDirectIO != 0 {
 		if _, err := unix.FcntlInt(f.Fd(), unix.F_NOCACHE, 1); err != nil {
 			_ = f.Close()
 			return nil, err

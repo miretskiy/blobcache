@@ -31,20 +31,19 @@ import (
 // (typically MemTable) where a "stale" write leaked into a newer epoch.
 var ErrSequenceRegression = errors.New("wal: sequence ID regression")
 
-// SyncMode controls how WAL entries are synced to disk.
-type SyncMode int
-
-const (
-	SyncNone SyncMode = iota // No sync (testing only)
-	SyncData                 // fdatasync (data only, not metadata)
-	SyncFull                 // fsync (full durability)
-)
+// WriteResult contains metadata about a completed WAL write.
+// Used by callers to track record positions for index updates.
+type WriteResult struct {
+	Offset       int64 // Absolute file offset of the record Magic byte
+	BytesWritten int64 // Physical size (Header + Key + Value)
+	BytesAligned int64 // Size on disk including padding (for stats/debugging)
+}
 
 // Config configures WAL behavior.
 type Config struct {
-	Dir          string   // Directory for WAL files
-	SyncMode     SyncMode // Sync mode (default: SyncData)
-	MaxBatchSize int      // Max staging buffer size (default: 16MB). 0 means use default.
+	Dir          string       // Directory for WAL files
+	Flags        sys.OpenFlag // File flags: FlDirectIO, FlDSync, FlSync (default: FlDirectIO|FlDSync)
+	MaxBatchSize int          // Max staging buffer size (default: 16MB). 0 means use default.
 }
 
 // DefaultMaxBatchSize is the staging buffer size for DirectIO (16MB).
@@ -54,8 +53,8 @@ const DefaultMaxBatchSize = 16 << 20
 // DefaultConfig returns a Config with sensible defaults.
 func DefaultConfig(dir string) Config {
 	return Config{
-		Dir:      dir,
-		SyncMode: SyncData,
+		Dir:   dir,
+		Flags: sys.FlDirectIO | sys.SyncData,
 	}
 }
 
@@ -74,8 +73,9 @@ type request struct {
 	// any pending normal records.
 	isOversized bool
 
-	Done bool  // Set true when request completes
-	Err  error // Error from processing (if any)
+	Done   bool        // Set true when request completes
+	Err    error       // Error from processing (if any)
+	Result WriteResult // Write result (valid when Done && Err == nil && !isRotation)
 }
 
 // Stats contains WAL metrics for observability.
@@ -162,8 +162,11 @@ func Open(cfg Config) (*WAL, error) {
 
 // Write adds a record to the WAL and blocks until the batch is synced.
 // Multiple concurrent callers batch together for a single fsync.
-func (w *WAL) Write(rec record.Record) error {
-	return w.submit(&request{rec: rec})
+// Returns WriteResult with the record's offset and size information.
+func (w *WAL) Write(rec record.Record) (WriteResult, error) {
+	req := &request{rec: rec}
+	err := w.submit(req)
+	return req.Result, err
 }
 
 // ErrUnalignedValue is returned when WriteDirect receives a value that
@@ -181,16 +184,18 @@ var ErrUnalignedValue = errors.New("wal: value not aligned or not page-sized for
 // Any pending normal writes are flushed before the oversized write.
 //
 // Returns ErrUnalignedValue if the value doesn't meet alignment requirements.
-func (w *WAL) WriteDirect(rec record.Record) error {
+func (w *WAL) WriteDirect(rec record.Record) (WriteResult, error) {
 	// Validate alignment requirements
 	if !sys.IsAligned(rec.Value) {
-		return ErrUnalignedValue
+		return WriteResult{}, ErrUnalignedValue
 	}
 	if int64(len(rec.Value))&sys.BlockMask != 0 {
-		return ErrUnalignedValue
+		return WriteResult{}, ErrUnalignedValue
 	}
 
-	return w.submit(&request{rec: rec, isOversized: true})
+	req := &request{rec: rec, isOversized: true}
+	err := w.submit(req)
+	return req.Result, err
 }
 
 // EnqueueRotation signals the WAL to close the current file after syncing
@@ -453,6 +458,7 @@ func (w *WAL) flushNormalRecords(batch []*request) error {
 }
 
 // writeChunk writes a chunk of records that fits in the staging buffer.
+// Populates WriteResult for each request in the chunk.
 func (w *WAL) writeChunk(chunk []*request, includeHeader bool) error {
 	// Calculate payload size
 	payloadSize := 0
@@ -469,7 +475,7 @@ func (w *WAL) writeChunk(chunk []*request, includeHeader bool) error {
 	buf := w.encodeBuf[:writeSize]
 
 	// Write header if needed
-	offset := 0
+	bufOffset := 0
 	if includeHeader {
 		hdr := FileHeader{
 			Magic:     FileMagic,
@@ -477,17 +483,33 @@ func (w *WAL) writeChunk(chunk []*request, includeHeader bool) error {
 			CreatedAt: time.Now().UnixNano(),
 		}
 		hdr.EncodeTo(buf)
-		offset = FileHeaderSize
+		bufOffset = FileHeaderSize
 	}
 
-	// Serialize records
+	// Track file offset for WriteResult (before writing)
+	baseFileOffset := w.fileOffset
+	if includeHeader {
+		baseFileOffset += FileHeaderSize
+	}
+
+	// Serialize records and populate WriteResult
 	for _, req := range chunk {
-		req.rec.EncodeTo(buf[offset:])
-		offset += req.rec.EncodedSize()
+		recSize := req.rec.EncodedSize()
+		req.rec.EncodeTo(buf[bufOffset:])
+
+		// Populate WriteResult with absolute file offset
+		req.Result = WriteResult{
+			Offset:       baseFileOffset,
+			BytesWritten: int64(recSize),
+			BytesAligned: int64(writeSize), // Shared across batch (total aligned write)
+		}
+
+		bufOffset += recSize
+		baseFileOffset += int64(recSize)
 	}
 
 	// Zero-pad tail
-	for i := offset; i < writeSize; i++ {
+	for i := bufOffset; i < writeSize; i++ {
 		buf[i] = 0
 	}
 
@@ -497,6 +519,7 @@ func (w *WAL) writeChunk(chunk []*request, includeHeader bool) error {
 
 // writeOversizedRecord handles a single record larger than the staging buffer.
 // Allocates a temporary aligned buffer for the write (slow path).
+// Populates WriteResult for the request.
 func (w *WAL) writeOversizedRecord(req *request) error {
 	if err := w.prepareWrite(req.rec.SeqID); err != nil {
 		return err
@@ -516,8 +539,14 @@ func (w *WAL) writeOversizedRecord(req *request) error {
 	buf := sys.AllocAligned(writeSize)
 	defer sys.FreeAligned(buf)
 
+	// Track file offset for WriteResult (before writing)
+	recordOffset := w.fileOffset
+	if includeHeader {
+		recordOffset += FileHeaderSize
+	}
+
 	// Write header if needed
-	offset := 0
+	bufOffset := 0
 	if includeHeader {
 		hdr := FileHeader{
 			Magic:     FileMagic,
@@ -525,16 +554,23 @@ func (w *WAL) writeOversizedRecord(req *request) error {
 			CreatedAt: time.Now().UnixNano(),
 		}
 		hdr.EncodeTo(buf)
-		offset = FileHeaderSize
+		bufOffset = FileHeaderSize
 	}
 
 	// Serialize record
-	req.rec.EncodeTo(buf[offset:])
-	offset += recSize
+	req.rec.EncodeTo(buf[bufOffset:])
+	bufOffset += recSize
 
 	// Zero-pad tail
-	for i := offset; i < writeSize; i++ {
+	for i := bufOffset; i < writeSize; i++ {
 		buf[i] = 0
+	}
+
+	// Populate WriteResult
+	req.Result = WriteResult{
+		Offset:       recordOffset,
+		BytesWritten: int64(recSize),
+		BytesAligned: int64(writeSize),
 	}
 
 	// Update metrics
@@ -591,14 +627,7 @@ func (w *WAL) sync() error {
 	if w.file == nil {
 		return nil
 	}
-	switch w.cfg.SyncMode {
-	case SyncData:
-		return sys.Fdatasync(w.file)
-	case SyncFull:
-		return w.file.Sync()
-	default:
-		return nil
-	}
+	return sys.SyncFile(w.file, w.cfg.Flags)
 }
 
 // ensureFile opens the WAL file if not already open.
@@ -612,7 +641,7 @@ func (w *WAL) ensureFile(firstSeqID uint64) error {
 	w.currentFirstID = firstSeqID
 	path := w.walPath(firstSeqID)
 
-	f, err := sys.OpenDirect(path, true)
+	f, err := sys.CreateFile(path, w.cfg.Flags)
 	if err != nil {
 		return fmt.Errorf("wal: create file: %w", err)
 	}
@@ -657,7 +686,18 @@ func (w *WAL) DeleteFile(firstSeqID uint64) error {
 // walPath returns the path for a WAL file with the given first sequence ID.
 // Uses 20-digit zero-padding to handle full uint64 range and ensure proper sorting.
 func (w *WAL) walPath(firstSeqID uint64) string {
-	return filepath.Join(w.cfg.Dir, fmt.Sprintf("wal-%020d.log", firstSeqID))
+	return WALFilePath(w.cfg.Dir, firstSeqID)
+}
+
+// FilePath returns the full path for a WAL file with the given sequence ID.
+// Used by memtable to rename WAL files to segments.
+func (w *WAL) FilePath(fileID uint64) string {
+	return WALFilePath(w.cfg.Dir, fileID)
+}
+
+// WALFilePath returns the path for a WAL file given directory and sequence ID.
+func WALFilePath(dir string, firstSeqID uint64) string {
+	return filepath.Join(dir, fmt.Sprintf("wal-%020d.log", firstSeqID))
 }
 
 // CurrentFirstID returns the first SeqID of the current WAL file (0 if not yet set).

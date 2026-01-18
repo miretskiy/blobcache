@@ -4,7 +4,6 @@ package sys
 
 import (
 	"os"
-	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
@@ -20,15 +19,6 @@ const RequiresAlignment = true
 // Uses fdatasync(2) on Linux for better performance than fsync
 func Fdatasync(f *os.File) error {
 	return unix.Fdatasync(int(f.Fd()))
-}
-
-// IsAligned checks if the memory address of the slice is on a 4KB boundary.
-func IsAligned(block []byte) bool {
-	if len(block) == 0 {
-		return true
-	}
-	// 4095 is the mask for 4096-byte alignment.
-	return uintptr(unsafe.Pointer(&block[0]))&4095 == 0
 }
 
 // Fallocate pre-allocates disk space for a file
@@ -76,14 +66,16 @@ func Fadvise(fd uintptr, offset Offset_t, length int64, hint FadviseHint) error 
 	return unix.Fadvise(int(fd), int64(offset), length, linuxHint)
 }
 
-// OpenDirect opens specified file for writing.
-// If directIO is true, uses O_DIRECT to bypass the page cache.
-func OpenDirect(path string, directIO bool) (*os.File, error) {
-	// We use O_WRONLY because the writer handle is append-only.
-	// We do NOT use O_APPEND because we use WriteAt for precise positioning.
-	flags := os.O_CREATE | os.O_WRONLY
-	if directIO {
-		flags |= unix.O_DIRECT
-	}
-	return os.OpenFile(path, flags, 0644)
+// RequiresExplicitSync indicates whether explicit sync calls are needed for durable writes.
+// On Linux, O_DSYNC/O_SYNC provides automatic durability at open time.
+const RequiresExplicitSync = false
+
+// CreateFile creates a file for writing with the specified flags.
+// Always uses O_CREATE | O_WRONLY | O_TRUNC. Additional flags control I/O behavior:
+//   - FlDirectIO: O_DIRECT (bypass page cache)
+//   - FlDSync: O_DSYNC (sync data before write returns)
+//   - FlSync: O_SYNC (sync data + metadata before write returns)
+func CreateFile(path string, flags OpenFlag) (*os.File, error) {
+	osFlags := os.O_CREATE | os.O_WRONLY | os.O_TRUNC | flags.OpenFlags()
+	return os.OpenFile(path, osFlags, 0644)
 }

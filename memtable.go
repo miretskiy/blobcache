@@ -3,12 +3,15 @@ package blobcache
 import (
 	"errors"
 	"fmt"
+	"os"
 	"slices"
 	"sync"
 	"sync/atomic"
 
 	"github.com/miretskiy/blobcache/compression"
+	"github.com/miretskiy/blobcache/internal/index"
 	"github.com/miretskiy/blobcache/internal/record"
+	"github.com/miretskiy/blobcache/internal/sys"
 	"github.com/miretskiy/blobcache/internal/wal"
 	"github.com/miretskiy/blobcache/internal/xmap"
 )
@@ -64,7 +67,7 @@ type MemTable struct {
 }
 
 func NewMemTable(
-		cfg config, b Batcher, reporter ErrorReporter, pub Publisher, w *wal.WAL,
+	cfg config, b Batcher, reporter ErrorReporter, pub Publisher, w *wal.WAL,
 ) *MemTable {
 	poolCapacity := cfg.MaxCachedSlabs + cfg.MaxInflightSlabs + 2
 
@@ -114,10 +117,10 @@ func (mt *MemTable) newActiveSlab(size int) *ActiveSlab {
 			buf:   buf,
 			index: xmap.New[SlabEntry, xmap.Pad32](xmap.WithShardShift(4)), // 16 shards for slab index
 		},
-		// Reserve first 8 bytes for block header (magic + version).
-		// SegmentWriter fills this in before each write, making every slab
-		// a self-describing block that can be validated independently.
-		wPos:       record.BlockHeaderSize,
+		// Reserve first 8 bytes for file header (magic + version).
+		// processFlush fills this in before writing, making every segment
+		// a self-describing file that can be validated independently.
+		wPos:       record.FileHeaderSize,
 		writesDone: newSignal(),
 	}
 
@@ -163,13 +166,13 @@ func (mt *MemTable) Put(seqID uint64, hash Key, keyBytes, value []byte) error {
 }
 
 func (mt *MemTable) PutChecksummed(
-		seqID uint64, hash Key, keyBytes, value []byte, checksum uint32,
+	seqID uint64, hash Key, keyBytes, value []byte, checksum uint32,
 ) error {
 	return mt.putWithChecksum(seqID, hash, keyBytes, value, &checksum)
 }
 
 func (mt *MemTable) putWithChecksum(
-		seqID uint64, hash Key, keyBytes, value []byte, checksum *uint32,
+	seqID uint64, hash Key, keyBytes, value []byte, checksum *uint32,
 ) error {
 	if int64(len(value)) > mt.LargeWriteThreshold {
 		return mt.putLarge(seqID, hash, keyBytes, value, checksum)
@@ -178,7 +181,7 @@ func (mt *MemTable) putWithChecksum(
 }
 
 func (mt *MemTable) putLarge(
-		seqID uint64, hash Key, keyBytes, value []byte, checksum *uint32,
+	seqID uint64, hash Key, keyBytes, value []byte, checksum *uint32,
 ) error {
 	// 1. Compress in caller's goroutine (distributed compression)
 	compressed := mt.maybeCompress(value)
@@ -204,15 +207,18 @@ func (mt *MemTable) putLarge(
 	// 4. WAL Write BEFORE slab allocation (blocks until synced for durability)
 	// If WAL fails, we haven't touched any state - clean early exit.
 	// Skip WAL in degraded mode (degraded mode does everything except actual I/O).
+	var walPos int64
 	if mt.wal != nil && !mt.IsDegraded() {
-		if err := mt.wal.Write(rec); err != nil {
+		result, err := mt.wal.Write(rec)
+		if err != nil {
 			mt.ReportError(fmt.Errorf("wal write: %w", err)) // Enter degraded mode
 			return err
 		}
+		walPos = result.Offset
 	}
 
 	// 5. Allocate slab just for this record (plus header reservation)
-	as := mt.newActiveSlab(rec.EncodedSize() + record.BlockHeaderSize)
+	as := mt.newActiveSlab(rec.EncodedSize() + record.FileHeaderSize)
 
 	// 6. Write record directly (zero-copy)
 	buf, offset := as.Alloc(rec.EncodedSize())
@@ -222,6 +228,7 @@ func (mt *MemTable) putLarge(
 	entry := SlabEntry{
 		Header: rec.Header,
 		Pos:    offset,
+		WalPos: walPos,
 	}
 	as.index.Put(hash, entry)
 	as.currentMaxSeq = seqID
@@ -238,7 +245,7 @@ func (mt *MemTable) putLarge(
 }
 
 func (mt *MemTable) putActive(
-		seqID uint64, hash Key, keyBytes, value []byte, checksum *uint32,
+	seqID uint64, hash Key, keyBytes, value []byte, checksum *uint32,
 ) error {
 	// 1. Compress before lock (parallel compression) - only on first call
 	c := mt.maybeCompress(value)
@@ -247,7 +254,7 @@ func (mt *MemTable) putActive(
 }
 
 func (mt *MemTable) putActiveCompressed(
-		seqID uint64, hash Key, keyBytes, value []byte, checksum *uint32, compressed BufferHandle,
+	seqID uint64, hash Key, keyBytes, value []byte, checksum *uint32, compressed BufferHandle,
 ) error {
 	// 1. Build record BEFORE lock (pure computation, no lock needed)
 	valueBytes := value
@@ -314,21 +321,27 @@ func (mt *MemTable) writeToSlab(seqID uint64, hash Key, rec record.Record) error
 	// 5. WAL Write (AFTER reservation, BEFORE fill - Reserve-First pattern)
 	// This prevents the "Spillover Bug" where a record written to WAL file N
 	// lands in slab N+1 after rotation, causing data loss when WAL N is deleted.
+	var walPos int64
 	if mt.wal != nil && !mt.IsDegraded() {
-		if err := mt.wal.Write(rec); err != nil {
+		result, err := mt.wal.Write(rec)
+		if err != nil {
 			active.pendingWrites.Add(-1)
 			mt.ReportError(fmt.Errorf("wal write: %w", err))
 			return err
 		}
+		walPos = result.Offset // Position in WAL file (becomes segment position after rename)
 	}
 
 	// 6. Write record directly to reserved region (zero-copy, outside lock)
 	rec.EncodeTo(buf)
 
 	// 7. Create SlabEntry for index lookup
+	// Pos: slab buffer position (for Librarian reads before flush)
+	// WalPos: WAL file position (for segment reads after WAL->segment rename)
 	entry := SlabEntry{
 		Header: rec.Header,
 		Pos:    wPos,
+		WalPos: walPos,
 	}
 
 	// 7. Concurrency Guard: Prevent "Check-Then-Act" race.
@@ -381,24 +394,9 @@ func (mt *MemTable) prepareRotationLocked() func() {
 			<-waitCh
 		}
 
-		// B. Send OLD slab to flusher (acquires its own reference via PurchaseTicket)
-		if shouldSend {
-			mt.sendToFlusher(old)
-		}
-
-		// C. Release "Active Writer" reference.
-		// The flusher has its own ref (via PurchaseTicket), and
-		// the Librarian has its own ref (if enabled).
-		old.buf.Unpin()
-
-		// D. Allocate NEW slab (Blocking Operation)
-		// This is done unlocked to prevent holding the mutex during allocation wait.
-		newSlab := mt.newActiveSlab(0)
-
-		// E. Rotate WAL file (treated as a control packet in the data stream).
-		// EnqueueRotation is serialized with Write() calls, ensuring all writes
-		// before this point go to the old file. Returns the closedFileID for
-		// later deletion when the slab is flushed.
+		// B. Rotate WAL file and capture the fileID.
+		// Must happen BEFORE sendToFlusher to avoid race with processFlush reading walFileID.
+		// Writers are blocked on activeReady, so WAL writes are quiesced.
 		if mt.wal != nil {
 			closedFileID, err := mt.wal.EnqueueRotation()
 			if err != nil {
@@ -406,6 +404,20 @@ func (mt *MemTable) prepareRotationLocked() func() {
 			}
 			old.walFileID = closedFileID
 		}
+
+		// C. Send OLD slab to flusher (acquires its own reference via PurchaseTicket)
+		if shouldSend {
+			mt.sendToFlusher(old)
+		}
+
+		// D. Release "Active Writer" reference.
+		// The flusher has its own ref (via PurchaseTicket), and
+		// the Librarian has its own ref (if enabled).
+		old.buf.Unpin()
+
+		// E. Allocate NEW slab (Blocking Operation)
+		// This is done unlocked to prevent holding the mutex during allocation wait.
+		newSlab := mt.newActiveSlab(0)
 
 		// F. Install NEW slab and Clear Barrier
 		mt.mu.Lock()
@@ -453,16 +465,6 @@ func (mt *MemTable) sendToFlusher(as *ActiveSlab) {
 
 func (mt *MemTable) flushWorker() {
 	defer mt.wg.Done()
-	writer, err := mt.openSegment()
-	if err != nil {
-		mt.ReportError(err)
-		return
-	}
-	defer func() {
-		if closeErr := writer.Close(); closeErr != nil {
-			mt.ReportError(fmt.Errorf("writer close failed: %w", closeErr))
-		}
-	}()
 
 	for {
 		select {
@@ -471,11 +473,9 @@ func (mt *MemTable) flushWorker() {
 				return
 			}
 			as := ticket.Active
-			nextWriter, flushErr := mt.processFlush(as, writer)
-			if flushErr != nil {
-				mt.ReportError(flushErr)
+			if err := mt.processFlush(as); err != nil {
+				mt.ReportError(err)
 			}
-			writer = nextWriter
 			ticket.Redeem()
 			mt.flushWg.Done()
 		case <-mt.stopCh:
@@ -484,29 +484,39 @@ func (mt *MemTable) flushWorker() {
 	}
 }
 
-func (mt *MemTable) processFlush(as *ActiveSlab, writer *SegmentWriter) (*SegmentWriter, error) {
+// processFlush finalizes a slab to a segment file.
+// In WAL mode: renames WAL file to segment, writes footer to .iseg.
+// In cache mode: writes slab data to segment, writes footer to .iseg.
+func (mt *MemTable) processFlush(as *ActiveSlab) error {
 	if mt.IsDegraded() {
-		return writer, nil
+		return nil
 	}
 
 	if mt.Knobs != nil && mt.Knobs.InjectWriteErr != nil {
 		if err := mt.Knobs.InjectWriteErr(); err != nil {
-			return writer, err
+			return err
 		}
 	}
 
-	// 1. Collect entries and convert to record.FooterEntry for WriteSlab
+	// Determine if this is WAL mode (segment file will be renamed WAL)
+	useWalPos := mt.wal != nil && as.walFileID != 0
+
+	// 1. Collect entries and convert to record.FooterEntry
 	var entries []record.FooterEntry
 	var maxSeqID uint64
 	as.index.ForEach(func(key xmap.Key, e SlabEntry, _ *xmap.Pad32) bool {
+		pos := e.Pos
+		if useWalPos {
+			pos = e.WalPos // Use WAL position for segment after rename
+		}
 		entries = append(entries, record.FooterEntry{
-			Key:          key, // Full 128-bit XXH3 hash
-			Pos:          e.Pos,
+			Key:          key,
+			Pos:          pos,
 			LogicalSize:  e.LogicalSize,
 			PhysicalSize: e.PhysicalSize,
 			SeqID:        e.SeqID,
 			Flags:        e.Flags,
-			KeyLen:       e.KeyLen, // From embedded record.Header
+			KeyLen:       e.KeyLen,
 		})
 		if e.SeqID > maxSeqID {
 			maxSeqID = e.SeqID
@@ -514,53 +524,73 @@ func (mt *MemTable) processFlush(as *ActiveSlab, writer *SegmentWriter) (*Segmen
 		return true
 	})
 
-	// 2. Sort by Physical Position (Offset) for linear I/O
+	// 2. Sort by Physical Position for linear I/O
 	slices.SortFunc(entries, func(a, b record.FooterEntry) int {
 		return int(a.Pos - b.Pos)
 	})
 
-	// 3. Write Physical Slab
-	alignedData := as.buf.AlignedBytes(as.wPos)
-	absoluteEntries, err := writer.WriteSlab(alignedData, entries)
-	if err != nil {
-		return writer, fmt.Errorf("physical write failed: %w", err)
+	// 3. Allocate segment ID and compute path
+	segmentID := mt.segmentID.Add(1)
+	segmentPath := getSegmentPath(mt.Path, mt.Shards, segmentID)
+
+	// Compute I/O flags
+	flags := sys.SyncNone
+	if mt.IO.DirectIOWrite {
+		flags |= sys.FlDirectIO
+	}
+	if mt.IO.FDataSync {
+		flags |= sys.SyncData
+	}
+
+	// 4. Create segment file (rename WAL or write slab data)
+	if useWalPos {
+		// WAL mode: rename WAL file to segment
+		walPath := mt.wal.FilePath(as.walFileID)
+		if err := os.Rename(walPath, segmentPath); err != nil {
+			return fmt.Errorf("rename wal to segment: %w", err)
+		}
+	} else {
+		// Cache mode: write slab data
+		alignedData := as.buf.AlignedBytes(as.wPos)
+		copy(alignedData[:record.FileHeaderSize], record.FileHeaderBytes[:])
+
+		if err := sys.WriteBulkAligned(segmentPath, alignedData, flags); err != nil {
+			return fmt.Errorf("write segment: %w", err)
+		}
 	}
 
 	if mt.Knobs != nil && mt.Knobs.InjectIndexErr != nil {
 		if err := mt.Knobs.InjectIndexErr(); err != nil {
-			return writer, err
+			return err
 		}
 	}
 
-	// 4. Update Index (with maxSeqID for WAL recovery checkpoint)
-	if err := mt.PutBatch(writer.id, absoluteEntries, maxSeqID); err != nil {
-		return writer, fmt.Errorf("index update failed: %w", err)
-	}
-
-	// 5. Delete WAL file now that slab is durably flushed to segment
-	if mt.wal != nil && as.walFileID != 0 {
-		if err := mt.wal.DeleteFile(as.walFileID); err != nil {
-			// Log but don't fail - WAL file will be cleaned up on next recovery
-			log.Warn("failed to delete WAL file", "walFileID", as.walFileID, "error", err)
+	// 5. Build index items from entries
+	items := make([]index.Item, 0, len(entries))
+	for i := range entries {
+		entry := &entries[i]
+		physicalLen := uint32(record.HeaderSize) + uint32(entry.KeyLen) + uint32(entry.PhysicalSize)
+		item := index.Item{
+			Key:         entry.Key,
+			SegmentID:   segmentID,
+			Offset:      uint32(entry.Pos),
+			PhysicalLen: physicalLen,
 		}
+		item.SetCompression(entry.Compression())
+		items = append(items, item)
 	}
 
-	if writer.CurrentPos() >= mt.SegmentSize {
-		if err := writer.Close(); err != nil {
-			return nil, fmt.Errorf("close segment failed: %w", err)
-		}
-		return mt.openSegment()
+	// 6. Update Index
+	if err := mt.PutBatch(segmentID, items, maxSeqID); err != nil {
+		return fmt.Errorf("index update: %w", err)
 	}
-	return writer, nil
-}
 
-func (mt *MemTable) openSegment() (*SegmentWriter, error) {
-	segmentID := mt.segmentID.Add(1)
-	path := getSegmentPath(mt.Path, mt.Shards, segmentID)
-	return NewSegmentWriter(
-		segmentID, path,
-		mt.SegmentSize, mt.footerPool, mt.IO.FDataSync, mt.IO.DirectIOWrite,
-	)
+	// 7. Write footer to separate .iseg file
+	if err := WriteFooter(segmentID, entries, segmentPath, mt.footerPool, flags); err != nil {
+		return fmt.Errorf("write footer: %w", err)
+	}
+
+	return nil
 }
 
 func (mt *MemTable) Close() {

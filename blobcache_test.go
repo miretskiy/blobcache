@@ -89,7 +89,7 @@ func TestCache_Put_EmptyValueAllowed(t *testing.T) {
 
 func TestCache_Put_LargeBlob(t *testing.T) {
 	// Tests the putLarge code path.
-	// Regression test: newActiveSlab must account for BlockHeaderSize reservation,
+	// Regression test: newActiveSlab must account for FileHeaderSize reservation,
 	// otherwise Alloc() would overflow the buffer (masked by allocateRaw's +4KB headroom).
 	tmpDir := t.TempDir()
 	cache, err := New(tmpDir,
@@ -337,7 +337,7 @@ func TestCache_HolePunching_Physical(t *testing.T) {
 	require.NoError(t, err)
 
 	// 2. Physically reclaim space via Storage
-	reclaimed, err := cache.storage.HolePunchBlob(entry.SegmentID, entry.Offset, entry.PhysicalLen)
+	reclaimed, err := cache.archivist.HolePunchBlob(entry.SegmentID, entry.Offset, entry.PhysicalLen)
 	require.NoError(t, err)
 	t.Logf("Hole punch reclaimed %d bytes (requested %d)", reclaimed, entry.PhysicalLen)
 

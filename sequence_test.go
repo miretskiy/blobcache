@@ -249,7 +249,6 @@ func TestCache_RetryLoop_IdempotentSuccess(t *testing.T) {
 
 	cache, err := New(tmpDir,
 		WithWriteBufferSize(64<<10),
-		WithSegmentSize(0), // Flush on put
 		WithTestingKnobs(&TestingKnobs{
 			SequenceVendor: seqVendor,
 		}),

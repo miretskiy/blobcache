@@ -80,9 +80,6 @@ cache, _ := blobcache.New("/data/cache",
     blobcache.WithMaxInflightBatches(8),    // 8GB total buffer
     blobcache.WithFlushConcurrency(4),      // 4 I/O workers
 
-    // Storage
-    blobcache.WithSegmentSize(2<<30),       // 2GB segments
-
     // Optional: Data integrity
     blobcache.WithChecksum(),               // CRC32 checksums
 )

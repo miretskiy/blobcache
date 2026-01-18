@@ -2,28 +2,18 @@
 
 package sys
 
-import (
-	"os"
-	"unsafe"
-
-	"github.com/ncw/directio"
-)
+import "os"
 
 // UseFadvise indicates whether fadvise is effective on this platform.
 const UseFadvise = false
 
+// RequiresAlignment indicates whether O_DIRECT requires 4KB-aligned buffers.
+// On unsupported platforms, alignment is not enforced.
+const RequiresAlignment = false
+
 // Fdatasync is a no-op on unsupported platforms
 func Fdatasync(f *os.File) error {
 	return f.Sync() // Fall back to full sync
-}
-
-// IsAligned checks if block is aligned in memory for DirectIO
-func IsAligned(block []byte) bool {
-	if len(block) == 0 {
-		return true
-	}
-	alignment := int(uintptr(unsafe.Pointer(&block[0])) & uintptr(directio.AlignSize-1))
-	return alignment == 0
 }
 
 // Fallocate is a no-op on unsupported platforms
@@ -43,7 +33,12 @@ func Fadvise(fd uintptr, offset Offset_t, length int64, hint FadviseHint) error 
 	return nil
 }
 
-// OpenDirect opens specified file for writing (no DirectIO support on this platform)
-func OpenDirect(path string, _ bool) (*os.File, error) {
-	return os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0644)
+// RequiresExplicitSync indicates whether explicit sync calls are needed for durable writes.
+// On unsupported platforms, we use standard sync.
+const RequiresExplicitSync = true
+
+// CreateFile creates a file for writing (no DirectIO support on this platform).
+// FlDirectIO and FlDSync/FlSync are ignored; caller must use Fdatasync after writes.
+func CreateFile(path string, _ OpenFlag) (*os.File, error) {
+	return os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 }

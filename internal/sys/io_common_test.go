@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/ncw/directio"
 	"github.com/stretchr/testify/require"
 )
 
@@ -14,8 +13,7 @@ func TestFallocate_FileSize(t *testing.T) {
 	tmpDir := t.TempDir()
 	path := filepath.Join(tmpDir, "fallocate_test.bin")
 
-	// Create file using OpenDirect with DirectIO enabled
-	f, err := OpenDirect(path, true)
+	f, err := CreateFile(path, FlDirectIO)
 	require.NoError(t, err)
 	defer f.Close()
 
@@ -88,10 +86,9 @@ func TestFdatasync(t *testing.T) {
 		require.NoError(t, err, "Fdatasync should succeed on buffered file")
 	})
 
-	// Test 2: O_DIRECT file
 	t.Run("DirectIO", func(t *testing.T) {
 		directPath := filepath.Join(tmpDir, "fdatasync_direct.bin")
-		f, err := OpenDirect(directPath, true)
+		f, err := CreateFile(directPath, FlDirectIO)
 		require.NoError(t, err)
 		defer f.Close()
 
@@ -221,8 +218,6 @@ func TestWritev_LargeBatch(t *testing.T) {
 }
 
 func TestAlignForHolePunch(t *testing.T) {
-	const bs = int64(directio.BlockSize) // 4096
-
 	tests := []struct {
 		name           string
 		offset, length int64
@@ -232,16 +227,16 @@ func TestAlignForHolePunch(t *testing.T) {
 	}{
 		{
 			name:           "Perfect alignment",
-			offset:         bs,
-			length:         bs,
-			expectOffset:   bs,
-			expectLength:   bs,
+			offset:         BlockSize,
+			length:         BlockSize,
+			expectOffset:   BlockSize,
+			expectLength:   BlockSize,
 			expectCanPunch: true,
 		},
 		{
 			name:           "Sub-block length",
 			offset:         0,
-			length:         bs - 1,
+			length:         BlockSize - 1,
 			expectOffset:   0,
 			expectLength:   0,
 			expectCanPunch: false,
@@ -249,49 +244,49 @@ func TestAlignForHolePunch(t *testing.T) {
 		{
 			name:           "Offset=1, Length=4096 (rounds UP, becomes 0)",
 			offset:         1,
-			length:         bs,
-			expectOffset:   bs, // Rounded UP
-			expectLength:   0,  // Nothing left after rounding
+			length:         BlockSize,
+			expectOffset:   BlockSize, // Rounded UP
+			expectLength:   0,         // Nothing left after rounding
 			expectCanPunch: false,
 		},
 		{
 			name:           "Offset just past page (4097)",
-			offset:         bs + 1,
-			length:         bs,
-			expectOffset:   2 * bs, // Round UP to 8192
-			expectLength:   0,      // Nothing left
+			offset:         BlockSize + 1,
+			length:         BlockSize,
+			expectOffset:   2 * BlockSize, // Round UP to 8192
+			expectLength:   0,             // Nothing left
 			expectCanPunch: false,
 		},
 		{
 			name:           "Large blob with small misalignment",
 			offset:         100,
-			length:         3*bs + 200, // 12,488 bytes
-			expectOffset:   bs,         // Round UP from 100 to 4096
-			expectLength:   2 * bs,     // 8192 (loses ~4KB to alignment)
+			length:         3*BlockSize + 200, // 12,488 bytes
+			expectOffset:   BlockSize,         // Round UP from 100 to 4096
+			expectLength:   2 * BlockSize,     // 8192 (loses ~4KB to alignment)
 			expectCanPunch: true,
 		},
 		{
 			name:           "Exactly 2 blocks, offset=1",
 			offset:         1,
-			length:         2 * bs,
-			expectOffset:   bs,
-			expectLength:   bs, // Only 1 block fits after rounding
+			length:         2 * BlockSize,
+			expectOffset:   BlockSize,
+			expectLength:   BlockSize, // Only 1 block fits after rounding
 			expectCanPunch: true,
 		},
 		{
 			name:           "Large aligned punch",
-			offset:         10 * bs,
-			length:         100 * bs,
-			expectOffset:   10 * bs,
-			expectLength:   100 * bs,
+			offset:         10 * BlockSize,
+			length:         100 * BlockSize,
+			expectOffset:   10 * BlockSize,
+			expectLength:   100 * BlockSize,
 			expectCanPunch: true,
 		},
 		{
 			name:           "End-of-file scenario (offset near end)",
-			offset:         100*bs - 10, // 10 bytes before page boundary
-			length:         bs + 100,    // Extends past boundary
-			expectOffset:   100 * bs,    // Round UP
-			expectLength:   bs,          // Exactly 1 block
+			offset:         100*BlockSize - 10, // 10 bytes before page boundary
+			length:         BlockSize + 100,    // Extends past boundary
+			expectOffset:   100 * BlockSize,    // Round UP
+			expectLength:   BlockSize,          // Exactly 1 block
 			expectCanPunch: true,
 		},
 	}
@@ -308,10 +303,52 @@ func TestAlignForHolePunch(t *testing.T) {
 					"length: want %d, got %d", tt.expectLength, gotLength)
 
 				// Verify alignment invariants
-				require.Equal(t, int64(0), gotOffset%bs, "offset must be block-aligned")
-				require.Equal(t, int64(0), gotLength%bs, "length must be block-aligned")
-				require.GreaterOrEqual(t, gotLength, bs, "length must be at least 1 block")
+				require.EqualValues(t, 0, gotOffset%BlockSize, "offset must be block-aligned")
+				require.EqualValues(t, 0, gotLength%BlockSize, "length must be block-aligned")
+				require.GreaterOrEqual(t, gotLength, int64(BlockSize), "length must be at least 1 block")
 			}
 		})
 	}
+}
+
+func TestWriteBulkAligned(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	t.Run("aligned data succeeds", func(t *testing.T) {
+		path := filepath.Join(tmpDir, "aligned.bin")
+		data := AllocAligned(8192)
+		for i := range data {
+			data[i] = byte(i % 256)
+		}
+
+		err := WriteBulkAligned(path, data, FlDirectIO|SyncData)
+		require.NoError(t, err)
+
+		// Verify file contents
+		got, err := os.ReadFile(path)
+		require.NoError(t, err)
+		require.Equal(t, data, got)
+	})
+
+	t.Run("unaligned data with DirectIO fails", func(t *testing.T) {
+		path := filepath.Join(tmpDir, "unaligned.bin")
+		// Create definitely unaligned buffer by taking a sub-slice starting at offset 1
+		buf := AllocAligned(8192)
+		data := buf[1:4097]
+
+		err := WriteBulkAligned(path, data, FlDirectIO)
+		require.ErrorIs(t, err, ErrAlignment)
+	})
+
+	t.Run("unaligned data without DirectIO succeeds", func(t *testing.T) {
+		path := filepath.Join(tmpDir, "unaligned_nodirect.bin")
+		data := []byte("hello world")
+
+		err := WriteBulkAligned(path, data, SyncNone)
+		require.NoError(t, err)
+
+		got, err := os.ReadFile(path)
+		require.NoError(t, err)
+		require.Equal(t, data, got)
+	})
 }

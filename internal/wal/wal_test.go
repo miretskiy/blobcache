@@ -12,6 +12,32 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// writeAndVerify writes a record to the WAL and verifies the WriteResult.
+// expectedOffset is the expected absolute file offset of the record.
+// Returns the WriteResult for chaining.
+func writeAndVerify(t *testing.T, w *WAL, rec record.Record, expectedOffset int64) WriteResult {
+	t.Helper()
+	result, err := w.Write(rec)
+	require.NoError(t, err)
+	require.Equal(t, expectedOffset, result.Offset, "offset mismatch for SeqID %d", rec.SeqID)
+	require.Equal(t, int64(rec.EncodedSize()), result.BytesWritten, "bytes written mismatch")
+	require.GreaterOrEqual(t, result.BytesAligned, result.BytesWritten, "aligned size should be >= written")
+	require.Zero(t, result.BytesAligned%4096, "aligned size should be 4KB-aligned")
+	return result
+}
+
+// writeDirectAndVerify writes a record via WriteDirect and verifies the WriteResult.
+func writeDirectAndVerify(t *testing.T, w *WAL, rec record.Record, expectedOffset int64) WriteResult {
+	t.Helper()
+	result, err := w.WriteDirect(rec)
+	require.NoError(t, err)
+	require.Equal(t, expectedOffset, result.Offset, "offset mismatch for SeqID %d", rec.SeqID)
+	require.Equal(t, int64(rec.EncodedSize()), result.BytesWritten, "bytes written mismatch")
+	require.GreaterOrEqual(t, result.BytesAligned, result.BytesWritten, "aligned size should be >= written")
+	require.Zero(t, result.BytesAligned%4096, "aligned size should be 4KB-aligned")
+	return result
+}
+
 func TestFileHeader_EncodeDecode(t *testing.T) {
 	hdr := FileHeader{
 		Magic:     FileMagic,
@@ -45,7 +71,7 @@ func TestFileHeader_TooSmall(t *testing.T) {
 func TestWAL_OpenClose(t *testing.T) {
 	dir := t.TempDir()
 	cfg := DefaultConfig(dir)
-	cfg.SyncMode = SyncNone // Faster tests
+	cfg.Flags = sys.FlDirectIO // Faster tests
 
 	w, err := Open(cfg)
 	require.NoError(t, err)
@@ -75,7 +101,7 @@ func (r *testReplayer) Drain() {}
 func TestWAL_WriteAndRecover(t *testing.T) {
 	dir := t.TempDir()
 	cfg := DefaultConfig(dir)
-	cfg.SyncMode = SyncNone
+	cfg.Flags = sys.FlDirectIO
 
 	// Write some records
 	w, err := Open(cfg)
@@ -87,9 +113,17 @@ func TestWAL_WriteAndRecover(t *testing.T) {
 		record.NewRecord(3, []byte("key3"), []byte("value3"), 6),
 	}
 
-	for _, rec := range records {
-		err := w.Write(rec)
-		require.NoError(t, err)
+	// First record starts after file header; sequential writes each become their own batch
+	expectedOffset := int64(FileHeaderSize)
+	for i, rec := range records {
+		result := writeAndVerify(t, w, rec, expectedOffset)
+		if i == 0 {
+			// First batch includes header, next starts at BytesAligned
+			expectedOffset = result.BytesAligned
+		} else {
+			// Subsequent batches: next offset is current + BytesAligned
+			expectedOffset += result.BytesAligned
+		}
 	}
 
 	require.NoError(t, w.Close())
@@ -117,20 +151,20 @@ func TestWAL_WriteAndRecover(t *testing.T) {
 func TestWAL_RecoverSkipsCommittedFiles(t *testing.T) {
 	dir := t.TempDir()
 	cfg := DefaultConfig(dir)
-	cfg.SyncMode = SyncNone
+	cfg.Flags = sys.FlDirectIO
 
 	// Write records with SeqID 100 to first file
 	w, err := Open(cfg)
 	require.NoError(t, err)
 
 	rec := record.NewRecord(100, []byte("key1"), []byte("value1"), 6)
-	require.NoError(t, w.Write(rec))
+	writeAndVerify(t, w, rec, int64(FileHeaderSize))
 	_, err = w.EnqueueRotation()
 	require.NoError(t, err)
 
-	// Write records with SeqID 200 to second file
+	// Write records with SeqID 200 to second file (new file, so offset resets to FileHeaderSize)
 	rec = record.NewRecord(200, []byte("key2"), []byte("value2"), 6)
-	require.NoError(t, w.Write(rec))
+	writeAndVerify(t, w, rec, int64(FileHeaderSize))
 	require.NoError(t, w.Close())
 
 	// Reopen and recover - mark first file as committed
@@ -154,7 +188,7 @@ func TestWAL_RecoverSkipsCommittedFiles(t *testing.T) {
 func TestWAL_Rotate(t *testing.T) {
 	dir := t.TempDir()
 	cfg := DefaultConfig(dir)
-	cfg.SyncMode = SyncNone
+	cfg.Flags = sys.FlDirectIO
 
 	w, err := Open(cfg)
 	require.NoError(t, err)
@@ -162,7 +196,7 @@ func TestWAL_Rotate(t *testing.T) {
 
 	// Write record with SeqID 100 (becomes first WAL file name)
 	rec1 := record.NewRecord(100, []byte("key1"), []byte("value1"), 6)
-	require.NoError(t, w.Write(rec1))
+	writeAndVerify(t, w, rec1, int64(FileHeaderSize))
 	require.Equal(t, uint64(100), w.CurrentFirstID())
 
 	// Rotate (closes current file)
@@ -170,18 +204,18 @@ func TestWAL_Rotate(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, uint64(0), w.CurrentFirstID()) // Reset until next write
 
-	// Write to new slab with SeqID 200
+	// Write to new slab with SeqID 200 (new file, offset resets)
 	rec2 := record.NewRecord(200, []byte("key2"), []byte("value2"), 6)
-	require.NoError(t, w.Write(rec2))
+	writeAndVerify(t, w, rec2, int64(FileHeaderSize))
 	require.Equal(t, uint64(200), w.CurrentFirstID())
 
 	// Rotate again
 	_, err = w.EnqueueRotation()
 	require.NoError(t, err)
 
-	// Write to new slab with SeqID 300
+	// Write to new slab with SeqID 300 (new file, offset resets)
 	rec3 := record.NewRecord(300, []byte("key3"), []byte("value3"), 6)
-	require.NoError(t, w.Write(rec3))
+	writeAndVerify(t, w, rec3, int64(FileHeaderSize))
 
 	// Check multiple files were created
 	files, err := w.listWALFiles()
@@ -192,7 +226,7 @@ func TestWAL_Rotate(t *testing.T) {
 func TestWAL_ConcurrentWrites(t *testing.T) {
 	dir := t.TempDir()
 	cfg := DefaultConfig(dir)
-	cfg.SyncMode = SyncNone
+	cfg.Flags = sys.FlDirectIO
 
 	w, err := Open(cfg)
 	require.NoError(t, err)
@@ -211,8 +245,12 @@ func TestWAL_ConcurrentWrites(t *testing.T) {
 			for j := 0; j < writesPerWriter; j++ {
 				seq := seqCounter.Add(1)
 				rec := record.NewRecord(seq, []byte("key"), []byte("value"), 5)
-				err := w.Write(rec)
+				result, err := w.Write(rec)
 				require.NoError(t, err)
+				// Can't verify exact offset in concurrent test, but verify invariants
+				require.Greater(t, result.Offset, int64(0))
+				require.Greater(t, result.BytesWritten, int64(0))
+				require.Zero(t, result.BytesAligned%4096)
 			}
 		}(i)
 	}
@@ -229,14 +267,14 @@ func TestWAL_ConcurrentWrites(t *testing.T) {
 func TestWAL_DeleteFile(t *testing.T) {
 	dir := t.TempDir()
 	cfg := DefaultConfig(dir)
-	cfg.SyncMode = SyncNone
+	cfg.Flags = sys.FlDirectIO
 
 	w, err := Open(cfg)
 	require.NoError(t, err)
 
 	// Write with SeqID 100 (file named wal-0000000000000100.log)
 	rec := record.NewRecord(100, []byte("key"), []byte("value"), 5)
-	require.NoError(t, w.Write(rec))
+	writeAndVerify(t, w, rec, int64(FileHeaderSize))
 
 	// Rotate
 	_, err = w.EnqueueRotation()
@@ -244,7 +282,7 @@ func TestWAL_DeleteFile(t *testing.T) {
 
 	// Write with SeqID 200 (file named wal-0000000000000200.log)
 	rec2 := record.NewRecord(200, []byte("key2"), []byte("value2"), 6)
-	require.NoError(t, w.Write(rec2))
+	writeAndVerify(t, w, rec2, int64(FileHeaderSize))
 
 	require.NoError(t, w.Close())
 
@@ -270,7 +308,7 @@ func TestWAL_DeleteFile(t *testing.T) {
 func TestWAL_DeleteRecord(t *testing.T) {
 	dir := t.TempDir()
 	cfg := DefaultConfig(dir)
-	cfg.SyncMode = SyncNone
+	cfg.Flags = sys.FlDirectIO
 
 	w, err := Open(cfg)
 	require.NoError(t, err)
@@ -290,7 +328,7 @@ func TestWAL_DeleteRecord(t *testing.T) {
 	}
 	rec.SetCRC(record.ComputeCRC(rec.Key, nil))
 
-	require.NoError(t, w.Write(rec))
+	writeAndVerify(t, w, rec, int64(FileHeaderSize))
 	require.NoError(t, w.Close())
 
 	// Recover and verify tombstone
@@ -309,7 +347,7 @@ func TestWAL_DeleteRecord(t *testing.T) {
 func TestWAL_RecoverCorruptedRecord(t *testing.T) {
 	dir := t.TempDir()
 	cfg := DefaultConfig(dir)
-	cfg.SyncMode = SyncNone
+	cfg.Flags = sys.FlDirectIO
 
 	// Write valid records
 	w, err := Open(cfg)
@@ -319,9 +357,10 @@ func TestWAL_RecoverCorruptedRecord(t *testing.T) {
 	rec2 := record.NewRecord(2, []byte("key2"), []byte("value2"), 6)
 	rec3 := record.NewRecord(3, []byte("key3"), []byte("value3"), 6)
 
-	require.NoError(t, w.Write(rec1))
-	require.NoError(t, w.Write(rec2))
-	require.NoError(t, w.Write(rec3))
+	// Sequential writes: each becomes its own batch
+	r1 := writeAndVerify(t, w, rec1, int64(FileHeaderSize))
+	r2 := writeAndVerify(t, w, rec2, r1.BytesAligned)
+	writeAndVerify(t, w, rec3, r1.BytesAligned+r2.BytesAligned)
 	require.NoError(t, w.Close())
 
 	// Corrupt the middle record by modifying its CRC
@@ -356,7 +395,7 @@ func TestWAL_RecoverCorruptedRecord(t *testing.T) {
 func TestWAL_RecoverTruncatedFile(t *testing.T) {
 	dir := t.TempDir()
 	cfg := DefaultConfig(dir)
-	cfg.SyncMode = SyncNone
+	cfg.Flags = sys.FlDirectIO
 
 	// Write records
 	w, err := Open(cfg)
@@ -365,8 +404,9 @@ func TestWAL_RecoverTruncatedFile(t *testing.T) {
 	rec1 := record.NewRecord(1, []byte("key1"), []byte("value1"), 6)
 	rec2 := record.NewRecord(2, []byte("key2"), []byte("value2"), 6)
 
-	require.NoError(t, w.Write(rec1))
-	require.NoError(t, w.Write(rec2))
+	// Sequential writes: each becomes its own batch
+	r1 := writeAndVerify(t, w, rec1, int64(FileHeaderSize))
+	writeAndVerify(t, w, rec2, r1.BytesAligned)
 	require.NoError(t, w.Close())
 
 	// Truncate file to simulate crash mid-write
@@ -398,14 +438,14 @@ func TestWAL_RecoverTruncatedFile(t *testing.T) {
 func TestWAL_RecoverEmptyFile(t *testing.T) {
 	dir := t.TempDir()
 	cfg := DefaultConfig(dir)
-	cfg.SyncMode = SyncNone
+	cfg.Flags = sys.FlDirectIO
 
 	// Create WAL and write one record to create file, then close
 	w, err := Open(cfg)
 	require.NoError(t, err)
 
 	rec := record.NewRecord(1, []byte("key"), []byte("value"), 5)
-	require.NoError(t, w.Write(rec))
+	writeAndVerify(t, w, rec, int64(FileHeaderSize))
 	require.NoError(t, w.Close())
 
 	// Truncate to just header (no records)
@@ -427,19 +467,19 @@ func TestWAL_RecoverEmptyFile(t *testing.T) {
 func TestWAL_RecoverMultipleFiles(t *testing.T) {
 	dir := t.TempDir()
 	cfg := DefaultConfig(dir)
-	cfg.SyncMode = SyncNone
+	cfg.Flags = sys.FlDirectIO
 
 	// Write records to two files
 	w, err := Open(cfg)
 	require.NoError(t, err)
 
 	rec1 := record.NewRecord(100, []byte("key1"), []byte("value1"), 6)
-	require.NoError(t, w.Write(rec1))
+	writeAndVerify(t, w, rec1, int64(FileHeaderSize))
 	_, err = w.EnqueueRotation()
 	require.NoError(t, err)
 
 	rec2 := record.NewRecord(200, []byte("key2"), []byte("value2"), 6)
-	require.NoError(t, w.Write(rec2))
+	writeAndVerify(t, w, rec2, int64(FileHeaderSize)) // New file, offset resets
 	require.NoError(t, w.Close())
 
 	// Verify 2 files exist
@@ -505,15 +545,22 @@ func TestComputeRecoveryCheckpoint(t *testing.T) {
 func TestScanMaxSeqID(t *testing.T) {
 	dir := t.TempDir()
 	cfg := DefaultConfig(dir)
-	cfg.SyncMode = SyncNone
+	cfg.Flags = sys.FlDirectIO
 
 	w, err := Open(cfg)
 	require.NoError(t, err)
 
-	// Write records with various SeqIDs
-	for _, seq := range []uint64{10, 50, 30, 100, 75} {
+	// Write records with various SeqIDs - sequential writes, each is its own batch
+	expectedOffset := int64(FileHeaderSize)
+	seqIDs := []uint64{10, 50, 30, 100, 75}
+	for i, seq := range seqIDs {
 		rec := record.NewRecord(seq, []byte("key"), []byte("value"), 5)
-		require.NoError(t, w.Write(rec))
+		result := writeAndVerify(t, w, rec, expectedOffset)
+		if i == 0 {
+			expectedOffset = result.BytesAligned
+		} else {
+			expectedOffset += result.BytesAligned
+		}
 	}
 	require.NoError(t, w.Close())
 
@@ -529,7 +576,7 @@ func TestScanMaxSeqID(t *testing.T) {
 func TestWAL_WriteAfterClose(t *testing.T) {
 	dir := t.TempDir()
 	cfg := DefaultConfig(dir)
-	cfg.SyncMode = SyncNone
+	cfg.Flags = sys.FlDirectIO
 
 	w, err := Open(cfg)
 	require.NoError(t, err)
@@ -537,7 +584,7 @@ func TestWAL_WriteAfterClose(t *testing.T) {
 
 	// Write after close should fail
 	rec := record.NewRecord(1, []byte("key"), []byte("value"), 5)
-	err = w.Write(rec)
+	_, err = w.Write(rec)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "closed")
 }
@@ -584,7 +631,7 @@ func TestParseWALFileName(t *testing.T) {
 func TestWAL_ListWALFiles(t *testing.T) {
 	dir := t.TempDir()
 	cfg := DefaultConfig(dir)
-	cfg.SyncMode = SyncNone
+	cfg.Flags = sys.FlDirectIO
 
 	w, err := Open(cfg)
 	require.NoError(t, err)
@@ -593,7 +640,7 @@ func TestWAL_ListWALFiles(t *testing.T) {
 	seqIDs := []uint64{100, 200, 300, 400}
 	for i, seqID := range seqIDs {
 		rec := record.NewRecord(seqID, []byte("key"), []byte("value"), 5)
-		require.NoError(t, w.Write(rec))
+		writeAndVerify(t, w, rec, int64(FileHeaderSize)) // Each file starts fresh
 		if i < len(seqIDs)-1 {
 			_, err = w.EnqueueRotation()
 			require.NoError(t, err)
@@ -616,7 +663,7 @@ func TestWAL_ListWALFiles(t *testing.T) {
 func TestWAL_BatchSplitting(t *testing.T) {
 	dir := t.TempDir()
 	cfg := DefaultConfig(dir)
-	cfg.SyncMode = SyncNone
+	cfg.Flags = sys.FlDirectIO
 	cfg.MaxBatchSize = 8192 // Small buffer (8KB) to force splitting
 
 	w, err := Open(cfg)
@@ -637,9 +684,14 @@ func TestWAL_BatchSplitting(t *testing.T) {
 		records[i] = record.NewRecord(uint64(i+1), key, value, 6)
 	}
 
-	// Write all records
+	// Write all records (batch splitting doesn't allow precise offset tracking)
+	offset := int64(FileHeaderSize)
 	for _, rec := range records {
-		require.NoError(t, w.Write(rec))
+		result, err := w.Write(rec)
+		require.NoError(t, err)
+		require.Greater(t, result.Offset, int64(0))
+		require.Zero(t, result.BytesAligned%4096)
+		offset += result.BytesWritten
 	}
 	require.NoError(t, w.Close())
 
@@ -667,7 +719,7 @@ func TestWAL_BatchSplitting(t *testing.T) {
 func TestWAL_OversizedRecord(t *testing.T) {
 	dir := t.TempDir()
 	cfg := DefaultConfig(dir)
-	cfg.SyncMode = SyncNone
+	cfg.Flags = sys.FlDirectIO
 	cfg.MaxBatchSize = 4096 // 4KB buffer
 
 	w, err := Open(cfg)
@@ -681,7 +733,7 @@ func TestWAL_OversizedRecord(t *testing.T) {
 	largeRec := record.NewRecord(1, []byte("bigkey"), largeValue, 6)
 
 	// Write should succeed via slow path
-	require.NoError(t, w.Write(largeRec))
+	writeAndVerify(t, w, largeRec, int64(FileHeaderSize))
 	require.NoError(t, w.Close())
 
 	// Recover and verify
@@ -704,7 +756,7 @@ func TestWAL_OversizedRecord(t *testing.T) {
 func TestWAL_MixedRecordSizes(t *testing.T) {
 	dir := t.TempDir()
 	cfg := DefaultConfig(dir)
-	cfg.SyncMode = SyncNone
+	cfg.Flags = sys.FlDirectIO
 	cfg.MaxBatchSize = 4096 // 4KB buffer
 
 	w, err := Open(cfg)
@@ -724,15 +776,18 @@ func TestWAL_MixedRecordSizes(t *testing.T) {
 	// Mix of small and large records
 	records := []record.Record{
 		record.NewRecord(1, []byte("small1"), []byte("value1"), 6),
-		record.NewRecord(2, []byte("bigkey"), largeValue1, 6),  // Oversized
+		record.NewRecord(2, []byte("bigkey"), largeValue1, 6), // Oversized
 		record.NewRecord(3, []byte("small2"), []byte("value2"), 6),
 		record.NewRecord(4, []byte("bigkey2"), largeValue2, 6), // Oversized
 		record.NewRecord(5, []byte("small3"), []byte("value3"), 6),
 	}
 
-	// Write all records
+	// Write all records (mixed sizes don't allow precise offset tracking)
 	for _, rec := range records {
-		require.NoError(t, w.Write(rec))
+		result, err := w.Write(rec)
+		require.NoError(t, err)
+		require.Greater(t, result.Offset, int64(0))
+		require.Zero(t, result.BytesAligned%4096)
 	}
 	require.NoError(t, w.Close())
 
@@ -759,7 +814,7 @@ func TestWAL_MixedRecordSizes(t *testing.T) {
 func TestWAL_BatchSplittingWithRotation(t *testing.T) {
 	dir := t.TempDir()
 	cfg := DefaultConfig(dir)
-	cfg.SyncMode = SyncNone
+	cfg.Flags = sys.FlDirectIO
 	cfg.MaxBatchSize = 4096 // Small buffer
 
 	w, err := Open(cfg)
@@ -772,7 +827,8 @@ func TestWAL_BatchSplittingWithRotation(t *testing.T) {
 			value[j] = byte(i)
 		}
 		rec := record.NewRecord(uint64(i), []byte("key"), value, 6)
-		require.NoError(t, w.Write(rec))
+		_, err := w.Write(rec)
+		require.NoError(t, err)
 
 		// Rotate after every 20 records
 		if i%20 == 0 && i < 50 {
@@ -809,25 +865,27 @@ func TestWAL_BatchSplittingWithRotation(t *testing.T) {
 func TestWAL_Guard_PreventsTimeTravel(t *testing.T) {
 	dir := t.TempDir()
 	cfg := DefaultConfig(dir)
-	cfg.SyncMode = SyncNone
+	cfg.Flags = sys.FlDirectIO
 
 	w, err := Open(cfg)
 	require.NoError(t, err)
 
 	// 1. Write SeqID 100
-	require.NoError(t, w.Write(record.NewRecord(100, []byte("k"), []byte("v"), 0)))
+	rec100 := record.NewRecord(100, []byte("k"), []byte("v"), 0)
+	writeAndVerify(t, w, rec100, int64(FileHeaderSize))
 
 	// 2. Rotate. This sets w.lastRotatedSeq = 100
 	_, err = w.EnqueueRotation()
 	require.NoError(t, err)
 
-	// 3. Write SeqID 200 (Valid: > 100)
-	require.NoError(t, w.Write(record.NewRecord(200, []byte("k"), []byte("v"), 0)))
+	// 3. Write SeqID 200 (Valid: > 100) - new file, offset resets
+	rec200 := record.NewRecord(200, []byte("k"), []byte("v"), 0)
+	writeAndVerify(t, w, rec200, int64(FileHeaderSize))
 
 	// 4. ATTACK: Attempt to write SeqID 99 (Time Travel)
 	// This should be rejected because 99 <= lastRotatedSeq (100)
 	recOld := record.NewRecord(99, []byte("k"), []byte("v"), 0)
-	err = w.Write(recOld)
+	_, err = w.Write(recOld) // Error expected, result not meaningful
 
 	require.Error(t, err)
 	require.ErrorIs(t, err, ErrSequenceRegression)
@@ -840,7 +898,7 @@ func TestWAL_Guard_PreventsTimeTravel(t *testing.T) {
 func TestWAL_WriteDirect_Aligned(t *testing.T) {
 	dir := t.TempDir()
 	cfg := DefaultConfig(dir)
-	cfg.SyncMode = SyncNone
+	cfg.Flags = sys.FlDirectIO
 
 	w, err := Open(cfg)
 	require.NoError(t, err)
@@ -856,12 +914,11 @@ func TestWAL_WriteDirect_Aligned(t *testing.T) {
 	}
 
 	rec := record.NewRecord(1, []byte("big-key"), value, 6)
-	err = w.WriteDirect(rec)
-	require.NoError(t, err)
+	result := writeDirectAndVerify(t, w, rec, int64(FileHeaderSize))
 
-	// Write another normal record to ensure we can continue
+	// Write another normal record - next offset is at BytesAligned (not BytesWritten)
 	rec2 := record.NewRecord(2, []byte("small-key"), []byte("small-value"), 6)
-	require.NoError(t, w.Write(rec2))
+	writeAndVerify(t, w, rec2, result.BytesAligned)
 
 	require.NoError(t, w.Close())
 
@@ -898,7 +955,7 @@ func TestWAL_WriteDirect_UnalignedValue(t *testing.T) {
 
 	dir := t.TempDir()
 	cfg := DefaultConfig(dir)
-	cfg.SyncMode = SyncNone
+	cfg.Flags = sys.FlDirectIO
 
 	w, err := Open(cfg)
 	require.NoError(t, err)
@@ -910,7 +967,7 @@ func TestWAL_WriteDirect_UnalignedValue(t *testing.T) {
 	unaligned := buf[1:4097] // Not aligned (starts at offset 1)
 
 	rec := record.NewRecord(1, []byte("key"), unaligned, 6)
-	err = w.WriteDirect(rec)
+	_, err = w.WriteDirect(rec) // Error expected, result not meaningful
 	require.ErrorIs(t, err, ErrUnalignedValue)
 }
 
@@ -919,7 +976,7 @@ func TestWAL_WriteDirect_UnalignedValue(t *testing.T) {
 func TestWAL_WriteDirect_NonPageSized(t *testing.T) {
 	dir := t.TempDir()
 	cfg := DefaultConfig(dir)
-	cfg.SyncMode = SyncNone
+	cfg.Flags = sys.FlDirectIO
 
 	w, err := Open(cfg)
 	require.NoError(t, err)
@@ -931,7 +988,7 @@ func TestWAL_WriteDirect_NonPageSized(t *testing.T) {
 	nonPageSized := buf[:4000] // 4000 is not a multiple of 4096
 
 	rec := record.NewRecord(1, []byte("key"), nonPageSized, 6)
-	err = w.WriteDirect(rec)
+	_, err = w.WriteDirect(rec) // Error expected, result not meaningful
 	require.ErrorIs(t, err, ErrUnalignedValue)
 }
 
@@ -939,7 +996,7 @@ func TestWAL_WriteDirect_NonPageSized(t *testing.T) {
 func TestWAL_WriteDirect_LargeRecord(t *testing.T) {
 	dir := t.TempDir()
 	cfg := DefaultConfig(dir)
-	cfg.SyncMode = SyncNone
+	cfg.Flags = sys.FlDirectIO
 
 	w, err := Open(cfg)
 	require.NoError(t, err)
@@ -955,8 +1012,7 @@ func TestWAL_WriteDirect_LargeRecord(t *testing.T) {
 	}
 
 	rec := record.NewRecord(1, []byte("megabyte-key"), value, 6)
-	err = w.WriteDirect(rec)
-	require.NoError(t, err)
+	writeDirectAndVerify(t, w, rec, int64(FileHeaderSize))
 
 	require.NoError(t, w.Close())
 
@@ -989,15 +1045,18 @@ func TestWAL_WriteDirect_LargeRecord(t *testing.T) {
 func TestWAL_WriteDirect_MixedWithNormal(t *testing.T) {
 	dir := t.TempDir()
 	cfg := DefaultConfig(dir)
-	cfg.SyncMode = SyncNone
+	cfg.Flags = sys.FlDirectIO
 
 	w, err := Open(cfg)
 	require.NoError(t, err)
 
 	// Write pattern: normal, direct, normal, direct, normal
+	// Sequential writes: each becomes its own batch; track using BytesAligned
+
 	// Normal write 1
 	rec1 := record.NewRecord(1, []byte("k1"), []byte("normal1"), 6)
-	require.NoError(t, w.Write(rec1))
+	r1 := writeAndVerify(t, w, rec1, int64(FileHeaderSize))
+	nextOffset := r1.BytesAligned // First batch includes header
 
 	// Direct write 1
 	val2 := sys.AllocAligned(4096)
@@ -1006,11 +1065,13 @@ func TestWAL_WriteDirect_MixedWithNormal(t *testing.T) {
 		val2[i] = 0xAA
 	}
 	rec2 := record.NewRecord(2, []byte("k2"), val2, 6)
-	require.NoError(t, w.WriteDirect(rec2))
+	r2 := writeDirectAndVerify(t, w, rec2, nextOffset)
+	nextOffset += r2.BytesAligned
 
 	// Normal write 2
 	rec3 := record.NewRecord(3, []byte("k3"), []byte("normal2"), 6)
-	require.NoError(t, w.Write(rec3))
+	r3 := writeAndVerify(t, w, rec3, nextOffset)
+	nextOffset += r3.BytesAligned
 
 	// Direct write 2
 	val4 := sys.AllocAligned(8192)
@@ -1019,11 +1080,12 @@ func TestWAL_WriteDirect_MixedWithNormal(t *testing.T) {
 		val4[i] = 0xBB
 	}
 	rec4 := record.NewRecord(4, []byte("k4"), val4, 6)
-	require.NoError(t, w.WriteDirect(rec4))
+	r4 := writeDirectAndVerify(t, w, rec4, nextOffset)
+	nextOffset += r4.BytesAligned
 
 	// Normal write 3
 	rec5 := record.NewRecord(5, []byte("k5"), []byte("normal3"), 6)
-	require.NoError(t, w.Write(rec5))
+	writeAndVerify(t, w, rec5, nextOffset)
 
 	require.NoError(t, w.Close())
 

@@ -16,27 +16,28 @@ import (
 	"github.com/miretskiy/blobcache/internal/sys"
 )
 
-type Storage struct {
+// Archivist manages read-only access to persisted segments.
+// It uses the Index Item contract: Offset points to Magic, PhysicalLen = 42 + KeyLen + PhysSize.
+type Archivist struct {
 	config
 	index *index.DurableIndex
 	cache sync.Map // segmentID (uint32) -> SegmentFile
 }
 
-func NewStorage(cfg config, idx *index.DurableIndex) *Storage {
-	s := Storage{config: cfg, index: idx}
-	return &s
+func NewArchivist(cfg config, idx *index.DurableIndex) *Archivist {
+	return &Archivist{config: cfg, index: idx}
 }
 
 // Close closes all cached segment mu
-func (s *Storage) Close() error {
+func (a *Archivist) Close() error {
 	var errs []error
-	s.cache.Range(func(key, value any) bool {
+	a.cache.Range(func(key, value any) bool {
 		if closer, ok := value.(io.Closer); ok {
 			if err := closer.Close(); err != nil {
 				errs = append(errs, err)
 			}
 		}
-		s.cache.Delete(key)
+		a.cache.Delete(key)
 		return true
 	})
 	return errors.Join(errs...)
@@ -50,8 +51,8 @@ func (s *Storage) Close() error {
 // read from the on-disk record.Header.
 //
 // expectedKey is used to verify the stored key matches (detects 128-bit hash collisions).
-func (s *Storage) ReadBlob(e index.Item, expectedKey []byte) (io.Reader, Releaser, error) {
-	sf, err := s.getSegmentFile(e.SegmentID)
+func (a *Archivist) ReadBlob(e index.Item, expectedKey []byte) (io.Reader, Releaser, error) {
+	sf, err := a.getSegmentFile(e.SegmentID)
 	if err != nil {
 		return nil, Releaser{}, fmt.Errorf("storage: segment %d not found: %w", e.SegmentID, err)
 	}
@@ -85,7 +86,7 @@ func (s *Storage) ReadBlob(e index.Item, expectedKey []byte) (io.Reader, Release
 
 	// 1. Kernel Hinting (Hybrid I/O)
 	// Prefetch header + value. Fadvise is advisory - errors are logged but not fatal.
-	if s.IO.Fadvise {
+	if a.IO.Fadvise {
 		totalSize := int64(e.PhysicalLen)
 		if err := sys.Fadvise(sf.file.Fd(), sys.Offset_t(e.Offset), totalSize, sys.FadvSequential); err != nil {
 			log.Warn("fadvise failed", "segID", e.SegmentID, "err", err)
@@ -123,8 +124,8 @@ func (s *Storage) ReadBlob(e index.Item, expectedKey []byte) (io.Reader, Release
 
 	// 3. Optional Integrity Layer
 	// Checksum is computed on ORIGINAL (uncompressed) data.
-	if s.Resilience.VerifyOnRead && hdr.HasValidCRC() && s.Resilience.ChecksumHasher != nil {
-		reader = newChecksumVerifyingReader(reader, s.Resilience.ChecksumHasher, hdr.CRC())
+	if a.Resilience.VerifyOnRead && hdr.HasValidCRC() && a.Resilience.ChecksumHasher != nil {
+		reader = newChecksumVerifyingReader(reader, a.Resilience.ChecksumHasher, hdr.CRC())
 	}
 
 	return reader, releaser, nil
@@ -140,21 +141,21 @@ func getSegmentPath(basePath string, numShards int, segmentID uint32) string {
 }
 
 // getSegmentFile returns cached SegmentFile or opens it
-func (s *Storage) getSegmentFile(segmentID uint32) (*segmentFile, error) {
+func (a *Archivist) getSegmentFile(segmentID uint32) (*segmentFile, error) {
 	// 1. Check the LRU/Map handle cache
-	if cached, ok := s.cache.Load(segmentID); ok {
+	if cached, ok := a.cache.Load(segmentID); ok {
 		return cached.(*segmentFile), nil
 	}
 
 	// 2. Open the file
-	path := getSegmentPath(s.Path, s.Shards, segmentID)
+	path := getSegmentPath(a.Path, a.Shards, segmentID)
 	f, err := os.OpenFile(path, os.O_RDWR, 0644)
 	if err != nil {
 		return nil, err
 	}
 
 	// 3. Verify the Index knows this segment exists
-	if _, ok := s.index.GetSegmentManifest(segmentID); !ok {
+	if _, ok := a.index.GetSegmentManifest(segmentID); !ok {
 		_ = f.Close()
 		return nil, fmt.Errorf("storage: segment %d unknown to index", segmentID)
 	}
@@ -162,7 +163,7 @@ func (s *Storage) getSegmentFile(segmentID uint32) (*segmentFile, error) {
 	sf := &segmentFile{file: f, segID: segmentID}
 
 	// 4. Cache the handle
-	actual, loaded := s.cache.LoadOrStore(segmentID, sf)
+	actual, loaded := a.cache.LoadOrStore(segmentID, sf)
 	if loaded {
 		_ = sf.Close()
 		return actual.(*segmentFile), nil
@@ -172,8 +173,8 @@ func (s *Storage) getSegmentFile(segmentID uint32) (*segmentFile, error) {
 }
 
 // HolePunchBlob releases disk space for an evicted blob.
-func (s *Storage) HolePunchBlob(segmentID uint32, offset uint32, physicalLen uint32) (int64, error) {
-	sf, err := s.getSegmentFile(segmentID)
+func (a *Archivist) HolePunchBlob(segmentID uint32, offset uint32, physicalLen uint32) (int64, error) {
+	sf, err := a.getSegmentFile(segmentID)
 	if err != nil {
 		return 0, err
 	}

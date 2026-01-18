@@ -1,14 +1,17 @@
 // Package record defines the unified binary record format used by both WAL and
 // Segment files. This enables consistent tooling, recovery logic, and data migration.
 //
-// Record Layout (35-byte header + variable payload):
+// Record Layout v2 (42-byte header + variable payload):
 //
-//	[Magic:1][Flags:8][SeqID:8][KeyLen:2][PhysicalSize:8][LogicalSize:8][Key][Value]
+//	[Magic:4][HeaderCRC:4][Flags:8][SeqID:8][KeyLen:2][PhysicalSize:8][LogicalSize:8][Key][Value]
 //
 // Design Philosophy:
 //   - Header-First: Magic at start enables single-seek reads and hole detection
+//   - HeaderCRC: Protects against "allocate-on-corrupt-size" panics
 //   - Mandatory Key Verification: Every Get() compares disk key with requested key
 //   - CRC in Flags: Bits 31-0 contain CRC32 of Key+Value for integrity
+//
+// Safety Invariant: Readers MUST verify HeaderCRC before trusting PhysSize to allocate memory.
 package record
 
 import (
@@ -22,25 +25,34 @@ import (
 
 // Record format constants.
 const (
-	// HeaderSize is the fixed size of the record header in bytes.
-	HeaderSize = 35 // Magic(1) + Flags(8) + SeqID(8) + KeyLen(2) + PhysicalSize(8) + LogicalSize(8)
+	// HeaderSize is the fixed size of the record header in bytes (v2 format).
+	HeaderSize = 42 // Magic(4) + HeaderCRC(4) + Flags(8) + SeqID(8) + KeyLen(2) + PhysicalSize(8) + LogicalSize(8)
 
-	// Magic bytes for record types.
-	RecordMagic byte = 0xBB // Valid record anchor
-	HoleMagic   byte = 0x00 // Punched hole / padding
+	// Magic number for valid records (0xB10BCAFE - "BlobCafe").
+	RecordMagic uint32 = 0xB10BCAFE
+
+	// HoleMagic identifies a punched hole or padding (zeros).
+	HoleMagic uint32 = 0x00000000
 
 	// MaxKeyLen is the maximum key length (uint16 max).
 	MaxKeyLen = 1<<16 - 1 // 65535 bytes
+
+	// headerCRCStart is the offset where HeaderCRC calculation begins (after Magic and HeaderCRC).
+	headerCRCStart = 8 // Skip Magic(4) + HeaderCRC(4)
+
+	// headerCRCLen is the number of bytes covered by HeaderCRC.
+	headerCRCLen = 34 // Flags(8) + SeqID(8) + KeyLen(2) + PhysicalSize(8) + LogicalSize(8)
 )
 
-// Header field offsets within the 35-byte header.
+// Header field offsets within the 42-byte header.
 const (
 	offMagic        = 0
-	offFlags        = 1
-	offSeqID        = 9
-	offKeyLen       = 17
-	offPhysicalSize = 19
-	offLogicalSize  = 27
+	offHeaderCRC    = 4
+	offFlags        = 8
+	offSeqID        = 16
+	offKeyLen       = 24
+	offPhysicalSize = 26
+	offLogicalSize  = 34
 )
 
 // Flags bit layout (reused from metadata.BlobRecord for compatibility).
@@ -63,19 +75,21 @@ const (
 
 // Errors returned by record operations.
 var (
-	ErrBufferTooSmall = errors.New("record: buffer too small")
-	ErrInvalidMagic   = errors.New("record: invalid magic byte")
-	ErrHole           = errors.New("record: hole detected")
-	ErrCRCMismatch    = errors.New("record: CRC mismatch")
-	ErrKeyMismatch    = errors.New("record: key mismatch (possible hash collision)")
-	ErrBoundsCheck    = errors.New("record: length exceeds bounds")
+	ErrBufferTooSmall    = errors.New("record: buffer too small")
+	ErrInvalidMagic      = errors.New("record: invalid magic number")
+	ErrHole              = errors.New("record: hole detected")
+	ErrHeaderCRCMismatch = errors.New("record: header CRC mismatch (corrupt header)")
+	ErrCRCMismatch       = errors.New("record: CRC mismatch")
+	ErrKeyMismatch       = errors.New("record: key mismatch (possible hash collision)")
+	ErrBoundsCheck       = errors.New("record: length exceeds bounds")
 )
 
-// Header represents the fixed 35-byte record header.
+// Header represents the fixed 42-byte record header (v2 format).
 // Use Encode/Decode methods for serialization.
 type Header struct {
-	Magic        byte   // 0xBB=valid, 0x00=hole
-	Flags        uint64 // Metadata, status, and CRC32
+	Magic        uint32 // 0xB10BCAFE=valid, 0x00000000=hole
+	HeaderCRC    uint32 // CRC32 of bytes 8-41 (Flags through LogicalSize)
+	Flags        uint64 // Metadata, status, and CRC32 of payload
 	SeqID        uint64 // Monotonic sequence ID
 	KeyLen       uint16 // Key length in bytes
 	PhysicalSize int64  // Value length on disk (possibly compressed)
@@ -159,29 +173,47 @@ func (h *Header) HasError() bool {
 
 // Encode writes the header to dst (must be at least HeaderSize bytes).
 // Returns the number of bytes written (always HeaderSize) or error.
+// The HeaderCRC is computed automatically over bytes 8-41.
 func (h *Header) Encode(dst []byte) (int, error) {
 	if len(dst) < HeaderSize {
 		return 0, ErrBufferTooSmall
 	}
 
-	dst[offMagic] = h.Magic
+	// Write Magic
+	binary.LittleEndian.PutUint32(dst[offMagic:], h.Magic)
+
+	// Write header fields (bytes 8-41, covered by HeaderCRC)
 	binary.LittleEndian.PutUint64(dst[offFlags:], h.Flags)
 	binary.LittleEndian.PutUint64(dst[offSeqID:], h.SeqID)
 	binary.LittleEndian.PutUint16(dst[offKeyLen:], h.KeyLen)
 	binary.LittleEndian.PutUint64(dst[offPhysicalSize:], uint64(h.PhysicalSize))
 	binary.LittleEndian.PutUint64(dst[offLogicalSize:], uint64(h.LogicalSize))
 
+	// Compute and write HeaderCRC over bytes 8-41 (34 bytes)
+	headerCRC := crc32.ChecksumIEEE(dst[headerCRCStart : headerCRCStart+headerCRCLen])
+	binary.LittleEndian.PutUint32(dst[offHeaderCRC:], headerCRC)
+
 	return HeaderSize, nil
 }
 
-// DecodeHeader reads a header from src (must be at least HeaderSize bytes).
+// DecodeHeader reads and verifies a header from src (must be at least HeaderSize bytes).
+// Returns ErrHeaderCRCMismatch if the HeaderCRC does not match.
+// This verification MUST occur before trusting PhysicalSize for memory allocation.
 func DecodeHeader(src []byte) (Header, error) {
 	if len(src) < HeaderSize {
 		return Header{}, ErrBufferTooSmall
 	}
 
+	// Verify HeaderCRC before trusting any size fields
+	storedCRC := binary.LittleEndian.Uint32(src[offHeaderCRC:])
+	computedCRC := crc32.ChecksumIEEE(src[headerCRCStart : headerCRCStart+headerCRCLen])
+	if storedCRC != computedCRC {
+		return Header{}, ErrHeaderCRCMismatch
+	}
+
 	return Header{
-		Magic:        src[offMagic],
+		Magic:        binary.LittleEndian.Uint32(src[offMagic:]),
+		HeaderCRC:    storedCRC,
 		Flags:        binary.LittleEndian.Uint64(src[offFlags:]),
 		SeqID:        binary.LittleEndian.Uint64(src[offSeqID:]),
 		KeyLen:       binary.LittleEndian.Uint16(src[offKeyLen:]),
@@ -191,13 +223,29 @@ func DecodeHeader(src []byte) (Header, error) {
 }
 
 // AppendHeader appends an encoded header to dst.
+// NOTE: The HeaderCRC is computed automatically over the appended bytes.
 func AppendHeader(dst []byte, h Header) []byte {
-	dst = append(dst, h.Magic)
+	// Remember start position for CRC calculation
+	startPos := len(dst)
+
+	// Append Magic (4 bytes)
+	dst = binary.LittleEndian.AppendUint32(dst, h.Magic)
+
+	// Placeholder for HeaderCRC (4 bytes) - will be filled in after
+	dst = binary.LittleEndian.AppendUint32(dst, 0)
+
+	// Append fields covered by HeaderCRC (34 bytes)
 	dst = binary.LittleEndian.AppendUint64(dst, h.Flags)
 	dst = binary.LittleEndian.AppendUint64(dst, h.SeqID)
 	dst = binary.LittleEndian.AppendUint16(dst, h.KeyLen)
 	dst = binary.LittleEndian.AppendUint64(dst, uint64(h.PhysicalSize))
 	dst = binary.LittleEndian.AppendUint64(dst, uint64(h.LogicalSize))
+
+	// Compute HeaderCRC over bytes 8-41 relative to header start
+	crcStart := startPos + headerCRCStart
+	headerCRC := crc32.ChecksumIEEE(dst[crcStart : crcStart+headerCRCLen])
+	binary.LittleEndian.PutUint32(dst[startPos+offHeaderCRC:], headerCRC)
+
 	return dst
 }
 
@@ -265,17 +313,23 @@ func AppendRecord(dst []byte, r Record) []byte {
 
 // EncodeTo writes the full record directly into dst using copy (zero-allocation).
 // Panics if dst is smaller than EncodedSize().
+// The HeaderCRC is computed automatically.
 func (r *Record) EncodeTo(dst []byte) {
 	// Bounds check via slice - panics if too small
 	dst = dst[:r.EncodedSize()]
 
 	// Header (inline to avoid function call overhead)
-	dst[offMagic] = r.Magic
+	binary.LittleEndian.PutUint32(dst[offMagic:], r.Magic)
+	// HeaderCRC placeholder - filled in after other fields
 	binary.LittleEndian.PutUint64(dst[offFlags:], r.Flags)
 	binary.LittleEndian.PutUint64(dst[offSeqID:], r.SeqID)
 	binary.LittleEndian.PutUint16(dst[offKeyLen:], r.KeyLen)
 	binary.LittleEndian.PutUint64(dst[offPhysicalSize:], uint64(r.PhysicalSize))
 	binary.LittleEndian.PutUint64(dst[offLogicalSize:], uint64(r.LogicalSize))
+
+	// Compute and write HeaderCRC
+	headerCRC := crc32.ChecksumIEEE(dst[headerCRCStart : headerCRCStart+headerCRCLen])
+	binary.LittleEndian.PutUint32(dst[offHeaderCRC:], headerCRC)
 
 	// Key + Value
 	keyEnd := HeaderSize + len(r.Key)

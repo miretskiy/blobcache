@@ -109,10 +109,10 @@ func RecoverIndex(path string, opts ...Option) (*Cache, error) {
 	}
 
 	c := &Cache{
-		config:  cfg,
-		index:   idx,
-		storage: NewStorage(cfg, idx),
-		stopCh:  make(chan struct{}),
+		config:    cfg,
+		index:     idx,
+		archivist: NewArchivist(cfg, idx),
+		stopCh:    make(chan struct{}),
 	}
 	c.librarian = NewLibrarian(cfg.MaxCachedSlabs, c)
 	c.Knobs = cfg.knobs
@@ -138,10 +138,11 @@ func RecoverIndex(path string, opts ...Option) (*Cache, error) {
 	return c, nil
 }
 
-// readSegmentFooter reads and validates a segment file's footer
-// Returns the SegmentFooter if valid, or an error if corrupt/incomplete
-func readSegmentFooter(path string, segmentID uint32) (record.SegmentFooter, error) {
-	file, err := os.Open(path)
+// readSegmentFooter reads and validates a segment's footer from its .iseg file.
+// Returns the SegmentFooter if valid, or an error if corrupt/missing.
+func readSegmentFooter(segmentPath string, segmentID uint32) (record.SegmentFooter, error) {
+	indexPath := segmentPath + IndexSegmentExtension
+	file, err := os.Open(indexPath)
 	if err != nil {
 		return record.SegmentFooter{}, err
 	}

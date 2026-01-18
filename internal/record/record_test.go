@@ -2,6 +2,7 @@ package record
 
 import (
 	"bytes"
+	"encoding/binary"
 	"testing"
 
 	"github.com/miretskiy/blobcache/compression"
@@ -27,7 +28,15 @@ func TestHeaderEncodeDecode(t *testing.T) {
 	// Decode
 	decoded, err := DecodeHeader(buf)
 	require.NoError(t, err)
-	require.Equal(t, h, decoded)
+
+	// Compare fields (HeaderCRC is computed during Encode, so use the decoded value)
+	require.Equal(t, h.Magic, decoded.Magic)
+	require.NotZero(t, decoded.HeaderCRC, "HeaderCRC should be computed")
+	require.Equal(t, h.Flags, decoded.Flags)
+	require.Equal(t, h.SeqID, decoded.SeqID)
+	require.Equal(t, h.KeyLen, decoded.KeyLen)
+	require.Equal(t, h.PhysicalSize, decoded.PhysicalSize)
+	require.Equal(t, h.LogicalSize, decoded.LogicalSize)
 }
 
 func TestAppendHeader(t *testing.T) {
@@ -45,7 +54,15 @@ func TestAppendHeader(t *testing.T) {
 
 	decoded, err := DecodeHeader(buf)
 	require.NoError(t, err)
-	require.Equal(t, h, decoded)
+
+	// Compare fields (HeaderCRC is computed during AppendHeader)
+	require.Equal(t, h.Magic, decoded.Magic)
+	require.NotZero(t, decoded.HeaderCRC, "HeaderCRC should be computed")
+	require.Equal(t, h.Flags, decoded.Flags)
+	require.Equal(t, h.SeqID, decoded.SeqID)
+	require.Equal(t, h.KeyLen, decoded.KeyLen)
+	require.Equal(t, h.PhysicalSize, decoded.PhysicalSize)
+	require.Equal(t, h.LogicalSize, decoded.LogicalSize)
 }
 
 func TestHeaderBufferTooSmall(t *testing.T) {
@@ -137,27 +154,27 @@ func TestVerifyCRC(t *testing.T) {
 	require.ErrorIs(t, VerifyCRC(key, value, crc+1), ErrCRCMismatch)
 }
 
-func TestBlockHeader(t *testing.T) {
+func TestFileHeader(t *testing.T) {
 	// Verify constant matches expected encoding
-	require.Len(t, BlockHeaderBytes, BlockHeaderSize)
+	require.Len(t, FileHeaderBytes, FileHeaderSize)
 
-	err := ValidateBlockHeader(BlockHeaderBytes[:])
+	err := ValidateFileHeader(FileHeaderBytes[:])
 	require.NoError(t, err)
 
 	// Invalid magic
-	badMagic := make([]byte, BlockHeaderSize)
-	copy(badMagic, BlockHeaderBytes[:])
+	badMagic := make([]byte, FileHeaderSize)
+	copy(badMagic, FileHeaderBytes[:])
 	badMagic[0] = 0xFF
-	require.ErrorIs(t, ValidateBlockHeader(badMagic), ErrInvalidBlockMagic)
+	require.ErrorIs(t, ValidateFileHeader(badMagic), ErrInvalidFileMagic)
 
 	// Invalid version
-	badVersion := make([]byte, BlockHeaderSize)
-	copy(badVersion, BlockHeaderBytes[:])
+	badVersion := make([]byte, FileHeaderSize)
+	copy(badVersion, FileHeaderBytes[:])
 	badVersion[4] = 0xFF
-	require.ErrorIs(t, ValidateBlockHeader(badVersion), ErrInvalidVersion)
+	require.ErrorIs(t, ValidateFileHeader(badVersion), ErrInvalidVersion)
 
 	// Too small
-	require.ErrorIs(t, ValidateBlockHeader([]byte{1, 2, 3}), ErrBufferTooSmall)
+	require.ErrorIs(t, ValidateFileHeader([]byte{1, 2, 3}), ErrBufferTooSmall)
 }
 
 func TestRoundtripRecord(t *testing.T) {
@@ -329,16 +346,24 @@ func TestDecodeRecord_CRCMismatch(t *testing.T) {
 }
 
 func TestDecodeRecord_InvalidMagic(t *testing.T) {
-	buf := make([]byte, HeaderSize+10)
-	buf[0] = 0x42 // Invalid magic
+	// Create a valid record, encode it, then corrupt the magic
+	rec := NewRecord(1, []byte("key"), []byte("value"), 5)
+	buf := AppendRecord(nil, rec)
+
+	// Corrupt the magic (bytes 0-3) - HeaderCRC doesn't cover magic so CRC is still valid
+	binary.LittleEndian.PutUint32(buf[0:], 0x42424242) // Invalid magic
 
 	_, err := DecodeRecord(buf, false)
 	require.ErrorIs(t, err, ErrInvalidMagic)
 }
 
 func TestDecodeRecord_Hole(t *testing.T) {
-	buf := make([]byte, HeaderSize+10)
-	buf[0] = HoleMagic
+	// Create a valid record, encode it, then change magic to HoleMagic
+	rec := NewRecord(1, []byte("key"), []byte("value"), 5)
+	buf := AppendRecord(nil, rec)
+
+	// Set magic to HoleMagic (zeros) - HeaderCRC doesn't cover magic so CRC is still valid
+	binary.LittleEndian.PutUint32(buf[0:], HoleMagic)
 
 	_, err := DecodeRecord(buf, false)
 	require.ErrorIs(t, err, ErrHole)

@@ -67,7 +67,7 @@ func (w *WAL) recoverFile(path string, applyFn func(record.Record) error) error 
 		hdr, err := record.DecodeHeader(recHeaderBuf)
 		if err != nil || !hdr.IsValid() {
 			// O_DIRECT padding: skip to next 4KB boundary
-			nextBlock := sys.RoundToBlock(pos + 1)
+			nextBlock := sys.PageAlign(pos + 1)
 			if nextBlock >= fileSize {
 				break
 			}
@@ -82,7 +82,7 @@ func (w *WAL) recoverFile(path string, applyFn func(record.Record) error) error 
 		// Sanity check: payload can't exceed remaining file size
 		// (protects against corrupted headers with garbage sizes)
 		if payloadSize < 0 || int64(fullSize) > fileSize-pos {
-			nextBlock := sys.RoundToBlock(pos + 1)
+			nextBlock := sys.PageAlign(pos + 1)
 			if nextBlock >= fileSize {
 				break
 			}
@@ -100,7 +100,7 @@ func (w *WAL) recoverFile(path string, applyFn func(record.Record) error) error 
 		rec, err := record.DecodeRecord(fullBuf, true)
 		if err != nil {
 			// CRC mismatch - skip to next block boundary
-			pos = sys.RoundToBlock(pos + 1)
+			pos = sys.PageAlign(pos + 1)
 			continue
 		}
 
@@ -145,7 +145,7 @@ func ScanMaxSeqID(path string) (uint64, error) {
 		hdr, err := record.DecodeHeader(headerBuf)
 		if err != nil || !hdr.IsValid() {
 			// O_DIRECT padding: skip to next 4KB boundary
-			nextBlock := sys.RoundToBlock(pos + 1)
+			nextBlock := sys.PageAlign(pos + 1)
 			if nextBlock >= fileSize {
 				break
 			}

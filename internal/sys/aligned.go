@@ -14,8 +14,8 @@ const (
 	BlockMask = BlockSize - 1
 )
 
-// RoundToBlock rounds size up to the nearest BlockSize (4KB) boundary.
-func RoundToBlock(size int64) int64 {
+// PageAlign rounds size up to the nearest BlockSize (4KB) boundary.
+func PageAlign(size int64) int64 {
 	return (size + BlockMask) &^ BlockMask
 }
 
@@ -24,10 +24,14 @@ func RoundToBlock(size int64) int64 {
 // page-aligned memory). The returned slice is pre-warmed to force physical
 // RAM commitment.
 //
-// The buffer is managed by Go's GC and will be automatically freed.
-// For explicit cleanup, use FreeAligned.
+// The returned buffer size is rounded UP to the nearest page boundary (4KB).
+// This is optimal for O_DIRECT I/O which requires page-aligned memory address,
+// write size, and file offset. Callers needing exactly N bytes can reslice.
+//
+// IMPORTANT: The buffer is NOT managed by Go's GC. Callers MUST call
+// FreeAligned to release the memory, otherwise it will leak.
 func AllocAligned(size int) []byte {
-	alignedSize := int(RoundToBlock(int64(size)))
+	alignedSize := int(PageAlign(int64(size)))
 	data, err := unix.Mmap(-1, 0, alignedSize,
 		unix.PROT_READ|unix.PROT_WRITE,
 		unix.MAP_ANON|unix.MAP_PRIVATE)
@@ -40,7 +44,8 @@ func AllocAligned(size int) []byte {
 		data[i] = 0
 	}
 
-	return data[:size]
+	// Return full page-aligned slice so callers can use the entire allocation
+	return data
 }
 
 // FreeAligned releases memory allocated by AllocAligned.
@@ -50,7 +55,7 @@ func FreeAligned(buf []byte) {
 		return
 	}
 	// Round up to get original allocation size
-	alignedSize := int(RoundToBlock(int64(cap(buf))))
+	alignedSize := int(PageAlign(int64(cap(buf))))
 	// Reslice to original capacity for munmap
 	_ = unix.Munmap(buf[:alignedSize])
 }

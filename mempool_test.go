@@ -28,7 +28,7 @@ func TestMmapPool_AcquireUnpooled(t *testing.T) {
 // TestMmapBuffer_ReaderRefCounting validates that concurrent readers
 // properly hold the "pin" even after the MemTable is done with the slab.
 func TestMmapBuffer_ReaderRefCounting(t *testing.T) {
-	pool := NewMmapPool("", 1024, 0, 1)
+	pool := NewMmapPool("", 1024, 1)
 	buf := pool.Acquire()
 
 	// Create concurrent readers.
@@ -65,7 +65,7 @@ func TestMmapBuffer_ReaderRefCounting(t *testing.T) {
 
 // TestMmapPool_SafetyNet validates the Go 1.24+ runtime.AddCleanup fallback.
 func TestMmapPool_SafetyNet(t *testing.T) {
-	pool := NewMmapPool("", 1024, 0, 1)
+	pool := NewMmapPool("", 1024, 1)
 	buf := pool.Acquire()
 
 	// Create a reader and leak it (don't call Close).
@@ -103,7 +103,7 @@ func TestMmapBuffer_WriteAt_Stress(t *testing.T) {
 		iters       = 100
 		entrySize   = 64
 	)
-	pool := NewMmapPool("", concurrency*iters*entrySize, 0, 1)
+	pool := NewMmapPool("", concurrency*iters*entrySize, 1)
 	buf := pool.Acquire()
 
 	var wg sync.WaitGroup

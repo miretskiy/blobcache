@@ -26,18 +26,6 @@ func writeAndVerify(t *testing.T, w *WAL, rec record.Record, expectedOffset int6
 	return result
 }
 
-// writeDirectAndVerify writes a record via WriteDirect and verifies the WriteResult.
-func writeDirectAndVerify(t *testing.T, w *WAL, rec record.Record, expectedOffset int64) WriteResult {
-	t.Helper()
-	result, err := w.WriteDirect(rec)
-	require.NoError(t, err)
-	require.Equal(t, expectedOffset, result.Offset, "offset mismatch for SeqID %d", rec.SeqID)
-	require.Equal(t, int64(rec.EncodedSize()), result.BytesWritten, "bytes written mismatch")
-	require.GreaterOrEqual(t, result.BytesAligned, result.BytesWritten, "aligned size should be >= written")
-	require.Zero(t, result.BytesAligned%4096, "aligned size should be 4KB-aligned")
-	return result
-}
-
 func TestFileHeader_EncodeDecode(t *testing.T) {
 	hdr := FileHeader{
 		Magic:     FileMagic,
@@ -893,9 +881,9 @@ func TestWAL_Guard_PreventsTimeTravel(t *testing.T) {
 	require.NoError(t, w.Close())
 }
 
-// TestWAL_WriteDirect_Aligned verifies that WriteDirect works with
-// properly aligned and page-sized values.
-func TestWAL_WriteDirect_Aligned(t *testing.T) {
+// TestWAL_Write_LargeAlignedValue verifies that Write handles large values
+// that exceed the staging buffer, using the slow path.
+func TestWAL_Write_LargeAlignedValue(t *testing.T) {
 	dir := t.TempDir()
 	cfg := DefaultConfig(dir)
 	cfg.Flags = sys.FlDirectIO
@@ -914,7 +902,7 @@ func TestWAL_WriteDirect_Aligned(t *testing.T) {
 	}
 
 	rec := record.NewRecord(1, []byte("big-key"), value, 6)
-	result := writeDirectAndVerify(t, w, rec, int64(FileHeaderSize))
+	result := writeAndVerify(t, w, rec, int64(FileHeaderSize))
 
 	// Write another normal record - next offset is at BytesAligned (not BytesWritten)
 	rec2 := record.NewRecord(2, []byte("small-key"), []byte("small-value"), 6)
@@ -946,54 +934,8 @@ func TestWAL_WriteDirect_Aligned(t *testing.T) {
 	require.Equal(t, []byte("small-key"), replayer.records[1].Key)
 }
 
-// TestWAL_WriteDirect_UnalignedValue verifies that WriteDirect rejects
-// values that aren't properly aligned.
-func TestWAL_WriteDirect_UnalignedValue(t *testing.T) {
-	if !sys.RequiresAlignment {
-		t.Skip("platform does not enforce alignment")
-	}
-
-	dir := t.TempDir()
-	cfg := DefaultConfig(dir)
-	cfg.Flags = sys.FlDirectIO
-
-	w, err := Open(cfg)
-	require.NoError(t, err)
-	defer w.Close()
-
-	// Allocate aligned buffer then create unaligned slice
-	buf := sys.AllocAligned(8192)
-	defer sys.FreeAligned(buf)
-	unaligned := buf[1:4097] // Not aligned (starts at offset 1)
-
-	rec := record.NewRecord(1, []byte("key"), unaligned, 6)
-	_, err = w.WriteDirect(rec) // Error expected, result not meaningful
-	require.ErrorIs(t, err, ErrUnalignedValue)
-}
-
-// TestWAL_WriteDirect_NonPageSized verifies that WriteDirect rejects
-// values that aren't a multiple of the page size.
-func TestWAL_WriteDirect_NonPageSized(t *testing.T) {
-	dir := t.TempDir()
-	cfg := DefaultConfig(dir)
-	cfg.Flags = sys.FlDirectIO
-
-	w, err := Open(cfg)
-	require.NoError(t, err)
-	defer w.Close()
-
-	// Allocate aligned buffer but use non-page-sized length
-	buf := sys.AllocAligned(8192)
-	defer sys.FreeAligned(buf)
-	nonPageSized := buf[:4000] // 4000 is not a multiple of 4096
-
-	rec := record.NewRecord(1, []byte("key"), nonPageSized, 6)
-	_, err = w.WriteDirect(rec) // Error expected, result not meaningful
-	require.ErrorIs(t, err, ErrUnalignedValue)
-}
-
-// TestWAL_WriteDirect_LargeRecord verifies recovery of large records (1MB+).
-func TestWAL_WriteDirect_LargeRecord(t *testing.T) {
+// TestWAL_Write_1MB_Record verifies recovery of large records (1MB+).
+func TestWAL_Write_1MB_Record(t *testing.T) {
 	dir := t.TempDir()
 	cfg := DefaultConfig(dir)
 	cfg.Flags = sys.FlDirectIO
@@ -1012,7 +954,7 @@ func TestWAL_WriteDirect_LargeRecord(t *testing.T) {
 	}
 
 	rec := record.NewRecord(1, []byte("megabyte-key"), value, 6)
-	writeDirectAndVerify(t, w, rec, int64(FileHeaderSize))
+	writeAndVerify(t, w, rec, int64(FileHeaderSize))
 
 	require.NoError(t, w.Close())
 
@@ -1040,9 +982,9 @@ func TestWAL_WriteDirect_LargeRecord(t *testing.T) {
 	}
 }
 
-// TestWAL_WriteDirect_MixedWithNormal verifies that WriteDirect works
-// correctly when interspersed with normal Write calls.
-func TestWAL_WriteDirect_MixedWithNormal(t *testing.T) {
+// TestWAL_Write_MixedSizes verifies that Write handles records of mixed sizes
+// correctly, with some exceeding the staging buffer (slow path) and some not.
+func TestWAL_Write_MixedSizes(t *testing.T) {
 	dir := t.TempDir()
 	cfg := DefaultConfig(dir)
 	cfg.Flags = sys.FlDirectIO
@@ -1050,7 +992,7 @@ func TestWAL_WriteDirect_MixedWithNormal(t *testing.T) {
 	w, err := Open(cfg)
 	require.NoError(t, err)
 
-	// Write pattern: normal, direct, normal, direct, normal
+	// Write pattern: small, large, small, large, small
 	// Sequential writes: each becomes its own batch; track using BytesAligned
 
 	// Normal write 1
@@ -1065,7 +1007,7 @@ func TestWAL_WriteDirect_MixedWithNormal(t *testing.T) {
 		val2[i] = 0xAA
 	}
 	rec2 := record.NewRecord(2, []byte("k2"), val2, 6)
-	r2 := writeDirectAndVerify(t, w, rec2, nextOffset)
+	r2 := writeAndVerify(t, w, rec2, nextOffset)
 	nextOffset += r2.BytesAligned
 
 	// Normal write 2
@@ -1080,7 +1022,7 @@ func TestWAL_WriteDirect_MixedWithNormal(t *testing.T) {
 		val4[i] = 0xBB
 	}
 	rec4 := record.NewRecord(4, []byte("k4"), val4, 6)
-	r4 := writeDirectAndVerify(t, w, rec4, nextOffset)
+	r4 := writeAndVerify(t, w, rec4, nextOffset)
 	nextOffset += r4.BytesAligned
 
 	// Normal write 3

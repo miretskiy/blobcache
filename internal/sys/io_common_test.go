@@ -321,7 +321,7 @@ func TestWriteBulkAligned(t *testing.T) {
 			data[i] = byte(i % 256)
 		}
 
-		err := WriteBulkAligned(path, data, FlDirectIO|SyncData)
+		err := WriteFile(path, data, FlDirectIO|SyncData)
 		require.NoError(t, err)
 
 		// Verify file contents
@@ -336,7 +336,7 @@ func TestWriteBulkAligned(t *testing.T) {
 		buf := AllocAligned(8192)
 		data := buf[1:4097]
 
-		err := WriteBulkAligned(path, data, FlDirectIO)
+		err := WriteFile(path, data, FlDirectIO)
 		require.ErrorIs(t, err, ErrAlignment)
 	})
 
@@ -344,7 +344,7 @@ func TestWriteBulkAligned(t *testing.T) {
 		path := filepath.Join(tmpDir, "unaligned_nodirect.bin")
 		data := []byte("hello world")
 
-		err := WriteBulkAligned(path, data, SyncNone)
+		err := WriteFile(path, data, SyncNone)
 		require.NoError(t, err)
 
 		got, err := os.ReadFile(path)

@@ -39,10 +39,10 @@ const (
 	SyncNone OpenFlag = 0
 
 	// SyncData opens with FlDSync for data durability.
-	SyncData OpenFlag = FlDSync
+	SyncData = FlDSync
 
 	// SyncFull opens with FlSync for full durability (data + metadata).
-	SyncFull OpenFlag = FlSync
+	SyncFull = FlSync
 )
 
 // ErrAlignment is returned when data is not properly aligned for O_DIRECT.
@@ -63,28 +63,45 @@ func SyncFile(f *os.File, flags OpenFlag) error {
 	return nil
 }
 
-// WriteBulkAligned atomically writes aligned data to a new file.
+// WriteFile atomically writes aligned data to a new file.
 // data must be 4KB-aligned if FlDirectIO is set.
-func WriteBulkAligned(path string, data []byte, flags OpenFlag) (retErr error) {
+func WriteFile(path string, data []byte, flags OpenFlag) (retErr error) {
 	if flags&FlDirectIO != 0 && !IsAligned(data) {
 		return ErrAlignment
 	}
 
-	f, err := CreateFile(path, flags)
+	f, err := CreateAndAllocateFile(path, flags, int64(len(data)))
 	if err != nil {
 		return err
 	}
 	defer func() { retErr = errors.Join(retErr, f.Close()) }()
-
-	if err := Fallocate(f, int64(len(data))); err != nil {
-		return err
-	}
 
 	if _, err := f.Write(data); err != nil {
 		return err
 	}
 
 	return SyncFile(f, flags)
+}
+
+func WriteAligned(buf []byte, f *os.File, flags OpenFlag) (n int, err error) {
+	if flags&FlDirectIO != 0 && !IsAligned(buf) {
+		return 0, ErrAlignment
+	}
+	return f.Write(buf)
+}
+
+// CreateAndAllocateFile creates a file and calls fallocate to allocate
+// requested size.
+func CreateAndAllocateFile(path string, flags OpenFlag, allocSize int64) (*os.File, error) {
+	f, err := CreateFile(path, flags)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := Fallocate(f, allocSize); err != nil {
+		return nil, errors.Join(err, f.Close())
+	}
+	return f, nil
 }
 
 type FadviseHint int

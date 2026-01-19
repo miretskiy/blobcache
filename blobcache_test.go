@@ -88,13 +88,12 @@ func TestCache_Put_EmptyValueAllowed(t *testing.T) {
 }
 
 func TestCache_Put_LargeBlob(t *testing.T) {
-	// Tests the putLarge code path.
-	// Regression test: newActiveSlab must account for FileHeaderSize reservation,
-	// otherwise Alloc() would overflow the buffer (masked by allocateRaw's +4KB headroom).
+	// Tests the XL (extra large) write code path.
+	// XL writes are triggered when record size exceeds WriteBufferSize.
 	tmpDir := t.TempDir()
+	bufferSize := int64(16 * 1024) // 16KB buffer
 	cache, err := New(tmpDir,
-		WithWriteBufferSize(16*1024),           // 16KB buffer
-		WithLargeWriteThreshold(1024),          // 1KB threshold triggers putLarge
+		WithWriteBufferSize(bufferSize),
 		WithMaxCachedSlabs(0),                  // Force disk path
 		WithCompression(compression.CodexNone), // No compression for predictable size
 	)
@@ -102,11 +101,14 @@ func TestCache_Put_LargeBlob(t *testing.T) {
 	defer cache.Close()
 
 	key := []byte("large-key")
-	// Value must be larger than LargeWriteThreshold to trigger putLarge
-	value := make([]byte, 2048) // 2KB value - larger than 1KB threshold
-	for i := range value {
+	// Value must be larger than WriteBufferSize to trigger XL write path
+	value := make([]byte, int(bufferSize)+1024) // Exceeds buffer size
+	// Use identifiable pattern for debugging
+	copy(value, "XLBLOB_START_")
+	for i := 13; i < len(value)-11; i++ {
 		value[i] = byte(i % 256)
 	}
+	copy(value[len(value)-11:], "_END_XLBLOB")
 
 	require.NoError(t, cache.Put(key, value))
 
@@ -114,8 +116,235 @@ func TestCache_Put_LargeBlob(t *testing.T) {
 	cache.Drain()
 
 	retrieved, found := readAll(t, cache, key)
-	require.True(t, found)
-	require.Equal(t, value, retrieved)
+	require.True(t, found, "key not found after drain")
+	require.Equal(t, len(value), len(retrieved), "length mismatch")
+	require.Equal(t, value, retrieved, "data mismatch")
+}
+
+// TestCache_LargeWrites_Comprehensive tests various combinations of normal and XL (extra large) writes.
+// XL writes are triggered when record size exceeds WriteBufferSize.
+// Tests verify correct round-trip for each pattern, both with and without WAL.
+func TestCache_LargeWrites_Comprehensive(t *testing.T) {
+	// Test patterns: 'N' = normal write, 'L' = large (XL) write
+	patterns := []struct {
+		name   string
+		writes string // 'N' for normal, 'L' for large
+		desc   string
+	}{
+		{"SimpleXL", "L", "single large write"},
+		{"XLThenNormal", "LN", "large followed by normal"},
+		{"XLThenMultiNormal", "LNNN", "large followed by multiple normals"},
+		{"NormalThenXL", "NL", "normal followed by large"},
+		{"MultiNormalThenXL", "NNNL", "multiple normals followed by large"},
+		{"Alternating", "NLNLNL", "alternating normal and large"},
+		{"Complex", "NLNLLLNN", "mixed: normal, large, normal, large, large, large, normal, normal"},
+		{"AllXL", "LLL", "multiple large writes"},
+		{"BookendXL", "LNNNL", "large at start and end"},
+	}
+
+	for _, walEnabled := range []bool{false, true} {
+		walName := "NoWAL"
+		if walEnabled {
+			walName = "WithWAL"
+		}
+
+		for _, p := range patterns {
+			t.Run(fmt.Sprintf("%s/%s", walName, p.name), func(t *testing.T) {
+				testLargeWritePattern(t, p.writes, walEnabled)
+			})
+		}
+	}
+}
+
+func testLargeWritePattern(t *testing.T, pattern string, walEnabled bool) {
+	tmpDir := t.TempDir()
+	bufferSize := int64(16 * 1024) // 16KB buffer
+
+	opts := []Option{
+		WithWriteBufferSize(bufferSize),
+		WithMaxCachedSlabs(0),                  // Force disk path
+		WithCompression(compression.CodexNone), // No compression for predictable size
+	}
+	if walEnabled {
+		opts = append(opts, WithWAL())
+	}
+
+	cache, err := New(tmpDir, opts...)
+	require.NoError(t, err)
+	defer cache.Close()
+
+	// Track what we write for verification
+	type writeRecord struct {
+		key   []byte
+		value []byte
+		isXL  bool
+	}
+	var writes []writeRecord
+
+	// Generate writes based on pattern
+	for i, ch := range pattern {
+		isXL := ch == 'L'
+		key := []byte(fmt.Sprintf("key-%d-%c", i, ch))
+
+		var value []byte
+		if isXL {
+			// Value larger than buffer to trigger XL path
+			value = make([]byte, int(bufferSize)+1024)
+		} else {
+			// Normal small value
+			value = make([]byte, 512)
+		}
+
+		// Fill with identifiable pattern
+		fillPattern(value, i, isXL)
+
+		writes = append(writes, writeRecord{key: key, value: value, isXL: isXL})
+		require.NoError(t, cache.Put(key, value), "Put failed for key %s", key)
+	}
+
+	// Flush to disk
+	cache.Drain()
+
+	// Verify all writes can be read back correctly
+	for _, w := range writes {
+		retrieved, found := cache.Get(w.key)
+		require.True(t, found, "key %s not found after drain (isXL=%v)", w.key, w.isXL)
+		require.Equal(t, len(w.value), len(retrieved),
+			"length mismatch for key %s (isXL=%v)", w.key, w.isXL)
+		require.Equal(t, w.value, retrieved,
+			"data mismatch for key %s (isXL=%v)", w.key, w.isXL)
+	}
+
+	// Verify segment file exists and has valid structure
+	verifySegmentFiles(t, tmpDir, cache.Shards)
+}
+
+// TestCache_XLRotation verifies that slab rotation occurs when XL writes
+// accumulate past the threshold (2x WriteBufferSize), preventing unbounded
+// memory usage in workloads with only large writes.
+func TestCache_XLRotation(t *testing.T) {
+	tmpDir := t.TempDir()
+	bufferSize := int64(16 * 1024) // 16KB buffer
+
+	cache, err := New(tmpDir,
+		WithWriteBufferSize(bufferSize),
+		WithMaxCachedSlabs(0),                  // Force disk path
+		WithCompression(compression.CodexNone), // No compression
+	)
+	require.NoError(t, err)
+	defer cache.Close()
+
+	// Each XL write is ~17KB (just over buffer size).
+	// Threshold is 2x buffer = 32KB.
+	// So 2 XL writes should trigger rotation before the 3rd.
+	xlSize := int(bufferSize) + 1024 // ~17KB
+
+	var keys [][]byte
+	for i := 0; i < 5; i++ {
+		key := []byte(fmt.Sprintf("xl-rotation-key-%d", i))
+		value := make([]byte, xlSize)
+		fillPattern(value, i, true)
+
+		keys = append(keys, key)
+		require.NoError(t, cache.Put(key, value))
+	}
+
+	cache.Drain()
+
+	// Verify all keys are readable
+	for i, key := range keys {
+		retrieved, found := cache.Get(key)
+		require.True(t, found, "key %d not found after rotation", i)
+		require.Equal(t, xlSize, len(retrieved), "key %d length mismatch", i)
+	}
+
+	// Count unique segment IDs from index - should be >1 due to rotation
+	segmentIDs := make(map[uint32]struct{})
+	for _, key := range keys {
+		h := xxh3.Hash128(key)
+		entry, ok := cache.index.Get(index.Key(h))
+		require.True(t, ok, "key should be in index")
+		segmentIDs[entry.SegmentID] = struct{}{}
+	}
+	require.Greater(t, len(segmentIDs), 1,
+		"should have multiple segments due to XL rotation (got %d)", len(segmentIDs))
+	t.Logf("XL rotation created %d segments for 5 XL writes", len(segmentIDs))
+
+	// Verify .iseg (footer) files exist for each segment - needed for disaster recovery
+	for segID := range segmentIDs {
+		footerPath := GetFooterPath(tmpDir, cache.Shards, segID)
+		_, err := os.Stat(footerPath)
+		require.NoError(t, err, "footer file should exist: %s", footerPath)
+	}
+}
+
+// fillPattern fills a buffer with an identifiable pattern for debugging
+func fillPattern(buf []byte, index int, isXL bool) {
+	prefix := "NORM_"
+	if isXL {
+		prefix = "XLBL_"
+	}
+	marker := fmt.Sprintf("%s%03d_START_", prefix, index)
+	copy(buf, marker)
+
+	// Fill middle with index-based pattern
+	for i := len(marker); i < len(buf)-12; i++ {
+		buf[i] = byte((i + index) % 256)
+	}
+
+	// End marker
+	endMarker := fmt.Sprintf("_END_%03d", index)
+	copy(buf[len(buf)-len(endMarker):], endMarker)
+}
+
+// verifySegmentFiles checks that segment files exist and have valid footer structure
+func verifySegmentFiles(t *testing.T, dir string, shards int) {
+	t.Helper()
+
+	// Find all .iseg files
+	segDir := fmt.Sprintf("%s/segments", dir)
+	for shard := 0; shard < shards; shard++ {
+		shardDir := fmt.Sprintf("%s/%04d", segDir, shard)
+		entries, err := os.ReadDir(shardDir)
+		if os.IsNotExist(err) {
+			continue // Shard may not have data
+		}
+		require.NoError(t, err)
+
+		for _, entry := range entries {
+			if !entry.IsDir() && len(entry.Name()) > 5 {
+				ext := entry.Name()[len(entry.Name())-5:]
+				if ext == ".iseg" {
+					path := fmt.Sprintf("%s/%s", shardDir, entry.Name())
+					verifySegmentFile(t, path)
+				}
+			}
+		}
+	}
+}
+
+// verifySegmentFile validates a single segment file structure
+func verifySegmentFile(t *testing.T, path string) {
+	t.Helper()
+
+	fi, err := os.Stat(path)
+	require.NoError(t, err, "segment file should exist: %s", path)
+	require.Greater(t, fi.Size(), int64(0), "segment file should not be empty: %s", path)
+
+	// Read file header
+	f, err := os.Open(path)
+	require.NoError(t, err)
+	defer f.Close()
+
+	// Verify file header magic
+	header := make([]byte, record.FileHeaderSize)
+	_, err = f.Read(header)
+	require.NoError(t, err, "should read file header")
+
+	magic := uint32(header[0]) | uint32(header[1])<<8 | uint32(header[2])<<16 | uint32(header[3])<<24
+	require.Equal(t, record.FileMagic, magic, "segment file should have correct magic: %s", path)
+
+	t.Logf("Verified segment file: %s (size=%d)", path, fi.Size())
 }
 
 func TestCache_PutChecksummed_CorrectChecksum(t *testing.T) {

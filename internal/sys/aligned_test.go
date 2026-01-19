@@ -47,17 +47,32 @@ func TestRoundToBlock(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		result := RoundToBlock(tt.input)
-		require.Equal(t, tt.expected, result, "RoundToBlock(%d)", tt.input)
+		result := PageAlign(tt.input)
+		require.Equal(t, tt.expected, result, "PageAlign(%d)", tt.input)
 	}
 }
 
 func TestAllocAligned_Alignment(t *testing.T) {
-	sizes := []int{1, 100, 4096, 8192, 16384}
-	for _, size := range sizes {
-		buf := AllocAligned(size)
-		require.True(t, IsAligned(buf), "AllocAligned(%d) should be aligned", size)
-		require.Equal(t, size, len(buf), "AllocAligned(%d) should have correct length", size)
+	// AllocAligned returns a page-aligned buffer of at least the requested size,
+	// rounded up to the nearest page boundary. This is optimal for O_DIRECT I/O
+	// which requires page-aligned memory, size, and offset.
+	tests := []struct {
+		request  int
+		expected int // page-aligned size
+	}{
+		{1, 4096},
+		{100, 4096},
+		{4096, 4096},
+		{4097, 8192},
+		{8192, 8192},
+		{16384, 16384},
+	}
+
+	for _, tt := range tests {
+		buf := AllocAligned(tt.request)
+		require.True(t, IsAligned(buf), "AllocAligned(%d) should be aligned", tt.request)
+		require.Equal(t, tt.expected, len(buf),
+			"AllocAligned(%d) should return page-aligned length", tt.request)
 		FreeAligned(buf)
 	}
 }

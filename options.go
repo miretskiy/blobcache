@@ -59,15 +59,14 @@ type config struct {
 	MaxInflightSlabs int   // Max slabs queueing for flush
 	MaxCachedSlabs   int   // Max slabs kept in memory for reading
 
-	LargeWriteThreshold int64
-	FlushConcurrency    int
-	BloomFPRate         float64
-	BloomEstimatedKeys  int
-	IO                  IOConfig
-	Resilience          ResilienceConfig
-	Compression         CompressionConfig
-	WAL                 WALConfig
-	DegradedMode        DegradedMode // How to handle degraded mode (default: memory-only)
+	FlushConcurrency   int
+	BloomFPRate        float64
+	BloomEstimatedKeys int
+	IO                 IOConfig
+	Resilience         ResilienceConfig
+	Compression        CompressionConfig
+	WAL                WALConfig
+	DegradedMode       DegradedMode // How to handle degraded mode (default: memory-only)
 
 	knobs *TestingKnobs
 }
@@ -137,10 +136,6 @@ func WithVerifyOnRead(enabled bool) Option {
 	return funcOpt(func(c *config) { c.Resilience.VerifyOnRead = enabled })
 }
 
-func WithLargeWriteThreshold(size int64) Option {
-	return funcOpt(func(c *config) { c.LargeWriteThreshold = size })
-}
-
 func WithFlushConcurrency(n int) Option {
 	return funcOpt(func(c *config) { c.FlushConcurrency = n })
 }
@@ -204,16 +199,16 @@ func WithDegradedMode(mode DegradedMode) Option {
 
 func defaultConfig(path string) config {
 	return config{
-		Path:                path,
-		MaxSize:             0,
-		Shards:              0,
-		WriteBufferSize:     128 << 20, // 128MB
-		LargeWriteThreshold: 4 << 20,
-		MaxInflightSlabs:    6,
-		MaxCachedSlabs:      8, // Keep ~1GB of recently written data in RAM
-		FlushConcurrency:    6,
-		BloomFPRate:         0.01,
-		BloomEstimatedKeys:  1_000_000,
+		Path:               path,
+		MaxSize:            0,
+		Shards:             0,
+		WriteBufferSize:    128 << 20, // 128MB
+		MaxInflightSlabs:   6,
+		MaxCachedSlabs:     8, // Keep ~1GB of recently written data in RAM
+		FlushConcurrency:   6,
+		BloomFPRate:        0.01,
+		BloomEstimatedKeys: 1_000_000,
+		DegradedMode:       DegradedMemoryOnly,
 		IO: IOConfig{
 			FDataSync:     false,
 			Fadvise:       sys.UseFadvise,

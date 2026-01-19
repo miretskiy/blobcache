@@ -7,6 +7,7 @@ import (
 	"github.com/miretskiy/blobcache/base"
 	"github.com/miretskiy/blobcache/compression"
 	"github.com/miretskiy/blobcache/internal/record"
+	"github.com/miretskiy/blobcache/internal/sys"
 	"github.com/miretskiy/blobcache/internal/xmap"
 )
 
@@ -16,6 +17,10 @@ type SlabEntry struct {
 	record.Header       // Flags, SeqID, PhysicalSize, LogicalSize (Magic/KeyLen unused here)
 	Pos           int64 // Byte offset within slab buffer (for Librarian reads)
 	WalPos        int64 // Byte offset within WAL file (for footer when WAL enabled)
+
+	// XLBuf is set for extra large writes that are not part of the normal buffer.
+	// XLBuf must be explicitly released to the pool.
+	XLBuf *MmapBuffer
 }
 
 // SharedSlab represents a populated chunk of memory and its index.
@@ -26,8 +31,8 @@ type SharedSlab struct {
 
 // Releaser is a zero-allocation handle for releasing a read lock or buffer.
 type Releaser struct {
-	slab   *SharedSlab
-	buffer BufferHandle
+	slab *MmapBuffer
+	bh   BufferHandle
 }
 
 func (r *Releaser) Release() {
@@ -35,16 +40,16 @@ func (r *Releaser) Release() {
 		return
 	}
 	if r.slab != nil {
-		r.slab.buf.Unpin()
+		r.slab.Unpin()
 		r.slab = nil
 	}
-	r.buffer.Release()
+	r.bh.Release()
+	*r = Releaser{}
 }
 
 // Acquire attempts to get a lease on the data.
 // For uncompressed blobs: Zero-copy slice into the slab buffer.
 // For compressed blobs: Allocates and returns decompressed data.
-// WAIT-FREE: This method uses no locks.
 // Returns (data, releaser, found, errno). Caller should check errno even when found=true.
 // NB: This is a low level method where the caller is expected to quickly consume
 // the returned data and promptly release it via Releaser.
@@ -60,30 +65,37 @@ func (s *SharedSlab) Acquire(key Key) ([]byte, Releaser, bool, base.BlobErrno) {
 		return nil, Releaser{}, true, rec.Errno()
 	}
 
+	buf := s.buf
+	offset := rec.Pos
+	if rec.XLBuf != nil {
+		buf = rec.XLBuf
+		offset = record.FileHeaderSize // XL data always starts after file header in XLBuf
+	}
+
 	// 3. SAFE PIN (CAS Loop)
 	// We attempt to promote our weak reference (from the list) to a strong reference.
 	// If the Librarian evicted this slab while we were looking at it,
 	// TryInc will return false, preventing us from using dead memory.
-	if !s.buf.TryInc() {
+	if !buf.TryInc() {
 		// The buffer died between step 1 and 2. Treat as a miss.
 		return nil, Releaser{}, false, base.ErrNone
 	}
 
 	// 4. Get Physical Data (skip past header and key to value bytes)
-	valueStart := rec.Pos + int64(record.HeaderSize) + int64(rec.KeyLen)
-	physicalData := s.buf.raw[valueStart : valueStart+rec.PhysicalSize]
-	releaser := Releaser{slab: s}
+	valueStart := offset + int64(record.HeaderSize) + int64(rec.KeyLen)
+	physicalData := buf.raw[valueStart : valueStart+rec.PhysicalSize]
+	releaser := Releaser{slab: buf}
 
 	// 5. Handle Decompression
 	if rec.IsCompressed() {
-		defer releaser.Release() // Release slab when done using physicalData
+		defer releaser.Release() // Release buf when done using physicalData
 
 		handle := AcquireBuffer(int(rec.LogicalSize), int(rec.LogicalSize))
 		if err := compression.Decompress(rec.Compression(), handle.Bytes(), physicalData); err != nil {
 			handle.Release()
 			return nil, Releaser{}, false, base.ErrDecompression
 		}
-		return handle.Bytes(), Releaser{buffer: handle}, true, base.ErrNone
+		return handle.Bytes(), Releaser{bh: handle}, true, base.ErrNone
 	}
 
 	// Uncompressed: zero-copy slice
@@ -121,6 +133,13 @@ type ActiveSlab struct {
 	// Used during rotation to set maxSealedSeq in MemTable.
 	// Accessed only under MemTable.mu.Lock, so no atomics needed.
 	currentMaxSeq uint64
+
+	// xlSize tracks cumulative size of XL (extra large) buffers in this slab.
+	// Used to force rotation when XL writes accumulate excessively.
+	// Without this, a workload of only XL writes would never rotate
+	// (since XL writes don't consume space in the main slab buffer).
+	// Accessed only under MemTable.mu.Lock, so no atomics needed.
+	xlSize int64
 }
 
 // Alloc reserves n bytes in the slab.
@@ -138,6 +157,11 @@ func (as *ActiveSlab) Alloc(n int) (buf []byte, offset int64) {
 	}
 	as.wPos = end
 	return as.buf.raw[offset:end], offset
+}
+
+func (as *ActiveSlab) AlignPosToPageBoundary() int64 {
+	as.wPos = sys.PageAlign(as.wPos)
+	return as.wPos
 }
 
 type FlushTicket struct {

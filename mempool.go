@@ -65,7 +65,7 @@ func (b *MmapBuffer) AlignedBytes(off int64) []byte {
 	if off <= 0 {
 		return nil
 	}
-	return b.raw[:sys.RoundToBlock(off)]
+	return b.raw[:sys.PageAlign(off)]
 }
 
 func (b *MmapBuffer) Cap() int { return len(b.raw) }
@@ -167,15 +167,15 @@ type MmapPool struct {
 	name        string
 }
 
-func NewMmapPool(name string, bufferSize int64, headroom int64, capacity int) *MmapPool {
+func NewMmapPool(name string, bufferSize int64, capacity int) *MmapPool {
 	p := &MmapPool{
 		buffers:  make(chan []byte, capacity),
-		poolSize: bufferSize + headroom,
+		poolSize: bufferSize,
 		name:     name,
 	}
 	// Pre-fill with aligned, pre-warmed buffers
 	for i := 0; i < capacity; i++ {
-		p.buffers <- sys.AllocAligned(int(bufferSize + headroom))
+		p.buffers <- sys.AllocAligned(int(bufferSize))
 	}
 	return p
 }

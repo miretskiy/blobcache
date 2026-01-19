@@ -59,7 +59,7 @@ func DefaultConfig(dir string) Config {
 }
 
 // request is the internal ticket for group commit.
-// It can be a data record, a rotation command, or an oversized write.
+// It can be a data record or a rotation command.
 type request struct {
 	rec record.Record // Payload (if not isRotation)
 
@@ -67,11 +67,6 @@ type request struct {
 	// When processed, the leader closes the current file (syncing all preceding
 	// writes) and the next data write will create a new file.
 	isRotation bool
-
-	// Oversized flag: if true, this record's Value is pre-aligned and page-sized.
-	// It bypasses the staging buffer and is written directly after flushing
-	// any pending normal records.
-	isOversized bool
 
 	Done   bool        // Set true when request completes
 	Err    error       // Error from processing (if any)
@@ -154,7 +149,7 @@ func Open(cfg Config) (*WAL, error) {
 	if bufSize <= 0 {
 		bufSize = DefaultMaxBatchSize
 	}
-	alignedSize := int(sys.RoundToBlock(int64(bufSize + FileHeaderSize)))
+	alignedSize := int(sys.PageAlign(int64(bufSize + FileHeaderSize)))
 	w.encodeBuf = sys.AllocAligned(alignedSize)
 
 	return w, nil
@@ -165,35 +160,6 @@ func Open(cfg Config) (*WAL, error) {
 // Returns WriteResult with the record's offset and size information.
 func (w *WAL) Write(rec record.Record) (WriteResult, error) {
 	req := &request{rec: rec}
-	err := w.submit(req)
-	return req.Result, err
-}
-
-// ErrUnalignedValue is returned when WriteDirect receives a value that
-// is not properly aligned or sized for O_DIRECT.
-var ErrUnalignedValue = errors.New("wal: value not aligned or not page-sized for O_DIRECT")
-
-// WriteDirect writes a record with a large, pre-aligned value directly to the WAL.
-// This bypasses the staging buffer for the value data.
-//
-// Requirements:
-//   - rec.Value must be 4KB-aligned (use sys.AllocAligned)
-//   - len(rec.Value) must be a multiple of 4KB
-//
-// The record is still serialized with other writes through the request queue.
-// Any pending normal writes are flushed before the oversized write.
-//
-// Returns ErrUnalignedValue if the value doesn't meet alignment requirements.
-func (w *WAL) WriteDirect(rec record.Record) (WriteResult, error) {
-	// Validate alignment requirements
-	if !sys.IsAligned(rec.Value) {
-		return WriteResult{}, ErrUnalignedValue
-	}
-	if int64(len(rec.Value))&sys.BlockMask != 0 {
-		return WriteResult{}, ErrUnalignedValue
-	}
-
-	req := &request{rec: rec, isOversized: true}
 	err := w.submit(req)
 	return req.Result, err
 }
@@ -277,51 +243,44 @@ func (w *WAL) submit(req *request) error {
 	}
 }
 
-// processBatch handles a batch of requests, splitting on control commands.
-// Control commands (rotation, oversized) act as barriers:
-//  1. All preceding normal records are flushed first
-//  2. The control command is processed
+// processBatch handles a batch of requests, splitting on rotation commands.
+// Rotation commands act as barriers:
+//  1. All preceding records are flushed first
+//  2. The rotation command is processed (file closed)
 //  3. Iteration continues with remaining requests
 func (w *WAL) processBatch(batch []*request) error {
 	for len(batch) > 0 {
-		// Find first control command
-		controlIdx := -1
+		// Find first rotation command
+		rotationIdx := -1
 		for i, req := range batch {
-			if req.isRotation || req.isOversized {
-				controlIdx = i
+			if req.isRotation {
+				rotationIdx = i
 				break
 			}
 		}
 
-		if controlIdx == -1 {
-			// No control commands, flush all as normal records
-			return w.flushNormalRecords(batch)
+		if rotationIdx == -1 {
+			// No rotation commands, flush all records
+			return w.flushRecords(batch)
 		}
 
-		// Flush everything before the control command
-		if controlIdx > 0 {
-			if err := w.flushNormalRecords(batch[:controlIdx]); err != nil {
+		// Flush everything before the rotation
+		if rotationIdx > 0 {
+			if err := w.flushRecords(batch[:rotationIdx]); err != nil {
 				return err
 			}
-			markDone(batch[:controlIdx], nil)
+			markDone(batch[:rotationIdx], nil)
 		}
 
-		// Process the control command
-		req := batch[controlIdx]
-		if req.isRotation {
-			if err := w.closeCurrentFile(); err != nil {
-				return err
-			}
-		} else { // isOversized
-			if err := w.writeOversizedRecord(req); err != nil {
-				return err
-			}
+		// Process the rotation command
+		if err := w.closeCurrentFile(); err != nil {
+			return err
 		}
-		req.Done = true
-		req.Err = nil
+		batch[rotationIdx].Done = true
+		batch[rotationIdx].Err = nil
 
 		// Continue with remaining batch
-		batch = batch[controlIdx+1:]
+		batch = batch[rotationIdx+1:]
 	}
 	return nil
 }
@@ -335,7 +294,7 @@ func markDone(batch []*request, err error) {
 }
 
 // prepareWrite validates the sequence guard, updates the max sequence tracker,
-// and ensures the file is open. Used by writeOversizedRecord for single-record writes.
+// and ensures the file is open. Used by writeLargeRecord for single-record writes.
 // For batch writes, flushNormalRecords handles this differently (min/max scanning).
 func (w *WAL) prepareWrite(seqID uint64) error {
 	if seqID <= w.lastRotatedSeq {
@@ -351,14 +310,14 @@ func (w *WAL) prepareWrite(seqID uint64) error {
 	return nil
 }
 
-// flushNormalRecords writes data records using "Pad & Advance" strategy for O_DIRECT.
+// flushRecords writes data records using "Pad & Advance" strategy for O_DIRECT.
 //
 // All writes are padded to 4KB boundaries with zeros. Recovery treats zeros as EOF.
 // On first write, file header is prepended to avoid a hole between header and data.
 //
 // If the batch exceeds buffer capacity, it is split into multiple chunks.
-// Records larger than the buffer are handled via writeOversizedRecord (slow path).
-func (w *WAL) flushNormalRecords(batch []*request) error {
+// Records larger than the buffer are handled via writeLargeRecord (slow path).
+func (w *WAL) flushRecords(batch []*request) error {
 	if len(batch) == 0 {
 		return nil
 	}
@@ -412,7 +371,7 @@ func (w *WAL) flushNormalRecords(batch []*request) error {
 
 		for idx < len(batch) {
 			recSize := batch[idx].rec.EncodedSize()
-			projectedWrite := int(sys.RoundToBlock(int64(chunkSize + recSize)))
+			projectedWrite := int(sys.PageAlign(int64(chunkSize + recSize)))
 
 			if projectedWrite <= bufCap {
 				// Record fits in current chunk
@@ -420,8 +379,8 @@ func (w *WAL) flushNormalRecords(batch []*request) error {
 				idx++
 			} else if chunkStart == idx {
 				// Single record exceeds buffer - use slow path
-				// writeOversizedRecord handles file opening and header internally
-				if err := w.writeOversizedRecord(batch[idx]); err != nil {
+				// writeLargeRecord handles file opening and header internally
+				if err := w.writeLargeRecord(batch[idx]); err != nil {
 					return err
 				}
 				totalBytes += recSize
@@ -430,7 +389,7 @@ func (w *WAL) flushNormalRecords(batch []*request) error {
 				chunkStart = idx
 				chunkSize = 0
 				overhead = 0
-				needHeader = false // Header was written by writeOversizedRecord
+				needHeader = false // Header was written by writeLargeRecord
 			} else {
 				// Chunk is full, write what we have
 				break
@@ -438,7 +397,7 @@ func (w *WAL) flushNormalRecords(batch []*request) error {
 		}
 
 		// Write the chunk (if we have records to write)
-		// Re-check header state since writeOversizedRecord may have written it
+		// Re-check header state since writeLargeRecord may have written it
 		if chunkStart < idx && chunkSize > overhead {
 			includeHeader := w.fileOffset == 0
 			if err := w.writeChunk(batch[chunkStart:idx], includeHeader); err != nil {
@@ -470,7 +429,7 @@ func (w *WAL) writeChunk(chunk []*request, includeHeader bool) error {
 	if includeHeader {
 		totalPayload += FileHeaderSize
 	}
-	writeSize := int(sys.RoundToBlock(int64(totalPayload)))
+	writeSize := int(sys.PageAlign(int64(totalPayload)))
 
 	buf := w.encodeBuf[:writeSize]
 
@@ -517,10 +476,10 @@ func (w *WAL) writeChunk(chunk []*request, includeHeader bool) error {
 	return w.writeAndSync(buf)
 }
 
-// writeOversizedRecord handles a single record larger than the staging buffer.
+// writeLargeRecord handles a single record larger than the staging buffer.
 // Allocates a temporary aligned buffer for the write (slow path).
 // Populates WriteResult for the request.
-func (w *WAL) writeOversizedRecord(req *request) error {
+func (w *WAL) writeLargeRecord(req *request) error {
 	if err := w.prepareWrite(req.rec.SeqID); err != nil {
 		return err
 	}
@@ -533,7 +492,7 @@ func (w *WAL) writeOversizedRecord(req *request) error {
 	if includeHeader {
 		totalPayload += FileHeaderSize
 	}
-	writeSize := int(sys.RoundToBlock(int64(totalPayload)))
+	writeSize := int(sys.PageAlign(int64(totalPayload)))
 
 	// Allocate temporary aligned buffer
 	buf := sys.AllocAligned(writeSize)

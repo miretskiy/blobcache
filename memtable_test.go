@@ -23,7 +23,7 @@ type TrackedPool struct {
 
 func NewTrackedPool(capacity int, slabSize int64) *TrackedPool {
 	return &TrackedPool{
-		MmapPool: NewMmapPool("", slabSize, 0, capacity),
+		MmapPool: NewMmapPool("", slabSize, capacity),
 	}
 }
 

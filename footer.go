@@ -22,7 +22,7 @@ type poolProvider interface {
 // 1. Computes min/max SeqID from entries
 // 2. Builds SegmentFooter struct
 // 3. Serializes to 4KB-aligned buffer
-// 4. Writes atomically using WriteBulkAligned
+// 4. Writes atomically using WriteFile
 //
 // The footer file path is derived from dataPath by adding .iseg extension.
 // Example: /data/segments/0001/00000001.seg -> /data/segments/0001/00000001.seg.iseg
@@ -67,5 +67,5 @@ func WriteFooter(
 
 	// 4. Write atomically to .iseg file
 	indexPath := dataPath + IndexSegmentExtension
-	return sys.WriteBulkAligned(indexPath, data, flags)
+	return sys.WriteFile(indexPath, data, flags)
 }

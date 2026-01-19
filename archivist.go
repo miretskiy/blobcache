@@ -119,7 +119,7 @@ func (a *Archivist) ReadBlob(e index.Item, expectedKey []byte) (io.Reader, Relea
 		}
 
 		reader = bytes.NewReader(decompressedHandle.Bytes())
-		releaser = Releaser{buffer: decompressedHandle}
+		releaser = Releaser{bh: decompressedHandle}
 	}
 
 	// 3. Optional Integrity Layer
@@ -138,6 +138,11 @@ func getSegmentPath(basePath string, numShards int, segmentID uint32) string {
 		fmt.Sprintf("%04d", shardNo),
 		fmt.Sprintf("%d.seg", segmentID),
 	)
+}
+
+// GetFooterPath returns the path for a segment's footer file (.iseg).
+func GetFooterPath(basePath string, numShards int, segmentID uint32) string {
+	return getSegmentPath(basePath, numShards, segmentID) + IndexSegmentExtension
 }
 
 // getSegmentFile returns cached SegmentFile or opens it
@@ -173,7 +178,9 @@ func (a *Archivist) getSegmentFile(segmentID uint32) (*segmentFile, error) {
 }
 
 // HolePunchBlob releases disk space for an evicted blob.
-func (a *Archivist) HolePunchBlob(segmentID uint32, offset uint32, physicalLen uint32) (int64, error) {
+func (a *Archivist) HolePunchBlob(
+	segmentID uint32, offset uint32, physicalLen uint32,
+) (int64, error) {
 	sf, err := a.getSegmentFile(segmentID)
 	if err != nil {
 		return 0, err

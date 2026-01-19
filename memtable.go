@@ -229,41 +229,38 @@ func (mt *MemTable) writeToSlab(seqID uint64, hash Key, rec record.Record) error
 
 	active := mt.mu.active
 	writeSize := rec.EncodedSize()
-
 	xlWrite := int64(writeSize) > mt.WriteBufferSize
+
 	var buf []byte
 	var wPos int64
-	var xlBuf *MmapBuffer
+	var needRotation bool
 
 	if xlWrite {
 		// Check if XL accumulation would exceed threshold (2x buffer size).
 		// Without this check, a workload of only XL writes would never rotate.
 		if active.xlSize+int64(writeSize) <= 2*mt.WriteBufferSize {
-			// Allocate XLBuf with room for file header + record.
-			// The file header space is reserved so XLBuf can be written as a standalone
-			// segment if needed, but normally we skip those bytes when writing to avoid
-			// emitting garbage in the middle of the file.
-			xlBuf = NewMmapBuffer(record.FileHeaderSize + int64(rec.EncodedSize()))
-			buf = xlBuf.raw[record.FileHeaderSize:]
-			// Align wPos to page boundary - that's where xlBuf will be inserted.
+			// Reserve position and increment xlSize under lock.
+			// Actual buffer allocation happens after unlock to avoid mmap syscall under lock.
 			wPos = active.AlignPosToPageBoundary()
-			active.xlSize += int64(len(xlBuf.Bytes()))
+			active.xlSize += int64(sys.PageAlign(record.FileHeaderSize + int64(writeSize)))
+		} else {
+			needRotation = true
 		}
-		// If threshold exceeded, buf remains nil and we'll rotate below
 	} else {
 		// 3. Allocate space (under lock) - combines capacity check and reservation
 		buf, wPos = active.Alloc(writeSize)
+		needRotation = buf == nil
 	}
 
 	// Rotation needed: either Alloc failed (normal) or XL threshold exceeded
-	if buf == nil {
+	if needRotation {
 		rotateUnlocked := mt.prepareRotationLocked()
 		mt.mu.Unlock()
 		rotateUnlocked()
 		return mt.writeToSlab(seqID, hash, rec) // Retry
 	}
 
-	// 4. Track pending write (after successful allocation)
+	// 4. Track pending write (after successful reservation)
 	active.pendingWrites.Add(1)
 
 	// Track highest seqID in this slab for rotation handoff
@@ -272,6 +269,14 @@ func (mt *MemTable) writeToSlab(seqID uint64, hash Key, rec record.Record) error
 	}
 
 	mt.mu.Unlock()
+
+	// 5. Allocate XL buffer outside lock (position already reserved).
+	// File header space reserved so XLBuf can be written as standalone segment if needed.
+	var xlBuf *MmapBuffer
+	if xlWrite {
+		xlBuf = NewMmapBuffer(record.FileHeaderSize + int64(rec.EncodedSize()))
+		buf = xlBuf.raw[record.FileHeaderSize:]
+	}
 
 	// 5. WAL Write (AFTER reservation, BEFORE fill - Reserve-First pattern)
 	// This prevents the "Spillover Bug" where a record written to WAL file N
@@ -442,37 +447,97 @@ func (mt *MemTable) flushWorker() {
 }
 
 // processFlush finalizes a slab to a segment file.
-// In WAL mode: renames WAL file to segment, writes footer to .iseg.
-// In cache mode: writes slab data to segment, writes footer to .iseg.
-func (mt *MemTable) processFlush(as *ActiveSlab) (retErr error) {
+// Dispatches to flushViaRename (WAL mode) or flushViaMerge (cache mode).
+func (mt *MemTable) processFlush(as *ActiveSlab) error {
 	if mt.IsDegraded() {
 		return nil
 	}
-
 	if mt.Knobs != nil && mt.Knobs.InjectWriteErr != nil {
 		if err := mt.Knobs.InjectWriteErr(); err != nil {
 			return err
 		}
 	}
 
-	// Determine if this is WAL mode (segment file will be renamed WAL)
 	useWalPos := mt.wal != nil && as.walFileID != 0
+	if useWalPos {
+		return mt.flushViaRename(as)
+	}
+	return mt.flushViaMerge(as)
+}
 
-	// 1. Collect entries and convert to record.FooterEntry
-	var entries []record.FooterEntry
-	var xlWrites []SlabEntry    // Slice to preserve all XL writes (Pos can collide)
-	var xlSeqIDs map[uint64]int // SeqID -> index in xlWrites
-	defer func() {
-		for _, xl := range xlWrites {
-			xl.XLBuf.Unpin()
+// flushViaRename handles WAL mode: renames WAL file to segment, writes footer.
+// Simple path with no XL buffer handling (WAL already contains all data).
+func (mt *MemTable) flushViaRename(as *ActiveSlab) error {
+	// 1. Collect entries using WalPos (actual position in WAL file)
+	entries, maxSeqID := mt.collectEntries(as, true)
+
+	// 2. Sort by position for linear I/O
+	sortEntriesByPos(entries)
+
+	// 3. Allocate segment ID
+	segmentID := mt.segmentID.Add(1)
+	segmentPath := getSegmentPath(mt.Path, mt.Shards, segmentID)
+
+	// 4. Rename WAL file to segment
+	walPath := mt.wal.FilePath(as.walFileID)
+	if err := os.Rename(walPath, segmentPath); err != nil {
+		return fmt.Errorf("rename wal to segment: %w", err)
+	}
+
+	// 5. Finalize (index update + footer)
+	return mt.finalizeFlush(segmentID, segmentPath, entries, maxSeqID)
+}
+
+// flushViaMerge handles cache mode: writes slab data with XL payloads interleaved.
+// Complex path that merges XL buffers at page-aligned insertion points.
+func (mt *MemTable) flushViaMerge(as *ActiveSlab) error {
+	// 1. Collect entries using Pos (slab buffer position) and track XL writes
+	entries, maxSeqID := mt.collectEntries(as, false)
+	xlWrites, xlSeqIDs := collectXLWrites(as)
+	defer releaseXLBuffers(xlWrites)
+
+	// 2. Sort both by (Pos, SeqID) for linear I/O
+	sortEntriesByPos(entries)
+	sortXLWritesByPos(xlWrites)
+
+	// 3. Adjust positions to account for XL buffer interleaving
+	if len(xlWrites) > 0 {
+		adjustFilePositionsForXLWrites(entries, xlWrites, xlSeqIDs)
+	}
+
+	// 4. Allocate segment ID and compute I/O flags
+	segmentID := mt.segmentID.Add(1)
+	segmentPath := getSegmentPath(mt.Path, mt.Shards, segmentID)
+	flags := mt.ioFlags()
+
+	// 5. Write segment file (with or without XL interleaving)
+	alignedData := as.buf.AlignedBytes(as.wPos)
+	copy(alignedData[:record.FileHeaderSize], record.FileHeaderBytes[:])
+
+	if len(xlWrites) > 0 {
+		if err := writeSegmentWithXLPayloads(segmentPath, flags, alignedData, xlWrites); err != nil {
+			return fmt.Errorf("writing segment with %d XL payloads: %w", len(xlWrites), err)
 		}
-	}()
+	} else {
+		if err := sys.WriteFile(segmentPath, alignedData, flags); err != nil {
+			return fmt.Errorf("write segment: %w", err)
+		}
+	}
 
+	// 6. Finalize (index update + footer)
+	return mt.finalizeFlush(segmentID, segmentPath, entries, maxSeqID)
+}
+
+// collectEntries extracts footer entries from the slab index.
+// If useWalPos is true, uses WalPos (for WAL mode); otherwise uses Pos (for cache mode).
+func (mt *MemTable) collectEntries(as *ActiveSlab, useWalPos bool) ([]record.FooterEntry, uint64) {
+	var entries []record.FooterEntry
 	var maxSeqID uint64
+
 	as.index.ForEach(func(key xmap.Key, e SlabEntry, _ *xmap.Pad32) bool {
 		pos := e.Pos
 		if useWalPos {
-			pos = e.WalPos // Use WAL position for segment after rename
+			pos = e.WalPos
 		}
 		entries = append(entries, record.FooterEntry{
 			Key:          key,
@@ -486,7 +551,18 @@ func (mt *MemTable) processFlush(as *ActiveSlab) (retErr error) {
 		if e.SeqID > maxSeqID {
 			maxSeqID = e.SeqID
 		}
+		return true
+	})
 
+	return entries, maxSeqID
+}
+
+// collectXLWrites extracts XL buffer entries from the slab index.
+func collectXLWrites(as *ActiveSlab) ([]SlabEntry, map[uint64]int) {
+	var xlWrites []SlabEntry
+	var xlSeqIDs map[uint64]int
+
+	as.index.ForEach(func(_ xmap.Key, e SlabEntry, _ *xmap.Pad32) bool {
 		if e.XLBuf != nil {
 			if xlSeqIDs == nil {
 				xlSeqIDs = make(map[uint64]int)
@@ -497,13 +573,20 @@ func (mt *MemTable) processFlush(as *ActiveSlab) (retErr error) {
 		return true
 	})
 
-	// 2. Sort entries by (Pos, SeqID) for linear I/O.
-	// SeqID determines write order when positions are equal.
+	return xlWrites, xlSeqIDs
+}
+
+func releaseXLBuffers(xlWrites []SlabEntry) {
+	for _, xl := range xlWrites {
+		xl.XLBuf.Unpin()
+	}
+}
+
+func sortEntriesByPos(entries []record.FooterEntry) {
 	slices.SortFunc(entries, func(a, b record.FooterEntry) int {
 		if a.Pos != b.Pos {
 			return int(a.Pos - b.Pos)
 		}
-		// Equal Pos: sort by SeqID (lower = earlier = comes first)
 		if a.SeqID < b.SeqID {
 			return -1
 		}
@@ -512,8 +595,9 @@ func (mt *MemTable) processFlush(as *ActiveSlab) (retErr error) {
 		}
 		return 0
 	})
+}
 
-	// Sort xlWrites by (Pos, SeqID) to match entries order
+func sortXLWritesByPos(xlWrites []SlabEntry) {
 	slices.SortFunc(xlWrites, func(a, b SlabEntry) int {
 		if a.Pos != b.Pos {
 			return int(a.Pos - b.Pos)
@@ -526,18 +610,9 @@ func (mt *MemTable) processFlush(as *ActiveSlab) (retErr error) {
 		}
 		return 0
 	})
+}
 
-	// 3. Adjust file positions for cache mode with XL writes.
-	// WAL mode doesn't need adjustment because WalPos already reflects actual file positions.
-	if !useWalPos && len(xlWrites) > 0 {
-		adjustFilePositionsForXLWrites(entries, xlWrites, xlSeqIDs)
-	}
-
-	// 3. Allocate segment ID and compute path
-	segmentID := mt.segmentID.Add(1)
-	segmentPath := getSegmentPath(mt.Path, mt.Shards, segmentID)
-
-	// Compute I/O flags
+func (mt *MemTable) ioFlags() sys.OpenFlag {
 	flags := sys.SyncNone
 	if mt.IO.DirectIOWrite {
 		flags |= sys.FlDirectIO
@@ -545,37 +620,20 @@ func (mt *MemTable) processFlush(as *ActiveSlab) (retErr error) {
 	if mt.IO.FDataSync {
 		flags |= sys.SyncData
 	}
+	return flags
+}
 
-	// 4. Create segment file (rename WAL or write slab data)
-	if useWalPos {
-		// WAL mode: rename WAL file to segment
-		walPath := mt.wal.FilePath(as.walFileID)
-		if err := os.Rename(walPath, segmentPath); err != nil {
-			return fmt.Errorf("rename wal to segment: %w", err)
-		}
-	} else {
-		// Cache mode: write slab data
-		alignedData := as.buf.AlignedBytes(as.wPos)
-		copy(alignedData[:record.FileHeaderSize], record.FileHeaderBytes[:])
-
-		if len(xlWrites) > 0 {
-			if err := writeSegmentWithXLPayloads(segmentPath, flags, alignedData, xlWrites); err != nil {
-				return fmt.Errorf("writing segment with %d XL payloads: %w", len(xlWrites), err)
-			}
-		} else {
-			if err := sys.WriteFile(segmentPath, alignedData, flags); err != nil {
-				return fmt.Errorf("write segment: %w", err)
-			}
-		}
-	}
-
+// finalizeFlush updates the index and writes the footer file.
+func (mt *MemTable) finalizeFlush(
+	segmentID uint32, segmentPath string, entries []record.FooterEntry, maxSeqID uint64,
+) error {
 	if mt.Knobs != nil && mt.Knobs.InjectIndexErr != nil {
 		if err := mt.Knobs.InjectIndexErr(); err != nil {
 			return err
 		}
 	}
 
-	// 5. Build index items from entries
+	// Build index items
 	items := make([]index.Item, 0, len(entries))
 	for i := range entries {
 		entry := &entries[i]
@@ -590,13 +648,13 @@ func (mt *MemTable) processFlush(as *ActiveSlab) (retErr error) {
 		items = append(items, item)
 	}
 
-	// 6. Update Index
+	// Update index
 	if err := mt.PutBatch(segmentID, items, maxSeqID); err != nil {
 		return fmt.Errorf("index update: %w", err)
 	}
 
-	// 7. Write footer to separate .iseg file
-	if err := WriteFooter(segmentID, entries, segmentPath, mt.footerPool, flags); err != nil {
+	// Write footer
+	if err := WriteFooter(segmentID, entries, segmentPath, mt.footerPool, mt.ioFlags()); err != nil {
 		return fmt.Errorf("write footer: %w", err)
 	}
 

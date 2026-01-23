@@ -2,6 +2,7 @@ package compression
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 
 	"github.com/DataDog/zstd"
@@ -68,7 +69,7 @@ func decompressZstd(dst, src []byte) error {
 		return err
 	}
 	if n != len(dst) {
-		return errors.New("zstd decompression: size mismatch")
+		return fmt.Errorf("zstd decompression: size mismatch (n=%d, expected=%d)", n, len(dst))
 	}
 	return nil
 }

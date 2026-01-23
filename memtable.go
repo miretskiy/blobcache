@@ -6,10 +6,8 @@ import (
 	"os"
 	"slices"
 	"sync"
-	"sync/atomic"
 
 	"github.com/miretskiy/blobcache/compression"
-	"github.com/miretskiy/blobcache/internal/index"
 	"github.com/miretskiy/blobcache/internal/record"
 	"github.com/miretskiy/blobcache/internal/sys"
 	"github.com/miretskiy/blobcache/internal/wal"
@@ -37,7 +35,7 @@ type MemTable struct {
 	ErrorReporter
 	Knobs *TestingKnobs
 
-	segmentID  atomic.Uint32
+	segIDs     SegmentIDProvider
 	slabPool   *MmapPool
 	footerPool *MmapPool
 	publisher  Publisher
@@ -68,6 +66,7 @@ type MemTable struct {
 
 func NewMemTable(
 	cfg config, b Batcher, reporter ErrorReporter, pub Publisher, w *wal.WAL,
+	segIDs SegmentIDProvider,
 ) *MemTable {
 	poolCapacity := cfg.MaxCachedSlabs + cfg.MaxInflightSlabs + 2
 
@@ -77,6 +76,7 @@ func NewMemTable(
 		ErrorReporter: reporter,
 		publisher:     pub,
 		wal:           w, // nil if WAL disabled
+		segIDs:        segIDs,
 		slabPool:      NewMmapPool("slab", cfg.WriteBufferSize, poolCapacity),
 		footerPool:    NewMmapPool("footer", 256<<10, cfg.MaxInflightSlabs+1),
 		flushCh:       make(chan FlushTicket, cfg.MaxInflightSlabs),
@@ -84,9 +84,6 @@ func NewMemTable(
 	}
 
 	mt.mu.active = mt.newActiveSlab(0)
-
-	// Initialize segment ID from the highest existing segment (workers will increment before use)
-	mt.segmentID.Store(maxSegmentID(cfg.Path, cfg.Shards))
 
 	mt.wg.Add(cfg.FlushConcurrency)
 	for i := 0; i < cfg.FlushConcurrency; i++ {
@@ -154,8 +151,8 @@ func (mt *MemTable) maybeCompress(src []byte) BufferHandle {
 		return BufferHandle{}
 	}
 
-	// Compression succeeded - update handle to point to actual compressed data
-	handle.buf = result
+	// Compression succeeded - update handle's working buffer to the compressed data
+	handle.SetBytes(result)
 	return handle
 }
 
@@ -177,11 +174,11 @@ func (mt *MemTable) putActive(
 	// 1. Compress before lock (parallel compression) - only on first call
 	c := mt.maybeCompress(value)
 	defer c.Release()
-	return mt.putActiveCompressed(seqID, hash, keyBytes, value, checksum, c)
+	return mt.putActiveCompressed(seqID, hash, keyBytes, value, checksum, &c)
 }
 
 func (mt *MemTable) putActiveCompressed(
-	seqID uint64, hash Key, keyBytes, value []byte, checksum *uint32, compressed BufferHandle,
+	seqID uint64, hash Key, keyBytes, value []byte, checksum *uint32, compressed *BufferHandle,
 ) error {
 	// 1. Build record BEFORE lock (pure computation, no lock needed)
 	valueBytes := value
@@ -475,7 +472,7 @@ func (mt *MemTable) flushViaRename(as *ActiveSlab) error {
 	sortEntriesByPos(entries)
 
 	// 3. Allocate segment ID
-	segmentID := mt.segmentID.Add(1)
+	segmentID := mt.segIDs.NextSegmentID()
 	segmentPath := getSegmentPath(mt.Path, mt.Shards, segmentID)
 
 	// 4. Rename WAL file to segment
@@ -506,7 +503,7 @@ func (mt *MemTable) flushViaMerge(as *ActiveSlab) error {
 	}
 
 	// 4. Allocate segment ID and compute I/O flags
-	segmentID := mt.segmentID.Add(1)
+	segmentID := mt.segIDs.NextSegmentID()
 	segmentPath := getSegmentPath(mt.Path, mt.Shards, segmentID)
 	flags := mt.ioFlags()
 
@@ -633,19 +630,10 @@ func (mt *MemTable) finalizeFlush(
 		}
 	}
 
-	// Build index items
-	items := make([]index.Item, 0, len(entries))
-	for i := range entries {
-		entry := &entries[i]
-		physicalLen := uint32(record.HeaderSize) + uint32(entry.KeyLen) + uint32(entry.PhysicalSize)
-		item := index.Item{
-			Key:         entry.Key,
-			SegmentID:   segmentID,
-			Offset:      uint32(entry.Pos),
-			PhysicalLen: physicalLen,
-		}
-		item.SetCompression(entry.Compression())
-		items = append(items, item)
+	// Build index items from footer entries
+	items, err := footerEntriesToIndexItems(segmentID, entries)
+	if err != nil {
+		return err
 	}
 
 	// Update index

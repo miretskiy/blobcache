@@ -32,7 +32,7 @@ type SharedSlab struct {
 // Releaser is a zero-allocation handle for releasing a read lock or buffer.
 type Releaser struct {
 	slab *MmapBuffer
-	bh   BufferHandle
+	bh   *BufferHandle
 }
 
 func (r *Releaser) Release() {
@@ -43,7 +43,9 @@ func (r *Releaser) Release() {
 		r.slab.Unpin()
 		r.slab = nil
 	}
-	r.bh.Release()
+	if r.bh != nil {
+		r.bh.Release()
+	}
 	*r = Releaser{}
 }
 
@@ -95,7 +97,7 @@ func (s *SharedSlab) Acquire(key Key) ([]byte, Releaser, bool, base.BlobErrno) {
 			handle.Release()
 			return nil, Releaser{}, false, base.ErrDecompression
 		}
-		return handle.Bytes(), Releaser{bh: handle}, true, base.ErrNone
+		return handle.Bytes(), Releaser{bh: &handle}, true, base.ErrNone
 	}
 
 	// Uncompressed: zero-copy slice
@@ -113,6 +115,12 @@ func (s *SharedSlab) ProtectedView(key Key, fn func(data []byte)) (bool, base.Bl
 
 	fn(data)
 	return true, base.ErrNone
+}
+
+// Invalidate removes a key from the slab's index.
+// Used by Delete to prevent serving stale data from the Librarian cache.
+func (s *SharedSlab) Invalidate(key Key) {
+	s.index.Delete(key)
 }
 
 type ActiveSlab struct {

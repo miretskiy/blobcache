@@ -114,7 +114,7 @@ func TestMemTable_Integration_Rotation(t *testing.T) {
 	mb := &MockBatcher{}
 	mh := &MockHealthReporter{}
 
-	mt := NewMemTable(cfg, mb, mh, &mockLibrarian{}, nil)
+	mt := NewMemTable(cfg, mb, mh, &mockLibrarian{}, nil, newSegmentIDProvider(cfg.Path, cfg.Shards))
 	defer mt.Close()
 
 	// Ingest blobs to force rotation across multiple 1MB segments.

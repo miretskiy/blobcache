@@ -19,7 +19,7 @@ func TestMemTable_LifecycleGuard(t *testing.T) {
 
 	mb := &MockBatcher{}
 	mh := &MockHealthReporter{}
-	mt := NewMemTable(cfg, mb, mh, nil, nil)
+	mt := NewMemTable(cfg, mb, mh, nil, nil, newSegmentIDProvider(cfg.Path, cfg.Shards))
 	defer mt.Close()
 
 	// Write with seqID=100
@@ -52,7 +52,7 @@ func TestMemTable_ConcurrencyGuard(t *testing.T) {
 
 	mb := &MockBatcher{}
 	mh := &MockHealthReporter{}
-	mt := NewMemTable(cfg, mb, mh, nil, nil)
+	mt := NewMemTable(cfg, mb, mh, nil, nil, newSegmentIDProvider(cfg.Path, cfg.Shards))
 	defer mt.Close()
 
 	key := xmap.Key{Lo: 12345, Hi: 0}
@@ -90,7 +90,7 @@ func TestMemTable_ConcurrentWritesSameKey(t *testing.T) {
 
 	mb := &MockBatcher{}
 	mh := &MockHealthReporter{}
-	mt := NewMemTable(cfg, mb, mh, nil, nil)
+	mt := NewMemTable(cfg, mb, mh, nil, nil, newSegmentIDProvider(cfg.Path, cfg.Shards))
 	defer mt.Close()
 
 	key := xmap.Key{Lo: 99999, Hi: 0}
@@ -139,7 +139,7 @@ func TestMemTable_RotationUpdatesMaxSealedSeq(t *testing.T) {
 
 	mb := &MockBatcher{}
 	mh := &MockHealthReporter{}
-	mt := NewMemTable(cfg, mb, mh, nil, nil)
+	mt := NewMemTable(cfg, mb, mh, nil, nil, newSegmentIDProvider(cfg.Path, cfg.Shards))
 	defer mt.Close()
 
 	// Write some data with increasing seqIDs
@@ -221,7 +221,7 @@ func TestCache_RetryLoop_ZombieResurrection(t *testing.T) {
 	require.NoError(t, cache.Put([]byte("zombie-key"), []byte("zombie-value")))
 
 	// Verify the write succeeded by reading back
-	data, found := readAll(t, cache, []byte("zombie-key"))
+	data, found := cache.Get([]byte("zombie-key"))
 	require.True(t, found, "zombie write should have succeeded after retry")
 	require.Equal(t, []byte("zombie-value"), data)
 
@@ -291,7 +291,7 @@ func TestCache_RetryLoop_IdempotentSuccess(t *testing.T) {
 	require.NoError(t, cache.Put(key, []byte("zombie-value")))
 
 	// The value should still be "newer-value" (zombie was idempotently "successful")
-	data, found := readAll(t, cache, key)
+	data, found := cache.Get(key)
 	require.True(t, found)
 	require.Equal(t, []byte("newer-value"), data, "should still have newer value, not zombie")
 }

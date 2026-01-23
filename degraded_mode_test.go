@@ -51,7 +51,7 @@ func TestCache_DegradedMode_FlushWriteError(t *testing.T) {
 	}
 
 	// Verify data still accessible from memtable
-	data, found := readAll(t, cache, []byte("key-15"))
+	data, found := cache.Get([]byte("key-15"))
 	require.True(t, found)
 	require.Equal(t, value, data)
 }
@@ -90,7 +90,7 @@ func TestCache_DegradedMode_IndexError(t *testing.T) {
 
 	// Cache still works in memory
 	require.NoError(t, cache.Put([]byte("new-key"), value))
-	data, found := readAll(t, cache, []byte("new-key"))
+	data, found := cache.Get([]byte("new-key"))
 	require.True(t, found)
 	require.Equal(t, value, data)
 }
@@ -140,7 +140,7 @@ func TestCache_DegradedMode_MemtableEviction(t *testing.T) {
 	}
 
 	// Recent keys should still be in files memtables
-	data, found := readAll(t, cache, []byte("new-key-25"))
+	data, found := cache.Get([]byte("new-key-25"))
 	require.True(t, found)
 	require.Equal(t, value, data)
 }
@@ -186,7 +186,7 @@ func TestCache_DegradedMode_EvictionError(t *testing.T) {
 
 	// Cache still works
 	require.NoError(t, cache.Put([]byte("after-error"), value))
-	data, found := readAll(t, cache, []byte("after-error"))
+	data, found := cache.Get([]byte("after-error"))
 	require.True(t, found)
 	require.Equal(t, value, data)
 }
@@ -225,7 +225,7 @@ func TestCache_DegradedMode_DrainDuringDegraded(t *testing.T) {
 	cache.Drain() // Should return immediately (no-op)
 
 	// Data should still be accessible
-	data, found := readAll(t, cache, []byte("key-4"))
+	data, found := cache.Get([]byte("key-4"))
 	require.True(t, found)
 	require.Equal(t, value, data)
 }

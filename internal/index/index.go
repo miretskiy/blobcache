@@ -76,9 +76,11 @@ func (item *Item) IsDeleted() bool {
 	return (item.Flags & itemFlagDeleted) != 0
 }
 
-// SetDeleted marks the blob as deleted.
+// SetDeleted marks the blob as deleted (tombstone).
+// Clears PhysicalLen and all flags except deleted, since tombstones have no data.
 func (item *Item) SetDeleted() {
-	item.Flags |= itemFlagDeleted
+	item.Flags = itemFlagDeleted // Clear compression, errno; keep only deleted flag
+	item.PhysicalLen = 0
 }
 
 // Errno returns the error code for this blob.
@@ -147,14 +149,14 @@ type node struct {
 // BlobIndex is the main entry point for the in-memory index.
 // It uses xmap for sharding with custom ShardState for eviction.
 type BlobIndex struct {
-	lookup *xmap.Map[uint32, ShardState]
+	*xmap.Map[uint32, ShardState]
 }
 
-// New creates a new index with the given initial capacity hint.
+// NewBlobIndex creates a new index with the given initial capacity hint.
 // The capacity is distributed across shards for pre-allocation.
-func New(initialCapacity int) *BlobIndex {
+func NewBlobIndex(initialCapacity int) *BlobIndex {
 	bi := &BlobIndex{
-		lookup: xmap.New[uint32, ShardState](
+		Map: xmap.New[uint32, ShardState](
 			xmap.WithShardShift(8), // 256 shards
 			xmap.WithInitialCapacity(initialCapacity),
 		),
@@ -166,7 +168,7 @@ func New(initialCapacity int) *BlobIndex {
 		shardCap = 1
 	}
 	for i := range ShardCount {
-		s := bi.lookup.ShardAt(i)
+		s := bi.ShardAt(i)
 		s.Lock()
 		s.Extra.nodes = make([]node, 0, shardCap)
 		s.Extra.freeHead = nullIdx
@@ -181,7 +183,7 @@ func New(initialCapacity int) *BlobIndex {
 // Get returns the item for the given key and marks it as visited (hot).
 // Uses RLock + atomic store to minimize contention on the hot path.
 func (idx *BlobIndex) Get(k Key) (Item, bool) {
-	s := idx.lookup.Shard(k)
+	s := idx.Shard(k)
 
 	s.RLock()
 	// Optimization: No defer in hot path to save ~5-10ns
@@ -211,7 +213,7 @@ func (idx *BlobIndex) Get(k Key) (Item, bool) {
 // The item's Key field must be set - it serves as both the map key and the
 // back-reference needed for eviction.
 func (idx *BlobIndex) Put(item Item) {
-	s := idx.lookup.Shard(item.Key)
+	s := idx.Shard(item.Key)
 
 	s.Lock()
 	defer s.Unlock()
@@ -234,7 +236,7 @@ func (idx *BlobIndex) Put(item Item) {
 // Delete removes an item explicitly.
 // Returns true if the item existed and was removed.
 func (idx *BlobIndex) Delete(k Key) bool {
-	s := idx.lookup.Shard(k)
+	s := idx.Shard(k)
 
 	s.Lock()
 	defer s.Unlock()
@@ -272,7 +274,7 @@ func (idx *BlobIndex) EvictBatch(targetBytes int64) []Item {
 				break
 			}
 			shardID := (startShard + i) % ShardCount
-			s := idx.lookup.ShardAt(shardID)
+			s := idx.ShardAt(shardID)
 
 			s.Lock()
 			freedTotal += evictUpTo(&s.Extra, s.Items, targetBytes-freedTotal, &evicted, maxEvictPerLock)
@@ -291,7 +293,7 @@ func (idx *BlobIndex) EvictBatch(targetBytes int64) []Item {
 				break
 			}
 
-			s := idx.lookup.ShardAt(i)
+			s := idx.ShardAt(i)
 			s.Lock()
 			freedTotal += evictUpTo(&s.Extra, s.Items, quotaPerShard, &evicted, maxEvictPerLock)
 			s.Unlock()
@@ -301,9 +303,9 @@ func (idx *BlobIndex) EvictBatch(targetBytes int64) []Item {
 	return evicted
 }
 
-// Len returns the total number of items across all shards.
-func (idx *BlobIndex) Len() int {
-	return idx.lookup.Len()
+// NumItems returns the total number of items across all shards.
+func (idx *BlobIndex) NumItems() int {
+	return idx.Len()
 }
 
 // Stats holds statistics about the index state.
@@ -321,7 +323,7 @@ func (idx *BlobIndex) Stats() Stats {
 	st.Shards = ShardCount
 
 	for i := range ShardCount {
-		s := idx.lookup.ShardAt(i)
+		s := idx.ShardAt(i)
 		s.RLock()
 		st.Items += len(s.Items)
 		st.ArenaNodes += len(s.Extra.nodes)
@@ -466,4 +468,43 @@ func evictUpTo(
 		freeNode(state, victimIdx)
 	}
 	return localFreed
+}
+
+// Relocate atomically moves an item from (oldSeg, oldOff) to (newSeg, newOff).
+// Returns true if the relocation succeeded, false if the current location doesn't match.
+//
+// This is used during compaction to safely move items to new segments:
+//   - If a concurrent write updated the item to a newer segment, relocation fails (safe)
+//   - If the item is still at the expected old location, relocation succeeds
+//
+// The compare-and-swap semantics prevent the "Leapfrog Hazard" where compaction
+// could accidentally overwrite a newer write with stale data from an old segment.
+func (idx *BlobIndex) Relocate(k Key, oldSeg, oldOff, newSeg, newOff uint32) bool {
+	s := idx.Shard(k)
+
+	s.Lock()
+	defer s.Unlock()
+
+	i, ok := s.Items[k]
+	if !ok {
+		return false
+	}
+
+	item := &s.Extra.nodes[i].item
+	if item.SegmentID != oldSeg || item.Offset != oldOff {
+		// Location changed since we read it - someone else updated the item
+		return false
+	}
+
+	// Ghost Guard: If deleted after staleness check, skip relocation.
+	// Prevents "Ghost Resurrection" where a concurrent delete could be
+	// overwritten by compaction's stale data.
+	if item.IsDeleted() {
+		return false
+	}
+
+	// Relocation success: update to new location
+	item.SegmentID = newSeg
+	item.Offset = newOff
+	return true
 }

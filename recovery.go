@@ -35,7 +35,7 @@ func RecoverIndex(path string, opts ...Option) (*Cache, error) {
 	}
 
 	// Create a raw Index. We talk to this directly, bypassing c.PutBatch().
-	recoveryIdx, err := index.Open(tempParentPath, 100000)
+	recoveryIdx, err := index.OpenIndex(tempParentPath, 100000)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create recovery index: %w", err)
 	}
@@ -103,7 +103,7 @@ func RecoverIndex(path string, opts ...Option) (*Cache, error) {
 
 	// 4. Final Assembly
 	// Re-open the index at the proper path
-	idx, err := index.Open(path, 100000)
+	idx, err := index.OpenIndex(path, 100000)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open recovered index: %w", err)
 	}
@@ -112,11 +112,12 @@ func RecoverIndex(path string, opts ...Option) (*Cache, error) {
 		config:    cfg,
 		index:     idx,
 		archivist: NewArchivist(cfg, idx),
+		segIDs:    newSegmentIDProvider(cfg.Path, cfg.Shards),
 		stopCh:    make(chan struct{}),
 	}
 	c.librarian = NewLibrarian(cfg.MaxCachedSlabs, c)
 	c.Knobs = cfg.knobs
-	c.memTable = NewMemTable(c.config, c, c, c.librarian, nil) // No WAL during recovery
+	c.memTable = NewMemTable(c.config, c, c, c.librarian, nil, c.segIDs) // No WAL during recovery
 	c.memTable.Knobs = c.Knobs
 
 	// Build Bloom Filter synchronously

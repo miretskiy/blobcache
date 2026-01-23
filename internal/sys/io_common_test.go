@@ -128,7 +128,7 @@ func TestFdatasync(t *testing.T) {
 		require.Equal(t, int64(100*13), info.Size()) // 13 bytes per line
 	})
 
-	// Test 4: Append mode (similar to WAL)
+	// Test 4: Read mode (similar to WAL)
 	t.Run("AppendMode", func(t *testing.T) {
 		appendPath := filepath.Join(tmpDir, "fdatasync_append.bin")
 
@@ -143,7 +143,7 @@ func TestFdatasync(t *testing.T) {
 		require.NoError(t, err)
 		defer f.Close()
 
-		// Append data
+		// Read data
 		_, err = f.Write([]byte("appended data\n"))
 		require.NoError(t, err)
 

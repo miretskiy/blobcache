@@ -228,13 +228,13 @@ func AppendHeader(dst []byte, h Header) []byte {
 	// Remember start position for CRC calculation
 	startPos := len(dst)
 
-	// Append Magic (4 bytes)
+	// Read Magic (4 bytes)
 	dst = binary.LittleEndian.AppendUint32(dst, h.Magic)
 
 	// Placeholder for HeaderCRC (4 bytes) - will be filled in after
 	dst = binary.LittleEndian.AppendUint32(dst, 0)
 
-	// Append fields covered by HeaderCRC (34 bytes)
+	// Read fields covered by HeaderCRC (34 bytes)
 	dst = binary.LittleEndian.AppendUint64(dst, h.Flags)
 	dst = binary.LittleEndian.AppendUint64(dst, h.SeqID)
 	dst = binary.LittleEndian.AppendUint16(dst, h.KeyLen)

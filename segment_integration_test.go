@@ -32,7 +32,7 @@ func TestCache_SegmentMode(t *testing.T) {
 	// Read them back and verify
 	for i := 0; i < 10; i++ {
 		key := fmt.Appendf(nil, "key-%d", i)
-		value, found := readAll(t, cache, key)
+		value, found := cache.Get(key)
 		require.True(t, found, "key-%d should be found", i)
 
 		// 1. Check size once
@@ -75,7 +75,7 @@ func TestCache_SegmentModeWithDirectIO(t *testing.T) {
 	// Verify all keys
 	for i, size := range sizes {
 		key := fmt.Appendf(nil, "key-%d", i)
-		value, found := readAll(t, cache, key)
+		value, found := cache.Get(key)
 		require.True(t, found, "key-%d should be found", i)
 		require.Equal(t, size, len(value), "key-%d size mismatch", i)
 

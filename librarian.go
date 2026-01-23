@@ -123,6 +123,15 @@ func (l *Librarian) View(key Key, fn func(r io.Reader)) bool {
 	return true
 }
 
+// Invalidate removes a key from all slabs in the Librarian.
+// Used by Delete to prevent serving stale data from cache after deletion.
+func (l *Librarian) Invalidate(key Key) {
+	list := *l.view.Load()
+	for _, slab := range list {
+		slab.Invalidate(key)
+	}
+}
+
 func (l *Librarian) Close() {
 	if l.closed.CompareAndSwap(false, true) {
 		list := *l.view.Load()

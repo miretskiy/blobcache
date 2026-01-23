@@ -30,12 +30,21 @@ const (
 	evictionHysteresis = 0.93
 )
 
+const (
+	// numSegmentLockShards is the number of shards for segment-level locking.
+	// Used to coordinate Delete and Compaction operations on the same segment.
+	// 256 shards provides good distribution with minimal contention.
+	numSegmentLockShards = 256
+	segmentLockShardMask = numSegmentLockShards - 1
+)
+
 // Cache is a high-performance blob storage with bloom filter optimization
 type Cache struct {
 	config
 	index     *index.DurableIndex
 	archivist *Archivist
 	wal       *wal.WAL // nil if WAL disabled
+	segIDs    SegmentIDProvider
 	bloom     struct {
 		atomic.Pointer[bloom.Filter]
 		hits        atomic.Uint64             // Bloom filter said "yes"
@@ -43,6 +52,11 @@ type Cache struct {
 		deletions   atomic.Int64              // Track cumulative deletions since last rebuild
 		lastRebuild atomic.Pointer[time.Time] // When the last rebuild happened.
 	}
+
+	// Segment-level locks for coordinating Delete and Compaction.
+	// Prevents concurrent modifications to the same segment's metadata.
+	// Usage: segmentLocks[segmentID & segmentLockShardMask].Lock()
+	segmentLocks [numSegmentLockShards]sync.Mutex
 
 	// --- ARCHITECTURE COMPONENTS ---
 	memTable  *MemTable  // The Write Engine (Producer)
@@ -82,6 +96,12 @@ type ErrorReporter interface {
 // Implement this interface to override the default sequence generation in tests.
 type SequenceVendor interface {
 	NextSeq() uint64
+}
+
+// SegmentIDProvider allocates unique segment IDs.
+// Both MemTable (normal writes) and Compaction use this to avoid conflicts.
+type SegmentIDProvider interface {
+	NextSegmentID() uint32
 }
 
 func (c *Cache) IsDegraded() bool {
@@ -191,6 +211,7 @@ func open(cfg config) (*Cache, bool, error) {
 		config:          cfg,
 		index:           idx,
 		archivist:       NewArchivist(cfg, idx),
+		segIDs:          newSegmentIDProvider(cfg.Path, cfg.Shards),
 		evictionTrigger: make(chan struct{}, 1),
 		stopCh:          make(chan struct{}),
 	}
@@ -215,7 +236,7 @@ func open(cfg config) (*Cache, bool, error) {
 	c.bloom.Store(filter)
 	c.approxSize.Store(totalSize)
 	c.Knobs = cfg.knobs
-	c.memTable = NewMemTable(c.config, c, c, c.librarian, c.wal)
+	c.memTable = NewMemTable(c.config, c, c, c.librarian, c.wal, c.segIDs)
 	c.memTable.Knobs = c.Knobs
 
 	// Run WAL recovery after memtable is initialized
@@ -290,7 +311,7 @@ func checkOrInitialize(cfg config) (*index.DurableIndex, error) {
 
 	// Check if already initialized
 	if _, err := os.Stat(markerPath); err == nil {
-		return index.Open(cfg.Path, capacityHint)
+		return index.OpenIndex(cfg.Path, capacityHint)
 	}
 
 	// Not initialized - create directory structure
@@ -301,7 +322,7 @@ func checkOrInitialize(cfg config) (*index.DurableIndex, error) {
 		}
 	}
 
-	idx, err := index.Open(cfg.Path, capacityHint)
+	idx, err := index.OpenIndex(cfg.Path, capacityHint)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open index: %w", err)
 	}
@@ -333,8 +354,8 @@ func (c *Cache) search(key []byte) (data []byte, r io.Reader, rel Releaser, ok b
 
 	// 3. Disk Hit (Storage)
 	entry, found := c.index.Get(h)
-	if !found {
-		// BLOOM GHOST: Bloom said yes, Index said no.
+	if !found || entry.IsDeleted() {
+		// BLOOM GHOST: Bloom said yes, Index said no (or item is deleted).
 		c.bloom.ghosts.Add(1)
 		return nil, nil, Releaser{}, false
 	}
@@ -347,8 +368,8 @@ func (c *Cache) search(key []byte) (data []byte, r io.Reader, rel Releaser, ok b
 
 	// 5. Read from disk (with key verification for collision detection)
 	diskReader, diskReleaser, err := c.archivist.ReadBlob(entry, key)
+	defer diskReleaser.Release()
 	if err != nil {
-		diskReleaser.Release()
 		c.handleStorageError(h, entry, err)
 		return nil, nil, Releaser{}, false
 	}
@@ -373,7 +394,7 @@ func (c *Cache) ZeroCopyView(key []byte) (io.Reader, Releaser, bool) {
 	return r, rel, true
 }
 
-func (c *Cache) Append(key []byte, dst []byte) ([]byte, bool) {
+func (c *Cache) Read(key []byte, dst []byte) ([]byte, bool) {
 	data, r, rel, ok := c.search(key)
 	if !ok {
 		return dst, false
@@ -411,11 +432,118 @@ func (c *Cache) View(key []byte, fn func(r io.Reader)) bool {
 }
 
 func (c *Cache) Get(key []byte) ([]byte, bool) {
-	return c.Append(key, nil)
+	return c.Read(key, nil)
 }
 
-// ErrEmptyKey is returned when Put is called with an empty key.
+// ErrEmptyKey is returned when Put or Delete is called with an empty key.
 var ErrEmptyKey = errors.New("blobcache: empty key not allowed")
+
+// Delete marks a blob as deleted (tombstone).
+//
+// Behavior depends on mode:
+// - CAS Mode (WAL enabled): Writes tombstone to WAL, defers space reclamation to compaction
+// - Cache Mode (no WAL): Immediately reclaims space via hole punching
+//
+// Returns nil if the key doesn't exist (idempotent delete).
+func (c *Cache) Delete(key []byte) error {
+	if len(key) == 0 {
+		return ErrEmptyKey
+	}
+
+	h := xxh3.Hash128(key)
+
+	// Look up in index - if not found, delete is a no-op (idempotent)
+	item, found := c.index.Get(h)
+	if !found {
+		return nil
+	}
+
+	// Already deleted? No-op.
+	if item.IsDeleted() {
+		return nil
+	}
+
+	// Invalidate Librarian cache to prevent serving stale data
+	c.librarian.Invalidate(h)
+
+	if c.wal != nil {
+		return c.deleteInCASMode(key, h, item)
+	}
+	return c.deleteInCacheMode(key, h, item)
+}
+
+// deleteInCASMode handles deletion in CAS mode (WAL enabled).
+// Writes tombstone to WAL for durability, defers space reclamation to compaction.
+//
+// Uses segment lock to coordinate with compaction (prevents concurrent segment drop).
+func (c *Cache) deleteInCASMode(key []byte, h Key, item index.Item) error {
+	segID := item.SegmentID
+
+	// Acquire exclusive segment lock (blocks compaction of this segment)
+	shard := c.index.SegmentMetaShard(segID)
+	shard.Lock()
+	defer shard.Unlock()
+
+	// TODO: Check if segment still exists (compaction may have dropped it while we waited)
+	// If dropped, just remove orphaned RAM reference and return
+
+	// Write tombstone to WAL for crash consistency
+	rec := record.Record{
+		Header: record.Header{
+			Magic:        record.RecordMagic,
+			Flags:        record.FlagDeleted | record.FlagInvalidCRC,
+			SeqID:        c.nextSeq(),
+			KeyLen:       uint16(len(key)),
+			PhysicalSize: 0,
+			LogicalSize:  0,
+		},
+		Key:   key,
+		Value: nil,
+	}
+	if _, err := c.wal.Write(rec); err != nil {
+		return fmt.Errorf("wal write delete: %w", err)
+	}
+
+	// Write tombstone to incremental log (with user key for collision detection)
+	if err := c.index.Tombstone(segID, h, key); err != nil {
+		return fmt.Errorf("write tombstone: %w", err)
+	}
+
+	c.bloom.deletions.Add(1)
+	return nil
+}
+
+// deleteInCacheMode handles deletion in Cache mode (no WAL).
+// Immediately reclaims space via hole punching.
+//
+// Uses segment lock to coordinate with compaction (prevents concurrent segment drop).
+func (c *Cache) deleteInCacheMode(key []byte, h Key, item index.Item) error {
+	segID := item.SegmentID
+
+	// Acquire exclusive segment lock (blocks compaction of this segment)
+	shard := c.index.SegmentMetaShard(segID)
+	shard.Lock()
+	defer shard.Unlock()
+
+	// Immediate space reclamation via hole punch
+	reclaimed, err := c.archivist.HolePunchBlob(segID, item.Offset, item.PhysicalLen)
+	if err != nil {
+		log.Warn("hole punch failed, space not reclaimed",
+			"segment", segID, "offset", item.Offset,
+			"size", item.PhysicalLen, "error", err)
+	} else if reclaimed > 0 {
+		log.Debug("reclaimed space via hole punch",
+			"segment", segID, "bytes", reclaimed)
+	}
+
+	// Write tombstone to incremental log (with user key)
+	if err := c.index.Tombstone(segID, h, key); err != nil {
+		return fmt.Errorf("write tombstone: %w", err)
+	}
+
+	c.bloom.deletions.Add(1)
+	return nil
+}
 
 func (c *Cache) Put(key []byte, value []byte) error {
 	if len(key) == 0 {
@@ -608,14 +736,27 @@ type cacheReplayer struct {
 }
 
 func (r *cacheReplayer) ReplayRecord(rec record.Record) error {
-	// Update bloom filter
 	h := xxh3.Hash128(rec.Key)
-	r.cache.bloom.Load().Add(h)
 
 	if rec.IsDeleted() {
-		// Tombstone - for now we just skip (future: implement Delete)
+		// Replay delete: look up item and mark as tombstone
+		item, found := r.cache.index.Get(h)
+		if found && !item.IsDeleted() {
+			// Hole punch to reclaim space (log errors but don't fail recovery)
+			if _, err := r.cache.archivist.HolePunchBlob(item.SegmentID, item.Offset, item.PhysicalLen); err != nil {
+				log.Warn("hole punch during delete replay failed", "key", h, "error", err)
+			}
+			// Mark as tombstone
+			if err := r.cache.index.DeleteBlobs(item); err != nil {
+				return fmt.Errorf("replay delete: %w", err)
+			}
+			r.cache.bloom.deletions.Add(1)
+		}
 		return nil
 	}
+
+	// Update bloom filter for puts
+	r.cache.bloom.Load().Add(h)
 
 	// Replay the Put directly:
 	// - Use original SeqID (not new sequence)
@@ -770,6 +911,53 @@ func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
 }
 
 func (c *Cache) maybeCompactSegments() error {
-	// Placeholder
+	// TODO: Implement segment selection logic
+	// For now, just run tombstone compaction on segments with many tombstones
+	return c.maybeCompactTombstones()
+}
+
+// maybeCompactTombstones identifies segments with many tombstones and compacts them.
+// This collapses the tombstone incremental log into the segment manifest and
+// reclaims space via hole punching.
+func (c *Cache) maybeCompactTombstones() error {
+	// TODO: Implement smart selection using SegmentMetadata.TombstoneCount
+	// For now, this is a placeholder
+	return nil
+}
+
+// compactSegmentTombstones performs tombstone compaction on a single segment.
+// This is the high-level operation that:
+// 1. Hole punches tombstoned blobs (space reclamation)
+// 2. Collapses tombstone log into segment manifest (metadata cleanup)
+// 3. Updates SegmentMetadata counts
+//
+// The caller must hold the segment lock before calling this method.
+func (c *Cache) compactSegmentTombstones(segID uint32) error {
+	var punchedCount int
+	var punchedBytes int64
+
+	err := c.index.CompactTombstones(segID, func(tr index.TombstoneRecord) {
+		// Hole punch (idempotent - no-op if already punched in cache mode/eviction)
+		reclaimed, err := c.archivist.HolePunchBlob(segID, tr.Item.Offset, tr.Item.PhysicalLen)
+		if err != nil {
+			log.Warn("hole punch failed during tombstone compaction",
+				"segment", segID, "key", tr.KeyHash, "error", err)
+		} else if reclaimed > 0 {
+			punchedCount++
+			punchedBytes += reclaimed
+		}
+	})
+
+	if err != nil {
+		return fmt.Errorf("compact tombstones segment %d: %w", segID, err)
+	}
+
+	if punchedCount > 0 {
+		log.Info("tombstone compaction completed",
+			"segment", segID,
+			"punched_count", punchedCount,
+			"reclaimed_mb", punchedBytes/(1024*1024))
+	}
+
 	return nil
 }

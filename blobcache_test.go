@@ -2,8 +2,10 @@ package blobcache
 
 import (
 	"bytes"
+	crand "crypto/rand"
 	"fmt"
 	"os"
+	"syscall"
 	"testing"
 	"time"
 
@@ -14,11 +16,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/zeebo/xxh3"
 )
-
-// Helper to read all bytes from Get()
-func readAll(t *testing.T, cache *Cache, key []byte) ([]byte, bool) {
-	return cache.Get(key)
-}
 
 func TestCache_PutGet_Basic(t *testing.T) {
 	tmpDir := t.TempDir()
@@ -35,7 +32,7 @@ func TestCache_PutGet_Basic(t *testing.T) {
 	// Flush memtable to disk to test the full IO path (Index + Storage)
 	cache.Drain()
 
-	retrieved, found := readAll(t, cache, key)
+	retrieved, found := cache.Get(key)
 	require.True(t, found)
 	require.Equal(t, value, retrieved)
 }
@@ -77,14 +74,185 @@ func TestCache_Put_EmptyValueAllowed(t *testing.T) {
 	cache.Drain()
 
 	// Empty slice should read back as empty
-	retrieved, found := readAll(t, cache, []byte("key-empty-slice"))
+	retrieved, found := cache.Get([]byte("key-empty-slice"))
 	require.True(t, found)
 	require.Empty(t, retrieved)
 
 	// Nil value should read back as empty
-	retrieved, found = readAll(t, cache, []byte("key-nil-value"))
+	retrieved, found = cache.Get([]byte("key-nil-value"))
 	require.True(t, found)
 	require.Empty(t, retrieved)
+}
+
+func TestCache_Delete_Basic(t *testing.T) {
+	tmpDir := t.TempDir()
+	cache, err := New(tmpDir, WithMaxCachedSlabs(0)) // Force disk path
+	require.NoError(t, err)
+	defer cache.Close()
+
+	key := []byte("delete-me")
+	value := []byte("some-value")
+
+	// Put and verify
+	require.NoError(t, cache.Put(key, value))
+	cache.Drain()
+	_, found := cache.Get(key)
+	require.True(t, found, "key should exist before delete")
+
+	// Delete
+	require.NoError(t, cache.Delete(key))
+
+	// Should not be found after delete
+	_, found = cache.Get(key)
+	require.False(t, found, "key should not be found after delete")
+
+	// Delete again should be idempotent (no error)
+	require.NoError(t, cache.Delete(key))
+}
+
+func TestCache_Delete_NonExistent(t *testing.T) {
+	tmpDir := t.TempDir()
+	cache, err := New(tmpDir)
+	require.NoError(t, err)
+	defer cache.Close()
+
+	// Deleting non-existent key should succeed (idempotent)
+	err = cache.Delete([]byte("never-existed"))
+	require.NoError(t, err)
+}
+
+func TestCache_Delete_EmptyKeyRejected(t *testing.T) {
+	tmpDir := t.TempDir()
+	cache, err := New(tmpDir)
+	require.NoError(t, err)
+	defer cache.Close()
+
+	err = cache.Delete([]byte{})
+	require.ErrorIs(t, err, ErrEmptyKey)
+
+	err = cache.Delete(nil)
+	require.ErrorIs(t, err, ErrEmptyKey)
+}
+
+func TestCache_Delete_Persistence(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Create cache and add data
+	cache, err := New(tmpDir, WithMaxCachedSlabs(0))
+	require.NoError(t, err)
+
+	key := []byte("persistent-delete")
+	require.NoError(t, cache.Put(key, []byte("value")))
+	cache.Drain()
+
+	// Delete and close
+	require.NoError(t, cache.Delete(key))
+	require.NoError(t, cache.Close())
+
+	// Reopen - deleted item should still be gone
+	cache2, err := New(tmpDir)
+	require.NoError(t, err)
+	defer cache2.Close()
+
+	_, found := cache2.Get(key)
+	require.False(t, found, "deleted key should not be found after reopen")
+}
+
+func TestCache_Delete_WAL_NoHolePunch(t *testing.T) {
+	// Validates that in CAS mode (WAL enabled), Delete() does NOT hole-punch.
+	// Space reclamation is deferred to compaction for durability guarantees.
+	tmpDir := t.TempDir()
+
+	cache, err := New(tmpDir,
+		WithWAL(),
+		WithMaxCachedSlabs(0), // Force disk path
+	)
+	require.NoError(t, err)
+	cache.Start()
+	defer cache.Close()
+
+	key := []byte("wal-delete-key")
+	value := make([]byte, 100_000) // 100KB
+	require.NoError(t, cache.Put(key, value))
+	cache.Drain()
+
+	// Get segment stats before delete
+	h := xxh3.Hash128(key)
+	item, found := cache.index.Get(h)
+	require.True(t, found)
+	segID := item.SegmentID
+
+	// Get physical size before delete
+	segPath := getSegmentPath(cache.Path, cache.Shards, segID)
+	beforeStat, err := os.Stat(segPath)
+	require.NoError(t, err)
+	beforeBlocks := beforeStat.Sys().(*syscall.Stat_t).Blocks
+
+	// Delete
+	require.NoError(t, cache.Delete(key))
+
+	// Verify tombstone in index
+	item, found = cache.index.Get(h)
+	require.True(t, found, "item should still exist as tombstone")
+	require.True(t, item.IsDeleted(), "item should be marked deleted")
+
+	// Verify NO hole punch happened (physical size unchanged)
+	afterStat, err := os.Stat(segPath)
+	require.NoError(t, err)
+	afterBlocks := afterStat.Sys().(*syscall.Stat_t).Blocks
+	require.Equal(t, beforeBlocks, afterBlocks,
+		"WAL mode should NOT hole-punch (space reclaimed during compaction)")
+}
+
+func TestCache_Delete_Cache_ImmediateReclaim(t *testing.T) {
+	// Validates that in Cache mode (no WAL), Delete() immediately hole-punches.
+	tmpDir := t.TempDir()
+
+	cache, err := New(tmpDir,
+		// No WAL = Cache mode
+		WithMaxCachedSlabs(0), // Force disk path
+	)
+	require.NoError(t, err)
+	cache.Start()
+	defer cache.Close()
+
+	key := []byte("cache-delete-key")
+	value := make([]byte, 100_000) // 100KB
+	require.NoError(t, cache.Put(key, value))
+	cache.Drain()
+
+	// Get segment stats before delete
+	h := xxh3.Hash128(key)
+	item, found := cache.index.Get(h)
+	require.True(t, found)
+	segID := item.SegmentID
+
+	// Get physical size before delete
+	segPath := getSegmentPath(cache.Path, cache.Shards, segID)
+	beforeStat, err := os.Stat(segPath)
+	require.NoError(t, err)
+	beforeBlocks := beforeStat.Sys().(*syscall.Stat_t).Blocks
+
+	// Delete
+	require.NoError(t, cache.Delete(key))
+
+	// Verify tombstone in index
+	item, found = cache.index.Get(h)
+	require.True(t, found, "item should still exist as tombstone")
+	require.True(t, item.IsDeleted(), "item should be marked deleted")
+
+	// Verify hole punch happened (physical size decreased)
+	afterStat, err := os.Stat(segPath)
+	require.NoError(t, err)
+	afterBlocks := afterStat.Sys().(*syscall.Stat_t).Blocks
+
+	reclaimedBytes := int64(beforeBlocks-afterBlocks) * 512
+	t.Logf("Reclaimed %d bytes (before: %d blocks, after: %d blocks)",
+		reclaimedBytes, beforeBlocks, afterBlocks)
+
+	// Should have reclaimed most of the blob (within 4KB alignment slack)
+	require.Greater(t, reclaimedBytes, int64(90_000),
+		"Cache mode should hole-punch and reclaim space immediately")
 }
 
 func TestCache_Put_LargeBlob(t *testing.T) {
@@ -115,7 +283,7 @@ func TestCache_Put_LargeBlob(t *testing.T) {
 	// Flush to disk and verify round-trip
 	cache.Drain()
 
-	retrieved, found := readAll(t, cache, key)
+	retrieved, found := cache.Get(key)
 	require.True(t, found, "key not found after drain")
 	require.Equal(t, len(value), len(retrieved), "length mismatch")
 	require.Equal(t, value, retrieved, "data mismatch")
@@ -369,7 +537,7 @@ func TestCache_PutChecksummed_CorrectChecksum(t *testing.T) {
 	cache.Drain()
 
 	// Should read back successfully with correct checksum
-	retrieved, found := readAll(t, cache, key)
+	retrieved, found := cache.Get(key)
 	require.True(t, found)
 	require.Equal(t, value, retrieved)
 }
@@ -587,12 +755,12 @@ func TestCache_Restart_Persistence(t *testing.T) {
 	cache1.Drain()
 	cache1.Close()
 
-	// Phase 2: Open and Verify
+	// Phase 2: OpenIndex and Verify
 	cache2, err := New(tmpDir)
 	require.NoError(t, err)
 	defer cache2.Close()
 
-	val, found := readAll(t, cache2, []byte("k1"))
+	val, found := cache2.Get([]byte("k1"))
 	require.True(t, found)
 	require.Equal(t, []byte("v1"), val)
 }
@@ -665,12 +833,12 @@ func TestCache_Compression_IncompressibleData(t *testing.T) {
 	require.NoError(t, err)
 	defer cache.Close()
 
-	// Create incompressible data (random-like pattern)
+	// Create truly incompressible data (crypto random)
 	// The 1/8th heuristic should detect this and store raw
 	original := make([]byte, 1000)
-	for i := range original {
-		original[i] = byte(i * 17 % 256) // Pseudo-random pattern
-	}
+	_, err = crand.Read(original)
+	require.NoError(t, err, "failed to generate random data")
+
 	key := []byte("incompressible-key")
 
 	require.NoError(t, cache.Put(key, original))

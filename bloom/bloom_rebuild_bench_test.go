@@ -22,7 +22,7 @@ func Benchmark_BloomRebuild(b *testing.B) {
 			}
 			defer os.RemoveAll(tmpDir)
 
-			idx, err := index.Open(tmpDir, numKeys)
+			idx, err := index.OpenIndex(tmpDir, numKeys)
 			if err != nil {
 				b.Fatal(err)
 			}

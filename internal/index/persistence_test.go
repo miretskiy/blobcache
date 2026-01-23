@@ -1,12 +1,17 @@
 package index
 
 import (
-	"os"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
+	"github.com/miretskiy/blobcache/internal/xmap"
 	"github.com/stretchr/testify/require"
 )
+
+// TestSegmentMetadata_Alignment verifies SegmentMetadata is properly aligned for xmap.
+func TestSegmentMetadata_Alignment(t *testing.T) {
+	err := xmap.VerifyAlignment[uint32, SegmentMetadata]()
+	require.NoError(t, err, "SegmentMetadata must be properly aligned for xmap usage")
+}
 
 func TestPersistence(t *testing.T) {
 	tmp := t.TempDir()
@@ -79,7 +84,12 @@ func TestPersistence(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, keyToDelete)
 
-		err = p.delete(keyToDelete)
+		// Delete key directly via transaction
+		txn := p.db.Transaction()
+		defer txn.Discard()
+		err = txn.Delete(keyToDelete)
+		require.NoError(t, err)
+		err = txn.Commit()
 		require.NoError(t, err)
 
 		count := 0
@@ -92,66 +102,11 @@ func TestPersistence(t *testing.T) {
 	})
 }
 
-func TestDeleteRecordsFromSegment_Collapse(t *testing.T) {
-	path, err := os.MkdirTemp("", "blobcache-test-*")
-	require.NoError(t, err)
-	defer os.RemoveAll(path)
-
-	// Override global limit for this test: header(12) + 10 items * 32 bytes = 332 bytes
-	defer testingSetMaxChunkSize(uint64(ManifestHeaderSize) + 10*ItemSize)()
-
-	p, err := newPersistence(path)
-	require.NoError(t, err)
-	defer p.close()
-
-	var segID uint32 = 777
-
-	// 25 blobs + limit of 10 = 3 chunks ([10], [10], [5])
-	totalBlobs := 25
-	items := make([]Item, totalBlobs)
-	for i := 0; i < totalBlobs; i++ {
-		items[i] = Item{Key: Key{Lo: uint64(i + 1)}, SegmentID: segID}
-	}
-
-	err = p.writeBatch(segID, items, 0)
-	require.NoError(t, err)
-
-	// Verify initial state
-	count := 0
-	p.scanSegment(segID, func(m DurableBatch) bool {
-		count++
-		return true
-	})
-	assert.Equal(t, 3, count, "Initial write failed to create 3 chunks")
-
-	// Delete 20 blobs, leaving 5
-	toDelete := make(map[Key]struct{})
-	for i := 1; i <= 20; i++ {
-		toDelete[Key{Lo: uint64(i)}] = struct{}{}
-	}
-
-	err = p.DeleteRecordsFromSegment(segID, toDelete)
-	require.NoError(t, err)
-
-	// Verify collapse to 1 chunk
-	finalCount := 0
-	totalLive := 0
-	err = p.scanSegment(segID, func(m DurableBatch) bool {
-		finalCount++
-		totalLive += len(m.Items)
-		return true
-	})
-
-	assert.NoError(t, err)
-	assert.Equal(t, 1, finalCount, "Should have collapsed from 3 chunks to 1")
-	assert.Equal(t, 5, totalLive, "Should only have 5 items remaining in persistence")
-}
-
 func TestDurableIndex(t *testing.T) {
 	tmp := t.TempDir()
 
 	// Create and populate index
-	idx, err := Open(tmp, 1000)
+	idx, err := OpenIndex(tmp, 1000)
 	require.NoError(t, err)
 
 	var segID uint32 = 1
@@ -164,23 +119,23 @@ func TestDurableIndex(t *testing.T) {
 	err = idx.IngestBatch(segID, items, 0)
 	require.NoError(t, err)
 
-	// Verify in-memory lookup
+	// Verify in-memory data
 	item, ok := idx.Get(Key{Lo: 200})
 	require.True(t, ok)
 	require.Equal(t, uint32(200), item.PhysicalLen)
 	require.Equal(t, segID, item.SegmentID)
 
-	require.Equal(t, 3, idx.Len())
+	require.Equal(t, 3, idx.NumItems())
 
 	// Close and reopen
 	require.NoError(t, idx.Close())
 
-	idx2, err := Open(tmp, 1000)
+	idx2, err := OpenIndex(tmp, 1000)
 	require.NoError(t, err)
 	defer idx2.Close()
 
 	// Verify data survived
-	require.Equal(t, 3, idx2.Len())
+	require.Equal(t, 3, idx2.NumItems())
 	item, ok = idx2.Get(Key{Lo: 200})
 	require.True(t, ok)
 	require.Equal(t, uint32(200), item.PhysicalLen)

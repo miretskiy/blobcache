@@ -16,13 +16,13 @@ func Benchmark_IndexLookup(b *testing.B) {
 	for _, numKeys := range sizes {
 		b.Run(fmt.Sprintf("Keys-%dK", numKeys>>10), func(b *testing.B) {
 			b.StopTimer()
-			tmpDir, err := os.MkdirTemp("", "bench-index-lookup-*")
+			tmpDir, err := os.MkdirTemp("", "bench-index-data-*")
 			if err != nil {
 				b.Fatal(err)
 			}
 			defer os.RemoveAll(tmpDir)
 
-			idx, err := Open(tmpDir, numKeys)
+			idx, err := OpenIndex(tmpDir, numKeys)
 			if err != nil {
 				b.Fatal(err)
 			}

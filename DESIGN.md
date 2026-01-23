@@ -675,6 +675,91 @@ Hole punching creates "Swiss Cheese" segments—files that remain physically lar
 * **Migration:** Segments falling below a threshold (e.g., 20%) are marked for compaction. Remaining live blobs are read and re-inserted into the `MemTable` as new `Put()` operations.
 * **Recycling:** Once live blobs are safely persisted in new, dense segments, the old sparse segment is physically deleted. This ensures long-term disk efficiency and maximizes NVMe storage utilization.
 
+### 10.3 The Deletion Model: Tombstones and Consistency
+
+BlobCache uses a **soft delete (tombstone)** model rather than immediate removal. When `Delete(key)` is called:
+
+1. **WAL Write:** If WAL is enabled, a delete record is appended (crash consistency)
+2. **Hole Punch:** Immediate space reclamation via `fallocate(PUNCH_HOLE)`
+3. **Tombstone:** The index entry is marked with `IsDeleted()` flag rather than removed
+
+```text
+DELETE LIFECYCLE:
+
+   Delete(key)
+        |
+        v
+   [WAL: Append Delete Record]  <-- Crash consistency
+        |
+        v
+   [Hole Punch Blob Data]       <-- Immediate space reclamation
+        |
+        v
+   [Mark Item as Tombstone]     <-- Soft delete in RAM + persistence
+        |
+        v
+   [Compaction drops tombstone] <-- Final cleanup (deferred)
+```
+
+**Why Tombstones?** Tombstones prevent the "Leapfrog Hazard"—a subtle bug that can resurrect deleted keys during compaction.
+
+### 10.4 The Strict Contiguity Rule
+
+Compaction must only merge **contiguous** segment ranges. This invariant prevents the Leapfrog Hazard:
+
+```text
+THE LEAPFROG HAZARD (Why Tombstones + Contiguity Matter)
+
+Timeline:
+  T1: Key K exists in Segment A (oldest)
+  T2: Key K deleted → tombstone in Segment A
+  T3: Key K re-written → new entry in Segment C (newest)
+
+Segments: [A: tombstone(K)] [B: ...] [C: live(K)]
+
+WRONG: Compact A + C, skipping B
+  - Merge A and C into D
+  - Tombstone from A "wins" over live entry from C (older segment)
+  - Result: K is deleted, even though it was re-written!
+
+CORRECT: Only compact contiguous ranges [A, B] or [B, C] or [A, B, C]
+  - Ensures temporal ordering is preserved
+  - Newer writes always supersede older tombstones
+```
+
+### 10.5 Tail GC: When Tombstones Can Be Dropped
+
+Tombstones can only be garbage collected when compacting the **oldest (tail) segment**:
+
+* **Non-tail compaction:** Tombstones must be preserved. A newer segment might contain a re-write of the same key.
+* **Tail compaction:** Safe to drop tombstones. By definition, no older segment exists that could have a conflicting entry.
+
+```text
+SEGMENT TIMELINE (oldest → newest):
+
+  [Seg 1] [Seg 2] [Seg 3] [Seg 4]
+     ^                        ^
+   TAIL                    HEAD
+   (oldest)              (newest)
+
+Compacting Seg 1 (tail): Can drop tombstones
+Compacting Seg 2-4: Must preserve tombstones
+```
+
+### 10.6 Compaction Algorithm
+
+The compaction flow:
+
+1. **Select segments:** Choose contiguous range `[A, B, C]` based on waste score
+2. **Read items:** Collect all items from source segments
+3. **Filter:** If tail compaction, drop tombstones
+4. **Copy data:** Write blob data to new segment file
+5. **Write metadata:** `IngestBatch(newSegID, items, maxSeqID)`
+6. **Relocate RAM:** For each item, `Relocate(key, oldSeg, oldOff, newSeg, newOff)`
+7. **Cleanup:** Delete old segment files and metadata
+
+The `Relocate` method provides atomic compare-and-swap semantics: if a concurrent write updated the item to a newer segment, the relocation fails (safe), and we skip that item—it now lives in the newer segment.
+
 ---
 
 ## 11. The Read-Path Spectrum: Page Cache vs. Direct I/O

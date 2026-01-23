@@ -120,7 +120,7 @@ func TestIndex_Alignment(t *testing.T) {
 // -----------------------------------------------------------------------------
 
 func TestBasicCRUD(t *testing.T) {
-	idx := New(1024)
+	idx := NewBlobIndex(1024)
 	k1 := makeTestKey(1)
 	item1 := makeItem(k1, 1, 50)
 	item1.Offset = 100
@@ -148,7 +148,7 @@ func TestBasicCRUD(t *testing.T) {
 func TestArenaReuse(t *testing.T) {
 	// Verifies the "Zero-Allocation" property in steady state.
 	count := 10_000
-	idx := New(count)
+	idx := NewBlobIndex(count)
 
 	// Fill
 	for i := 0; i < count; i++ {
@@ -159,7 +159,7 @@ func TestArenaReuse(t *testing.T) {
 	getArenaSize := func() int {
 		total := 0
 		for i := 0; i < ShardCount; i++ {
-			s := idx.lookup.ShardAt(i)
+			s := idx.ShardAt(i)
 			s.RLock()
 			total += len(s.Extra.nodes)
 			s.RUnlock()
@@ -189,7 +189,7 @@ func TestArenaReuse(t *testing.T) {
 }
 
 func TestEviction_ClockLogic(t *testing.T) {
-	idx := New(100)
+	idx := NewBlobIndex(100)
 
 	// Find 3 keys that hash to Shard 0 for deterministic testing
 	// With 256 shards, shard 0 is k.Lo & 0xFF == 0
@@ -227,7 +227,7 @@ func TestEviction_ClockLogic(t *testing.T) {
 }
 
 func TestEviction_SizeBased(t *testing.T) {
-	idx := New(1000)
+	idx := NewBlobIndex(1000)
 	count := 100
 	var itemSize uint32 = 1024
 
@@ -251,21 +251,21 @@ func TestEviction_SizeBased(t *testing.T) {
 }
 
 func TestLen(t *testing.T) {
-	idx := New(100)
-	require.Equal(t, 0, idx.Len())
+	idx := NewBlobIndex(100)
+	require.Equal(t, 0, idx.NumItems())
 
 	for i := 0; i < 50; i++ {
 		k := makeTestKey(i)
 		idx.Put(makeItem(k, uint32(i), 100))
 	}
-	require.Equal(t, 50, idx.Len())
+	require.Equal(t, 50, idx.NumItems())
 
 	idx.Delete(makeTestKey(0))
-	require.Equal(t, 49, idx.Len())
+	require.Equal(t, 49, idx.NumItems())
 }
 
 func TestStats(t *testing.T) {
-	idx := New(100)
+	idx := NewBlobIndex(100)
 	for i := 0; i < 100; i++ {
 		k := makeTestKey(i)
 		idx.Put(makeItem(k, uint32(i), 100))
@@ -279,6 +279,211 @@ func TestStats(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------------
+// Relocate Tests (Compare-And-Swap for Compaction)
+// -----------------------------------------------------------------------------
+
+func TestRelocate_Success(t *testing.T) {
+	idx := NewBlobIndex(100)
+	k := makeTestKey(1)
+
+	// Insert item at segment 10, offset 100
+	item := makeItem(k, 10, 500)
+	item.Offset = 100
+	idx.Put(item)
+
+	// Relocate from (10, 100) to (20, 200)
+	ok := idx.Relocate(k, 10, 100, 20, 200)
+	require.True(t, ok, "Relocate should succeed when location matches")
+
+	// Verify the item was updated
+	got, found := idx.Get(k)
+	require.True(t, found)
+	require.Equal(t, uint32(20), got.SegmentID)
+	require.Equal(t, uint32(200), got.Offset)
+	require.Equal(t, uint32(500), got.PhysicalLen, "PhysicalLen should be preserved")
+}
+
+func TestRelocate_FailSegmentMismatch(t *testing.T) {
+	idx := NewBlobIndex(100)
+	k := makeTestKey(1)
+
+	// Insert item at segment 10, offset 100
+	item := makeItem(k, 10, 500)
+	item.Offset = 100
+	idx.Put(item)
+
+	// Try to relocate from wrong segment (15, 100) - should fail
+	ok := idx.Relocate(k, 15, 100, 20, 200)
+	require.False(t, ok, "Relocate should fail when segment doesn't match")
+
+	// Verify the item was NOT updated
+	got, _ := idx.Get(k)
+	require.Equal(t, uint32(10), got.SegmentID)
+	require.Equal(t, uint32(100), got.Offset)
+}
+
+func TestRelocate_FailOffsetMismatch(t *testing.T) {
+	idx := NewBlobIndex(100)
+	k := makeTestKey(1)
+
+	// Insert item at segment 10, offset 100
+	item := makeItem(k, 10, 500)
+	item.Offset = 100
+	idx.Put(item)
+
+	// Try to relocate from wrong offset (10, 150) - should fail
+	ok := idx.Relocate(k, 10, 150, 20, 200)
+	require.False(t, ok, "Relocate should fail when offset doesn't match")
+
+	// Verify the item was NOT updated
+	got, _ := idx.Get(k)
+	require.Equal(t, uint32(10), got.SegmentID)
+	require.Equal(t, uint32(100), got.Offset)
+}
+
+func TestRelocate_FailKeyNotFound(t *testing.T) {
+	idx := NewBlobIndex(100)
+	k := makeTestKey(1)
+
+	// Try to relocate non-existent key
+	ok := idx.Relocate(k, 10, 100, 20, 200)
+	require.False(t, ok, "Relocate should fail when key doesn't exist")
+}
+
+func TestRelocate_ConcurrentRace(t *testing.T) {
+	// Tests the scenario where compaction reads an item, but a concurrent write
+	// updates it before compaction can relocate. Only one should win.
+	idx := NewBlobIndex(100)
+	k := makeTestKey(1)
+
+	// Insert item at segment 10, offset 100
+	item := makeItem(k, 10, 500)
+	item.Offset = 100
+	idx.Put(item)
+
+	var wg sync.WaitGroup
+	var relocateWon, putWon atomic.Bool
+
+	// Goroutine 1: Compaction tries to relocate from (10, 100) to (20, 200)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if idx.Relocate(k, 10, 100, 20, 200) {
+			relocateWon.Store(true)
+		}
+	}()
+
+	// Goroutine 2: Concurrent write updates to (30, 300)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		newItem := makeItem(k, 30, 600)
+		newItem.Offset = 300
+		idx.Put(newItem)
+		putWon.Store(true) // Put always "wins" in terms of completing
+	}()
+
+	wg.Wait()
+
+	// Check final state
+	got, _ := idx.Get(k)
+
+	// One of these outcomes must be true:
+	// 1. Relocate ran first: item at (20, 200), then Put updated to (30, 300) => final (30, 300)
+	// 2. Put ran first: item at (30, 300), then Relocate fails (location mismatch) => final (30, 300)
+	// 3. Relocate ran first and Put hasn't completed: item at (20, 200)
+	//
+	// The key invariant: we never lose the Put's update (no "Leapfrog Hazard")
+	if relocateWon.Load() {
+		// Relocate succeeded, so item was at (10, 100) when relocate ran
+		// Final state depends on Put timing
+		t.Logf("Relocate won, final state: seg=%d, off=%d", got.SegmentID, got.Offset)
+	} else {
+		// Relocate failed because Put ran first and changed the location
+		require.Equal(t, uint32(30), got.SegmentID, "Put should have won")
+		require.Equal(t, uint32(300), got.Offset)
+		t.Log("Put won - Relocate correctly detected location change")
+	}
+}
+
+func TestRelocate_PreservesFlags(t *testing.T) {
+	idx := NewBlobIndex(100)
+	k := makeTestKey(1)
+
+	// Insert item with errno flag set (but not deleted)
+	item := makeItem(k, 10, 500)
+	item.Offset = 100
+	item.SetErrno(5)
+	idx.Put(item)
+
+	// Relocate should succeed (item is live, just has error flag)
+	ok := idx.Relocate(k, 10, 100, 20, 200)
+	require.True(t, ok, "Relocate should succeed for live item with errno")
+
+	// Verify flags are preserved and location updated
+	got, _ := idx.Get(k)
+	require.False(t, got.IsDeleted(), "Should not be deleted")
+	require.Equal(t, item.Errno(), got.Errno(), "Errno should be preserved")
+	require.Equal(t, uint32(20), got.SegmentID, "SegmentID should be updated")
+	require.Equal(t, uint32(200), got.Offset, "Offset should be updated")
+}
+
+func TestRelocate_GhostGuard(t *testing.T) {
+	// This test validates the "Ghost Guard" fix that prevents the
+	// "Ghost Resurrection" bug where a concurrent delete during compaction
+	// could be overwritten by compaction's stale live data.
+	//
+	// Scenario:
+	// 1. Compactor reads segment, sees key K as live at (seg=10, off=100)
+	// 2. User deletes K → tombstone marked in RAM
+	// 3. Compactor writes K to new segment at (seg=50, off=200)
+	// 4. Compactor calls Relocate(K, 10, 100, 50, 200)
+	// 5. WITHOUT fix: Relocate succeeds, zombie K reappears as live
+	// 6. WITH fix: Relocate fails, K stays deleted
+
+	idx := NewBlobIndex(100)
+	key := makeTestKey(999)
+
+	// T0: Initial state - live item at old location
+	item := makeItem(key, 10, 1000)
+	item.Offset = 100
+	idx.Put(item)
+
+	// Verify initial state
+	got, ok := idx.Get(key)
+	require.True(t, ok)
+	require.False(t, got.IsDeleted(), "initially should be live")
+	require.Equal(t, uint32(10), got.SegmentID)
+	require.Equal(t, uint32(100), got.Offset)
+
+	// T1: Concurrent delete (marks tombstone in RAM)
+	// This simulates user calling Delete() while compaction is in flight
+	s := idx.Shard(key)
+	s.Lock()
+	i := s.Items[key]
+	s.Extra.nodes[i].item.SetDeleted()
+	s.Unlock()
+
+	// T2: Verify item is now marked deleted
+	got, ok = idx.Get(key)
+	require.True(t, ok)
+	require.True(t, got.IsDeleted(), "should be marked deleted")
+
+	// T3: Compactor attempts relocation (has stale view of item as live)
+	// This should FAIL because item is now deleted
+	relocated := idx.Relocate(key, 10, 100, 50, 200)
+	require.False(t, relocated, "should not relocate deleted item (Ghost Guard)")
+
+	// T4: Verify item remains deleted with OLD location
+	// (compaction should skip this item entirely)
+	got, ok = idx.Get(key)
+	require.True(t, ok)
+	require.True(t, got.IsDeleted(), "should still be deleted")
+	require.Equal(t, uint32(10), got.SegmentID, "location should not change")
+	require.Equal(t, uint32(100), got.Offset, "location should not change")
+}
+
+// -----------------------------------------------------------------------------
 // Concurrency & Stress Tests
 // -----------------------------------------------------------------------------
 
@@ -287,7 +492,7 @@ func TestConcurrency_Correctness(t *testing.T) {
 		t.Skip("Skipping stress test in short mode")
 	}
 
-	idx := New(10_000)
+	idx := NewBlobIndex(10_000)
 	var wg sync.WaitGroup
 
 	const (
@@ -394,7 +599,7 @@ func BenchmarkGC_Comparison(b *testing.B) {
 		runtime.GC()
 		runtime.ReadMemStats(&m1)
 
-		idx := New(numItems)
+		idx := NewBlobIndex(numItems)
 
 		var wg sync.WaitGroup
 		workers := 16
@@ -463,7 +668,7 @@ func BenchmarkThroughput(b *testing.B) {
 		benchThroughput(b, newOldIndex(), 1_000_000)
 	})
 	b.Run("Spread_1M/New_Arena", func(b *testing.B) {
-		benchThroughput(b, New(1_000_000), 1_000_000)
+		benchThroughput(b, NewBlobIndex(1_000_000), 1_000_000)
 	})
 
 	// Scenario 2: High Contention (1K keys)
@@ -472,6 +677,6 @@ func BenchmarkThroughput(b *testing.B) {
 		benchThroughput(b, newOldIndex(), 1_000)
 	})
 	b.Run("Contention_1K/New_Arena", func(b *testing.B) {
-		benchThroughput(b, New(1_000), 1_000)
+		benchThroughput(b, NewBlobIndex(1_000), 1_000)
 	})
 }

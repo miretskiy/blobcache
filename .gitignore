@@ -21,3 +21,6 @@ Cargo.lock
 *.dylib
 *.dll
 *.exe
+
+# TLA+ tools (download separately)
+tla2tools.jar

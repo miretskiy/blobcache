@@ -263,6 +263,47 @@ type TestingKnobs struct {
 5. **Sequence Order**: Concurrency correctness (`sequence_test.go`)
 6. **Race Detection**: `go test -race ./...` (REQUIRED for all concurrent code)
 
+### Formal Verification with TLA+
+
+The `model/` directory contains TLA+ specifications for formally verifying critical protocols.
+
+**Why TLA+?**
+- Exhaustively explores ALL interleavings of concurrent operations
+- Finds bugs that testing cannot (race conditions, ordering violations)
+- Used by Amazon (DynamoDB, S3), Microsoft (Cosmos DB), MongoDB (Raft)
+
+**Current Models:**
+- `model/wal/WAL.tla` - WAL Group Commit protocol verification
+
+**What the WAL model verifies:**
+1. **Durability**: If `Write()` returns success, data is on disk
+2. **Single Leader**: At most one goroutine flushes at a time
+3. **No Lost Writes**: Acknowledged writes survive crashes
+4. **Liveness**: Pending writes eventually complete (no deadlock)
+
+**Running the model:**
+```bash
+# Install TLA+ tools
+brew install tla-plus/tap/tla-plus  # macOS
+# Or download from: https://github.com/tlaplus/tlaplus/releases
+
+# Run model checker
+cd model/wal
+java -jar tla2tools.jar -config WAL.cfg WAL.tla
+```
+
+**When to update/create TLA+ models:**
+- New concurrent protocol (leader election, group commit, etc.)
+- Changes to existing protocol semantics
+- Bug found in production → reproduce in model, verify fix
+
+**When NOT needed:**
+- Refactoring that doesn't change protocol behavior
+- Adding logging or metrics
+- Performance optimizations with same semantics
+
+See `model/README.md` for a comprehensive beginner's guide to TLA+.
+
 ## High-Level Architecture
 
 BlobCache implements a tiered storage pipeline optimized for zero-copy reads and minimal GC pressure:
@@ -626,7 +667,9 @@ blobcache/
 │   └── xmap/              # Memory alignment utilities
 ├── bloom/                 # Unified lock-free bloom filter
 ├── compression/           # Compression codecs (Zstd, LZ4, S2)
-└── base/                  # Error types and constants
+├── base/                  # Error types and constants
+└── model/                 # TLA+ formal verification specs
+    └── wal/               # WAL Group Commit model
 ```
 
 ## Performance Expectations

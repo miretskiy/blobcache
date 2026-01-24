@@ -471,15 +471,20 @@ func evictUpTo(
 }
 
 // Relocate atomically moves an item from (oldSeg, oldOff) to (newSeg, newOff).
-// Returns true if the relocation succeeded, false if the current location doesn't match.
+// Returns true if the relocation succeeded, false if the current location doesn't match
+// or if the item's deleted state doesn't match expectDeleted.
 //
 // This is used during compaction to safely move items to new segments:
 //   - If a concurrent write updated the item to a newer segment, relocation fails (safe)
 //   - If the item is still at the expected old location, relocation succeeds
 //
+// The expectDeleted parameter controls the "Ghost Guard" behavior:
+//   - expectDeleted=false: Relocating live items. Fails if item was deleted (Ghost Guard).
+//   - expectDeleted=true: Relocating tombstones. Fails if item is NOT deleted (race detected).
+//
 // The compare-and-swap semantics prevent the "Leapfrog Hazard" where compaction
 // could accidentally overwrite a newer write with stale data from an old segment.
-func (idx *BlobIndex) Relocate(k Key, oldSeg, oldOff, newSeg, newOff uint32) bool {
+func (idx *BlobIndex) Relocate(k Key, oldSeg, oldOff, newSeg, newOff uint32, expectDeleted bool) bool {
 	s := idx.Shard(k)
 
 	s.Lock()
@@ -496,10 +501,10 @@ func (idx *BlobIndex) Relocate(k Key, oldSeg, oldOff, newSeg, newOff uint32) boo
 		return false
 	}
 
-	// Ghost Guard: If deleted after staleness check, skip relocation.
-	// Prevents "Ghost Resurrection" where a concurrent delete could be
-	// overwritten by compaction's stale data.
-	if item.IsDeleted() {
+	// State Guard: Verify deleted state matches expectation.
+	// - expectDeleted=false (live items): Fails if deleted (Ghost Guard)
+	// - expectDeleted=true (tombstones): Fails if not deleted (race detected)
+	if item.IsDeleted() != expectDeleted {
 		return false
 	}
 

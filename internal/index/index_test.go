@@ -292,7 +292,7 @@ func TestRelocate_Success(t *testing.T) {
 	idx.Put(item)
 
 	// Relocate from (10, 100) to (20, 200)
-	ok := idx.Relocate(k, 10, 100, 20, 200)
+	ok := idx.Relocate(k, 10, 100, 20, 200, false)
 	require.True(t, ok, "Relocate should succeed when location matches")
 
 	// Verify the item was updated
@@ -313,7 +313,7 @@ func TestRelocate_FailSegmentMismatch(t *testing.T) {
 	idx.Put(item)
 
 	// Try to relocate from wrong segment (15, 100) - should fail
-	ok := idx.Relocate(k, 15, 100, 20, 200)
+	ok := idx.Relocate(k, 15, 100, 20, 200, false)
 	require.False(t, ok, "Relocate should fail when segment doesn't match")
 
 	// Verify the item was NOT updated
@@ -332,7 +332,7 @@ func TestRelocate_FailOffsetMismatch(t *testing.T) {
 	idx.Put(item)
 
 	// Try to relocate from wrong offset (10, 150) - should fail
-	ok := idx.Relocate(k, 10, 150, 20, 200)
+	ok := idx.Relocate(k, 10, 150, 20, 200, false)
 	require.False(t, ok, "Relocate should fail when offset doesn't match")
 
 	// Verify the item was NOT updated
@@ -346,7 +346,7 @@ func TestRelocate_FailKeyNotFound(t *testing.T) {
 	k := makeTestKey(1)
 
 	// Try to relocate non-existent key
-	ok := idx.Relocate(k, 10, 100, 20, 200)
+	ok := idx.Relocate(k, 10, 100, 20, 200, false)
 	require.False(t, ok, "Relocate should fail when key doesn't exist")
 }
 
@@ -368,7 +368,7 @@ func TestRelocate_ConcurrentRace(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if idx.Relocate(k, 10, 100, 20, 200) {
+		if idx.Relocate(k, 10, 100, 20, 200, false) {
 			relocateWon.Store(true)
 		}
 	}()
@@ -417,7 +417,7 @@ func TestRelocate_PreservesFlags(t *testing.T) {
 	idx.Put(item)
 
 	// Relocate should succeed (item is live, just has error flag)
-	ok := idx.Relocate(k, 10, 100, 20, 200)
+	ok := idx.Relocate(k, 10, 100, 20, 200, false)
 	require.True(t, ok, "Relocate should succeed for live item with errno")
 
 	// Verify flags are preserved and location updated
@@ -471,7 +471,7 @@ func TestRelocate_GhostGuard(t *testing.T) {
 
 	// T3: Compactor attempts relocation (has stale view of item as live)
 	// This should FAIL because item is now deleted
-	relocated := idx.Relocate(key, 10, 100, 50, 200)
+	relocated := idx.Relocate(key, 10, 100, 50, 200, false)
 	require.False(t, relocated, "should not relocate deleted item (Ghost Guard)")
 
 	// T4: Verify item remains deleted with OLD location
@@ -481,6 +481,91 @@ func TestRelocate_GhostGuard(t *testing.T) {
 	require.True(t, got.IsDeleted(), "should still be deleted")
 	require.Equal(t, uint32(10), got.SegmentID, "location should not change")
 	require.Equal(t, uint32(100), got.Offset, "location should not change")
+}
+
+func TestRelocate_TombstoneMigration(t *testing.T) {
+	// This test validates that tombstones CAN be relocated during compaction
+	// when using expectDeleted=true.
+	//
+	// Scenario:
+	// 1. Item exists at (seg=10, off=100)
+	// 2. Item is deleted (tombstone)
+	// 3. Compaction wants to move tombstone to new segment (seg=50, off=0)
+	// 4. Relocate with expectDeleted=true should succeed
+
+	idx := NewBlobIndex(100)
+	key := makeTestKey(888)
+
+	// Initial state - live item
+	item := makeItem(key, 10, 1000)
+	item.Offset = 100
+	idx.Put(item)
+
+	// Delete the item (mark tombstone)
+	s := idx.Shard(key)
+	s.Lock()
+	i := s.Items[key]
+	s.Extra.nodes[i].item.SetDeleted()
+	s.Unlock()
+
+	// Verify tombstone state
+	got, ok := idx.Get(key)
+	require.True(t, ok)
+	require.True(t, got.IsDeleted())
+	require.Equal(t, uint32(10), got.SegmentID)
+	require.Equal(t, uint32(100), got.Offset)
+
+	// Relocate with expectDeleted=false should FAIL (Ghost Guard)
+	relocatedLive := idx.Relocate(key, 10, 100, 50, 0, false)
+	require.False(t, relocatedLive, "should not relocate tombstone as live item")
+
+	// Relocate with expectDeleted=true should SUCCEED (tombstone migration)
+	relocatedTombstone := idx.Relocate(key, 10, 100, 50, 0, true)
+	require.True(t, relocatedTombstone, "should relocate tombstone with expectDeleted=true")
+
+	// Verify tombstone was moved
+	got, ok = idx.Get(key)
+	require.True(t, ok)
+	require.True(t, got.IsDeleted(), "should still be deleted")
+	require.Equal(t, uint32(50), got.SegmentID, "segment should be updated")
+	require.Equal(t, uint32(0), got.Offset, "offset should be updated")
+}
+
+func TestRelocate_TombstoneMigration_RaceDetection(t *testing.T) {
+	// Tests that relocating a tombstone fails if the item was un-deleted
+	// (race with a new Put) during compaction.
+
+	idx := NewBlobIndex(100)
+	key := makeTestKey(777)
+
+	// Initial state - deleted item (tombstone)
+	item := makeItem(key, 10, 1000)
+	item.Offset = 100
+	item.SetDeleted()
+	idx.Put(item)
+
+	// Verify tombstone state
+	got, ok := idx.Get(key)
+	require.True(t, ok)
+	require.True(t, got.IsDeleted())
+
+	// Simulate concurrent Put that overwrites tombstone with new live item
+	s := idx.Shard(key)
+	s.Lock()
+	i := s.Items[key]
+	s.Extra.nodes[i].item.Flags = 0          // Clear deleted flag
+	s.Extra.nodes[i].item.PhysicalLen = 2000 // New data
+	s.Extra.nodes[i].item.SegmentID = 20     // New segment
+	s.Extra.nodes[i].item.Offset = 500       // New offset
+	s.Unlock()
+
+	// Tombstone relocation should FAIL because item is now live
+	relocated := idx.Relocate(key, 10, 100, 50, 0, true)
+	require.False(t, relocated, "should fail: item is no longer deleted")
+
+	// Also fails because location doesn't match
+	relocated = idx.Relocate(key, 20, 500, 50, 0, true)
+	require.False(t, relocated, "should fail: item is live, not tombstone")
 }
 
 // -----------------------------------------------------------------------------

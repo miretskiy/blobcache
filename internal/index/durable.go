@@ -88,8 +88,8 @@ func (idx *DurableIndex) BlobStats() Stats {
 	return idx.blobs.Stats()
 }
 
-func (idx *DurableIndex) Relocate(k Key, oldSeg, oldOff, newSeg, newOff uint32) bool {
-	return idx.blobs.Relocate(k, oldSeg, oldOff, newSeg, newOff)
+func (idx *DurableIndex) Relocate(k Key, oldSeg, oldOff, newSeg, newOff uint32, expectDeleted bool) bool {
+	return idx.blobs.Relocate(k, oldSeg, oldOff, newSeg, newOff, expectDeleted)
 }
 
 // GetSegmentManifest retrieves the metadata for a specific segment.

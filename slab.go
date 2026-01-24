@@ -52,19 +52,21 @@ func (r *Releaser) Release() {
 // Acquire attempts to get a lease on the data.
 // For uncompressed blobs: Zero-copy slice into the slab buffer.
 // For compressed blobs: Allocates and returns decompressed data.
-// Returns (data, releaser, found, errno). Caller should check errno even when found=true.
+// Returns (data, keyBytes, releaser, found, errno). Caller should check errno even when found=true.
+// keyBytes is a zero-copy slice into the slab buffer containing the stored key.
+// Caller should verify keyBytes matches the expected key to detect hash collisions.
 // NB: This is a low level method where the caller is expected to quickly consume
 // the returned data and promptly release it via Releaser.
-func (s *SharedSlab) Acquire(key Key) ([]byte, Releaser, bool, base.BlobErrno) {
+func (s *SharedSlab) Acquire(key Key) ([]byte, []byte, Releaser, bool, base.BlobErrno) {
 	// 1. Lock-free lookup
 	rec, ok := s.index.Get(key)
 	if !ok {
-		return nil, Releaser{}, false, base.ErrNone
+		return nil, nil, Releaser{}, false, base.ErrNone
 	}
 
 	// 2. Check if record has existing error
 	if rec.HasError() {
-		return nil, Releaser{}, true, rec.Errno()
+		return nil, nil, Releaser{}, true, rec.Errno()
 	}
 
 	buf := s.buf
@@ -80,40 +82,44 @@ func (s *SharedSlab) Acquire(key Key) ([]byte, Releaser, bool, base.BlobErrno) {
 	// TryInc will return false, preventing us from using dead memory.
 	if !buf.TryInc() {
 		// The buffer died between step 1 and 2. Treat as a miss.
-		return nil, Releaser{}, false, base.ErrNone
+		return nil, nil, Releaser{}, false, base.ErrNone
 	}
 
-	// 4. Get Physical Data (skip past header and key to value bytes)
-	valueStart := offset + int64(record.HeaderSize) + int64(rec.KeyLen)
-	physicalData := buf.raw[valueStart : valueStart+rec.PhysicalSize]
+	// 4. Extract key bytes (zero-copy slice for collision detection)
+	keyStart := offset + int64(record.HeaderSize)
+	keyEnd := keyStart + int64(rec.KeyLen)
+	keyBytes := buf.raw[keyStart:keyEnd]
+
+	// 5. Get Physical Data (skip past header and key to value bytes)
+	physicalData := buf.raw[keyEnd : keyEnd+rec.PhysicalSize]
 	releaser := Releaser{slab: buf}
 
-	// 5. Handle Decompression
+	// 6. Handle Decompression
 	if rec.IsCompressed() {
-		defer releaser.Release() // Release buf when done using physicalData
-
 		handle := AcquireBuffer(int(rec.LogicalSize), int(rec.LogicalSize))
 		if err := compression.Decompress(rec.Compression(), handle.Bytes(), physicalData); err != nil {
 			handle.Release()
-			return nil, Releaser{}, false, base.ErrDecompression
+			releaser.Release()
+			return nil, nil, Releaser{}, false, base.ErrDecompression
 		}
-		return handle.Bytes(), Releaser{bh: &handle}, true, base.ErrNone
+		// Keep slab pinned for keyBytes, add bh for decompressed value
+		return handle.Bytes(), keyBytes, Releaser{slab: buf, bh: &handle}, true, base.ErrNone
 	}
 
 	// Uncompressed: zero-copy slice
-	return physicalData, releaser, true, base.ErrNone
+	return physicalData, keyBytes, releaser, true, base.ErrNone
 }
 
 // ProtectedView handles the lifecycle automatically via a closure.
-// Returns (found, errno).
-func (s *SharedSlab) ProtectedView(key Key, fn func(data []byte)) (bool, base.BlobErrno) {
-	data, releaser, found, errno := s.Acquire(key)
+// Returns (found, errno). The callback receives the stored key and value.
+func (s *SharedSlab) ProtectedView(hashKey Key, fn func(storedKey, value []byte)) (bool, base.BlobErrno) {
+	value, storedKey, releaser, found, errno := s.Acquire(hashKey)
 	if !found || errno != base.ErrNone {
 		return found, errno
 	}
 	defer releaser.Release()
 
-	fn(data)
+	fn(storedKey, value)
 	return true, base.ErrNone
 }
 

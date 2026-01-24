@@ -70,9 +70,11 @@ func (l *Librarian) Publish(slab *SharedSlab) {
 
 // Acquire searches the catalog for the key.
 // WAIT-FREE: No mutexes.
+// Returns (value, storedKey, releaser, found). storedKey is the key bytes stored with
+// this hash - caller should verify it matches expected key to detect hash collisions.
 // NB: This is a low level method where the caller is expected to quickly consume
 // the returned data and promptly release it via Releaser.
-func (l *Librarian) Acquire(key Key) ([]byte, Releaser, bool) {
+func (l *Librarian) Acquire(hashKey Key) (value []byte, storedKey []byte, rel Releaser, found bool) {
 	// 1. Load the immutable snapshot
 	list := *l.view.Load()
 
@@ -81,26 +83,27 @@ func (l *Librarian) Acquire(key Key) ([]byte, Releaser, bool) {
 		// 3. Attempt to Acquire
 		// If 'Publish' evicts this slab while we are iterating,
 		// slab.Acquire() will return false via TryInc(), protecting us.
-		data, releaser, found, errno := slab.Acquire(key)
+		data, keyBytes, releaser, ok, errno := slab.Acquire(hashKey)
 		if errno != base.ErrNone {
-			l.errReporter.ReportBlobError(key, errno)
-			return nil, Releaser{}, false
+			l.errReporter.ReportBlobError(hashKey, errno)
+			return nil, nil, Releaser{}, false
 		}
-		if found {
-			return data, releaser, true
+		if ok {
+			return data, keyBytes, releaser, true
 		}
 	}
-	return nil, Releaser{}, false
+	return nil, nil, Releaser{}, false
 }
 
 // ProtectedView handles the lifecycle automatically via a closure.
+// The callback receives (storedKey, value) - caller should verify storedKey matches expected.
 // NB: data is valid only for the duration of the function.
-func (l *Librarian) ProtectedView(key Key, fn func(data []byte)) bool {
+func (l *Librarian) ProtectedView(hashKey Key, fn func(storedKey, value []byte)) bool {
 	list := *l.view.Load()
 	for _, slab := range list {
-		found, errno := slab.ProtectedView(key, fn)
+		found, errno := slab.ProtectedView(hashKey, fn)
 		if errno != base.ErrNone {
-			l.errReporter.ReportBlobError(key, errno)
+			l.errReporter.ReportBlobError(hashKey, errno)
 			return false
 		}
 		if found {
@@ -111,9 +114,10 @@ func (l *Librarian) ProtectedView(key Key, fn func(data []byte)) bool {
 }
 
 // View is a convenient (but a bit more expensive) way to view the data via io.Reader.
+// Note: This method does not return storedKey - use Acquire directly if key verification needed.
 // NB: the reader is valid only for the duration of the function.
-func (l *Librarian) View(key Key, fn func(r io.Reader)) bool {
-	data, releaser, found := l.Acquire(key)
+func (l *Librarian) View(hashKey Key, fn func(r io.Reader)) bool {
+	data, _, releaser, found := l.Acquire(hashKey)
 	if !found {
 		return false
 	}

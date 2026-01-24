@@ -30,14 +30,6 @@ const (
 	evictionHysteresis = 0.93
 )
 
-const (
-	// numSegmentLockShards is the number of shards for segment-level locking.
-	// Used to coordinate Delete and Compaction operations on the same segment.
-	// 256 shards provides good distribution with minimal contention.
-	numSegmentLockShards = 256
-	segmentLockShardMask = numSegmentLockShards - 1
-)
-
 // Cache is a high-performance blob storage with bloom filter optimization
 type Cache struct {
 	config
@@ -53,14 +45,10 @@ type Cache struct {
 		lastRebuild atomic.Pointer[time.Time] // When the last rebuild happened.
 	}
 
-	// Segment-level locks for coordinating Delete and Compaction.
-	// Prevents concurrent modifications to the same segment's metadata.
-	// Usage: segmentLocks[segmentID & segmentLockShardMask].Lock()
-	segmentLocks [numSegmentLockShards]sync.Mutex
-
 	// --- ARCHITECTURE COMPONENTS ---
 	memTable  *MemTable  // The Write Engine (Producer)
 	librarian *Librarian // The Read Cache (Consumer)
+	compactor *Compactor // Segment merge compaction
 
 	// Global monotonic sequence counter for operation ordering.
 	// Initialized to time.Now().UnixNano() for continuity across restarts.
@@ -71,6 +59,11 @@ type Cache struct {
 	// LogicalSize tracking for reactive eviction
 	approxSize      atomic.Int64 // Approximate total size (updated during flush/eviction)
 	evictionRunning atomic.Bool  // Prevents concurrent evictions
+
+	// Oldest segment tracking for tombstone GC
+	// Tombstones can only be safely dropped when compacting the tail (oldest) segment.
+	// See CLAUDE.md "Deletion Model (Tombstones)" for rationale.
+	oldestLiveSegmentID atomic.Uint32
 
 	// Background error tracking
 	bgError atomic.Pointer[error] // First background error (nil = healthy)
@@ -106,6 +99,19 @@ type SegmentIDProvider interface {
 
 func (c *Cache) IsDegraded() bool {
 	return c.bgError.Load() != nil
+}
+
+// IsTailSegment returns true if segID is the oldest live segment.
+// Tombstones can only be safely dropped when compacting the tail segment;
+// otherwise the Leapfrog Hazard can resurrect deleted keys.
+func (c *Cache) IsTailSegment(segID uint32) bool {
+	return segID == c.oldestLiveSegmentID.Load()
+}
+
+// OldestLiveSegmentID returns the oldest segment ID still in use.
+// Returns 0 if no segments exist.
+func (c *Cache) OldestLiveSegmentID() uint32 {
+	return c.oldestLiveSegmentID.Load()
 }
 
 func (c *Cache) ReportError(err error) {
@@ -193,9 +199,15 @@ func open(cfg config) (*Cache, bool, error) {
 	}
 
 	// Create new bloom filter and figure out how much data on disk from segment meta.
+	// Also track oldest segment ID for tombstone GC.
 	var totalSize int64
+	var oldestSegID uint32
 	filter := bloom.New(uint(cfg.BloomEstimatedKeys), cfg.BloomFPRate)
 	if err := idx.ForEachSegment(func(m index.DurableBatch) bool {
+		// Track oldest segment
+		if oldestSegID == 0 || m.SegmentID < oldestSegID {
+			oldestSegID = m.SegmentID
+		}
 		for _, item := range m.Items {
 			if !item.IsDeleted() {
 				filter.Add(item.Key)                 // Full 128-bit key
@@ -235,9 +247,21 @@ func open(cfg config) (*Cache, bool, error) {
 	c.librarian = NewLibrarian(cfg.MaxCachedSlabs, c)
 	c.bloom.Store(filter)
 	c.approxSize.Store(totalSize)
+	c.oldestLiveSegmentID.Store(oldestSegID)
 	c.Knobs = cfg.knobs
 	c.memTable = NewMemTable(c.config, c, c, c.librarian, c.wal, c.segIDs)
 	c.memTable.Knobs = c.Knobs
+
+	// Initialize compactor for segment merge operations
+	compactFooterPool := NewMmapPool("compact-footer", 256<<10, 2)
+	ioFlags := sys.SyncNone
+	if cfg.IO.DirectIOWrite {
+		ioFlags |= sys.FlDirectIO
+	}
+	if cfg.IO.FDataSync {
+		ioFlags |= sys.SyncData
+	}
+	c.compactor = NewCompactor(idx, c.archivist, c.segIDs, cfg.Path, cfg.Shards, ioFlags, compactFooterPool)
 
 	// Run WAL recovery after memtable is initialized
 	var recovered bool
@@ -338,6 +362,7 @@ func checkOrInitialize(cfg config) (*index.DurableIndex, error) {
 
 // search attempts to locate the blob in RAM (returning data) or Disk (returning r).
 // It acts as the Single Source of Truth for Bloom metrics (Hits vs Ghosts).
+// Key verification happens on both paths to detect 128-bit hash collisions.
 func (c *Cache) search(key []byte) (data []byte, r io.Reader, rel Releaser, ok bool) {
 	h := xxh3.Hash128(key)
 
@@ -348,7 +373,13 @@ func (c *Cache) search(key []byte) (data []byte, r io.Reader, rel Releaser, ok b
 	c.bloom.hits.Add(1) // Bloom said "yes"
 
 	// 2. RAM Hit (Librarian)
-	if ramData, releaser, found := c.librarian.Acquire(h); found {
+	if ramData, storedKey, releaser, found := c.librarian.Acquire(h); found {
+		// Verify key to detect hash collision
+		if !bytes.Equal(storedKey, key) {
+			releaser.Release()
+			c.bloom.ghosts.Add(1) // Hash collision: bloom said yes, wrong key
+			return nil, nil, Releaser{}, false
+		}
 		return ramData, nil, releaser, true
 	}
 
@@ -368,7 +399,6 @@ func (c *Cache) search(key []byte) (data []byte, r io.Reader, rel Releaser, ok b
 
 	// 5. Read from disk (with key verification for collision detection)
 	diskReader, diskReleaser, err := c.archivist.ReadBlob(entry, key)
-	defer diskReleaser.Release()
 	if err != nil {
 		c.handleStorageError(h, entry, err)
 		return nil, nil, Releaser{}, false
@@ -445,21 +475,26 @@ var ErrEmptyKey = errors.New("blobcache: empty key not allowed")
 // - Cache Mode (no WAL): Immediately reclaims space via hole punching
 //
 // Returns nil if the key doesn't exist (idempotent delete).
+// Returns nil if the key hash exists but stored key differs (hash collision - not our key).
 func (c *Cache) Delete(key []byte) error {
 	if len(key) == 0 {
 		return ErrEmptyKey
 	}
 
+	// Verify the key exists and matches (handles hash collision detection).
+	// search() checks both RAM and disk paths with key verification.
+	_, _, rel, found := c.search(key)
+	if !found {
+		return nil // Not found or hash collision - idempotent
+	}
+	rel.Release()
+
 	h := xxh3.Hash128(key)
 
-	// Look up in index - if not found, delete is a no-op (idempotent)
+	// Re-lookup to get index.Item (safe - search verified the key)
 	item, found := c.index.Get(h)
-	if !found {
-		return nil
-	}
-
-	// Already deleted? No-op.
-	if item.IsDeleted() {
+	if !found || item.IsDeleted() {
+		// Race: item was deleted between search and here
 		return nil
 	}
 
@@ -911,18 +946,94 @@ func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
 }
 
 func (c *Cache) maybeCompactSegments() error {
-	// TODO: Implement segment selection logic
-	// For now, just run tombstone compaction on segments with many tombstones
-	return c.maybeCompactTombstones()
+	// Phase 1: Tombstone compaction (metadata cleanup + hole punching)
+	if err := c.maybeCompactTombstones(); err != nil {
+		log.Warn("tombstone compaction failed", "error", err)
+		// Continue to merge compaction even if tombstone compaction fails
+	}
+
+	// Phase 2: Merge compaction (combine sparse segments)
+	if err := c.maybeMergeSegments(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// maybeMergeSegments identifies sparse segments and merges contiguous ranges.
+// This reclaims space by combining multiple sparse segments into fewer dense segments.
+func (c *Cache) maybeMergeSegments() error {
+	// Select candidate ranges: segments with >75% waste, ranges of at least 2 segments
+	ranges, err := c.selectSegmentsForMerge(0.75, 2)
+	if err != nil {
+		return fmt.Errorf("select segments for merge: %w", err)
+	}
+
+	if len(ranges) == 0 {
+		return nil
+	}
+
+	log.Debug("merge compaction starting", "range_count", len(ranges))
+
+	oldestSegID := c.OldestLiveSegmentID()
+	var errs []error
+
+	for _, segmentIDs := range ranges {
+		// Determine if this is a tail compaction (includes oldest segment)
+		// Safe to drop tombstones if we're compacting the oldest segment
+		dropTombstones := len(segmentIDs) > 0 && segmentIDs[0] == oldestSegID
+
+		result, err := c.compactor.Compact(segmentIDs, dropTombstones)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("compact segments %v: %w", segmentIDs, err))
+			continue
+		}
+
+		log.Info("segment merge completed",
+			"old_segments", result.OldSegmentIDs,
+			"new_segment", result.NewSegmentID,
+			"items_compacted", result.ItemsCompacted,
+			"tombstones_kept", result.TombstonesKept,
+			"tombstones_dropped", result.TombstonesDropped)
+	}
+
+	// Recalculate oldest segment after dropping segments
+	if err := c.recalculateOldestSegmentID(); err != nil {
+		errs = append(errs, fmt.Errorf("recalculate oldest segment: %w", err))
+	}
+
+	return errors.Join(errs...)
 }
 
 // maybeCompactTombstones identifies segments with many tombstones and compacts them.
 // This collapses the tombstone incremental log into the segment manifest and
 // reclaims space via hole punching.
 func (c *Cache) maybeCompactTombstones() error {
-	// TODO: Implement smart selection using SegmentMetadata.TombstoneCount
-	// For now, this is a placeholder
-	return nil
+	segments, err := c.selectSegmentsForTombstoneCompaction(DefaultTombstoneCompactionThreshold)
+	if err != nil {
+		return fmt.Errorf("select segments for tombstone compaction: %w", err)
+	}
+
+	if len(segments) == 0 {
+		return nil
+	}
+
+	log.Debug("tombstone compaction starting", "segment_count", len(segments))
+
+	var errs []error
+	for _, segID := range segments {
+		// Acquire segment lock (shared with compaction, exclusive from Delete)
+		shard := c.index.SegmentMetaShard(segID)
+		shard.Lock()
+		err := c.compactSegmentTombstones(segID)
+		shard.Unlock()
+
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	return errors.Join(errs...)
 }
 
 // compactSegmentTombstones performs tombstone compaction on a single segment.

@@ -41,7 +41,7 @@ func TestCompactor_LeapfrogHazard(t *testing.T) {
 		{Key: index.Key{Lo: 200, Hi: 0}, SegmentID: 2, Offset: 0, PhysicalLen: 100},
 	}, 0))
 
-	_, err = c.Compact([]uint32{1, 3})
+	_, err = c.Compact([]uint32{1, 3}, false)
 	require.Error(t, err, "should fail when segment exists in gap")
 	require.Contains(t, err.Error(), "segment 2 exists in gap")
 	require.Contains(t, err.Error(), "Leapfrog Hazard")
@@ -50,7 +50,7 @@ func TestCompactor_LeapfrogHazard(t *testing.T) {
 	// Delete segment 2 from index
 	require.NoError(t, idx.DeleteSegment(2))
 
-	_, err = c.Compact([]uint32{1, 3})
+	_, err = c.Compact([]uint32{1, 3}, false)
 	require.NoError(t, err, "should succeed when gap is empty (segments were deleted)")
 }
 
@@ -88,7 +88,7 @@ func TestCompactor_ContiguityValidation(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := c.Compact(tc.segments)
+			_, err := c.Compact(tc.segments, false)
 			if tc.wantError {
 				require.Error(t, err, "expected error for segments %v", tc.segments)
 				if tc.errRegex != "" {
@@ -120,7 +120,7 @@ func TestCompactor_EmptySegments(t *testing.T) {
 	require.NoError(t, idx.IngestBatch(1, nil, 0))
 	require.NoError(t, idx.IngestBatch(2, nil, 0))
 
-	result, err := c.Compact([]uint32{1, 2})
+	result, err := c.Compact([]uint32{1, 2}, false)
 	require.NoError(t, err)
 	require.Equal(t, uint32(0), result.NewSegmentID, "no new segment should be created for empty input")
 	require.Equal(t, 0, result.ItemsCompacted)
@@ -168,7 +168,7 @@ func TestCompactor_StalenessFiltering(t *testing.T) {
 	// The manifest still has key2 at sourceSegID, but RAM index says segment 99
 	idx.Put(index.Item{Key: key2, SegmentID: 99, Offset: 500, PhysicalLen: 150})
 
-	result, err := c.Compact([]uint32{sourceSegID})
+	result, err := c.Compact([]uint32{sourceSegID}, false)
 	require.NoError(t, err)
 
 	// Only key1 should be compacted (key2 is stale - RAM says it's in segment 5)
@@ -228,7 +228,7 @@ func TestCompactor_TombstonePreservation(t *testing.T) {
 	// Remove the deleted key from RAM (tombstones don't stay in RAM index for lookups)
 	idx.Delete(keyDeleted)
 
-	result, err := c.Compact([]uint32{sourceSegID})
+	result, err := c.Compact([]uint32{sourceSegID}, false)
 	require.NoError(t, err)
 
 	require.Equal(t, 1, result.ItemsCompacted)
@@ -246,6 +246,79 @@ func TestCompactor_TombstonePreservation(t *testing.T) {
 		}
 	}
 	require.True(t, foundTombstone, "tombstone should be in compacted segment manifest")
+}
+
+func TestCompactor_TombstoneDropping(t *testing.T) {
+	// When dropTombstones=true (tail segment), tombstones should be garbage collected
+	// from BOTH disk (manifest) AND RAM (BlobIndex).
+	//
+	// This test verifies the fix for the memory leak where tombstones were removed
+	// from the manifest but left as zombie entries in the RAM index.
+
+	tmpDir := t.TempDir()
+	setupTestDirs(t, tmpDir)
+	pool := NewMmapPool("test-footer", 256<<10, 2)
+	defer pool.Close()
+
+	idx, err := index.OpenIndex(tmpDir, 100)
+	require.NoError(t, err)
+	defer idx.Close()
+
+	archivist := NewArchivist(config{Path: tmpDir}, idx)
+	defer archivist.Close()
+
+	segIDs := &segmentIDProvider{}
+	sourceSegID := segIDs.NextSegmentID()
+
+	c := NewCompactor(idx, archivist, segIDs, tmpDir, 0, sys.SyncNone, pool)
+
+	key1 := index.Key{Lo: 1, Hi: 1}
+	keyDeleted := index.Key{Lo: 2, Hi: 2}
+
+	// Write source segment with one live item
+	blob1 := makeTestBlob(t, key1, []byte("value1"), 1)
+	segPath := getSegmentPath(tmpDir, 0, sourceSegID)
+	writeTestSegment(t, segPath, blob1)
+
+	// Create items: one live, one tombstone
+	deletedItem := index.Item{Key: keyDeleted, SegmentID: sourceSegID, Offset: 0, PhysicalLen: 0}
+	deletedItem.SetDeleted()
+
+	items := []index.Item{
+		{Key: key1, SegmentID: sourceSegID, Offset: record.FileHeaderSize, PhysicalLen: uint32(len(blob1))},
+		deletedItem,
+	}
+	require.NoError(t, idx.IngestBatch(sourceSegID, items, 10))
+
+	// Simulate real deletion scenario: markDeleted sets the flag but KEEPS item in RAM.
+	// This is what happens when Delete() is called - the item stays in RAM with IsDeleted=true.
+	// We use MarkDeleted (not Delete) to preserve the entry for the memory leak test.
+	idx.MarkDeleted(keyDeleted)
+
+	// Verify the tombstone is still in RAM before compaction (marked as deleted)
+	itemBefore, foundBefore := idx.Get(keyDeleted)
+	require.True(t, foundBefore, "tombstone should be in RAM before compaction")
+	require.True(t, itemBefore.IsDeleted(), "item should be marked as deleted")
+
+	// Compact with dropTombstones=true (simulating tail segment compaction)
+	result, err := c.Compact([]uint32{sourceSegID}, true)
+	require.NoError(t, err)
+
+	require.Equal(t, 1, result.ItemsCompacted)
+	require.Equal(t, 0, result.TombstonesKept, "tombstones should not be kept")
+	require.Equal(t, 1, result.TombstonesDropped, "tombstone should be dropped")
+
+	// Verify the tombstone was NOT persisted in the new segment's manifest
+	manifest, found := idx.GetSegmentManifest(result.NewSegmentID)
+	require.True(t, found)
+
+	for _, item := range manifest.Items {
+		require.NotEqual(t, keyDeleted, item.Key, "tombstone should not be in compacted manifest")
+	}
+
+	// CRITICAL: Verify tombstone is gone from RAM index (fix for memory leak)
+	_, foundInRAM := idx.Get(keyDeleted)
+	require.False(t, foundInRAM, "tombstone should be removed from RAM index after tail GC")
 }
 
 func TestCompactor_ConcurrentWriteRace(t *testing.T) {
@@ -291,7 +364,7 @@ func TestCompactor_ConcurrentWriteRace(t *testing.T) {
 		},
 	}
 
-	result, err := c.Compact([]uint32{sourceSegID})
+	result, err := c.Compact([]uint32{sourceSegID}, false)
 	require.NoError(t, err)
 
 	// Compaction should succeed (data was written to new segment)

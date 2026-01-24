@@ -67,10 +67,11 @@ func NewCompactor(
 
 // CompactResult contains the outcome of a compaction operation.
 type CompactResult struct {
-	NewSegmentID   uint32   // ID of the newly created segment (0 if nothing written)
-	OldSegmentIDs  []uint32 // IDs of segments that were compacted
-	ItemsCompacted int      // Number of live items written to new segment
-	TombstonesKept int      // Number of tombstones preserved
+	NewSegmentID      uint32   // ID of the newly created segment (0 if nothing written)
+	OldSegmentIDs     []uint32 // IDs of segments that were compacted
+	ItemsCompacted    int      // Number of live items written to new segment
+	TombstonesKept    int      // Number of tombstones preserved
+	TombstonesDropped int      // Number of tombstones garbage collected (tail only)
 }
 
 // relocInfo tracks an item being relocated during compaction.
@@ -86,13 +87,15 @@ type relocInfo struct {
 // (Strict Contiguity Rule). This prevents the "Leapfrog Hazard" where skipping
 // segments could resurrect deleted keys.
 //
-// Tombstones are preserved in the new segment for crash safety. Callers that
-// want to GC tombstones should ensure they're only compacting the oldest segments
-// where no older data could conflict.
+// Parameters:
+//   - segmentIDs: Segment IDs to compact (must be contiguous and ascending)
+//   - dropTombstones: If true, tombstones are garbage collected instead of preserved.
+//     ONLY set this to true when compacting the tail (oldest) segment range.
+//     Otherwise, the Leapfrog Hazard can resurrect deleted keys.
 //
 // Locking: Acquires shared (read) locks on all segment shards to allow concurrent
 // compactions while blocking Delete operations on these segments.
-func (c *Compactor) Compact(segmentIDs []uint32) (CompactResult, error) {
+func (c *Compactor) Compact(segmentIDs []uint32, dropTombstones bool) (CompactResult, error) {
 	result := CompactResult{OldSegmentIDs: segmentIDs}
 
 	if len(segmentIDs) == 0 {
@@ -133,16 +136,30 @@ func (c *Compactor) Compact(segmentIDs []uint32) (CompactResult, error) {
 		return result, err
 	}
 
-	// Add tombstones to index (they have no data in segment file)
+	// Build new items list
 	newItems := make([]index.Item, 0, len(toRelocate)+len(tombstones))
 	for i := range toRelocate {
 		newItems = append(newItems, toRelocate[i].item)
 	}
-	for _, ts := range tombstones {
-		ts.SegmentID = newSegID
-		ts.Offset = 0 // Tombstones have no data
-		newItems = append(newItems, ts)
-		result.TombstonesKept++
+
+	// Handle tombstones based on dropTombstones flag
+	if dropTombstones {
+		// Tail segment: GC tombstones (safe - no older data can conflict)
+		// CRITICAL: We must remove these from the RAM index, otherwise they become
+		// memory leaks (zombie entries pointing to deleted segments).
+		for _, ts := range tombstones {
+			c.index.Delete(ts.Key)
+		}
+		result.TombstonesDropped = len(tombstones)
+		tombstones = nil // Now safe to clear - won't relocate them
+	} else {
+		// Non-tail segment: Preserve tombstones (required for crash safety)
+		for _, ts := range tombstones {
+			ts.SegmentID = newSegID
+			ts.Offset = 0 // Tombstones have no data
+			newItems = append(newItems, ts)
+			result.TombstonesKept++
+		}
 	}
 
 	// Write footer file for crash recovery
@@ -156,12 +173,19 @@ func (c *Compactor) Compact(segmentIDs []uint32) (CompactResult, error) {
 		return result, fmt.Errorf("compaction: write index: %w", err)
 	}
 
-	// Atomically update RAM index via Relocate
+	// Atomically update RAM index via Relocate (live items only)
 	for _, ri := range toRelocate {
 		if c.Knobs != nil && c.Knobs.BeforeRelocate != nil {
 			c.Knobs.BeforeRelocate(ri.item.Key)
 		}
-		c.index.Relocate(ri.item.Key, ri.oldSeg, ri.oldOff, ri.item.SegmentID, ri.item.Offset)
+		// expectDeleted=false: these are live items, fail if deleted (Ghost Guard)
+		c.index.Relocate(ri.item.Key, ri.oldSeg, ri.oldOff, ri.item.SegmentID, ri.item.Offset, false)
+	}
+
+	// Update RAM index for tombstones (they have no physical data but need segment ID update)
+	for _, ts := range tombstones {
+		// expectDeleted=true: these are tombstones, fail if NOT deleted (race detected)
+		c.index.Relocate(ts.Key, ts.SegmentID, ts.Offset, newSegID, 0, true)
 	}
 
 	// Drop old segment metadata and files

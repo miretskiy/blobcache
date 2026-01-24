@@ -22,5 +22,8 @@ Cargo.lock
 *.dll
 *.exe
 
-# TLA+ tools (download separately)
+# TLA+ tools and artifacts
 tla2tools.jar
+*_TTrace_*.bin
+*_TTrace_*.tla
+states/

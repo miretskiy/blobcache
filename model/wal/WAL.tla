@@ -436,14 +436,21 @@ Next ==
 (***************************************************************************
  * FAIRNESS
  *
- * Weak fairness ensures progress: if an action is always enabled,
+ * Weak fairness (WF) ensures progress: if an action is continuously enabled,
  * it eventually happens. This models Go runtime fairness guarantees.
  *
+ * We need fairness on:
+ * - BecomeLeader: If pending writers exist and no leader, one becomes leader
+ * - FlushBatch*: Leaders eventually flush
+ * - FinishFlush: Flushing leaders eventually finish
+ * - WriterReturnsDone: Done writers eventually return to idle
+ *
  * Without fairness, TLC could construct pathological behaviors where
- * a leader holds the lock forever - unrealistic given sync.Mutex fairness.
+ * the system stutters forever - unrealistic given Go's scheduler.
  ***************************************************************************)
 
 Fairness ==
+    /\ \A w \in Writers : WF_vars(BecomeLeader(w))
     /\ \A w \in Writers : WF_vars(FlushBatchSuccess(w))
     /\ \A w \in Writers : WF_vars(FlushBatchReject(w))
     /\ \A w \in Writers : WF_vars(FinishFlush(w))
@@ -491,6 +498,16 @@ InvDurability ==
 \* (Data that was fsync'd stays fsync'd)
 PropCrashSafe ==
     [][\A s \in disk : s \in disk']_vars
+
+\* PROP-2: Liveness - A submitted write eventually completes
+\* The "~>" (leads-to) operator means: if P becomes true, Q eventually becomes true.
+\* With fairness constraints in Spec, this verifies no deadlocks or starvation.
+\*
+\* Note: Crash resets writers to "idle", so even with crashes this property holds.
+\* A writer either: (a) completes normally, (b) is reset by crash to idle.
+PropWriteCompletes ==
+    \A w \in Writers :
+        (writerState[w] = "pending") ~> (writerState[w] = "idle")
 
 (***************************************************************************
  * ERROR TRACE GUIDE

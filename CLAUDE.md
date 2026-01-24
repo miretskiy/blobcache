@@ -30,7 +30,7 @@ Both modes share the same unified log-structured architecture (Project Ferrum) w
 - Exceptional API design with clear configuration options
 - Code clarity over cleverness
 - Static analysis: `go vet`, `staticcheck`, `go fmt` on ALL files before commit
-- Zero warnings tolerated
+- **ZERO WARNINGS TOLERATED** - This means exactly what it says: NOT A SINGLE WARNING. No distinction between "new" vs "pre-existing" warnings. No excuses. If `go vet` or `staticcheck` produces ANY warning in ANY file, fix it before committing. The codebase must be warning-free at all times.
 
 **Resource Management:**
 - Minimal GC impact via `MmapPool` arena allocations

@@ -32,6 +32,12 @@ func (p *segmentIDProvider) NextSegmentID() uint32 {
 	return p.counter.Add(1)
 }
 
+// CurrentSegmentID returns the most recently allocated segment ID.
+// Used by compaction to determine the "cooling period" boundary.
+func (p *segmentIDProvider) CurrentSegmentID() uint32 {
+	return p.counter.Load()
+}
+
 // scanMaxSegmentID scans the segments directory and returns the highest segment ID found.
 // Returns 0 if no segments exist.
 func scanMaxSegmentID(basePath string, shards int) uint32 {

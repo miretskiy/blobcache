@@ -292,7 +292,7 @@ func TestRelocate_Success(t *testing.T) {
 	idx.Put(item)
 
 	// Relocate from (10, 100) to (20, 200)
-	ok := idx.Relocate(k, 10, 100, 20, 200, false)
+	ok := idx.Relocate(k, 10, 20, 100, 200, RelocateLive)
 	require.True(t, ok, "Relocate should succeed when location matches")
 
 	// Verify the item was updated
@@ -313,7 +313,7 @@ func TestRelocate_FailSegmentMismatch(t *testing.T) {
 	idx.Put(item)
 
 	// Try to relocate from wrong segment (15, 100) - should fail
-	ok := idx.Relocate(k, 15, 100, 20, 200, false)
+	ok := idx.Relocate(k, 15, 20, 100, 200, RelocateLive)
 	require.False(t, ok, "Relocate should fail when segment doesn't match")
 
 	// Verify the item was NOT updated
@@ -332,7 +332,7 @@ func TestRelocate_FailOffsetMismatch(t *testing.T) {
 	idx.Put(item)
 
 	// Try to relocate from wrong offset (10, 150) - should fail
-	ok := idx.Relocate(k, 10, 150, 20, 200, false)
+	ok := idx.Relocate(k, 10, 20, 150, 200, RelocateLive)
 	require.False(t, ok, "Relocate should fail when offset doesn't match")
 
 	// Verify the item was NOT updated
@@ -346,7 +346,7 @@ func TestRelocate_FailKeyNotFound(t *testing.T) {
 	k := makeTestKey(1)
 
 	// Try to relocate non-existent key
-	ok := idx.Relocate(k, 10, 100, 20, 200, false)
+	ok := idx.Relocate(k, 10, 20, 100, 200, RelocateLive)
 	require.False(t, ok, "Relocate should fail when key doesn't exist")
 }
 
@@ -368,7 +368,7 @@ func TestRelocate_ConcurrentRace(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if idx.Relocate(k, 10, 100, 20, 200, false) {
+		if idx.Relocate(k, 10, 20, 100, 200, RelocateLive) {
 			relocateWon.Store(true)
 		}
 	}()
@@ -417,7 +417,7 @@ func TestRelocate_PreservesFlags(t *testing.T) {
 	idx.Put(item)
 
 	// Relocate should succeed (item is live, just has error flag)
-	ok := idx.Relocate(k, 10, 100, 20, 200, false)
+	ok := idx.Relocate(k, 10, 20, 100, 200, RelocateLive)
 	require.True(t, ok, "Relocate should succeed for live item with errno")
 
 	// Verify flags are preserved and location updated
@@ -471,7 +471,7 @@ func TestRelocate_GhostGuard(t *testing.T) {
 
 	// T3: Compactor attempts relocation (has stale view of item as live)
 	// This should FAIL because item is now deleted
-	relocated := idx.Relocate(key, 10, 100, 50, 200, false)
+	relocated := idx.Relocate(key, 10, 50, 100, 200, RelocateLive)
 	require.False(t, relocated, "should not relocate deleted item (Ghost Guard)")
 
 	// T4: Verify item remains deleted with OLD location
@@ -515,13 +515,13 @@ func TestRelocate_TombstoneMigration(t *testing.T) {
 	require.Equal(t, uint32(10), got.SegmentID)
 	require.Equal(t, uint32(100), got.Offset)
 
-	// Relocate with expectDeleted=false should FAIL (Ghost Guard)
-	relocatedLive := idx.Relocate(key, 10, 100, 50, 0, false)
+	// Relocate with RelocateLive should FAIL (Ghost Guard)
+	relocatedLive := idx.Relocate(key, 10, 50, 100, 0, RelocateLive)
 	require.False(t, relocatedLive, "should not relocate tombstone as live item")
 
-	// Relocate with expectDeleted=true should SUCCEED (tombstone migration)
-	relocatedTombstone := idx.Relocate(key, 10, 100, 50, 0, true)
-	require.True(t, relocatedTombstone, "should relocate tombstone with expectDeleted=true")
+	// Relocate with RelocateTombstone should SUCCEED (tombstone migration)
+	relocatedTombstone := idx.Relocate(key, 10, 50, 100, 0, RelocateTombstone)
+	require.True(t, relocatedTombstone, "should relocate tombstone with RelocateTombstone")
 
 	// Verify tombstone was moved
 	got, ok = idx.Get(key)
@@ -560,11 +560,11 @@ func TestRelocate_TombstoneMigration_RaceDetection(t *testing.T) {
 	s.Unlock()
 
 	// Tombstone relocation should FAIL because item is now live
-	relocated := idx.Relocate(key, 10, 100, 50, 0, true)
+	relocated := idx.Relocate(key, 10, 50, 100, 0, RelocateTombstone)
 	require.False(t, relocated, "should fail: item is no longer deleted")
 
 	// Also fails because location doesn't match
-	relocated = idx.Relocate(key, 20, 500, 50, 0, true)
+	relocated = idx.Relocate(key, 20, 50, 500, 0, RelocateTombstone)
 	require.False(t, relocated, "should fail: item is live, not tombstone")
 }
 

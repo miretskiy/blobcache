@@ -153,7 +153,7 @@ func (mt *MemTable) maybeCompress(src []byte) BufferHandle {
 
 	// Compression succeeded - update handle's working buffer to the compressed data
 	handle.SetBytes(result)
-	return handle
+	return BufferHandle{h: handle.h}
 }
 
 // --- Write Logic ---

@@ -29,6 +29,27 @@ func (s SegmentStats) WasteRatio() float64 {
 // Segments with fewer tombstones are not worth the I/O overhead.
 const DefaultTombstoneCompactionThreshold = 100
 
+// coolingPeriodMargin adds safety margin to the cooling period.
+// This ensures segments are fully aged out of Librarian before compaction.
+const coolingPeriodMargin = 2
+
+// isEligibleForCompaction returns true if a segment has "cooled" enough to be compacted.
+// The cooling period ensures segments still in Librarian's cache are not compacted,
+// preventing dangling references when segment files are deleted.
+//
+// The boundary is: segID + coolingGap < currentSegID
+// where coolingGap = MaxCachedSlabs + margin
+func (c *Cache) isEligibleForCompaction(segID uint32) bool {
+	currentSegID := c.segIDs.CurrentSegmentID()
+	coolingGap := uint32(c.MaxCachedSlabs + coolingPeriodMargin)
+
+	// Avoid underflow: if currentSegID is small, no segments are eligible
+	if currentSegID <= coolingGap {
+		return false
+	}
+	return segID < currentSegID-coolingGap
+}
+
 // computeSegmentStats scans all segments and computes statistics.
 // Returns a map from SegmentID to stats.
 func (c *Cache) computeSegmentStats() (map[uint32]*SegmentStats, error) {
@@ -59,6 +80,7 @@ func (c *Cache) computeSegmentStats() (map[uint32]*SegmentStats, error) {
 
 // selectSegmentsForTombstoneCompaction returns segment IDs that exceed the tombstone threshold.
 // Returns segments sorted by SegmentID (ascending) for deterministic processing.
+// Segments still in the "hot zone" (Librarian cache) are excluded via cooling period check.
 func (c *Cache) selectSegmentsForTombstoneCompaction(minTombstones int) ([]uint32, error) {
 	stats, err := c.computeSegmentStats()
 	if err != nil {
@@ -67,7 +89,7 @@ func (c *Cache) selectSegmentsForTombstoneCompaction(minTombstones int) ([]uint3
 
 	var selected []uint32
 	for _, ss := range stats {
-		if ss.TombstoneCount >= minTombstones {
+		if ss.TombstoneCount >= minTombstones && c.isEligibleForCompaction(ss.SegmentID) {
 			selected = append(selected, ss.SegmentID)
 		}
 	}
@@ -114,6 +136,7 @@ func selectContiguousRanges(segmentIDs []uint32) [][]uint32 {
 // contiguous ranges of at least minRangeSize.
 //
 // Returns slices of contiguous segment IDs that can be passed to Compactor.Compact().
+// Segments still in the "hot zone" (Librarian cache) are excluded via cooling period check.
 // Future: Will use PhysicalBytes/LogicalBytes ratio from stat.Blocks.
 func (c *Cache) selectSegmentsForMerge(maxWasteRatio float64, minRangeSize int) ([][]uint32, error) {
 	stats, err := c.computeSegmentStats()
@@ -121,10 +144,10 @@ func (c *Cache) selectSegmentsForMerge(maxWasteRatio float64, minRangeSize int) 
 		return nil, err
 	}
 
-	// Collect segments with high waste ratio
+	// Collect segments with high waste ratio that have cooled
 	var sparse []uint32
 	for _, ss := range stats {
-		if ss.WasteRatio() >= maxWasteRatio {
+		if ss.WasteRatio() >= maxWasteRatio && c.isEligibleForCompaction(ss.SegmentID) {
 			sparse = append(sparse, ss.SegmentID)
 		}
 	}

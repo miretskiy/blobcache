@@ -478,13 +478,13 @@ func evictUpTo(
 //   - If a concurrent write updated the item to a newer segment, relocation fails (safe)
 //   - If the item is still at the expected old location, relocation succeeds
 //
-// The expectDeleted parameter controls the "Ghost Guard" behavior:
-//   - expectDeleted=false: Relocating live items. Fails if item was deleted (Ghost Guard).
-//   - expectDeleted=true: Relocating tombstones. Fails if item is NOT deleted (race detected).
+// The mode parameter controls the "Ghost Guard" behavior:
+//   - RelocateLive: Relocating live items. Fails if item was deleted (Ghost Guard).
+//   - RelocateTombstone: Relocating tombstones. Fails if item is NOT deleted (race detected).
 //
 // The compare-and-swap semantics prevent the "Leapfrog Hazard" where compaction
 // could accidentally overwrite a newer write with stale data from an old segment.
-func (idx *BlobIndex) Relocate(k Key, oldSeg, oldOff, newSeg, newOff uint32, expectDeleted bool) bool {
+func (idx *BlobIndex) Relocate(k Key, oldSeg, newSeg SegmentID, oldOff, newOff Offset, mode RelocateMode) bool {
 	s := idx.Shard(k)
 
 	s.Lock()
@@ -496,20 +496,87 @@ func (idx *BlobIndex) Relocate(k Key, oldSeg, oldOff, newSeg, newOff uint32, exp
 	}
 
 	item := &s.Extra.nodes[i].item
-	if item.SegmentID != oldSeg || item.Offset != oldOff {
+	if SegmentID(item.SegmentID) != oldSeg || Offset(item.Offset) != oldOff {
 		// Location changed since we read it - someone else updated the item
 		return false
 	}
 
 	// State Guard: Verify deleted state matches expectation.
-	// - expectDeleted=false (live items): Fails if deleted (Ghost Guard)
-	// - expectDeleted=true (tombstones): Fails if not deleted (race detected)
-	if item.IsDeleted() != expectDeleted {
+	// - RelocateLive: Fails if deleted (Ghost Guard)
+	// - RelocateTombstone: Fails if not deleted (race detected)
+	if item.IsDeleted() != mode.ExpectDeleted() {
 		return false
 	}
 
 	// Relocation success: update to new location
-	item.SegmentID = newSeg
-	item.Offset = newOff
+	item.SegmentID = uint32(newSeg)
+	item.Offset = uint32(newOff)
 	return true
+}
+
+// RelocationRequest describes a single item relocation.
+type RelocationRequest struct {
+	Key          Key
+	OldSegmentID SegmentID
+	OldOffset    Offset
+	NewSegmentID SegmentID
+	NewOffset    Offset
+	Mode         RelocateMode
+}
+
+// RelocateBatch applies multiple relocations with minimized lock contention.
+// Updates are grouped by shard so each shard lock is acquired exactly once,
+// eliminating per-item lock thrashing during large compactions.
+//
+// Returns the number of successful relocations.
+func (idx *BlobIndex) RelocateBatch(requests []RelocationRequest) int {
+	if len(requests) == 0 {
+		return 0
+	}
+
+	// Partition requests by shard index (no locking)
+	// Use slice of slices to avoid map overhead
+	shardRequests := make([][]int, ShardCount)
+	for i := range requests {
+		shardID := int(requests[i].Key.Lo & uint64(ShardCount-1))
+		shardRequests[shardID] = append(shardRequests[shardID], i)
+	}
+
+	// Process each shard (lock once per shard)
+	successCount := 0
+	for shardID, reqIndices := range shardRequests {
+		if len(reqIndices) == 0 {
+			continue
+		}
+
+		s := idx.ShardAt(shardID)
+		s.Lock()
+		for _, reqIdx := range reqIndices {
+			req := &requests[reqIdx]
+
+			nodeIdx, ok := s.Items[req.Key]
+			if !ok {
+				continue
+			}
+
+			item := &s.Extra.nodes[nodeIdx].item
+			if SegmentID(item.SegmentID) != req.OldSegmentID || Offset(item.Offset) != req.OldOffset {
+				// Location changed - concurrent write won
+				continue
+			}
+
+			if item.IsDeleted() != req.Mode.ExpectDeleted() {
+				// State mismatch - Ghost Guard / Race Guard triggered
+				continue
+			}
+
+			// Success: update location
+			item.SegmentID = uint32(req.NewSegmentID)
+			item.Offset = uint32(req.NewOffset)
+			successCount++
+		}
+		s.Unlock()
+	}
+
+	return successCount
 }

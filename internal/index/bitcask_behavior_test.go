@@ -144,7 +144,7 @@ func TestBitcask_ConcurrentDeleteDuringTransaction(t *testing.T) {
 	require.NoError(t, db.Delete([]byte("victim")))
 
 	// T4: Transaction reads again
-	val, err = txn.Get([]byte("victim"))
+	_, err = txn.Get([]byte("victim"))
 
 	if err != nil {
 		t.Log("⚠️  SEES DELETION: Transaction sees external delete")

@@ -95,6 +95,7 @@ type SequenceVendor interface {
 // Both MemTable (normal writes) and Compaction use this to avoid conflicts.
 type SegmentIDProvider interface {
 	NextSegmentID() uint32
+	CurrentSegmentID() uint32
 }
 
 func (c *Cache) IsDegraded() bool {

@@ -143,6 +143,14 @@ func TestSelectSegmentsForTombstoneCompaction(t *testing.T) {
 		require.NoError(t, cache.Delete(key))
 	}
 
+	// Create additional segments to push the first segment past the cooling period.
+	// With MaxCachedSlabs=0, coolingGap=2, so we need at least 2 more segment IDs.
+	for range 3 {
+		largeValue := make([]byte, 200_000) // Force new segments
+		require.NoError(t, cache.Put([]byte("filler-key"), largeValue))
+		cache.Drain()
+	}
+
 	// Now should select the segment with threshold=10
 	segments, err = cache.selectSegmentsForTombstoneCompaction(10)
 	require.NoError(t, err)

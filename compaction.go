@@ -178,14 +178,20 @@ func (c *Compactor) Compact(segmentIDs []uint32, dropTombstones bool) (CompactRe
 		if c.Knobs != nil && c.Knobs.BeforeRelocate != nil {
 			c.Knobs.BeforeRelocate(ri.item.Key)
 		}
-		// expectDeleted=false: these are live items, fail if deleted (Ghost Guard)
-		c.index.Relocate(ri.item.Key, ri.oldSeg, ri.oldOff, ri.item.SegmentID, ri.item.Offset, false)
+		// RelocateLive: these are live items, fail if deleted (Ghost Guard)
+		c.index.Relocate(ri.item.Key,
+			index.SegmentID(ri.oldSeg), index.SegmentID(ri.item.SegmentID),
+			index.Offset(ri.oldOff), index.Offset(ri.item.Offset),
+			index.RelocateLive)
 	}
 
 	// Update RAM index for tombstones (they have no physical data but need segment ID update)
 	for _, ts := range tombstones {
-		// expectDeleted=true: these are tombstones, fail if NOT deleted (race detected)
-		c.index.Relocate(ts.Key, ts.SegmentID, ts.Offset, newSegID, 0, true)
+		// RelocateTombstone: these are tombstones, fail if NOT deleted (race detected)
+		c.index.Relocate(ts.Key,
+			index.SegmentID(ts.SegmentID), index.SegmentID(newSegID),
+			index.Offset(ts.Offset), index.Offset(0),
+			index.RelocateTombstone)
 	}
 
 	// Drop old segment metadata and files

@@ -33,16 +33,6 @@ const (
 // maxChunkSize is the maximum size for a Bitcask value (default 256KB).
 var maxChunkSize uint64 = 256 << 10
 
-// testingSetMaxChunkSize sets a custom max chunk size for testing.
-// Usage: defer testingSetMaxChunkSize(123)()
-func testingSetMaxChunkSize(size uint64) func() {
-	old := maxChunkSize
-	maxChunkSize = size
-	return func() {
-		maxChunkSize = old
-	}
-}
-
 // DurableBatch holds lean Items for a batch in persistent storage.
 // This is what gets serialized to Bitcask.
 type DurableBatch struct {
@@ -553,9 +543,7 @@ func (p *persistence) compactTombstones(segID uint32, onTombstone TombstoneFn) e
 			maxSeqID = manifest.MaxSeqID
 		}
 
-		for _, item := range manifest.Items {
-			allItems = append(allItems, item)
-		}
+		allItems = append(allItems, manifest.Items...)
 		return nil
 	})
 	if err != nil {

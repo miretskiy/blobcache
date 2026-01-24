@@ -173,26 +173,37 @@ func (c *Compactor) Compact(segmentIDs []uint32, dropTombstones bool) (CompactRe
 		return result, fmt.Errorf("compaction: write index: %w", err)
 	}
 
-	// Atomically update RAM index via Relocate (live items only)
+	// Build relocation requests for batch processing
+	// Call test hooks before building requests (simulates concurrent modifications)
+	requests := make([]index.RelocationRequest, 0, len(toRelocate)+len(tombstones))
+
 	for _, ri := range toRelocate {
 		if c.Knobs != nil && c.Knobs.BeforeRelocate != nil {
 			c.Knobs.BeforeRelocate(ri.item.Key)
 		}
-		// RelocateLive: these are live items, fail if deleted (Ghost Guard)
-		c.index.Relocate(ri.item.Key,
-			index.SegmentID(ri.oldSeg), index.SegmentID(ri.item.SegmentID),
-			index.Offset(ri.oldOff), index.Offset(ri.item.Offset),
-			index.RelocateLive)
+		requests = append(requests, index.RelocationRequest{
+			Key:          ri.item.Key,
+			OldSegmentID: index.SegmentID(ri.oldSeg),
+			OldOffset:    index.Offset(ri.oldOff),
+			NewSegmentID: index.SegmentID(ri.item.SegmentID),
+			NewOffset:    index.Offset(ri.item.Offset),
+			Mode:         index.RelocateLive,
+		})
 	}
 
-	// Update RAM index for tombstones (they have no physical data but need segment ID update)
 	for _, ts := range tombstones {
-		// RelocateTombstone: these are tombstones, fail if NOT deleted (race detected)
-		c.index.Relocate(ts.Key,
-			index.SegmentID(ts.SegmentID), index.SegmentID(newSegID),
-			index.Offset(ts.Offset), index.Offset(0),
-			index.RelocateTombstone)
+		requests = append(requests, index.RelocationRequest{
+			Key:          ts.Key,
+			OldSegmentID: index.SegmentID(ts.SegmentID),
+			OldOffset:    index.Offset(ts.Offset),
+			NewSegmentID: index.SegmentID(newSegID),
+			NewOffset:    0,
+			Mode:         index.RelocateTombstone,
+		})
 	}
+
+	// Batch relocate: acquires each shard lock exactly once
+	c.index.RelocateBatch(requests)
 
 	// Drop old segment metadata and files
 	if err := c.dropSegments(segmentIDs); err != nil {

@@ -92,6 +92,10 @@ func (idx *DurableIndex) Relocate(k Key, oldSeg, newSeg SegmentID, oldOff, newOf
 	return idx.blobs.Relocate(k, oldSeg, newSeg, oldOff, newOff, mode)
 }
 
+func (idx *DurableIndex) RelocateBatch(requests []RelocationRequest) int {
+	return idx.blobs.RelocateBatch(requests)
+}
+
 // GetSegmentManifest retrieves the metadata for a specific segment.
 // It reconstructs the manifest from fragmented chunks if necessary.
 // Returns (manifest, true) if found, or (zero-value, false) if not.

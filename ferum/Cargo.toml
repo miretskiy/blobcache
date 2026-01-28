@@ -1,0 +1,67 @@
+[package]
+name = "ferum"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "High-performance blob cache with CAS storage support"
+license = "Apache-2.0"
+repository = "https://github.com/miretskiy/blobcache"
+keywords = ["cache", "storage", "blob", "cas"]
+categories = ["caching", "data-structures"]
+
+[dependencies]
+# Hashing
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+crc32fast = "1.4"
+
+# Memory mapping
+memmap2 = "0.9"
+
+# Compression
+zstd = "0.13"
+lz4_flex = "0.11"
+
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "fs", "io-util", "macros"] }
+
+# Concurrency
+parking_lot = "0.12"
+crossbeam = { version = "0.8", features = ["crossbeam-channel"] }
+arc-swap = "1.7"
+
+# Error handling
+thiserror = "2"
+
+# Utilities
+byteorder = "1.5"
+libc = "0.2"
+
+# Durable index (Bitcask-style persistence)
+redb = "2"
+
+[dev-dependencies]
+proptest = "1.6"
+criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3"
+rand = { version = "0.8", features = ["small_rng"] }  # Use 0.8 for rand_distr compatibility
+rand_distr = "0.4"  # For Zipf distribution (requires rand 0.8)
+hdrhistogram = "7"  # HDR histogram for latency tracking
+sysinfo = "0.33"    # For memory/system monitoring
+num_cpus = "1.16"   # For parallel benchmark
+
+[[bench]]
+name = "cache"
+harness = false
+
+[features]
+default = []
+# Enable loom for concurrency testing
+loom = []
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.bench]
+debug = true

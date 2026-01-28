@@ -47,10 +47,14 @@ const COMPACTION_INTERVAL: Duration = Duration::from_secs(10 * 60);
 struct RecoveryReplayer<'a> {
     memtable: &'a MemTable,
     bloom: &'a BloomFilter,
+    index: &'a DurableIndex,
 }
 
 impl<'a> Replayer for RecoveryReplayer<'a> {
     /// Replays a WAL record into the memtable.
+    ///
+    /// For puts: writes record as-is (no compression, no CRC recalc).
+    /// For deletes: looks up existing item and marks as tombstone (does NOT write to slab).
     fn replay_record(&mut self, record: Record) -> Result<()> {
         #[cfg(test)]
         eprintln!(
@@ -62,22 +66,23 @@ impl<'a> Replayer for RecoveryReplayer<'a> {
         );
         let key = Key::from_bytes(&record.key);
 
-        // Add to bloom filter
+        if record.header.is_deleted() {
+            // Replay delete: remove item from in-memory index
+            // Do NOT write to memtable - tombstones are index-only operations during recovery
+            // The item was already committed to a segment before the delete
+            self.index.delete(&key);
+            return Ok(());
+        }
+
+        // Add to bloom filter for puts
         self.bloom.add(key);
 
-        // Check if this is a tombstone (delete) record
-        let result = if record.header.is_deleted() {
-            // Replay as delete - write tombstone to memtable
-            self.memtable.delete(record.header.seq_id, key, &record.key)
-        } else {
-            // Replay as normal put
-            self.memtable.put(
-                record.header.seq_id,
-                key,
-                &record.key,
-                &record.value,
-            )
-        };
+        // Replay the Put directly:
+        // - Use original SeqID (not new sequence)
+        // - Use original CRC (already verified during WAL read)
+        // - Bypass compression (value is already in final form)
+        // - Write record as-is to slab
+        let result = self.memtable.replay_record(key, &record);
 
         #[cfg(test)]
         if let Err(ref e) = result {
@@ -242,6 +247,7 @@ impl Cache {
         let mut replayer = RecoveryReplayer {
             memtable: &memtable,
             bloom: &bloom,
+            index: &index,
         };
 
         // Recover - replays records and flushes

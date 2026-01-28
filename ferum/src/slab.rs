@@ -212,19 +212,14 @@ impl SharedSlab {
         // 3. Determine which buffer to read from
         // For XL entries, xl_buf contains the full record starting at offset 0
         // For normal entries, pos points to the record start in the slab buffer
+        // Arc::clone safely increments ref count - no try_inc needed
         let (buf, offset) = if let Some(ref xl_buf) = entry.xl_buf {
             (Arc::clone(xl_buf), 0i64)
         } else {
             (Arc::clone(&self.buf), entry.pos)
         };
 
-        // 4. Safe pin via TryInc
-        if !buf.try_inc() {
-            // Buffer died between lookup and pin
-            return Ok(None);
-        }
-
-        // 5. Extract key bytes
+        // 4. Extract key bytes
         let key_start = offset as usize + HEADER_SIZE;
         let key_end = key_start + entry.key_len as usize;
         let stored_key = buf.as_slice()[key_start..key_end].to_vec();
@@ -233,13 +228,13 @@ impl SharedSlab {
         let value_end = key_end + entry.physical_size as usize;
         let physical_data = &buf.as_slice()[key_end..value_end];
 
-        // 7. Handle decompression
+        // 6. Handle decompression
+        // Note: buf (Arc) is automatically dropped when we return, releasing the reference
         let value = if entry.is_compressed() {
             let mut decompressed = vec![0u8; entry.logical_size as usize];
             match compression::decompress(entry.compression(), &mut decompressed, physical_data) {
                 Ok(()) => decompressed,
                 Err(_) => {
-                    buf.unpin();
                     return Err(BlobErrno::Decompression);
                 }
             }
@@ -277,7 +272,8 @@ pub struct ActiveSlab {
     /// Current write position in the buffer.
     pub write_pos: AtomicI64,
     /// Number of pending writes (writers that have reserved but not committed).
-    pub pending_writes: AtomicI64,
+    /// Wrapped in Arc so writers can hold a reference across lock releases.
+    pub pending_writes: Arc<AtomicI64>,
     /// Whether this slab has been retired (no longer accepting writes).
     pub retired: AtomicBool,
     /// ID of the WAL file containing this slab's records.
@@ -295,7 +291,7 @@ impl ActiveSlab {
             buf,
             index: Arc::new(SlabIndex::new()),
             write_pos: AtomicI64::new(0),
-            pending_writes: AtomicI64::new(0),
+            pending_writes: Arc::new(AtomicI64::new(0)),
             retired: AtomicBool::new(false),
             wal_file_id: AtomicU64::new(0),
             current_max_seq: AtomicU64::new(0),
@@ -386,10 +382,8 @@ impl ActiveSlab {
     }
 
     /// Creates a flush ticket (reference to the buffer for flushing).
+    /// Arc::clone safely increments ref count - no try_inc needed.
     pub fn flush_ticket(&self) -> FlushTicket {
-        if !self.buf.try_inc() {
-            panic!("attempted to flush a dead slab");
-        }
         FlushTicket {
             buf: Arc::clone(&self.buf),
         }
@@ -412,8 +406,9 @@ impl FlushTicket {
     }
 
     /// Redeems (releases) the ticket.
+    /// The Arc is dropped when FlushTicket is dropped, releasing the reference.
     pub fn redeem(self) {
-        self.buf.unpin();
+        // Arc dropped implicitly - no explicit unpin needed
     }
 }
 

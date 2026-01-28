@@ -444,15 +444,16 @@ impl Wal {
     }
 
     /// Flush a batch of records using "Pad & Advance" for O_DIRECT.
+    /// If the batch exceeds buffer capacity, it is split into multiple chunks.
+    /// Records larger than the buffer are handled via write_large_record (slow path).
     fn flush_records(&self, state: &mut WalState, batch: &[*mut Request]) -> Result<()> {
         if batch.is_empty() {
             return Ok(());
         }
 
-        // Scan for min/max SeqID and validate sequence guard
+        // 1. Scan for min/max SeqID and validate sequence guard
         let mut min_seq = u64::MAX;
         let mut max_seq = 0u64;
-        let mut total_size = 0usize;
 
         for req_ptr in batch {
             let req = unsafe { &**req_ptr };
@@ -473,7 +474,6 @@ impl Wal {
                         ),
                     });
                 }
-                total_size += record.encoded_size();
             }
         }
 
@@ -482,85 +482,228 @@ impl Wal {
             state.current_max_seq = max_seq;
         }
 
-        // Ensure file is open
+        // 2. Ensure file is open
         if state.file.is_none() {
             self.ensure_file(state, min_seq)?;
         }
 
-        // Calculate write size
-        let need_header = state.file_offset == 0;
-        let mut payload_size = total_size;
-        if need_header {
-            payload_size += FILE_HEADER_SIZE;
-        }
-        let write_size = sys::page_align(payload_size);
+        // 3. Write records in chunks that fit the staging buffer
+        let buf_cap = state.encode_buf.capacity();
+        let mut total_bytes = 0usize;
+        let mut idx = 0;
 
-        // Check buffer capacity
-        let buf_capacity = state.encode_buf.capacity();
-        if buf_capacity < write_size {
-            return Err(Error::BufferTooSmall {
-                needed: write_size,
-                have: buf_capacity,
+        while idx < batch.len() {
+            // Check if we need file header (may change after oversized writes)
+            let need_header = state.file_offset == 0;
+            let overhead = if need_header { FILE_HEADER_SIZE } else { 0 };
+
+            let chunk_start = idx;
+            let mut chunk_size = overhead;
+
+            while idx < batch.len() {
+                let req = unsafe { &*batch[idx] };
+                if let Some(ref record) = req.record {
+                    let rec_size = record.encoded_size();
+                    let projected_write = sys::page_align(chunk_size + rec_size);
+
+                    if projected_write <= buf_cap {
+                        // Record fits in current chunk
+                        chunk_size += rec_size;
+                        idx += 1;
+                    } else if chunk_start == idx {
+                        // Single record exceeds buffer - use slow path
+                        self.write_large_record(state, batch[idx])?;
+                        total_bytes += rec_size;
+                        idx += 1;
+                        // Reset chunk tracking - header may have been written
+                        break;
+                    } else {
+                        // Chunk is full, write what we have
+                        break;
+                    }
+                } else {
+                    idx += 1;
+                }
+            }
+
+            // Write the chunk (if we have records to write)
+            if chunk_start < idx && chunk_size > overhead {
+                let include_header = state.file_offset == 0;
+                let bytes_written = self.write_chunk(state, &batch[chunk_start..idx], include_header)?;
+                total_bytes += bytes_written;
+            }
+        }
+
+        // Update stats
+        self.stats.written_bytes.fetch_add(total_bytes as i64, Ordering::Relaxed);
+        self.stats.written_records.fetch_add(batch.len() as i64, Ordering::Relaxed);
+        self.stats.sync_count.fetch_add(1, Ordering::Relaxed);
+        self.stats.group_commits.fetch_add(1, Ordering::Relaxed);
+
+        Ok(())
+    }
+
+    /// Writes a chunk of records that fits in the staging buffer.
+    /// Returns the number of payload bytes written (excluding header and padding).
+    fn write_chunk(&self, state: &mut WalState, chunk: &[*mut Request], include_header: bool) -> Result<usize> {
+        // Calculate payload size
+        let mut payload_size = 0usize;
+        for &req_ptr in chunk {
+            let req = unsafe { &*req_ptr };
+            if let Some(ref record) = req.record {
+                payload_size += record.encoded_size();
+            }
+        }
+
+        let mut total_payload = payload_size;
+        if include_header {
+            total_payload += FILE_HEADER_SIZE;
+        }
+        let write_size = sys::page_align(total_payload);
+
+        // Track base file offset for WriteResult (before modifying state)
+        let base_file_offset = if include_header {
+            state.file_offset + FILE_HEADER_SIZE as i64
+        } else {
+            state.file_offset
+        };
+
+        // Build buffer, encode, and write - all in one scope
+        {
+            let buf = &mut state.encode_buf.spare_capacity_mut()[..write_size];
+            let mut buf_offset = 0;
+
+            // Write header if needed
+            if include_header {
+                let header = FileHeader::new();
+                header.encode(&mut buf[0..FILE_HEADER_SIZE]);
+                buf_offset = FILE_HEADER_SIZE;
+            }
+
+            // Serialize records and populate WriteResult
+            let mut record_offset = base_file_offset;
+            for &req_ptr in chunk {
+                let req = unsafe { &mut *req_ptr };
+                if let Some(ref record) = req.record {
+                    let rec_size = record.encoded_size();
+                    record.encode(&mut buf[buf_offset..]).map_err(|e| {
+                        Error::io("encode record", std::io::Error::other(e.to_string()))
+                    })?;
+
+                    req.result = WriteResult {
+                        offset: record_offset,
+                        bytes_written: rec_size as i64,
+                        bytes_aligned: write_size as i64,
+                    };
+
+                    buf_offset += rec_size;
+                    record_offset += rec_size as i64;
+                }
+            }
+
+            // Zero-pad tail
+            for b in &mut buf[buf_offset..write_size] {
+                *b = 0;
+            }
+        }
+
+        // Now write using a fresh slice from encode_buf
+        let file = state.file.as_mut().ok_or_else(|| {
+            Error::InvalidConfig { message: "WAL file not open".to_string() }
+        })?;
+        let data = &state.encode_buf.spare_capacity_mut()[..write_size];
+        file.write_all(data).map_err(|e| Error::io("write WAL", e))?;
+        sys::sync_file(file, self.config.flags)?;
+        state.file_offset += write_size as i64;
+
+        Ok(payload_size)
+    }
+
+    /// Handles a single record larger than the staging buffer.
+    /// Allocates a temporary aligned buffer for the write (slow path).
+    fn write_large_record(&self, state: &mut WalState, req_ptr: *mut Request) -> Result<()> {
+        let req = unsafe { &mut *req_ptr };
+        let record = match &req.record {
+            Some(r) => r,
+            None => return Ok(()),
+        };
+
+        // Validate sequence and update max tracker
+        let seq = record.header.seq_id;
+        if seq <= state.last_rotated_seq {
+            return Err(Error::InvalidConfig {
+                message: format!("sequence regression: {} <= {}", seq, state.last_rotated_seq),
             });
         }
+        if seq > state.current_max_seq {
+            state.current_max_seq = seq;
+        }
 
-        // Build the write buffer using full capacity
-        let buf = &mut state.encode_buf.spare_capacity_mut()[..write_size];
+        // Ensure file is open
+        if state.file.is_none() {
+            self.ensure_file(state, seq)?;
+        }
+
+        // Determine if we need to include the file header
+        let include_header = state.file_offset == 0;
+
+        let rec_size = record.encoded_size();
+        let mut total_payload = rec_size;
+        if include_header {
+            total_payload += FILE_HEADER_SIZE;
+        }
+        let write_size = sys::page_align(total_payload);
+
+        // Allocate temporary aligned buffer
+        let mut buf = sys::alloc_aligned(write_size);
+
+        // Track file offset for WriteResult (before writing)
+        let record_offset = if include_header {
+            state.file_offset + FILE_HEADER_SIZE as i64
+        } else {
+            state.file_offset
+        };
+
+        // Write header if needed
         let mut buf_offset = 0;
-
-        // Write file header if needed
-        if need_header {
+        if include_header {
             let header = FileHeader::new();
             header.encode(&mut buf[0..FILE_HEADER_SIZE]);
             buf_offset = FILE_HEADER_SIZE;
         }
 
-        // Track base offset for WriteResult
-        let base_file_offset = if need_header {
-            FILE_HEADER_SIZE as i64
-        } else {
-            state.file_offset
-        };
-
-        // Encode records and populate WriteResult
-        let mut record_offset = base_file_offset;
-        for req_ptr in batch {
-            let req = unsafe { &mut **req_ptr };
-            if let Some(ref record) = req.record {
-                let rec_size = record.encoded_size();
-                record.encode(&mut buf[buf_offset..]).map_err(|e| {
-                    Error::io("encode record", std::io::Error::other(e.to_string()))
-                })?;
-
-                req.result = WriteResult {
-                    offset: record_offset,
-                    bytes_written: rec_size as i64,
-                    bytes_aligned: write_size as i64,
-                };
-
-                buf_offset += rec_size;
-                record_offset += rec_size as i64;
-            }
-        }
+        // Serialize record
+        record.encode(&mut buf[buf_offset..]).map_err(|e| {
+            Error::io("encode record", std::io::Error::other(e.to_string()))
+        })?;
+        buf_offset += rec_size;
 
         // Zero-pad tail
         for b in &mut buf[buf_offset..write_size] {
             *b = 0;
         }
 
+        // Populate WriteResult
+        req.result = WriteResult {
+            offset: record_offset,
+            bytes_written: rec_size as i64,
+            bytes_aligned: write_size as i64,
+        };
+
         // Write and sync
-        let file = state.file.as_mut().unwrap();
+        self.write_and_sync(state, &buf)?;
+
+        Ok(())
+    }
+
+    /// Performs the actual write and fsync.
+    fn write_and_sync(&self, state: &mut WalState, buf: &[u8]) -> Result<()> {
+        let file = state.file.as_mut().ok_or_else(|| {
+            Error::InvalidConfig { message: "WAL file not open".to_string() }
+        })?;
         file.write_all(buf).map_err(|e| Error::io("write WAL", e))?;
         sys::sync_file(file, self.config.flags)?;
-
-        state.file_offset += write_size as i64;
-
-        // Update stats
-        self.stats.written_bytes.fetch_add(total_size as i64, Ordering::Relaxed);
-        self.stats.written_records.fetch_add(batch.len() as i64, Ordering::Relaxed);
-        self.stats.sync_count.fetch_add(1, Ordering::Relaxed);
-        self.stats.group_commits.fetch_add(1, Ordering::Relaxed);
-
+        state.file_offset += buf.len() as i64;
         Ok(())
     }
 

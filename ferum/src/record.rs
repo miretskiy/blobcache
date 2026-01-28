@@ -405,14 +405,95 @@ pub const FILE_MAGIC: u32 = 0x424C_4F42;
 /// File format version.
 pub const FILE_VERSION: u32 = 2;
 
-/// Size of the file header in bytes.
-pub const FILE_HEADER_SIZE: usize = 8;
+/// Size of the file header in bytes (32 bytes to match WAL header size).
+///
+/// This ensures consistent segment format whether created via:
+/// - flush_via_rename (WAL file becomes segment)
+/// - flush_via_copy (new segment file written)
+pub const FILE_HEADER_SIZE: usize = 32;
+
+/// Segment file header structure (32 bytes).
+///
+/// Layout:
+/// - magic: u32 (4 bytes) - "BLOB"
+/// - version: u32 (4 bytes)
+/// - flags: u32 (4 bytes) - reserved
+/// - _padding: u32 (4 bytes)
+/// - created_at: i64 (8 bytes) - creation timestamp (nanos since epoch)
+/// - reserved: u64 (8 bytes)
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FileHeader {
+    pub magic: u32,
+    pub version: u32,
+    pub flags: u32,
+    pub created_at: i64,
+}
+
+impl FileHeader {
+    /// Creates a new header with current timestamp.
+    pub fn new() -> Self {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        FileHeader {
+            magic: FILE_MAGIC,
+            version: FILE_VERSION,
+            flags: 0,
+            created_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos() as i64)
+                .unwrap_or(0),
+        }
+    }
+
+    /// Encodes the header into a buffer.
+    pub fn encode(&self, buf: &mut [u8]) {
+        assert!(buf.len() >= FILE_HEADER_SIZE);
+        buf[0..4].copy_from_slice(&self.magic.to_le_bytes());
+        buf[4..8].copy_from_slice(&self.version.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.flags.to_le_bytes());
+        buf[12..16].copy_from_slice(&0u32.to_le_bytes()); // padding
+        buf[16..24].copy_from_slice(&(self.created_at as u64).to_le_bytes());
+        buf[24..32].copy_from_slice(&0u64.to_le_bytes()); // reserved
+    }
+
+    /// Decodes a header from a buffer.
+    pub fn decode(buf: &[u8]) -> crate::error::Result<Self> {
+        use crate::error::Error;
+
+        if buf.len() < FILE_HEADER_SIZE {
+            return Err(Error::BufferTooSmall {
+                needed: FILE_HEADER_SIZE,
+                have: buf.len(),
+            });
+        }
+
+        let magic = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+        if magic != FILE_MAGIC {
+            return Err(Error::InvalidMagic {
+                expected: FILE_MAGIC,
+                got: magic,
+            });
+        }
+
+        let version = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+        if version != FILE_VERSION {
+            return Err(Error::InvalidConfig {
+                message: format!("unsupported segment version: {}", version),
+            });
+        }
+
+        Ok(FileHeader {
+            magic,
+            version,
+            flags: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
+            created_at: u64::from_le_bytes(buf[16..24].try_into().unwrap()) as i64,
+        })
+    }
+}
 
 /// Returns the file header bytes for segment files.
 pub fn file_header_bytes() -> [u8; FILE_HEADER_SIZE] {
     let mut buf = [0u8; FILE_HEADER_SIZE];
-    buf[0..4].copy_from_slice(&FILE_MAGIC.to_le_bytes());
-    buf[4..8].copy_from_slice(&FILE_VERSION.to_le_bytes());
+    FileHeader::new().encode(&mut buf);
     buf
 }
 

@@ -8,7 +8,7 @@
 //!
 //! - **Lock-free**: Uses `ArcSwap` for atomic pointer swapping, no mutexes
 //! - **Wait-free reads**: Readers just load the atomic pointer and iterate
-//! - **Safe eviction**: Reference counting via `TryInc` prevents use-after-free
+//! - **Safe eviction**: Reference counting via `Arc` prevents use-after-free
 //! - **Bounded memory**: Configurable max cached slabs with automatic eviction
 //! - **Zero-copy**: Direct access to mmap'd slab buffers
 
@@ -100,10 +100,8 @@ impl Librarian {
             return;
         }
 
-        // Take our own reference. The caller (MemTable) keeps its "Active Writer" ref.
-        if !slab.buf.try_inc() {
-            return; // Slab already dead, skip
-        }
+        // SharedSlab contains Arc<MmapBuffer> - Arc::clone is safe and increments ref count.
+        // No try_inc needed.
 
         // Optimistic Update Loop (Compare-And-Swap)
         // Ensures linear history even if Publish is called concurrently
@@ -132,10 +130,8 @@ impl Librarian {
 
             if Arc::ptr_eq(&result, &old_guard) {
                 // Success! We installed the new view.
-                // Now we can safely unpin the victim.
-                if let Some(v) = victim {
-                    v.buf.unpin();
-                }
+                // Victim (if any) is dropped automatically, releasing the Arc reference.
+                drop(victim);
                 return;
             }
             // CAS failed, retry
@@ -155,8 +151,8 @@ impl Librarian {
         // 2. Iterate through slabs
         for slab in list.iter() {
             // 3. Attempt to acquire from this slab.
-            // If 'Publish' evicts this slab while we are iterating,
-            // slab.acquire() will return false via TryInc(), protecting us.
+            // Arc-based reference counting ensures the slab buffer remains valid
+            // even if 'Publish' evicts this slab while we are iterating.
             match slab.acquire(&hash_key) {
                 Ok(Some(result)) => {
                     return Ok(Some(AcquireResult {
@@ -218,13 +214,8 @@ impl Librarian {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            // Load old list and replace with empty
-            let old_list = self.view.swap(Arc::new(Vec::new()));
-
-            // Unpin all slabs
-            for slab in old_list.iter() {
-                slab.buf.unpin();
-            }
+            // Replace with empty list - old list is dropped, releasing all Arc references.
+            self.view.swap(Arc::new(Vec::new()));
         }
     }
 }

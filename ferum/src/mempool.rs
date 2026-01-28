@@ -7,11 +7,10 @@
 //!
 //! - **Pool the memory, not the struct**: Solves the ABA problem by ensuring
 //!   each `MmapBuffer` instance is unique, even if reusing the same memory.
-//! - **Reference counting**: Safe concurrent access via `Arc<MmapBuffer>`.
+//! - **Arc-based lifetime**: Use Rust's `Arc<MmapBuffer>` for reference counting.
+//!   When the last Arc is dropped, the buffer's memory is returned to the pool.
 //! - **Backpressure**: Bounded channel blocks when all buffers are in use.
 
-use std::io;
-use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,18 +22,16 @@ use crate::sys::{self, BLOCK_SIZE};
 // MmapBuffer
 // =============================================================================
 
-/// A reference-counted, mmap-backed buffer with 4KB alignment.
+/// An mmap-backed buffer with 4KB alignment for Direct I/O.
 ///
-/// Use [`MmapBuffer::try_inc`] for safe concurrent reference acquisition.
-/// The buffer is automatically released when the reference count drops to zero.
+/// Lifetime is managed by `Arc<MmapBuffer>`. When the last Arc reference is
+/// dropped, the buffer's memory is automatically returned to the pool (if pooled)
+/// or unmapped (if standalone).
 pub struct MmapBuffer {
-    // Note: Debug not derived due to raw pointer and Mutex fields
     /// The raw mmap'd memory.
     raw: *mut u8,
     /// Size of the allocation.
     capacity: usize,
-    /// Reference count for concurrent access.
-    ref_count: AtomicI32,
     /// Pool to return memory to (None for standalone buffers).
     pool: Option<Sender<RawBuffer>>,
     /// Callbacks to run when buffer is released.
@@ -42,6 +39,7 @@ pub struct MmapBuffer {
 }
 
 // Safety: MmapBuffer manages its own memory and synchronization.
+// The raw pointer is only accessed through safe slice methods.
 unsafe impl Send for MmapBuffer {}
 unsafe impl Sync for MmapBuffer {}
 
@@ -49,7 +47,6 @@ impl std::fmt::Debug for MmapBuffer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MmapBuffer")
             .field("capacity", &self.capacity)
-            .field("ref_count", &self.ref_count.load(Ordering::Relaxed))
             .field("pooled", &self.pool.is_some())
             .finish()
     }
@@ -67,48 +64,29 @@ unsafe impl Send for RawBuffer {}
 impl MmapBuffer {
     /// Creates a new standalone (unpooled) mmap buffer.
     ///
-    /// The buffer will be unmapped when the reference count drops to zero.
+    /// The buffer will be unmapped when the Arc is dropped.
     pub fn new(size: usize) -> Arc<Self> {
         let aligned_size = sys::page_align(size);
         if aligned_size == 0 {
             return Arc::new(MmapBuffer {
                 raw: std::ptr::null_mut(),
                 capacity: 0,
-                ref_count: AtomicI32::new(1),
                 pool: None,
                 on_release: parking_lot::Mutex::new(Vec::new()),
             });
         }
 
-        let ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                aligned_size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_ANON | libc::MAP_PRIVATE,
-                -1,
-                0,
-            )
-        };
-
-        if ptr == libc::MAP_FAILED {
-            panic!(
-                "failed to allocate {} aligned bytes: {}",
-                aligned_size,
-                io::Error::last_os_error()
-            );
-        }
+        let ptr = sys::mmap_anon(aligned_size);
 
         // Pre-warm: force physical RAM commitment
-        let slice = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u8, aligned_size) };
+        let slice = unsafe { std::slice::from_raw_parts_mut(ptr, aligned_size) };
         for i in (0..aligned_size).step_by(BLOCK_SIZE) {
             slice[i] = 0;
         }
 
         Arc::new(MmapBuffer {
-            raw: ptr as *mut u8,
+            raw: ptr,
             capacity: aligned_size,
-            ref_count: AtomicI32::new(1),
             pool: None,
             on_release: parking_lot::Mutex::new(Vec::new()),
         })
@@ -119,70 +97,9 @@ impl MmapBuffer {
         Arc::new(MmapBuffer {
             raw: raw.ptr,
             capacity: raw.capacity,
-            ref_count: AtomicI32::new(1),
             pool: Some(pool),
             on_release: parking_lot::Mutex::new(Vec::new()),
         })
-    }
-
-    /// Attempts to increment the reference count safely.
-    ///
-    /// Returns `true` if successful, `false` if the buffer is already dead (ref_count <= 0).
-    /// This allows safe resurrection from a list without holding a lock.
-    pub fn try_inc(&self) -> bool {
-        loop {
-            let count = self.ref_count.load(Ordering::Acquire);
-            if count <= 0 {
-                return false;
-            }
-            if self
-                .ref_count
-                .compare_exchange_weak(count, count + 1, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                return true;
-            }
-        }
-    }
-
-    /// Decrements the reference count and releases if it reaches zero.
-    pub fn unpin(&self) {
-        let prev = self.ref_count.fetch_sub(1, Ordering::AcqRel);
-        if prev == 1 {
-            // Execute release callbacks
-            let callbacks = std::mem::take(&mut *self.on_release.lock());
-            for callback in callbacks {
-                callback();
-            }
-            self.release_memory();
-        }
-    }
-
-    /// Releases the underlying memory.
-    fn release_memory(&self) {
-        if self.raw.is_null() || self.capacity == 0 {
-            return;
-        }
-
-        if let Some(ref pool) = self.pool {
-            // Return to pool
-            let raw = RawBuffer {
-                ptr: self.raw,
-                capacity: self.capacity,
-            };
-            if pool.try_send(raw).is_err() {
-                // Pool is full, unmap directly
-                unsafe {
-                    libc::madvise(self.raw as *mut libc::c_void, self.capacity, libc::MADV_DONTNEED);
-                    libc::munmap(self.raw as *mut libc::c_void, self.capacity);
-                }
-            }
-        } else {
-            // Standalone buffer, unmap directly
-            unsafe {
-                libc::munmap(self.raw as *mut libc::c_void, self.capacity);
-            }
-        }
     }
 
     /// Adds a callback to run when the buffer is released.
@@ -241,6 +158,35 @@ impl MmapBuffer {
     }
 }
 
+impl Drop for MmapBuffer {
+    fn drop(&mut self) {
+        // Execute release callbacks
+        let callbacks = std::mem::take(&mut *self.on_release.lock());
+        for callback in callbacks {
+            callback();
+        }
+
+        if self.raw.is_null() || self.capacity == 0 {
+            return;
+        }
+
+        if let Some(ref pool) = self.pool {
+            // Return to pool
+            let raw = RawBuffer {
+                ptr: self.raw,
+                capacity: self.capacity,
+            };
+            if pool.try_send(raw).is_err() {
+                // Pool is full or closed, unmap directly
+                sys::munmap(self.raw, self.capacity);
+            }
+        } else {
+            // Standalone buffer, unmap directly
+            sys::munmap(self.raw, self.capacity);
+        }
+    }
+}
+
 // =============================================================================
 // MmapPool
 // =============================================================================
@@ -268,33 +214,16 @@ impl MmapPool {
 
         // Pre-fill with aligned, pre-warmed buffers
         for _ in 0..capacity {
-            let ptr = unsafe {
-                libc::mmap(
-                    std::ptr::null_mut(),
-                    aligned_size,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_ANON | libc::MAP_PRIVATE,
-                    -1,
-                    0,
-                )
-            };
-
-            if ptr == libc::MAP_FAILED {
-                panic!(
-                    "failed to allocate {} aligned bytes for pool: {}",
-                    aligned_size,
-                    io::Error::last_os_error()
-                );
-            }
+            let ptr = sys::mmap_anon(aligned_size);
 
             // Pre-warm
-            let slice = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u8, aligned_size) };
+            let slice = unsafe { std::slice::from_raw_parts_mut(ptr, aligned_size) };
             for i in (0..aligned_size).step_by(BLOCK_SIZE) {
                 slice[i] = 0;
             }
 
             let raw = RawBuffer {
-                ptr: ptr as *mut u8,
+                ptr,
                 capacity: aligned_size,
             };
             sender.send(raw).expect("channel should not be full");
@@ -350,9 +279,7 @@ impl Drop for MmapPool {
     fn drop(&mut self) {
         // Drain and unmap all remaining buffers
         while let Ok(raw) = self.buffers.try_recv() {
-            unsafe {
-                libc::munmap(raw.ptr as *mut libc::c_void, raw.capacity);
-            }
+            sys::munmap(raw.ptr, raw.capacity);
         }
     }
 }
@@ -385,6 +312,10 @@ impl BufferHandle {
     }
 }
 
+// =============================================================================
+// Tests
+// =============================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,31 +323,23 @@ mod tests {
 
     #[test]
     fn test_mmap_buffer_new() {
-        let buf = MmapBuffer::new(1000);
-        assert!(buf.capacity() >= 1000);
+        let buf = MmapBuffer::new(4096);
+        assert_eq!(buf.capacity(), 4096);
         assert!(buf.is_aligned());
+
+        // Write some data
+        buf.write_at(b"hello", 0);
+        assert_eq!(&buf.as_slice()[0..5], b"hello");
     }
 
     #[test]
     fn test_mmap_buffer_write() {
         let buf = MmapBuffer::new(4096);
         buf.write_at(b"hello", 0);
+        buf.write_at(b"world", 100);
+
         assert_eq!(&buf.as_slice()[0..5], b"hello");
-    }
-
-    #[test]
-    fn test_mmap_buffer_try_inc() {
-        let buf = MmapBuffer::new(4096);
-
-        // Should succeed while ref_count > 0
-        assert!(buf.try_inc());
-
-        // Unpin twice to drop ref_count to 0
-        buf.unpin();
-        buf.unpin();
-
-        // Now ref_count is 0, try_inc should fail
-        // Note: This would normally be unsafe, but we're testing the mechanism
+        assert_eq!(&buf.as_slice()[100..105], b"world");
     }
 
     #[test]
@@ -431,11 +354,11 @@ mod tests {
         let buf2 = pool.acquire();
         assert_eq!(pool.available(), 0);
 
-        // Return buf1 to pool
-        buf1.unpin();
+        // Drop buf1 to return to pool
+        drop(buf1);
         assert_eq!(pool.available(), 1);
 
-        buf2.unpin();
+        drop(buf2);
         assert_eq!(pool.available(), 2);
     }
 
@@ -450,7 +373,7 @@ mod tests {
                 let buf = pool.acquire();
                 buf.write_at(format!("thread-{}", i).as_bytes(), 0);
                 thread::sleep(Duration::from_millis(10));
-                buf.unpin();
+                // buf is dropped here, returning to pool
             }));
         }
 
@@ -471,8 +394,6 @@ mod tests {
 
         // Pool should still have all buffers (large one is standalone)
         assert_eq!(pool.available(), 2);
-
-        large_buf.unpin();
     }
 
     #[test]
@@ -482,13 +403,14 @@ mod tests {
         let called = Arc::new(AtomicBool::new(false));
         let called_clone = Arc::clone(&called);
 
-        let buf = MmapBuffer::new(4096);
-        buf.add_on_release(move || {
-            called_clone.store(true, Ordering::SeqCst);
-        });
+        {
+            let buf = MmapBuffer::new(4096);
+            buf.add_on_release(move || {
+                called_clone.store(true, Ordering::Release);
+            });
+            // buf is dropped here
+        }
 
-        assert!(!called.load(Ordering::SeqCst));
-        buf.unpin();
-        assert!(called.load(Ordering::SeqCst));
+        assert!(called.load(Ordering::Acquire));
     }
 }

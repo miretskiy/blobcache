@@ -236,6 +236,12 @@ impl MemTable {
     ///
     /// XL writes (larger than write_buffer_size) are only supported in CAS mode
     /// with WAL. In this case, data goes directly to WAL without slab allocation.
+    ///
+    /// # Safety Note
+    ///
+    /// This method captures Arc references to slab components BEFORE releasing the
+    /// lock. This is critical because rotation can happen while the lock is released,
+    /// and we must continue working with the ORIGINAL slab we reserved space in.
     fn write_to_slab(&self, seq_id: u64, key: Key, rec: Record) -> Result<()> {
         let write_size = rec.encoded_size();
         let is_xl = write_size > self.config.write_buffer_size;
@@ -248,6 +254,23 @@ impl MemTable {
                     write_size, self.config.write_buffer_size
                 ),
             });
+        }
+
+        // Check degraded mode at entry - fail fast for CAS mode if configured
+        if self.is_degraded() && self.wal.is_some() {
+            match self.config.degraded_mode {
+                crate::config::DegradedMode::Panic => {
+                    panic!("write rejected: cache is in degraded mode");
+                }
+                crate::config::DegradedMode::Return => {
+                    return Err(Error::Degraded {
+                        reason: "previous I/O error caused degraded mode".to_string(),
+                    });
+                }
+                crate::config::DegradedMode::Log => {
+                    // Continue with best-effort (RAM only)
+                }
+            }
         }
 
         loop {
@@ -269,13 +292,20 @@ impl MemTable {
             let active = state.active.as_ref().expect("no active slab");
 
             // 3. Handle XL vs normal allocation
-            let (slab_offset, xl_buffer) = if is_xl {
+            // CRITICAL: Capture Arc references BEFORE dropping the lock.
+            // Rotation may move the slab out of state.active, but we must
+            // continue working with the slab we reserved space in.
+            let (slab_offset, xl_buffer, slab_buf, slab_index, pending_writes) = if is_xl {
                 // XL Write in CAS mode: Skip slab allocation, data goes to WAL + xl_buf
                 // Reserve position for ordering (at page boundary)
                 let pos = active.position();
 
+                // Capture references BEFORE incrementing pending_writes
+                let slab_index = Arc::clone(&active.index);
+                let pending_writes = Arc::clone(&active.pending_writes);
+
                 // Increment pending writes
-                active.pending_writes.fetch_add(1, Ordering::AcqRel);
+                pending_writes.fetch_add(1, Ordering::AcqRel);
 
                 // Track max seq
                 loop {
@@ -296,7 +326,7 @@ impl MemTable {
                 let xl_buf = MmapBuffer::new(write_size);
                 rec.encode(xl_buf.as_mut_slice())?;
 
-                (pos, Some(xl_buf))
+                (pos, Some(xl_buf), None, slab_index, pending_writes)
             } else {
                 // Normal allocation
                 #[cfg(test)]
@@ -308,8 +338,13 @@ impl MemTable {
                 eprintln!("write_to_slab: allocation result = {:?}", allocation);
 
                 if let Some((offset, _)) = allocation {
+                    // Capture Arc references BEFORE incrementing pending_writes
+                    let slab_buf = Arc::clone(&active.buf);
+                    let slab_index = Arc::clone(&active.index);
+                    let pending_writes = Arc::clone(&active.pending_writes);
+
                     // Increment pending writes
-                    active.pending_writes.fetch_add(1, Ordering::AcqRel);
+                    pending_writes.fetch_add(1, Ordering::AcqRel);
 
                     // Track max seq
                     loop {
@@ -326,11 +361,10 @@ impl MemTable {
 
                     drop(state); // Release lock before I/O
 
-                    // Write record to reserved region
-                    let active_ref = self.state.lock().active.as_ref().unwrap().buf.clone();
-                    rec.encode(active_ref.as_mut_slice().get_mut(offset as usize..).unwrap())?;
+                    // Write record to reserved region using captured buffer
+                    rec.encode(slab_buf.as_mut_slice().get_mut(offset as usize..).unwrap())?;
 
-                    (offset, None)
+                    (offset, None, Some(slab_buf), slab_index, pending_writes)
                 } else {
                     // Need rotation
                     self.prepare_rotation(state);
@@ -371,40 +405,33 @@ impl MemTable {
             };
 
             // 6. Concurrency Guard: sharded lock for same-key updates
+            // Use captured slab_index - do NOT re-acquire main state lock
             let shard = key.shard() as usize;
             let _lock = self.index_locks[shard].lock();
 
-            let state = self.state.lock();
-            let active = state.active.as_ref().unwrap();
             #[cfg(test)]
-            let index_len_before = active.index.len();
+            let index_len_before = slab_index.len();
 
-            if let Some(existing) = active.index.get(&key) {
+            if let Some(existing) = slab_index.get(&key) {
                 if seq_id > existing.seq_id {
-                    active.index.insert(key, entry);
+                    slab_index.insert(key, entry);
                 }
             } else {
-                active.index.insert(key, entry);
+                slab_index.insert(key, entry);
             }
 
             #[cfg(test)]
             {
-                let index_len_after = active.index.len();
+                let index_len_after = slab_index.len();
                 eprintln!("write_to_slab: index insert - before={}, after={}", index_len_before, index_len_after);
             }
 
-            drop(state);
+            // 7. Decrement pending writes using captured reference
+            // This correctly decrements the ORIGINAL slab's counter, even if rotation happened
+            pending_writes.fetch_sub(1, Ordering::AcqRel);
 
-            // 7. Decrement pending writes
-            let prev = self.state.lock().active.as_ref().unwrap()
-                .pending_writes.fetch_sub(1, Ordering::AcqRel);
-            if prev == 1 {
-                // Last pending write completed
-                let state = self.state.lock();
-                if state.active.as_ref().unwrap().is_retired() {
-                    // Signal flush can proceed
-                }
-            }
+            // Keep slab_buf alive until after write is complete
+            drop(slab_buf);
 
             return Ok(());
         }
@@ -498,10 +525,22 @@ impl MemTable {
             match self.flush_rx.recv_timeout(std::time::Duration::from_millis(100)) {
                 Ok(ticket) => {
                     if let Err(e) = self.process_flush(ticket.active) {
-                        #[cfg(test)]
-                        eprintln!("flush error: {}", e);
-                        let _ = &e; // Suppress unused warning in release
-                        self.degraded.store(true, Ordering::Release);
+                        // Handle flush failure according to degraded_mode config
+                        match self.config.degraded_mode {
+                            crate::config::DegradedMode::Panic => {
+                                panic!("flush failed: {}", e);
+                            }
+                            crate::config::DegradedMode::Return => {
+                                // Log and enter degraded mode
+                                eprintln!("flush error (degraded mode): {}", e);
+                                self.degraded.store(true, Ordering::Release);
+                            }
+                            crate::config::DegradedMode::Log => {
+                                // Log and enter degraded mode (best-effort)
+                                eprintln!("flush error (continuing): {}", e);
+                                self.degraded.store(true, Ordering::Release);
+                            }
+                        }
                     }
                 }
                 Err(channel::RecvTimeoutError::Timeout) => continue,
@@ -512,9 +551,9 @@ impl MemTable {
 
     /// Processes a flush (writes slab to segment file).
     fn process_flush(&self, slab: ActiveSlab) -> Result<()> {
-        // Ensure buffer is released back to pool when we're done
+        // Flush the slab - buffer is released via Arc Drop when slab goes out of scope
         let result = self.do_flush(&slab);
-        slab.buf.unpin();
+        // slab (and its Arc<MmapBuffer>) dropped here, releasing reference
 
         // Signal that this flush is done
         self.pending_flushes.fetch_sub(1, Ordering::AcqRel);
@@ -877,6 +916,79 @@ impl MemTable {
             Some(active) => (active.position(), active.index.len()),
             None => (-1, 0),
         }
+    }
+
+    /// Replays a WAL record directly during recovery.
+    ///
+    /// MUST only be called during initialization (no concurrent writers).
+    /// Bypasses compression and CRC computation - record is written verbatim.
+    /// This is critical for performance: WAL records are already in final form.
+    pub fn replay_record(&self, key: Key, record: &Record) -> Result<()> {
+        let write_size = record.encoded_size();
+        let mut state = self.state.lock();
+
+        // Ensure we have an active slab
+        if state.active.is_none() {
+            let buf = self.slab_pool.acquire();
+            state.active = Some(ActiveSlab::new(buf));
+        }
+
+        // Try to allocate space in current slab
+        let active = state.active.as_mut().unwrap();
+        let allocation = active.alloc(write_size);
+
+        let wpos = match allocation {
+            Some((offset, _)) => offset,
+            None => {
+                // Current slab is full - rotate to a new slab
+                // During recovery, we use a simple rotation:
+                // 1. Queue old slab for flush via channel
+                // 2. Create new slab
+                let old_slab = state.active.take().unwrap();
+
+                // Send to flush workers via channel (like normal rotation)
+                let ticket = FlushTicket { active: old_slab };
+                if self.flush_tx.send(ticket).is_err() {
+                    return Err(Error::InvalidConfig {
+                        message: "flush channel closed during recovery".to_string(),
+                    });
+                }
+                self.pending_flushes.fetch_add(1, Ordering::AcqRel);
+
+                // Create new slab
+                let buf = self.slab_pool.acquire();
+                state.active = Some(ActiveSlab::new(buf));
+
+                // Allocate from new slab
+                let active = state.active.as_mut().unwrap();
+                let (offset, _) = active.alloc(write_size).ok_or_else(|| {
+                    Error::InvalidConfig {
+                        message: "record too large for slab buffer".to_string(),
+                    }
+                })?;
+                offset
+            }
+        };
+
+        // Write the record directly (no compression, no CRC recalc - already done in WAL)
+        let active = state.active.as_ref().unwrap();
+        let dst = active.buf.as_mut_slice().get_mut(wpos as usize..).ok_or_else(|| {
+            Error::InvalidConfig {
+                message: "invalid slab offset during replay".to_string(),
+            }
+        })?;
+        record.encode(dst)?;
+
+        // Update max sequence ID
+        if record.header.seq_id > active.current_max_seq.load(Ordering::Acquire) {
+            active.current_max_seq.store(record.header.seq_id, Ordering::Release);
+        }
+
+        // Add to slab index
+        let entry = SlabEntry::from_header(&record.header, wpos);
+        active.index.insert(key, entry);
+
+        Ok(())
     }
 
     /// Closes the MemTable.

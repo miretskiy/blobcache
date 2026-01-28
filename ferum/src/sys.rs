@@ -142,6 +142,68 @@ pub fn align_for_hole_punch(offset: i64, length: i64) -> (i64, i64, bool) {
 }
 
 // =============================================================================
+// Raw Memory Mapping
+// =============================================================================
+
+/// Allocates anonymous memory-mapped region with 4KB alignment.
+///
+/// The returned pointer is page-aligned and suitable for Direct I/O.
+/// Memory is pre-warmed to force physical RAM commitment.
+///
+/// # Panics
+///
+/// Panics if mmap fails (out of memory).
+pub fn mmap_anon(size: usize) -> *mut u8 {
+    if size == 0 {
+        return std::ptr::null_mut();
+    }
+
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_ANON | libc::MAP_PRIVATE,
+            -1,
+            0,
+        )
+    };
+
+    if ptr == libc::MAP_FAILED {
+        panic!(
+            "failed to mmap {} bytes: {}",
+            size,
+            io::Error::last_os_error()
+        );
+    }
+
+    ptr as *mut u8
+}
+
+/// Unmaps a memory region previously allocated with `mmap_anon`.
+///
+/// # Safety
+///
+/// The caller must ensure:
+/// - `ptr` was returned by `mmap_anon`
+/// - `size` matches the original allocation size
+/// - The memory is not accessed after this call
+pub fn munmap(ptr: *mut u8, size: usize) {
+    if ptr.is_null() || size == 0 {
+        return;
+    }
+
+    let result = unsafe { libc::munmap(ptr as *mut libc::c_void, size) };
+    if result == -1 {
+        // Log error but don't panic - we're likely in a Drop impl
+        eprintln!(
+            "warning: munmap failed: {}",
+            io::Error::last_os_error()
+        );
+    }
+}
+
+// =============================================================================
 // Aligned Memory Allocation
 // =============================================================================
 

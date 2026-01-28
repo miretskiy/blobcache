@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -44,9 +45,9 @@ import (
 //
 // -------------------------------------------------------------------------
 const (
-	WriteWeight    = 10
+	WriteWeight    = 40
 	HotReadWeight  = 40
-	ColdReadWeight = 25
+	ColdReadWeight = 10
 
 	WriteBound    = WriteWeight
 	HotReadBound  = WriteBound + HotReadWeight
@@ -75,9 +76,10 @@ func BenchmarkBlobCache(b *testing.B) {
 		WithMaxSize(400<<30),
 		WithWriteBufferSize(128<<20),
 		WithMaxInflightSlabs(32),
+		WithMaxCachedSlabs(64),
 		WithFlushConcurrency(6),
 		WithDirectIOWrite(directIO),
-		WithWAL(),
+		// WithWAL(),
 		WithFDataSync(true),
 		WithDegradedMode(DegradedPanic), // Crash on errors during benchmarks
 	)
@@ -172,7 +174,9 @@ func BenchmarkBlobCache(b *testing.B) {
 					localPut.RecordValue(time.Since(start).Nanoseconds())
 					dataWritten = true // Exit inner loop, count this iteration
 				} else if op < HotReadBound {
-					id := zipf.Uint64() % maxID
+					// Target newest keys so hot reads hit the Librarian (recent slabs)
+					zipfVal := zipf.Uint64() % maxID
+					id := maxID - 1 - zipfVal
 					k := fastFormatKey(keyBuf, "key-", id)
 					found := cache.View(k, func(r io.Reader) {
 						io.CopyN(io.Discard, r, 64) // Force page fault
@@ -226,8 +230,9 @@ func reportLatency(b *testing.B, name string, h *hdrhistogram.Histogram) {
 	b.ReportMetric(float64(p99), prefix+"-p99-ns")
 	b.ReportMetric(float64(p999), prefix+"-p999-ns")
 }
+
 func startSystemMonitor(
-	ctx context.Context, logicalBytes *atomic.Int64, cachePath string,
+		ctx context.Context, logicalBytes *atomic.Int64, cachePath string,
 ) <-chan SystemMetrics {
 	out := make(chan SystemMetrics, 1)
 	go func() {
@@ -259,10 +264,14 @@ func startSystemMonitor(
 					maxRSS = rss
 				}
 
-				// 2. IO Pressure (Queue Depth)
+				// 2. IO Pressure (Queue Depth) - only count physical devices (nvme*, sd*)
 				v2, _ := disk.IOCounters()
-				var currentQD, physWriteBytes float64
+				var currentQD, physWriteBytes, physReadBytes float64
 				for name, stat2 := range v2 {
+					// Only count physical devices, skip dm-*/loop* to avoid double-counting
+					if !strings.HasPrefix(name, "nvme") && !strings.HasPrefix(name, "sd") {
+						continue
+					}
 					if stat1, ok := v1[name]; ok {
 						// Calculate Delta
 						weightedDelta := float64(stat2.WeightedIO - stat1.WeightedIO)
@@ -279,6 +288,7 @@ func startSystemMonitor(
 						}
 
 						physWriteBytes += float64(stat2.WriteBytes - stat1.WriteBytes)
+						physReadBytes += float64(stat2.ReadBytes - stat1.ReadBytes)
 					}
 				}
 
@@ -302,7 +312,8 @@ func startSystemMonitor(
 
 				// 4. Performance Throughput
 				currLog := logicalBytes.Load()
-				physTP := (physWriteBytes / (1 << 30)) / interval.Seconds()
+				physWriteTP := (physWriteBytes / (1 << 30)) / interval.Seconds()
+				physReadTP := (physReadBytes / (1 << 30)) / interval.Seconds()
 				logicalTP := (float64(currLog-prevLog) / (1 << 30)) / interval.Seconds()
 
 				// 5. System Safety Check
@@ -310,10 +321,10 @@ func startSystemMonitor(
 				freeGB := float64(usage.Free) / (1 << 30)
 
 				fmt.Printf("\n[HEARTBEAT %s]\n"+
-					"  MEM:   RSS: %.2fGB\n"+
-					"  DISK:  IO Depth: %.2f | Phys-Write: %.2f GB/s | Free: %.1fGB\n"+
-					"  SIEVE: Phys: %.2fGB | Log: %.2fGB | Ratio: %.2f | Log-TP: %.2f GB/s\n",
-					time.Now().Format("15:04:05"), rss, currentQD, physTP, freeGB,
+						"  MEM:   RSS: %.2fGB\n"+
+						"  DISK:  IO Depth: %.2f | Phys-Read: %.2f GB/s | Phys-Write: %.2f GB/s | Free: %.1fGB\n"+
+						"  SIEVE: Phys: %.2fGB | Log: %.2fGB | Ratio: %.2f | Log-TP: %.2f GB/s\n",
+					time.Now().Format("15:04:05"), rss, currentQD, physReadTP, physWriteTP, freeGB,
 					float64(physicalSize)/(1<<30), float64(logicalSize)/(1<<30),
 					sRatio, logicalTP)
 

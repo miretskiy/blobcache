@@ -36,6 +36,34 @@ fn random_data(size: usize) -> Vec<u8> {
     data
 }
 
+/// Zero-allocation key formatter. Writes "prefix<id>" into buf and returns the slice used.
+/// Buffer must be at least prefix.len() + 20 bytes (max u64 decimal digits).
+#[inline]
+fn format_key<'a>(buf: &'a mut [u8], prefix: &[u8], id: u64) -> &'a [u8] {
+    let prefix_len = prefix.len();
+    buf[..prefix_len].copy_from_slice(prefix);
+
+    // Fast path for small numbers (common case)
+    if id < 10 {
+        buf[prefix_len] = b'0' + id as u8;
+        return &buf[..prefix_len + 1];
+    }
+
+    // Format number backwards into buffer
+    let mut n = id;
+    let mut pos = buf.len();
+    while n > 0 {
+        pos -= 1;
+        buf[pos] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+
+    // Move digits to right after prefix
+    let digit_len = buf.len() - pos;
+    buf.copy_within(pos.., prefix_len);
+    &buf[..prefix_len + digit_len]
+}
+
 /// Benchmark put operations.
 fn bench_put(c: &mut Criterion) {
     let dir = tempdir().unwrap();
@@ -300,6 +328,9 @@ fn bench_parallel_blobcache(c: &mut Criterion) {
     use std::time::{Duration, Instant};
     use sysinfo::System;
 
+    // Initialize logger (RUST_LOG=info to see eviction logs)
+    let _ = env_logger::try_init();
+
     // Parse iteration count from environment or use default
     let iterations: u64 = std::env::var("BENCH_ITERATIONS")
         .ok()
@@ -325,7 +356,7 @@ fn bench_parallel_blobcache(c: &mut Criterion) {
     config.max_size = 400 << 30;           // 400GB
     config.write_buffer_size = 128 << 20;  // 128MB
     config.max_inflight_slabs = 32;        // 32
-    config.max_cached_slabs = 8;           // 8
+    config.max_cached_slabs = 64;          // 64 (increased for Librarian hits)
     config.flush_concurrency = 6;          // 6
     config.direct_io_write = true;
     config.fdatasync = true;
@@ -337,12 +368,13 @@ fn bench_parallel_blobcache(c: &mut Criterion) {
     // Pre-generate entropy buffer (32MB)
     let entropy: Arc<Vec<u8>> = Arc::new(random_data(32 << 20));
 
-    // Constants matching Go
+    // Constants matching Go (updated weights: 40/40/10/10)
     const BLOB_SIZE_LO: usize = 100_000;
     const BLOB_SIZE_HI_RNG: usize = 1_900_000;
-    const WRITE_BOUND: u32 = 10;
-    const HOT_READ_BOUND: u32 = 50;
-    const COLD_READ_BOUND: u32 = 75;
+    const WRITE_BOUND: u32 = 40;      // 40% writes
+    const HOT_READ_BOUND: u32 = 80;   // 40% hot reads (40 + 40)
+    const COLD_READ_BOUND: u32 = 90;  // 10% cold reads (80 + 10)
+    // Remaining 10% = misses
     const WARMUP_KEYS: u64 = 10_000;
     const READ_MIN_KEYS: u64 = 5_000;
 
@@ -390,8 +422,39 @@ fn bench_parallel_blobcache(c: &mut Criterion) {
         let mut last_bytes = 0u64;
         let mut last_time = start;
 
+        // Helper to read disk stats from /proc/diskstats (Linux only)
+        fn read_disk_stats() -> (u64, u64) {
+            #[cfg(target_os = "linux")]
+            {
+                if let Ok(content) = std::fs::read_to_string("/proc/diskstats") {
+                    let mut read_bytes = 0u64;
+                    let mut write_bytes = 0u64;
+                    for line in content.lines() {
+                        let parts: Vec<&str> = line.split_whitespace().collect();
+                        if parts.len() >= 14 {
+                            let name = parts[2];
+                            // Only count physical devices (nvme*, sd*)
+                            if name.starts_with("nvme") || name.starts_with("sd") {
+                                // Field 6: sectors read, Field 10: sectors written
+                                // Sector size is 512 bytes
+                                if let (Ok(r), Ok(w)) = (parts[5].parse::<u64>(), parts[9].parse::<u64>()) {
+                                    read_bytes += r * 512;
+                                    write_bytes += w * 512;
+                                }
+                            }
+                        }
+                    }
+                    return (read_bytes, write_bytes);
+                }
+            }
+            (0, 0)
+        }
+
+        // Initial disk stats
+        let (mut last_disk_read, mut last_disk_write) = read_disk_stats();
+
         while !monitor_stop.load(Ordering::Relaxed) {
-            thread::sleep(Duration::from_secs(60)); // Heartbeat every minute like Go
+            thread::sleep(Duration::from_secs(10)); // Heartbeat every 10s like Go
 
             let now = Instant::now();
             let elapsed = now.duration_since(start).as_secs_f64();
@@ -401,7 +464,12 @@ fn bench_parallel_blobcache(c: &mut Criterion) {
             // Calculate throughput since last heartbeat
             let delta_bytes = bytes - last_bytes;
             let delta_time = now.duration_since(last_time).as_secs_f64();
-            let throughput = (delta_bytes as f64 / (1024.0 * 1024.0 * 1024.0)) / delta_time;
+            let log_throughput = (delta_bytes as f64 / (1024.0 * 1024.0 * 1024.0)) / delta_time;
+
+            // Disk I/O stats
+            let (curr_read, curr_write) = read_disk_stats();
+            let phys_read_tp = ((curr_read - last_disk_read) as f64 / (1024.0 * 1024.0 * 1024.0)) / delta_time;
+            let phys_write_tp = ((curr_write - last_disk_write) as f64 / (1024.0 * 1024.0 * 1024.0)) / delta_time;
 
             // Get RSS
             let mut sys = monitor_sys.lock().unwrap();
@@ -413,12 +481,14 @@ fn bench_parallel_blobcache(c: &mut Criterion) {
                 .unwrap_or(0.0);
 
             println!(
-                ">>> [{:.0}s] Writes: {}, Bytes: {:.2} GB, Throughput: {:.2} GB/s, RSS: {:.2} GB",
-                elapsed, writes, bytes as f64 / (1024.0 * 1024.0 * 1024.0), throughput, rss
+                "\n[HEARTBEAT {:.0}s]\n  MEM:   RSS: {:.2}GB\n  DISK:  Phys-Read: {:.2} GB/s | Phys-Write: {:.2} GB/s\n  WRITE: Writes: {} | Log-TP: {:.2} GB/s | Total: {:.2} GB",
+                elapsed, rss, phys_read_tp, phys_write_tp, writes, log_throughput, bytes as f64 / (1024.0 * 1024.0 * 1024.0)
             );
 
             last_bytes = bytes;
             last_time = now;
+            last_disk_read = curr_read;
+            last_disk_write = curr_write;
         }
     });
 
@@ -465,6 +535,9 @@ fn bench_parallel_blobcache(c: &mut Criterion) {
                     let mut local_get_hist = Histogram::<u64>::new(3).unwrap();
                     let mut local_put_hist = Histogram::<u64>::new(3).unwrap();
 
+                    // Zero-allocation key buffer (prefix + max u64 digits)
+                    let mut key_buf = [0u8; 32];
+
                     loop {
                         // Check if we've done enough iterations
                         let done = iter_done.fetch_add(1, Ordering::Relaxed);
@@ -489,12 +562,12 @@ fn bench_parallel_blobcache(c: &mut Criterion) {
                                 // Write with latency tracking
                                 let start = Instant::now();
                                 let id = write_head.fetch_add(1, Ordering::Relaxed);
-                                let key = format!("key-{}", id);
+                                let key = format_key(&mut key_buf, b"key-", id);
                                 let blob_size = BLOB_SIZE_LO + rng.gen_range(0..BLOB_SIZE_HI_RNG);
                                 let offset: usize =
                                     rng.gen_range(0..entropy.len().saturating_sub(blob_size));
                                 cache
-                                    .put(key.as_bytes(), &entropy[offset..offset + blob_size])
+                                    .put(key, &entropy[offset..offset + blob_size])
                                     .unwrap();
                                 let elapsed = start.elapsed().as_micros() as u64;
                                 let _ = local_put_hist.record(elapsed);
@@ -503,11 +576,12 @@ fn bench_parallel_blobcache(c: &mut Criterion) {
                                 total_writes.fetch_add(1, Ordering::Relaxed);
                                 data_written = true;
                             } else if op < HOT_READ_BOUND {
-                                // Hot read with latency tracking
+                                // Hot read with latency tracking (target newest keys for Librarian hits)
                                 let start = Instant::now();
-                                let id = (zipf.sample(&mut rng) as u64) % max_id;
-                                let key = format!("key-{}", id);
-                                black_box(cache.get(key.as_bytes()));
+                                let zipf_val = (zipf.sample(&mut rng) as u64) % max_id;
+                                let id = max_id - 1 - zipf_val;
+                                let key = format_key(&mut key_buf, b"key-", id);
+                                black_box(cache.get(key));
                                 let elapsed = start.elapsed().as_micros() as u64;
                                 let _ = local_get_hist.record(elapsed);
                             } else if op < COLD_READ_BOUND {
@@ -515,8 +589,8 @@ fn bench_parallel_blobcache(c: &mut Criterion) {
                                 let start = Instant::now();
                                 let base_id = rng.gen_range(0..max_id.saturating_sub(4).max(1));
                                 for i in 0..4 {
-                                    let key = format!("key-{}", base_id + i);
-                                    black_box(cache.get(key.as_bytes()));
+                                    let key = format_key(&mut key_buf, b"key-", base_id + i);
+                                    black_box(cache.get(key));
                                 }
                                 let elapsed = start.elapsed().as_micros() as u64;
                                 let _ = local_get_hist.record(elapsed);
@@ -524,8 +598,8 @@ fn bench_parallel_blobcache(c: &mut Criterion) {
                                 // Miss
                                 let start = Instant::now();
                                 let miss_id: u64 = rng.r#gen();
-                                let key = format!("miss-{}", miss_id);
-                                black_box(cache.get(key.as_bytes()));
+                                let key = format_key(&mut key_buf, b"miss-", miss_id);
+                                black_box(cache.get(key));
                                 let elapsed = start.elapsed().as_micros() as u64;
                                 let _ = local_get_hist.record(elapsed);
                             }

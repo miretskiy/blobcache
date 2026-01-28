@@ -36,6 +36,9 @@ thiserror = "2"
 byteorder = "1.5"
 libc = "0.2"
 
+# Logging
+log = "0.4"
+
 # Durable index (Bitcask-style persistence)
 redb = "2"
 
@@ -48,6 +51,7 @@ rand_distr = "0.4"  # For Zipf distribution (requires rand 0.8)
 hdrhistogram = "7"  # HDR histogram for latency tracking
 sysinfo = "0.33"    # For memory/system monitoring
 num_cpus = "1.16"   # For parallel benchmark
+env_logger = "0.11" # For log output in benchmarks
 
 [[bench]]
 name = "cache"

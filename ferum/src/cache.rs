@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use log::info;
 use parking_lot::Mutex;
 
 use crate::bloom::Filter as BloomFilter;
@@ -695,6 +696,7 @@ impl Cache {
 
         // Run SIEVE to select victims
         let victims = self.index.evict_batch(to_evict as i64);
+        let num_victims = victims.len();
 
         // Hole-punch each victim to reclaim disk space
         let mut freed_bytes: u64 = 0;
@@ -722,6 +724,16 @@ impl Cache {
 
         // Update size counter
         self.sub_approx_size(freed_bytes);
+
+        // Log eviction results
+        info!(
+            "SIEVE eviction: freed {:.2} MB ({} items), size: {:.2} GB -> {:.2} GB (max: {:.2} GB)",
+            freed_bytes as f64 / (1024.0 * 1024.0),
+            num_victims,
+            current_size as f64 / (1024.0 * 1024.0 * 1024.0),
+            self.approx_size.load(Ordering::Relaxed) as f64 / (1024.0 * 1024.0 * 1024.0),
+            max_size as f64 / (1024.0 * 1024.0 * 1024.0),
+        );
     }
 
     /// Spawns the background compaction worker thread.

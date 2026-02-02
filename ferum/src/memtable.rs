@@ -747,8 +747,9 @@ impl MemTable {
                 writer.write(remaining)?;
             }
         } else {
-            // Simple path: write entire slab (header + data) in one aligned write
-            let data = &slab.buf.as_slice()[..slab_pos as usize];
+            // Simple path: write entire slab (header + data) in one aligned write.
+            // Use aligned_bytes to round up size to 4KB for Direct I/O.
+            let data = slab.buf.aligned_bytes(slab_pos as usize);
             writer.write(data)?;
         }
 

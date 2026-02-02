@@ -621,6 +621,13 @@ fn bench_parallel_blobcache(c: &mut Criterion) {
 
     group.finish();
 
+    // CRITICAL: Drain all pending I/O BEFORE stopping timer for accurate throughput
+    println!("\n>>> Workers finished, draining pending I/O...");
+    let drain_start = Instant::now();
+    cache.drain();
+    let drain_elapsed = drain_start.elapsed();
+    println!(">>> Drain completed in {:.2}s", drain_elapsed.as_secs_f64());
+
     let bench_elapsed = bench_start.elapsed();
 
     // Stop monitor
@@ -634,13 +641,13 @@ fn bench_parallel_blobcache(c: &mut Criterion) {
         (total_bytes as f64 / (1024.0 * 1024.0 * 1024.0)) / bench_elapsed.as_secs_f64();
 
     println!("\n>>> Benchmark complete!");
-    println!(">>> Duration: {:.2}s", bench_elapsed.as_secs_f64());
+    println!(">>> Duration: {:.2}s (including drain)", bench_elapsed.as_secs_f64());
     println!(">>> Total writes: {}", total_writes_count);
     println!(
         ">>> Total written: {:.2} GB",
         total_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
     );
-    println!(">>> Throughput: {:.2} GB/s", throughput);
+    println!(">>> Throughput: {:.2} GB/s (end-to-end)", throughput);
 
     // Print latency histograms
     {
@@ -676,7 +683,7 @@ fn bench_parallel_blobcache(c: &mut Criterion) {
         println!(">>> Final RSS: {:.2} GB", rss);
     }
 
-    cache.drain();
+    // drain() already called above before timing stopped
     cache.close().unwrap();
 
     // Cleanup

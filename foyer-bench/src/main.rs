@@ -2,12 +2,12 @@
 //!
 //! This benchmark uses the same workload distribution as BlobCache for fair comparison:
 //!
-//! # Workload Distribution
+//! # Workload Distribution (40/40/10/10 - write-heavy to saturate NVMe)
 //!
-//! - 10% Write (new data, 100KB - 2MB per blob)
+//! - 40% Write (new data, 100KB - 2MB per blob)
 //! - 40% Hot Read (Zipfian: top 10-15% of keys = 60-70% of accesses)
-//! - 25% Cold Read (sequential scan pattern)
-//! - 25% Miss (negative lookups, tests bloom filter)
+//! - 10% Cold Read (sequential scan pattern)
+//! - 10% Miss (negative lookups, tests bloom filter)
 //!
 //! # Usage
 //!
@@ -35,14 +35,15 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use sysinfo::{ProcessRefreshKind, System};
 
-// --- WORKLOAD CONFIGURATION (matches BlobCache) ---
-const WRITE_WEIGHT: u32 = 10;
+// --- WORKLOAD CONFIGURATION (matches BlobCache 40/40/10/10) ---
+// Higher write percentage to saturate NVMe bandwidth
+const WRITE_WEIGHT: u32 = 40;
 const HOT_READ_WEIGHT: u32 = 40;
-const COLD_READ_WEIGHT: u32 = 25;
+const COLD_READ_WEIGHT: u32 = 10;
 
-const WRITE_BOUND: u32 = WRITE_WEIGHT;
-const HOT_READ_BOUND: u32 = WRITE_BOUND + HOT_READ_WEIGHT;
-const COLD_READ_BOUND: u32 = HOT_READ_BOUND + COLD_READ_WEIGHT;
+const WRITE_BOUND: u32 = WRITE_WEIGHT;           // 40% writes
+const HOT_READ_BOUND: u32 = WRITE_BOUND + HOT_READ_WEIGHT;    // 80% (40+40)
+const COLD_READ_BOUND: u32 = HOT_READ_BOUND + COLD_READ_WEIGHT; // 90% (80+10), remaining 10% = miss
 
 const WARMUP_KEYS: u64 = 10000;
 const READ_MIN_KEYS: u64 = 5000;
@@ -342,11 +343,11 @@ async fn main() -> anyhow::Result<()> {
         args.iterations as f64 / 1024.0
     );
     println!();
-    println!("Workload distribution:");
-    println!("  10% Write  (100KB - 2MB per blob)");
+    println!("Workload distribution (40/40/10/10 - write-heavy):");
+    println!("  40% Write  (100KB - 2MB per blob)");
     println!("  40% Hot    (Zipfian: top 10-15% keys = 60-70% accesses)");
-    println!("  25% Cold   (Sequential scan of 4 keys)");
-    println!("  25% Miss   (Negative lookups)");
+    println!("  10% Cold   (Sequential scan of 4 keys)");
+    println!("  10% Miss   (Negative lookups)");
     println!();
 
     // Clean up old benchmark data

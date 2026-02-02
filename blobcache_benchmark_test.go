@@ -27,7 +27,7 @@ import (
 // Benchmark Semantics:
 //
 //	-benchtime=XXXx means "perform XXX writes" (each ~1MB on average)
-//	Each write iteration includes interspersed reads (10% writes, 90% reads)
+//	Each write iteration includes interspersed reads (40% writes, 60% reads)
 //
 // Example workloads:
 //
@@ -36,12 +36,12 @@ import (
 //	-benchtime=256000x    →  256,000 writes ≈ 256GB
 //	-benchtime=1000000x   →  1M writes      ≈ 1TB (tests eviction + hole punching)
 //
-// Write/Read Distribution:
+// Write/Read Distribution (40/40/10/10 - write-heavy to saturate NVMe):
 //
-//	10% Write (new data)
+//	40% Write (new data)
 //	40% Hot Read (Zipfian: 10% of cache is hot)
-//	25% Cold Read (sequential scan pattern)
-//	25% Miss (negative lookups, tests bloom filter)
+//	10% Cold Read (sequential scan pattern)
+//	10% Miss (negative lookups, tests bloom filter)
 //
 // -------------------------------------------------------------------------
 const (

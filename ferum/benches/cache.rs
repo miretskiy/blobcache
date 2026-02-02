@@ -147,10 +147,10 @@ fn bench_get_miss(c: &mut Criterion) {
 /// Benchmark mixed read/write workload with Zipfian distribution.
 ///
 /// This is the Rust equivalent of Go's BenchmarkBlobCache:
-/// - 10% writes with ~1MB blob sizes
+/// - 40% writes with ~1MB blob sizes (write-heavy to saturate NVMe)
 /// - 40% hot reads (Zipfian distribution)
-/// - 25% cold reads (sequential scan)
-/// - 25% misses (bloom filter test)
+/// - 10% cold reads (sequential scan)
+/// - 10% misses (bloom filter test)
 ///
 /// Configuration matches Go EXACTLY:
 /// - max_size: 400GB
@@ -182,11 +182,11 @@ fn bench_blobcache(c: &mut Criterion) {
     config.max_size = 400 << 30;           // 400GB (matches Go)
     config.write_buffer_size = 128 << 20;  // 128MB
     config.max_inflight_slabs = 32;        // 32 (matches Go)
-    config.max_cached_slabs = 8;           // 8 (matches Go default)
+    config.max_cached_slabs = 64;          // 64 (increased for Librarian hits)
     config.flush_concurrency = 6;          // 6 (matches Go)
     config.direct_io_write = true;         // Direct I/O for writes
     config.fdatasync = true;               // fdatasync enabled
-    config.wal_enabled = true;             // WAL enabled (CAS mode)
+    config.wal_enabled = false;            // Cache mode (no WAL) for foyer comparison
     config.degraded_mode = DegradedMode::Panic; // Crash on errors
 
     let cache = Arc::new(ferum::Cache::open(config).unwrap());
@@ -198,10 +198,10 @@ fn bench_blobcache(c: &mut Criterion) {
     const BLOB_SIZE_LO: usize = 100_000;
     const BLOB_SIZE_HI_RNG: usize = 1_900_000;
 
-    // Workload weights (matches Go)
-    const WRITE_BOUND: u32 = 10;
-    const HOT_READ_BOUND: u32 = 50; // 10 + 40
-    const COLD_READ_BOUND: u32 = 75; // 50 + 25
+    // Workload weights (40/40/10/10 - write-heavy to saturate NVMe)
+    const WRITE_BOUND: u32 = 40;      // 40% writes
+    const HOT_READ_BOUND: u32 = 80;   // 40% hot reads (40 + 40)
+    const COLD_READ_BOUND: u32 = 90;  // 10% cold reads (80 + 10), remaining 10% = miss
 
     // Warmup phase (10000 keys like Go)
     const WARMUP_KEYS: u64 = 10_000;
@@ -360,7 +360,7 @@ fn bench_parallel_blobcache(c: &mut Criterion) {
     config.flush_concurrency = 6;          // 6
     config.direct_io_write = true;
     config.fdatasync = true;
-    config.wal_enabled = true;
+    config.wal_enabled = false;  // Cache mode (no WAL) for foyer comparison
     config.degraded_mode = DegradedMode::Panic;
 
     let cache = Arc::new(ferum::Cache::open(config).unwrap());

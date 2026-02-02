@@ -1,21 +1,62 @@
+//! Foyer Benchmark - Aligned with BlobCache's BenchmarkBlobCache
+//!
+//! This benchmark uses the same workload distribution as BlobCache for fair comparison:
+//!
+//! # Workload Distribution
+//!
+//! - 10% Write (new data, 100KB - 2MB per blob)
+//! - 40% Hot Read (Zipfian: top 10-15% of keys = 60-70% of accesses)
+//! - 25% Cold Read (sequential scan pattern)
+//! - 25% Miss (negative lookups, tests bloom filter)
+//!
+//! # Usage
+//!
+//! ```bash
+//! # Small test: ~10GB logical writes
+//! cargo run --release -- --iterations 10000
+//!
+//! # Medium test: ~100GB logical writes
+//! cargo run --release -- --iterations 100000
+//!
+//! # Large test: ~256GB
+//! cargo run --release -- --iterations 256000
+//! ```
+
 use clap::Parser;
 use foyer::{HybridCache, HybridCacheBuilder, HybridCachePolicy};
 use foyer_storage::{BlockEngineBuilder, DeviceBuilder, FsDeviceBuilder, Throttle};
 use hdrhistogram::Histogram;
-use leaky_bucket::RateLimiter;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+use rand_distr::{Distribution, Zipf};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+use sysinfo::{ProcessRefreshKind, System};
+
+// --- WORKLOAD CONFIGURATION (matches BlobCache) ---
+const WRITE_WEIGHT: u32 = 10;
+const HOT_READ_WEIGHT: u32 = 40;
+const COLD_READ_WEIGHT: u32 = 25;
+
+const WRITE_BOUND: u32 = WRITE_WEIGHT;
+const HOT_READ_BOUND: u32 = WRITE_BOUND + HOT_READ_WEIGHT;
+const COLD_READ_BOUND: u32 = HOT_READ_BOUND + COLD_READ_WEIGHT;
+
+const WARMUP_KEYS: u64 = 10000;
+const READ_MIN_KEYS: u64 = 5000;
+
+// Blob size range: 100KB - 2MB (matches BlobCache)
+const BLOB_SIZE_LO: usize = 100_000;
+const BLOB_SIZE_HI_RNG: usize = 1_900_000;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version, about = "Foyer Benchmark - Aligned with BlobCache workload")]
 struct Args {
-    /// Number of operations (default: 2560000 to match Go benchmark)
-    #[arg(short, long, default_value_t = 2560000)]
-    iterations: usize,
+    /// Number of write operations (each ~1MB average)
+    #[arg(short = 'n', long, default_value_t = 256000)]
+    iterations: u64,
 
     /// Number of worker threads (default: num_cpus)
     #[arg(short, long)]
@@ -25,8 +66,8 @@ struct Args {
     #[arg(short, long, default_value = "/tmp/foyer-bench")]
     path: PathBuf,
 
-    /// Cache capacity in GB (default: 256)
-    #[arg(short, long, default_value_t = 256)]
+    /// Cache capacity in GB (default: 400 to match BlobCache)
+    #[arg(short, long, default_value_t = 400)]
     capacity_gb: usize,
 
     /// Rate limit writes (MB/s, 0 = unlimited)
@@ -35,29 +76,27 @@ struct Args {
 }
 
 struct WorkerStats {
-    num_writes: Arc<AtomicI64>,
-    completed_writes: Arc<AtomicI64>,
-    num_reads: Arc<AtomicI64>,
-    num_found: Arc<AtomicI64>,
-    total_bytes_written: Arc<AtomicI64>,
-    hit_hist: Arc<Mutex<Histogram<u64>>>,
-    miss_hist: Arc<Mutex<Histogram<u64>>>,
+    write_head: Arc<AtomicU64>,
+    num_reads: Arc<AtomicU64>,
+    num_found: Arc<AtomicU64>,
+    total_bytes_written: Arc<AtomicU64>,
+    put_hist: Arc<Mutex<Histogram<u64>>>,
+    get_hist: Arc<Mutex<Histogram<u64>>>,
 }
 
 impl WorkerStats {
     fn new() -> Self {
-        // Histograms: 1ns to 60 seconds, 3 significant digits
-        let hit_hist = Histogram::<u64>::new_with_bounds(1, 60_000_000_000, 3).unwrap();
-        let miss_hist = Histogram::<u64>::new_with_bounds(1, 60_000_000_000, 3).unwrap();
+        // Histograms: 10ns to 60 seconds, 3 significant digits (matches BlobCache)
+        let put_hist = Histogram::<u64>::new_with_bounds(10, 60_000_000_000, 3).unwrap();
+        let get_hist = Histogram::<u64>::new_with_bounds(10, 60_000_000_000, 3).unwrap();
 
         Self {
-            num_writes: Arc::new(AtomicI64::new(0)),
-            completed_writes: Arc::new(AtomicI64::new(0)),
-            num_reads: Arc::new(AtomicI64::new(0)),
-            num_found: Arc::new(AtomicI64::new(0)),
-            total_bytes_written: Arc::new(AtomicI64::new(0)),
-            hit_hist: Arc::new(Mutex::new(hit_hist)),
-            miss_hist: Arc::new(Mutex::new(miss_hist)),
+            write_head: Arc::new(AtomicU64::new(0)),
+            num_reads: Arc::new(AtomicU64::new(0)),
+            num_found: Arc::new(AtomicU64::new(0)),
+            total_bytes_written: Arc::new(AtomicU64::new(0)),
+            put_hist: Arc::new(Mutex::new(put_hist)),
+            get_hist: Arc::new(Mutex::new(get_hist)),
         }
     }
 }
@@ -66,120 +105,278 @@ async fn run_worker(
     worker_id: usize,
     cache: Arc<HybridCache<Vec<u8>, Vec<u8>>>,
     stats: Arc<WorkerStats>,
-    ops_per_worker: usize,
-    total_ops: usize,
-    rate_limiter: Option<Arc<RateLimiter>>,
+    iterations_per_worker: u64,
+    entropy: Arc<Vec<u8>>,
 ) {
     let mut rng = StdRng::seed_from_u64(42 + worker_id as u64);
-    let mut my_keys: Vec<i64> = Vec::with_capacity(1024);
 
-    for _i in 0..ops_per_worker {
-        let op = rng.gen_range(0..100);
+    // Zipfian distribution (s=1.1 matches BlobCache)
+    // Top 10-15% of keys get 60-70% of accesses
+    let zipf = Zipf::new(1 << 25, 1.1).expect("Failed to create Zipf distribution");
 
-        if op < 10 {
-            // Rate limiting: acquire 1MB worth of tokens before write
-            if let Some(limiter) = &rate_limiter {
-                limiter.acquire(1024 * 1024).await;
-            }
+    // Local histograms for this worker
+    let mut local_put = Histogram::<u64>::new_with_bounds(10, 60_000_000_000, 3).unwrap();
+    let mut local_get = Histogram::<u64>::new_with_bounds(10, 60_000_000_000, 3).unwrap();
 
-            // 10% writes - 1MB blobs
-            let mut value = vec![0u8; 1024 * 1024];
+    for _ in 0..iterations_per_worker {
+        let mut data_written = false;
 
-            // Randomize some bytes (every 128KB) to prevent compression artifacts
-            for i in (0..value.len()).step_by(128 * 1024) {
-                value[i] = rng.gen::<u8>();
-            }
+        while !data_written {
+            let op: u32 = rng.gen_range(0..100);
+            let max_id = stats.write_head.load(Ordering::Relaxed);
 
-            let key_id = stats.num_writes.fetch_add(1, Ordering::Relaxed);
-            let key = format!("w-{}-key-{}", worker_id, key_id).into_bytes();
+            // Bias towards writes when not enough keys for reads
+            let adjusted_op = if max_id < READ_MIN_KEYS {
+                if op < 50 {
+                    0
+                } else {
+                    99
+                }
+            } else {
+                op
+            };
 
-            cache.insert(key, value);
-            stats.total_bytes_written.fetch_add(1024 * 1024, Ordering::Relaxed);
-            my_keys.push(key_id);
-            stats.completed_writes.fetch_add(1, Ordering::Relaxed);
-        } else if op < 55 {
-            // 45% reads from this worker's completed writes (hits)
-            if !my_keys.is_empty() {
-                let read_start = Instant::now();
+            let start = Instant::now();
 
-                let idx = rng.gen_range(0..my_keys.len());
-                let key_id = my_keys[idx];
-                let key = format!("w-{}-key-{}", worker_id, key_id).into_bytes();
+            if adjusted_op < WRITE_BOUND {
+                // 10% Write - Variable blob sizes (100KB - 2MB)
+                let blob_size = BLOB_SIZE_LO + rng.gen_range(0..BLOB_SIZE_HI_RNG);
+                let offset: usize = rng.gen_range(0..entropy.len().saturating_sub(blob_size));
+
+                let id = stats.write_head.fetch_add(1, Ordering::Relaxed);
+                let key = format!("key-{}", id).into_bytes();
+                let value = entropy[offset..offset + blob_size].to_vec();
+
+                cache.insert(key, value);
+                stats
+                    .total_bytes_written
+                    .fetch_add(blob_size as u64, Ordering::Relaxed);
+                local_put.record(start.elapsed().as_nanos() as u64).ok();
+                data_written = true;
+            } else if adjusted_op < HOT_READ_BOUND {
+                // 40% Hot Read - Zipfian distribution targeting recent keys
+                if max_id > 0 {
+                    let zipf_val = zipf.sample(&mut rng) as u64 % max_id;
+                    let id = max_id.saturating_sub(1).saturating_sub(zipf_val);
+                    let key = format!("key-{}", id).into_bytes();
+
+                    stats.num_reads.fetch_add(1, Ordering::Relaxed);
+                    if let Ok(Some(entry)) = cache.get(&key).await {
+                        // Touch the value to force any lazy loading
+                        let _ = entry.value().len();
+                        stats.num_found.fetch_add(1, Ordering::Relaxed);
+                    }
+                    local_get.record(start.elapsed().as_nanos() as u64).ok();
+                }
+            } else if adjusted_op < COLD_READ_BOUND {
+                // 25% Cold Read - Sequential scan of 4 consecutive keys
+                if max_id > 4 {
+                    let base_id = rng.gen_range(0..max_id.saturating_sub(4));
+                    for i in 0..4u64 {
+                        let key = format!("key-{}", base_id + i).into_bytes();
+                        let _ = cache.get(&key).await;
+                    }
+                    stats.num_reads.fetch_add(4, Ordering::Relaxed);
+                }
+            } else {
+                // 25% Miss - Negative lookups (bloom filter test)
+                let miss_id: u64 = rng.gen();
+                let key = format!("miss-{}", miss_id).into_bytes();
 
                 stats.num_reads.fetch_add(1, Ordering::Relaxed);
-                if let Ok(Some(entry)) = cache.get(&key).await {
-                    // Read the value to match Go benchmark behavior
-                    let _value = entry.value();
+                if let Ok(Some(_)) = cache.get(&key).await {
+                    // Unexpected hit on miss key
                     stats.num_found.fetch_add(1, Ordering::Relaxed);
-
-                    let latency_ns = read_start.elapsed().as_nanos() as u64;
-                    stats.hit_hist.lock().unwrap().record(latency_ns).ok();
                 }
             }
-        } else {
-            // 45% reads with miss prefix (bloom filter test)
-            let miss_start = Instant::now();
-
-            let key_id = rng.gen_range(0..total_ops as i64);
-            let key = format!("miss-{}", key_id).into_bytes();
-
-            stats.num_reads.fetch_add(1, Ordering::Relaxed);  // Count all reads!
-            if let Ok(Some(_)) = cache.get(&key).await {
-                eprintln!("Expected missing, but found instead miss-{}", key_id);
-                stats.num_found.fetch_add(1, Ordering::Relaxed);  // False positive
-            }
-
-            let latency_ns = miss_start.elapsed().as_nanos() as u64;
-            stats.miss_hist.lock().unwrap().record(latency_ns).ok();
         }
     }
+
+    // Merge local histograms into global
+    stats.put_hist.lock().unwrap().add(&local_put).ok();
+    stats.get_hist.lock().unwrap().add(&local_get).ok();
+}
+
+fn system_monitor(
+    stop: Arc<AtomicBool>,
+    total_bytes: Arc<AtomicU64>,
+    cache_path: PathBuf,
+) -> f64 {
+    let mut sys = System::new_all();
+    let mut max_rss: f64 = 0.0;
+    let mut prev_bytes = total_bytes.load(Ordering::Relaxed);
+    let interval = Duration::from_secs(10);
+    let pid = sysinfo::get_current_pid().ok();
+
+    while !stop.load(Ordering::Relaxed) {
+        std::thread::sleep(interval);
+
+        // Refresh process info
+        sys.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::everything(),
+        );
+
+        let rss_gb = if let Some(pid) = pid {
+            if let Some(proc) = sys.process(pid) {
+                proc.memory() as f64 / (1u64 << 30) as f64
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+
+        if rss_gb > max_rss {
+            max_rss = rss_gb;
+        }
+
+        // Throughput
+        let curr_bytes = total_bytes.load(Ordering::Relaxed);
+        let bytes_delta = curr_bytes.saturating_sub(prev_bytes);
+        let throughput = (bytes_delta as f64 / (1u64 << 30) as f64) / interval.as_secs_f64();
+        prev_bytes = curr_bytes;
+
+        // Disk usage
+        let (physical_size, logical_size) = get_cache_sizes(&cache_path);
+        let ratio = if logical_size > 0 {
+            physical_size as f64 / logical_size as f64
+        } else {
+            0.0
+        };
+
+        // Get free disk space
+        let free_gb = get_free_space(&cache_path);
+
+        println!();
+        println!("[HEARTBEAT {}]", format_time());
+        println!("  MEM:   RSS: {:.2}GB", rss_gb);
+        println!(
+            "  DISK:  Throughput: {:.2} GB/s | Free: {:.1}GB",
+            throughput, free_gb
+        );
+        println!(
+            "  CACHE: Phys: {:.2}GB | Log: {:.2}GB | Ratio: {:.2}",
+            physical_size as f64 / (1u64 << 30) as f64,
+            logical_size as f64 / (1u64 << 30) as f64,
+            ratio
+        );
+    }
+
+    max_rss
+}
+
+fn get_cache_sizes(path: &PathBuf) -> (u64, u64) {
+    let mut physical: u64 = 0;
+    let mut logical: u64 = 0;
+
+    fn walk_dir(dir: &std::path::Path, physical: &mut u64, logical: &mut u64) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk_dir(&path, physical, logical);
+                } else if let Ok(meta) = entry.metadata() {
+                    *logical += meta.len();
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::MetadataExt;
+                        *physical += meta.blocks() * 512;
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        *physical += meta.len();
+                    }
+                }
+            }
+        }
+    }
+
+    walk_dir(path, &mut physical, &mut logical);
+    (physical, logical)
+}
+
+fn get_free_space(path: &PathBuf) -> f64 {
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        if let Ok(c_path) = CString::new(path.to_string_lossy().as_bytes()) {
+            let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+            let ret = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+            if ret == 0 {
+                return (stat.f_bavail as u64 * stat.f_frsize as u64) as f64 / (1u64 << 30) as f64;
+            }
+        }
+    }
+    0.0
+}
+
+fn format_time() -> String {
+    use std::time::SystemTime;
+    let now = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    let secs = now.as_secs();
+    let hours = (secs / 3600) % 24;
+    let mins = (secs / 60) % 60;
+    let s = secs % 60;
+    format!("{:02}:{:02}:{:02}", hours, mins, s)
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // No tracing initialization - use official foyer without modifications
-
     let args = Args::parse();
 
-    // Determine worker count (like Go's b.RunParallel)
+    // Determine worker count
     let num_workers = args.workers.unwrap_or_else(num_cpus::get);
-    let ops_per_worker = args.iterations / num_workers;
+    let iterations_per_worker = args.iterations / num_workers as u64;
 
-    println!("=== Foyer Benchmark (Mixed Workload) ===");
-    println!("Iterations: {}", args.iterations);
+    println!("=== Foyer Benchmark (BlobCache-aligned workload) ===");
+    println!("Iterations: {} (writes)", args.iterations);
     println!("Workers: {}", num_workers);
     println!("Cache path: {:?}", args.path);
     println!("Cache capacity: {} GB", args.capacity_gb);
-    println!("Expected writes: ~{} ({} GB)",
-             args.iterations / 10,
-             args.iterations / 10 / 1024);
+    println!(
+        "Expected data: ~{:.1} GB (avg 1MB/write)",
+        args.iterations as f64 / 1024.0
+    );
+    println!();
+    println!("Workload distribution:");
+    println!("  10% Write  (100KB - 2MB per blob)");
+    println!("  40% Hot    (Zipfian: top 10-15% keys = 60-70% accesses)");
+    println!("  25% Cold   (Sequential scan of 4 keys)");
+    println!("  25% Miss   (Negative lookups)");
     println!();
 
     // Clean up old benchmark data
     let _ = std::fs::remove_dir_all(&args.path);
     std::fs::create_dir_all(&args.path)?;
 
-    // Set explicit disk capacity - 512GB to ensure we can hold 256GB + overhead
-    // Explicitly disable throttling to ensure unlimited write rate
+    // Pre-generate entropy buffer (32MB) - same as BlobCache
+    println!("Generating entropy buffer (32MB)...");
+    let mut entropy = vec![0u8; 32 << 20];
+    let mut rng = StdRng::seed_from_u64(12345);
+    rng.fill(&mut entropy[..]);
+    let entropy = Arc::new(entropy);
+
+    // Build foyer cache
+    // Using WriteOnInsertion to ensure data goes to disk (not just memory)
     let device = FsDeviceBuilder::new(&args.path)
-        .with_capacity(512 * 1024 * 1024 * 1024)
-        .with_throttle(Throttle::new())  // Unlimited (all None)
+        .with_capacity((args.capacity_gb + 100) * 1024 * 1024 * 1024) // usize capacity
+        .with_throttle(Throttle::new()) // Unlimited
         .build()?;
 
-    // Reasonable configuration for disk caching
     let engine = BlockEngineBuilder::new(device)
-        .with_flushers(8)  // Reasonable parallelism
-        .with_buffer_pool_size(8 * 1024 * 1024 * 1024)  // 8GB total (1GB per flusher)
+        .with_flushers(8)
+        .with_buffer_pool_size(8 * 1024 * 1024 * 1024) // 8GB buffer pool
         .with_submit_queue_size_threshold(8 * 1024 * 1024 * 1024);
 
     let cache: Arc<HybridCache<Vec<u8>, Vec<u8>>> = Arc::new(
         HybridCacheBuilder::new()
             .with_name("foyer-bench")
-            // CRITICAL: WriteOnInsertion writes every entry to disk immediately
-            // Default (WriteOnEviction) only writes when memory evicts
             .with_policy(HybridCachePolicy::WriteOnInsertion)
-            // Small memory tier (minimize memory-only caching)
-            .memory(100 * 1024 * 1024) // 100MB
+            .memory(100 * 1024 * 1024) // 100MB memory tier (minimal, emphasize disk)
             .with_weighter(|_k: &Vec<u8>, v: &Vec<u8>| v.len())
             .storage()
             .with_engine_config(engine)
@@ -188,45 +385,68 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let stats = Arc::new(WorkerStats::new());
-    let start = Instant::now();
 
-    // Create rate limiter if enabled
-    let rate_limiter = if args.write_rate_limit_mb > 0 {
-        println!("Write rate limit: {} MB/s", args.write_rate_limit_mb);
-        // Create rate limiter: refills at write_rate_limit_mb tokens/sec
-        // Max capacity = 2 seconds of burst
-        let refill_rate = (args.write_rate_limit_mb * 1024 * 1024) as usize;
-        Some(Arc::new(
-            RateLimiter::builder()
-                .initial(refill_rate / 10)  // Start with 100ms worth
-                .refill(refill_rate / 10)  // Refill 100ms worth at a time
-                .interval(std::time::Duration::from_millis(100))  // Refill every 100ms
-                .max(refill_rate / 2)  // Max 500ms of burst
-                .build()
-        ))
-    } else {
-        None
-    };
+    // --- WARMUP PHASE (matches BlobCache) ---
+    println!(
+        ">>> Warmup: Writing {} keys to reach steady-state...",
+        WARMUP_KEYS
+    );
+    let warmup_start = Instant::now();
+    let mut warmup_bytes: u64 = 0;
 
-    println!("Starting benchmark...");
+    for i in 0..WARMUP_KEYS {
+        let blob_size = 1024 * 1024; // 1MB during warmup
+        let key = format!("key-{}", i).into_bytes();
+        let value = entropy[..blob_size].to_vec();
+        cache.insert(key, value);
+        warmup_bytes += blob_size as u64;
+    }
 
-    // Spawn workers (match Go's b.RunParallel pattern)
+    // Wait for warmup writes to flush
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let warmup_elapsed = warmup_start.elapsed();
+    let warmup_throughput =
+        (warmup_bytes as f64 / (1u64 << 30) as f64) / warmup_elapsed.as_secs_f64();
+    println!(
+        ">>> Warmup complete: {:.2} GB/s ({} keys in {:.2}s)",
+        warmup_throughput,
+        WARMUP_KEYS,
+        warmup_elapsed.as_secs_f64()
+    );
+    println!();
+
+    stats.write_head.store(WARMUP_KEYS, Ordering::Release);
+
+    // --- SYSTEM MONITOR (Background Heartbeat) ---
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let monitor_stop = Arc::clone(&stop_flag);
+    let monitor_bytes = Arc::clone(&stats.total_bytes_written);
+    let monitor_path = args.path.clone();
+    let monitor_handle = std::thread::spawn(move || {
+        system_monitor(monitor_stop, monitor_bytes, monitor_path)
+    });
+
+    // --- MAIN BENCHMARK ---
+    println!("Starting benchmark ({} iterations)...", args.iterations);
+    let benchmark_start = Instant::now();
+
+    // Spawn workers
     let mut handles = vec![];
     for worker_id in 0..num_workers {
         let cache_clone = Arc::clone(&cache);
         let stats_clone = Arc::clone(&stats);
-        let total_ops = args.iterations;
-        let limiter_clone = rate_limiter.clone();
+        let entropy_clone = Arc::clone(&entropy);
 
         let handle = tokio::spawn(async move {
             run_worker(
                 worker_id,
                 cache_clone,
                 stats_clone,
-                ops_per_worker,
-                total_ops,
-                limiter_clone,
-            ).await;
+                iterations_per_worker,
+                entropy_clone,
+            )
+            .await;
         });
 
         handles.push(handle);
@@ -237,73 +457,78 @@ async fn main() -> anyhow::Result<()> {
         handle.await?;
     }
 
-    let workers_done = start.elapsed();
-    println!("Workers finished in {:.2}s, now flushing buffer to disk...", workers_done.as_secs_f64());
+    let workers_done = benchmark_start.elapsed();
+    println!(
+        "\nWorkers finished in {:.2}s, flushing to disk...",
+        workers_done.as_secs_f64()
+    );
 
-    // Wait for pending writes to flush (like cache.Drain())
-    // This is where actual disk I/O happens!
+    // Flush remaining data
     cache.close().await?;
 
-    let duration = start.elapsed();
-    let flush_time = duration - workers_done;
-
+    let total_elapsed = benchmark_start.elapsed();
+    let flush_time = total_elapsed - workers_done;
     println!("Flush completed in {:.2}s", flush_time.as_secs_f64());
 
-    // Report results
-    println!();
-    println!("=== Results ===");
-    println!("Duration: {:.2}s", duration.as_secs_f64());
-    println!("Total operations: {}", args.iterations);
-    println!("Writes: {}", stats.num_writes.load(Ordering::Relaxed));
-    println!("Completed writes: {}", stats.completed_writes.load(Ordering::Relaxed));
-    println!("Reads: {}", stats.num_reads.load(Ordering::Relaxed));
-    println!("Found (hits): {}", stats.num_found.load(Ordering::Relaxed));
+    // Stop monitor
+    stop_flag.store(true, Ordering::Release);
+    let peak_rss = monitor_handle.join().unwrap_or(0.0);
 
-    let writes = stats.num_writes.load(Ordering::Relaxed);
-    let write_throughput_gb_s = (writes as f64) / duration.as_secs_f64() / 1024.0;
-    let avg_latency_us = duration.as_micros() as f64 / args.iterations as f64;
-
+    // --- FINAL REPORT ---
     println!();
-    println!("Write throughput: {:.2} GB/s", write_throughput_gb_s);
-    println!("Average latency: {:.2} µs", avg_latency_us);
-    println!("Operations/sec: {:.0}", args.iterations as f64 / duration.as_secs_f64());
-    println!("Worker time: {:.2}s", workers_done.as_secs_f64());
-    println!("Flush time: {:.2}s", flush_time.as_secs_f64());
+    println!("=== FINAL LATENCY (clat) REPORT (ns) ===");
 
-    // Read latency percentiles
-    println!();
-    let hit_hist = stats.hit_hist.lock().unwrap();
-    if hit_hist.len() > 0 {
-        println!("Hit latencies (µs):");
-        println!("  avg: {:.2}", hit_hist.mean() / 1000.0);
-        println!("  p50: {:.2}", hit_hist.value_at_quantile(0.50) as f64 / 1000.0);
-        println!("  p90: {:.2}", hit_hist.value_at_quantile(0.90) as f64 / 1000.0);
-        println!("  p95: {:.2}", hit_hist.value_at_quantile(0.95) as f64 / 1000.0);
-        println!("  p99: {:.2}", hit_hist.value_at_quantile(0.99) as f64 / 1000.0);
-        println!("  max: {:.2}", hit_hist.max() as f64 / 1000.0);
+    let put_hist = stats.put_hist.lock().unwrap();
+    if put_hist.len() > 0 {
+        println!(
+            "PUT | p50: {}ns | p99: {}ns | p999: {}ns | max: {}ns",
+            put_hist.value_at_quantile(0.50),
+            put_hist.value_at_quantile(0.99),
+            put_hist.value_at_quantile(0.999),
+            put_hist.max()
+        );
     }
 
-    let miss_hist = stats.miss_hist.lock().unwrap();
-    if miss_hist.len() > 0 {
-        println!("Miss latencies (ns):");
-        println!("  avg: {:.0}", miss_hist.mean());
-        println!("  p50: {}", miss_hist.value_at_quantile(0.50));
-        println!("  p90: {}", miss_hist.value_at_quantile(0.90));
-        println!("  p95: {}", miss_hist.value_at_quantile(0.95));
-        println!("  p99: {}", miss_hist.value_at_quantile(0.99));
-        println!("  max: {}", miss_hist.max());
+    let get_hist = stats.get_hist.lock().unwrap();
+    if get_hist.len() > 0 {
+        println!(
+            "GET | p50: {}ns | p99: {}ns | p999: {}ns | max: {}ns",
+            get_hist.value_at_quantile(0.50),
+            get_hist.value_at_quantile(0.99),
+            get_hist.value_at_quantile(0.999),
+            get_hist.max()
+        );
     }
 
-    let total_reads = stats.num_reads.load(Ordering::Relaxed);
-    let hits = stats.num_found.load(Ordering::Relaxed);
-    if total_reads > 0 {
-        let hit_rate = hits as f64 / total_reads as f64 * 100.0;
-        println!("Hit rate: {:.1}%", hit_rate);
-    }
+    let total_bytes = stats.total_bytes_written.load(Ordering::Relaxed);
+    let reads = stats.num_reads.load(Ordering::Relaxed);
+    let found = stats.num_found.load(Ordering::Relaxed);
+    let hit_rate = if reads > 0 {
+        found as f64 / reads as f64 * 100.0
+    } else {
+        0.0
+    };
+
+    println!();
+    println!("=== SUMMARY ===");
+    println!("Total time: {:.2}s", total_elapsed.as_secs_f64());
+    println!("  Worker time: {:.2}s", workers_done.as_secs_f64());
+    println!("  Flush time: {:.2}s", flush_time.as_secs_f64());
+    println!(
+        "Total written: {:.2} GB",
+        total_bytes as f64 / (1u64 << 30) as f64
+    );
+    println!(
+        "Write throughput: {:.2} GB/s",
+        (total_bytes as f64 / (1u64 << 30) as f64) / total_elapsed.as_secs_f64()
+    );
+    println!("Warmup throughput: {:.2} GB/s", warmup_throughput);
+    println!("Read hit rate: {:.1}% ({}/{})", hit_rate, found, reads);
+    println!("Peak RSS: {:.2} GB", peak_rss);
 
     // Verify disk usage
     if let Ok(output) = std::process::Command::new("du")
-        .args(&["-sh", args.path.to_str().unwrap()])
+        .args(["-sh", args.path.to_str().unwrap()])
         .output()
     {
         if let Ok(usage) = String::from_utf8(output.stdout) {

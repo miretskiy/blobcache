@@ -705,14 +705,16 @@ impl MemTable {
             self.config.segment_write_flags(),
         )?;
 
-        // Write header
-        writer.write_header()?;
+        // Copy file header INTO the slab buffer at position 0 (like Go does).
+        // This ensures we write header + data together as one aligned write for Direct I/O.
+        let header_bytes = record::file_header_bytes();
+        slab.buf.as_mut_slice()[..record::FILE_HEADER_SIZE].copy_from_slice(&header_bytes);
 
         if has_xl {
             // Interleave slab data with XL buffers
             let slab_data = slab.buf.as_slice();
-            let mut slab_cursor = record::FILE_HEADER_SIZE;
-            let mut segment_pos = record::FILE_HEADER_SIZE as i64;
+            let mut slab_cursor = 0usize; // Start from 0 (includes header)
+            let mut segment_pos = 0i64;
 
             for (xl_pos, xl_buf) in &xl_entries {
                 // Write slab data up to XL position
@@ -745,8 +747,8 @@ impl MemTable {
                 writer.write(remaining)?;
             }
         } else {
-            // Simple path: write slab data directly
-            let data = &slab.buf.as_slice()[record::FILE_HEADER_SIZE..slab_pos as usize];
+            // Simple path: write entire slab (header + data) in one aligned write
+            let data = &slab.buf.as_slice()[..slab_pos as usize];
             writer.write(data)?;
         }
 

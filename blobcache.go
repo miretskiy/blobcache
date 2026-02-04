@@ -80,6 +80,10 @@ type Cache struct {
 
 	// Knobs provides testing hooks. Set directly in tests: c.Knobs = &TestingKnobs{...}
 	Knobs *TestingKnobs
+
+	// ballast is a heap allocation that reduces GC frequency by keeping
+	// the heap larger. Never accessed after initialization.
+	ballast []byte
 }
 
 // ErrorReporter interface allows memtable to check/set degraded state
@@ -280,6 +284,13 @@ func open(cfg config) (*Cache, bool, error) {
 			c.wal.Close()
 			return nil, false, fmt.Errorf("WAL recovery failed: %w", recoveryErr)
 		}
+	}
+
+	// Allocate heap ballast to reduce GC frequency.
+	// Size matches total slab pool (inflight + cached) to keep GC threshold high.
+	if !cfg.DisableBallast {
+		ballastSize := int64(cfg.MaxInflightSlabs+cfg.MaxCachedSlabs) * cfg.WriteBufferSize
+		c.ballast = make([]byte, ballastSize)
 	}
 
 	return c, recovered, nil

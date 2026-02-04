@@ -68,6 +68,7 @@ type config struct {
 	WAL                WALConfig
 	DegradedMode       DegradedMode // How to handle degraded mode (default: memory-only)
 	TrustHash          bool         // Skip key verification on reads (cache mode optimization)
+	DisableBallast     bool         // Disable heap ballast allocation (default: enabled)
 
 	knobs *TestingKnobs
 }
@@ -207,6 +208,15 @@ func WithDegradedMode(mode DegradedMode) Option {
 // CAS mode: hash collision = data corruption (must verify)
 func WithTrustHash(enabled bool) Option {
 	return funcOpt(func(c *config) { c.TrustHash = enabled })
+}
+
+// WithDisableBallast disables heap ballast allocation.
+// By default, the cache allocates a ballast (make([]byte, N)) at startup
+// where N = (MaxInflightSlabs + MaxCachedSlabs) * WriteBufferSize.
+// This keeps the heap larger so GC triggers less frequently, reducing GC overhead.
+// Disable this if you want tighter memory control or are running multiple caches.
+func WithDisableBallast() Option {
+	return funcOpt(func(c *config) { c.DisableBallast = true })
 }
 
 func defaultConfig(path string) config {

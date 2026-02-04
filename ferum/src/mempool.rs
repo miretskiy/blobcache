@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use crossbeam::channel::{self, Receiver, Sender};
 
+use crate::error::{Error, Result};
 use crate::sys::{self, BLOCK_SIZE};
 
 // =============================================================================
@@ -65,18 +66,19 @@ impl MmapBuffer {
     /// Creates a new standalone (unpooled) mmap buffer.
     ///
     /// The buffer will be unmapped when the Arc is dropped.
-    pub fn new(size: usize) -> Arc<Self> {
+    /// Returns an error if memory allocation fails.
+    pub fn new(size: usize) -> Result<Arc<Self>> {
         let aligned_size = sys::page_align(size);
         if aligned_size == 0 {
-            return Arc::new(MmapBuffer {
+            return Ok(Arc::new(MmapBuffer {
                 raw: std::ptr::null_mut(),
                 capacity: 0,
                 pool: None,
                 on_release: parking_lot::Mutex::new(Vec::new()),
-            });
+            }));
         }
 
-        let ptr = sys::mmap_anon(aligned_size);
+        let ptr = sys::mmap_anon(aligned_size)?;
 
         // Pre-warm: force physical RAM commitment
         let slice = unsafe { std::slice::from_raw_parts_mut(ptr, aligned_size) };
@@ -84,12 +86,12 @@ impl MmapBuffer {
             slice[i] = 0;
         }
 
-        Arc::new(MmapBuffer {
+        Ok(Arc::new(MmapBuffer {
             raw: ptr,
             capacity: aligned_size,
             pool: None,
             on_release: parking_lot::Mutex::new(Vec::new()),
-        })
+        }))
     }
 
     /// Creates a buffer from pooled memory.
@@ -135,11 +137,45 @@ impl MmapBuffer {
         unsafe { std::slice::from_raw_parts_mut(self.raw, self.capacity) }
     }
 
-    /// Writes data at the specified offset.
+    /// Writes data at the specified offset using raw pointers.
+    ///
+    /// # Safety
+    ///
+    /// This method is safe to call from multiple threads writing to
+    /// NON-OVERLAPPING regions. It uses raw pointer operations to avoid
+    /// creating multiple `&mut` references to the same buffer, which would
+    /// be undefined behavior.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `offset + data.len() > capacity` or if the buffer is null.
     #[inline]
-    pub fn write_at(&self, data: &[u8], offset: usize) {
-        let slice = self.as_mut_slice();
-        slice[offset..offset + data.len()].copy_from_slice(data);
+    pub fn write_at(&self, offset: usize, data: &[u8]) {
+        assert!(!self.raw.is_null(), "cannot write to null buffer");
+        assert!(
+            offset + data.len() <= self.capacity,
+            "write_at: offset {} + len {} exceeds capacity {}",
+            offset, data.len(), self.capacity
+        );
+
+        // SAFETY: We've verified bounds above. Using raw pointer copy avoids
+        // creating overlapping &mut references when multiple threads write
+        // to different offsets in the same buffer.
+        unsafe {
+            let dst = self.raw.add(offset);
+            std::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
+        }
+    }
+
+    /// Returns a raw pointer to the buffer for low-level operations.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that any writes through this pointer do not
+    /// overlap with concurrent writes, and that all accesses are within bounds.
+    #[inline]
+    pub fn as_ptr(&self) -> *mut u8 {
+        self.raw
     }
 
     /// Returns a slice rounded to the nearest 4KB page boundary.
@@ -208,13 +244,15 @@ pub struct MmapPool {
 
 impl MmapPool {
     /// Creates a new pool with `capacity` pre-allocated buffers of `buffer_size` bytes.
-    pub fn new(name: impl Into<String>, buffer_size: usize, capacity: usize) -> Self {
+    ///
+    /// Returns an error if memory allocation fails during pool creation.
+    pub fn new(name: impl Into<String>, buffer_size: usize, capacity: usize) -> Result<Self> {
         let aligned_size = sys::page_align(buffer_size);
         let (sender, receiver) = channel::bounded(capacity);
 
         // Pre-fill with aligned, pre-warmed buffers
         for _ in 0..capacity {
-            let ptr = sys::mmap_anon(aligned_size);
+            let ptr = sys::mmap_anon(aligned_size)?;
 
             // Pre-warm
             let slice = unsafe { std::slice::from_raw_parts_mut(ptr, aligned_size) };
@@ -229,26 +267,26 @@ impl MmapPool {
             sender.send(raw).expect("channel should not be full");
         }
 
-        MmapPool {
+        Ok(MmapPool {
             buffers: receiver,
             sender,
             buffer_size: aligned_size,
             name: name.into(),
-        }
+        })
     }
 
     /// Acquires a buffer from the pool, blocking if none are available.
     ///
-    /// Times out after 10 seconds with a panic (indicates deadlock or resource exhaustion).
-    pub fn acquire(&self) -> Arc<MmapBuffer> {
+    /// Returns `Error::Backpressure` if the pool is exhausted after a 10s timeout.
+    pub fn acquire(&self) -> Result<Arc<MmapBuffer>> {
         match self.buffers.recv_timeout(Duration::from_secs(10)) {
-            Ok(raw) => MmapBuffer::from_pool(raw, self.sender.clone()),
-            Err(_) => {
-                panic!(
-                    "timeout acquiring buffer from pool '{}' - possible deadlock",
+            Ok(raw) => Ok(MmapBuffer::from_pool(raw, self.sender.clone())),
+            Err(_) => Err(Error::Backpressure {
+                message: format!(
+                    "timeout acquiring buffer from pool '{}' after 10s - pool exhausted",
                     self.name
-                );
-            }
+                ),
+            }),
         }
     }
 
@@ -256,7 +294,7 @@ impl MmapPool {
     ///
     /// If size fits in the pool's buffer size, returns a pooled buffer.
     /// Otherwise, allocates a standalone buffer.
-    pub fn acquire_aligned(&self, size: usize) -> Arc<MmapBuffer> {
+    pub fn acquire_aligned(&self, size: usize) -> Result<Arc<MmapBuffer>> {
         if size <= self.buffer_size {
             self.acquire()
         } else {
@@ -323,20 +361,20 @@ mod tests {
 
     #[test]
     fn test_mmap_buffer_new() {
-        let buf = MmapBuffer::new(4096);
+        let buf = MmapBuffer::new(4096).unwrap();
         assert_eq!(buf.capacity(), 4096);
         assert!(buf.is_aligned());
 
         // Write some data
-        buf.write_at(b"hello", 0);
+        buf.write_at(0, b"hello");
         assert_eq!(&buf.as_slice()[0..5], b"hello");
     }
 
     #[test]
     fn test_mmap_buffer_write() {
-        let buf = MmapBuffer::new(4096);
-        buf.write_at(b"hello", 0);
-        buf.write_at(b"world", 100);
+        let buf = MmapBuffer::new(4096).unwrap();
+        buf.write_at(0, b"hello");
+        buf.write_at(100, b"world");
 
         assert_eq!(&buf.as_slice()[0..5], b"hello");
         assert_eq!(&buf.as_slice()[100..105], b"world");
@@ -344,14 +382,14 @@ mod tests {
 
     #[test]
     fn test_mmap_pool() {
-        let pool = MmapPool::new("test", 4096, 2);
+        let pool = MmapPool::new("test", 4096, 2).unwrap();
         assert_eq!(pool.available(), 2);
 
-        let buf1 = pool.acquire();
+        let buf1 = pool.acquire().unwrap();
         assert_eq!(pool.available(), 1);
         assert!(buf1.is_aligned());
 
-        let buf2 = pool.acquire();
+        let buf2 = pool.acquire().unwrap();
         assert_eq!(pool.available(), 0);
 
         // Drop buf1 to return to pool
@@ -364,14 +402,14 @@ mod tests {
 
     #[test]
     fn test_mmap_pool_concurrent() {
-        let pool = Arc::new(MmapPool::new("concurrent", 4096, 4));
+        let pool = Arc::new(MmapPool::new("concurrent", 4096, 4).unwrap());
         let mut handles = vec![];
 
         for i in 0..8 {
             let pool = Arc::clone(&pool);
             handles.push(thread::spawn(move || {
-                let buf = pool.acquire();
-                buf.write_at(format!("thread-{}", i).as_bytes(), 0);
+                let buf = pool.acquire().unwrap();
+                buf.write_at(0, format!("thread-{}", i).as_bytes());
                 thread::sleep(Duration::from_millis(10));
                 // buf is dropped here, returning to pool
             }));
@@ -386,10 +424,10 @@ mod tests {
 
     #[test]
     fn test_acquire_aligned_oversized() {
-        let pool = MmapPool::new("oversized", 4096, 2);
+        let pool = MmapPool::new("oversized", 4096, 2).unwrap();
 
         // Request larger than pool buffer size
-        let large_buf = pool.acquire_aligned(1024 * 1024);
+        let large_buf = pool.acquire_aligned(1024 * 1024).unwrap();
         assert!(large_buf.capacity() >= 1024 * 1024);
 
         // Pool should still have all buffers (large one is standalone)
@@ -404,7 +442,7 @@ mod tests {
         let called_clone = Arc::clone(&called);
 
         {
-            let buf = MmapBuffer::new(4096);
+            let buf = MmapBuffer::new(4096).unwrap();
             buf.add_on_release(move || {
                 called_clone.store(true, Ordering::Release);
             });

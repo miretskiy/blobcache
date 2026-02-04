@@ -334,6 +334,19 @@ impl Record {
         Ok(total_size)
     }
 
+    /// Encodes the full record and returns it as a Vec<u8>.
+    ///
+    /// This is useful when you need the encoded bytes without writing
+    /// directly to a mutable slice (e.g., for concurrent writes to
+    /// different regions of a shared buffer).
+    pub fn encode_to_vec(&self) -> Vec<u8> {
+        let total_size = self.encoded_size();
+        let mut buf = vec![0u8; total_size];
+        // encode() cannot fail when buffer is correctly sized
+        self.encode(&mut buf).expect("encode to vec failed");
+        buf
+    }
+
     /// Decodes a record from src.
     /// If verify_crc is true and the header has a valid CRC, validates the checksum.
     pub fn decode(src: &[u8], verify_crc: bool) -> Result<Self> {

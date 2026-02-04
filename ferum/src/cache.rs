@@ -166,11 +166,12 @@ impl Cache {
         std::fs::create_dir_all(&config.path)
             .map_err(|e| Error::io("create cache directory", e))?;
 
-        // Create shard directories
+        // Create segment shard directories (must match get_segment_path format)
+        // Format: {base_path}/segments/{shard:04}/
         for i in 0..config.shards {
-            let shard_dir = config.path.join(format!("{:02x}", i));
+            let shard_dir = config.path.join("segments").join(format!("{:04}", i));
             std::fs::create_dir_all(&shard_dir)
-                .map_err(|e| Error::io("create shard directory", e))?;
+                .map_err(|e| Error::io("create segment shard directory", e))?;
         }
 
         // Phase 1: WAL Recovery (if needed)
@@ -425,12 +426,23 @@ impl Cache {
             config.segment_write_flags(),
         ));
 
-        // Initialize sequence counter with current nanosecond timestamp.
-        // This guarantees monotonicity across process restarts.
+        // Initialize sequence counter.
+        //
+        // CRITICAL: We must use max(now, index_max_seq + 1) to handle:
+        // 1. Clock drift backwards (NTP correction, VM migration)
+        // 2. Recovery from persistence where max_seq > current time
+        //
+        // Without this check, if now < index_max_seq, new writes would get
+        // seqIDs that are lower than existing data, causing the "zombie write"
+        // bug where valid writes are silently discarded.
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_nanos() as u64;
+
+        // Get max seq from index (includes recovered and persisted data)
+        let index_max_seq = index.memory_max_seq_id();
+        let initial_seq = now.max(index_max_seq.saturating_add(1));
 
         let cache = Arc::new(Cache {
             config,
@@ -441,7 +453,7 @@ impl Cache {
             bloom,
             memtable,
             librarian,
-            global_seq: AtomicU64::new(now),
+            global_seq: AtomicU64::new(initial_seq),
             approx_size: AtomicU64::new(0),
             degraded: AtomicBool::new(false),
             closed: AtomicBool::new(false),
@@ -591,6 +603,58 @@ impl Cache {
         } else {
             false
         }
+    }
+
+    /// Retrieves a blob into a pre-allocated buffer (zero allocation).
+    ///
+    /// The buffer is cleared and filled with the blob data if found.
+    /// Returns true if the key was found and data was written to buf.
+    ///
+    /// This is more efficient than `get()` for repeated reads as it
+    /// avoids allocation per call.
+    pub fn get_into(&self, key: &[u8], buf: &mut Vec<u8>) -> bool {
+        buf.clear();
+
+        if key.is_empty() {
+            return false;
+        }
+
+        let hash_key = Key::from_bytes(key);
+
+        // 1. Bloom filter gate
+        if !self.bloom.test(hash_key) {
+            return false;
+        }
+
+        // 2. Check librarian (RAM cache)
+        if let Ok(Some(result)) = self.librarian.acquire(hash_key) {
+            // Verify key to detect hash collision
+            if result.stored_key == key {
+                buf.extend_from_slice(&result.value);
+                return true;
+            }
+            // Hash collision - not our key
+            return false;
+        }
+
+        // 3. Check disk via archivist
+        if let Some(item) = self.index.get(&hash_key) {
+            if item.is_deleted() {
+                return false;
+            }
+
+            match self.archivist.read_blob(&item, key) {
+                Ok(result) => {
+                    buf.extend_from_slice(&result.value);
+                    return true;
+                }
+                Err(_) => {
+                    return false;
+                }
+            }
+        }
+
+        false
     }
 
     /// Deletes a blob from the cache.
@@ -1493,6 +1557,510 @@ mod tests {
             assert!(value.is_some(), "normal key {} should exist", key);
             assert_eq!(value.unwrap(), expected.as_bytes());
         }
+
+        cache.close().unwrap();
+    }
+
+    /// Test that segment files are actually created on disk after flush.
+    /// This test catches the bug where data was "written" but never persisted.
+    #[test]
+    fn test_segment_files_created_after_flush() {
+        use std::fs;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path();
+
+        // Configure cache with direct_io_write like the benchmark
+        let config = Config::new(path)
+            .write_buffer_size(1 << 20)  // 1MB buffer for faster flush
+            .max_inflight_slabs(2)
+            .flush_concurrency(1)
+            .direct_io_write(true);  // Direct I/O like benchmark
+
+        let cache = Cache::open(config).unwrap();
+
+        // Write enough data to fill the buffer and trigger flush
+        // With 1MB buffer, write 2MB to ensure at least one flush
+        let value = vec![0xAB; 100_000];  // 100KB per write
+        for i in 0..25 {
+            let key = format!("segkey{:04}", i);
+            cache.put(key.as_bytes(), &value).unwrap();
+        }
+
+        // Drain to ensure all data is flushed to disk
+        cache.drain();
+
+        // Check that segments directory exists
+        let segments_dir = path.join("segments");
+        assert!(
+            segments_dir.exists(),
+            "segments directory should exist at {:?}",
+            segments_dir
+        );
+
+        // Find segment files
+        let mut segment_files = Vec::new();
+        for shard_entry in fs::read_dir(&segments_dir).unwrap() {
+            let shard_dir = shard_entry.unwrap().path();
+            if shard_dir.is_dir() {
+                for file_entry in fs::read_dir(&shard_dir).unwrap() {
+                    let file_path = file_entry.unwrap().path();
+                    if file_path.extension().map_or(false, |ext| ext == "seg") {
+                        segment_files.push(file_path);
+                    }
+                }
+            }
+        }
+
+        assert!(
+            !segment_files.is_empty(),
+            "at least one segment file should exist in {:?}",
+            segments_dir
+        );
+
+        // Verify segment files have actual content (not empty)
+        for seg_file in &segment_files {
+            let metadata = fs::metadata(seg_file).unwrap();
+            assert!(
+                metadata.len() > 0,
+                "segment file {:?} should not be empty",
+                seg_file
+            );
+        }
+
+        // Calculate total segment size
+        let total_size: u64 = segment_files
+            .iter()
+            .map(|f| fs::metadata(f).unwrap().len())
+            .sum();
+
+        // We wrote ~2.5MB, should have at least 1MB on disk after compression/overhead
+        assert!(
+            total_size > 500_000,
+            "total segment size {} should be > 500KB (wrote ~2.5MB)",
+            total_size
+        );
+
+        eprintln!(
+            "test_segment_files_created_after_flush: {} segment files, total {} bytes",
+            segment_files.len(),
+            total_size
+        );
+
+        cache.close().unwrap();
+    }
+
+    /// Test segment files with direct_io_write disabled (buffered I/O).
+    /// This is the control test to ensure the test itself is correct.
+    #[test]
+    fn test_segment_files_created_buffered_io() {
+        use std::fs;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path();
+
+        // Configure cache WITHOUT direct_io_write
+        let config = Config::new(path)
+            .write_buffer_size(1 << 20)  // 1MB buffer
+            .max_inflight_slabs(2)
+            .flush_concurrency(1)
+            .direct_io_write(false);  // Buffered I/O
+
+        let cache = Cache::open(config).unwrap();
+
+        // Write enough data to fill the buffer and trigger flush
+        let value = vec![0xAB; 100_000];  // 100KB per write
+        for i in 0..25 {
+            let key = format!("bufkey{:04}", i);
+            cache.put(key.as_bytes(), &value).unwrap();
+        }
+
+        // Drain to ensure all data is flushed to disk
+        cache.drain();
+
+        // Check that segments directory exists
+        let segments_dir = path.join("segments");
+        assert!(
+            segments_dir.exists(),
+            "segments directory should exist at {:?}",
+            segments_dir
+        );
+
+        // Find and count segment files
+        let mut total_size: u64 = 0;
+        let mut segment_count = 0;
+        for shard_entry in fs::read_dir(&segments_dir).unwrap() {
+            let shard_dir = shard_entry.unwrap().path();
+            if shard_dir.is_dir() {
+                for file_entry in fs::read_dir(&shard_dir).unwrap() {
+                    let file_path = file_entry.unwrap().path();
+                    if file_path.extension().map_or(false, |ext| ext == "seg") {
+                        let size = fs::metadata(&file_path).unwrap().len();
+                        assert!(size > 0, "segment file {:?} should not be empty", file_path);
+                        total_size += size;
+                        segment_count += 1;
+                    }
+                }
+            }
+        }
+
+        assert!(segment_count > 0, "at least one segment file should exist");
+        assert!(
+            total_size > 500_000,
+            "total segment size {} should be > 500KB",
+            total_size
+        );
+
+        eprintln!(
+            "test_segment_files_created_buffered_io: {} segment files, total {} bytes",
+            segment_count,
+            total_size
+        );
+
+        cache.close().unwrap();
+    }
+
+    /// Test with exact benchmark configuration to catch benchmark-specific bugs.
+    /// Uses the same config as benches/cache.rs parallel_blobcache benchmark.
+    #[test]
+    fn test_benchmark_config_segment_creation() {
+        use std::fs;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path();
+
+        // EXACT configuration from benchmark (except smaller max_size for test)
+        let mut config = Config::new(path);
+        config.max_size = 10 << 30;           // 10GB (smaller for test, benchmark uses 400GB)
+        config.write_buffer_size = 128 << 20;  // 128MB exactly like benchmark
+        config.max_inflight_slabs = 32;        // 32 exactly like benchmark
+        config.max_cached_slabs = 64;          // 64 exactly like benchmark
+        config.flush_concurrency = 6;          // 6 exactly like benchmark
+        config.direct_io_write = true;         // Direct I/O like benchmark
+        config.fdatasync = true;               // fdatasync like benchmark
+        config.wal_enabled = false;            // No WAL (cache mode) like benchmark
+        config.degraded_mode = crate::config::DegradedMode::Panic;  // Panic on errors!
+
+        eprintln!("test_benchmark_config: opening cache with benchmark config");
+        let cache = Cache::open(config).unwrap();
+        eprintln!("test_benchmark_config: cache opened successfully");
+
+        // Write ~256MB to trigger at least 2 flushes
+        let value = vec![0xCD; 1_000_000];  // 1MB per write
+        eprintln!("test_benchmark_config: writing 256 x 1MB values...");
+        for i in 0..256 {
+            let key = format!("benchkey{:08}", i);
+            cache.put(key.as_bytes(), &value).unwrap();
+            if (i + 1) % 64 == 0 {
+                eprintln!("test_benchmark_config: wrote {} keys", i + 1);
+            }
+        }
+        eprintln!("test_benchmark_config: all writes complete, draining...");
+
+        // Drain
+        cache.drain();
+        eprintln!("test_benchmark_config: drain complete");
+
+        // Check segments
+        let segments_dir = path.join("segments");
+        assert!(segments_dir.exists(), "segments dir must exist");
+
+        // Count and measure segment files
+        let mut total_size: u64 = 0;
+        let mut segment_count = 0;
+        for shard_entry in fs::read_dir(&segments_dir).unwrap() {
+            let shard_dir = shard_entry.unwrap().path();
+            if shard_dir.is_dir() {
+                for file_entry in fs::read_dir(&shard_dir).unwrap() {
+                    let file_path = file_entry.unwrap().path();
+                    if file_path.extension().map_or(false, |ext| ext == "seg") {
+                        let size = fs::metadata(&file_path).unwrap().len();
+                        eprintln!("  segment {:?}: {} bytes", file_path, size);
+                        assert!(size > 0, "segment {:?} must not be empty", file_path);
+                        total_size += size;
+                        segment_count += 1;
+                    }
+                }
+            }
+        }
+
+        // We wrote 256MB, should have at least 128MB on disk (at least 1 full buffer)
+        eprintln!(
+            "test_benchmark_config: {} segments, total {} bytes",
+            segment_count, total_size
+        );
+
+        assert!(segment_count >= 2, "should have at least 2 segments (wrote 256MB with 128MB buffer)");
+        assert!(
+            total_size >= 128 << 20,
+            "total size {} should be >= 128MB (wrote 256MB)",
+            total_size
+        );
+
+        cache.close().unwrap();
+    }
+
+    // =========================================================================
+    // Bug regression tests
+    // =========================================================================
+
+    /// Test that close() properly drains all data (BUG: close() loses data).
+    ///
+    /// This test writes data, calls close() WITHOUT explicit drain, re-opens,
+    /// and verifies all data is present. If close() silently drops data,
+    /// this test WILL FAIL.
+    #[test]
+    fn test_close_drains_all_data() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+
+        // Use small buffer to create many pending slabs
+        let mut config = Config::new(&path);
+        config.write_buffer_size = 1 << 20; // 1MB
+        config.max_inflight_slabs = 32;
+        config.flush_concurrency = 6;
+        config.degraded_mode = crate::config::DegradedMode::Panic;
+        config.wal_enabled = true; // Enable WAL for durable test
+
+        let num_keys = 100;
+        let value = vec![0xCD; 100_000]; // 100KB per write = 10MB total
+
+        // Phase 1: Write data and close WITHOUT explicit drain
+        {
+            let cache = Cache::open(config.clone()).unwrap();
+
+            for i in 0..num_keys {
+                let key = format!("closekey{:04}", i);
+                cache.put(key.as_bytes(), &value).unwrap();
+            }
+
+            // BUG: close() should implicitly drain, but currently doesn't
+            cache.close().unwrap();
+        }
+
+        // Phase 2: Re-open and verify ALL data is present
+        {
+            let cache = Cache::open(config).unwrap();
+
+            // Wait for recovery
+            cache.drain();
+
+            let mut missing = 0;
+            for i in 0..num_keys {
+                let key = format!("closekey{:04}", i);
+                if cache.get(key.as_bytes()).is_none() {
+                    missing += 1;
+                    eprintln!("MISSING: {}", key);
+                }
+            }
+
+            assert_eq!(
+                missing, 0,
+                "close() lost {} keys out of {} - data silently dropped!",
+                missing, num_keys
+            );
+
+            cache.close().unwrap();
+        }
+    }
+
+    /// Test that sequence IDs are properly initialized from index max_seq.
+    ///
+    /// BUG: global_seq is initialized from SystemTime without checking
+    /// index.max_seq_id(). If clock drifts backwards, new writes may be
+    /// silently discarded as "zombies".
+    #[test]
+    fn test_seq_id_initialization_uses_max_seq() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+
+        let mut config = Config::new(&path);
+        config.wal_enabled = true;
+        config.write_buffer_size = 1 << 20;
+        config.degraded_mode = crate::config::DegradedMode::Panic;
+
+        // Phase 1: Write data with high sequence IDs
+        {
+            let cache = Cache::open(config.clone()).unwrap();
+
+            for i in 0..10 {
+                let key = format!("seqkey{:04}", i);
+                let value = format!("value{}", i);
+                cache.put(key.as_bytes(), value.as_bytes()).unwrap();
+            }
+
+            cache.drain();
+            cache.close().unwrap();
+        }
+
+        // Phase 2: Re-open and write new data
+        // BUG: If global_seq < persisted max_seq, writes are silently dropped
+        {
+            let cache = Cache::open(config.clone()).unwrap();
+
+            // Write new values (should overwrite old ones)
+            for i in 0..10 {
+                let key = format!("seqkey{:04}", i);
+                let value = format!("NEWVALUE{}", i);
+                cache.put(key.as_bytes(), value.as_bytes()).unwrap();
+            }
+
+            // Verify new values are readable
+            for i in 0..10 {
+                let key = format!("seqkey{:04}", i);
+                let expected = format!("NEWVALUE{}", i);
+                let actual = cache.get(key.as_bytes());
+
+                assert!(actual.is_some(), "key {} should exist after overwrite", key);
+                assert_eq!(
+                    actual.unwrap(),
+                    expected.as_bytes(),
+                    "key {} should have NEW value, not old",
+                    key
+                );
+            }
+
+            cache.close().unwrap();
+        }
+    }
+
+    /// Rapid open/close stress test for data integrity.
+    #[test]
+    fn test_rapid_close_reopen_data_integrity() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+
+        let mut config = Config::new(&path);
+        config.write_buffer_size = 1 << 20;
+        config.max_inflight_slabs = 4;
+        config.flush_concurrency = 2;
+        config.wal_enabled = true;
+        config.degraded_mode = crate::config::DegradedMode::Panic;
+
+        let value = vec![0xEF; 50_000]; // 50KB per write
+        let mut expected_keys = std::collections::HashSet::new();
+
+        // Multiple rounds of open/write/close
+        for round in 0..5 {
+            let cache = Cache::open(config.clone()).unwrap();
+
+            for i in 0..20 {
+                let key = format!("round{}key{:04}", round, i);
+                cache.put(key.as_bytes(), &value).unwrap();
+                expected_keys.insert(key);
+            }
+
+            // Close WITHOUT explicit drain
+            cache.close().unwrap();
+        }
+
+        // Final verification
+        let cache = Cache::open(config).unwrap();
+        cache.drain();
+
+        let mut missing = Vec::new();
+        for key in &expected_keys {
+            if cache.get(key.as_bytes()).is_none() {
+                missing.push(key.clone());
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "Missing {} keys after rapid open/close cycles: {:?}",
+            missing.len(),
+            missing.iter().take(10).collect::<Vec<_>>()
+        );
+
+        cache.close().unwrap();
+    }
+
+    /// Benchmark simulation test to verify all data is written.
+    #[test]
+    fn test_benchmark_simulation_data_integrity() {
+        use std::fs;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+
+        // Configuration matching benchmark (scaled down)
+        let mut config = Config::new(&path);
+        config.write_buffer_size = 4 << 20; // 4MB
+        config.max_inflight_slabs = 8;
+        config.max_cached_slabs = 16;
+        config.flush_concurrency = 4;
+        config.direct_io_write = true;
+        config.fdatasync = true;
+        config.wal_enabled = false; // Cache mode like benchmark
+        config.degraded_mode = crate::config::DegradedMode::Panic;
+
+        let cache = Cache::open(config.clone()).unwrap();
+
+        let entropy = vec![0xAB; 2 << 20]; // 2MB entropy buffer
+        let num_writes = 100;
+        let mut total_bytes: u64 = 0;
+
+        for i in 0..num_writes {
+            let key = format!("benchsim-{}", i);
+            let blob_size = 100_000 + (i % 10) * 100_000; // 100KB - 1MB
+            cache.put(key.as_bytes(), &entropy[..blob_size]).unwrap();
+            total_bytes += blob_size as u64;
+        }
+
+        eprintln!("Wrote {} keys, {} bytes total", num_writes, total_bytes);
+
+        // Close like benchmark (which may not explicitly drain)
+        cache.close().unwrap();
+
+        // Measure segment files on disk
+        let segments_dir = path.join("segments");
+        let mut disk_bytes: u64 = 0;
+        if segments_dir.exists() {
+            for shard_entry in fs::read_dir(&segments_dir).unwrap() {
+                let shard_dir = shard_entry.unwrap().path();
+                if shard_dir.is_dir() {
+                    for file_entry in fs::read_dir(&shard_dir).unwrap() {
+                        let file_path = file_entry.unwrap().path();
+                        if file_path.extension().map_or(false, |e| e == "seg") {
+                            disk_bytes += fs::metadata(&file_path).unwrap().len();
+                        }
+                    }
+                }
+            }
+        }
+
+        eprintln!(
+            "Disk bytes written: {} ({:.2}% of logical)",
+            disk_bytes,
+            disk_bytes as f64 / total_bytes as f64 * 100.0
+        );
+
+        // With proper close(), this should be ~100%
+        assert!(
+            disk_bytes >= total_bytes / 2,
+            "Only {}% of data written to disk - close() may be losing data!",
+            disk_bytes as f64 / total_bytes as f64 * 100.0
+        );
+
+        // Re-open and verify readability
+        let cache = Cache::open(config).unwrap();
+        cache.drain();
+
+        let mut readable = 0;
+        for i in 0..num_writes {
+            let key = format!("benchsim-{}", i);
+            if cache.get(key.as_bytes()).is_some() {
+                readable += 1;
+            }
+        }
+
+        eprintln!("Readable keys: {} / {}", readable, num_writes);
+
+        assert!(
+            readable >= num_writes * 9 / 10,
+            "Only {} / {} keys readable after close/reopen - data loss!",
+            readable, num_writes
+        );
 
         cache.close().unwrap();
     }

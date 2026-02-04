@@ -93,9 +93,9 @@ func (a *Archivist) ReadBlob(e index.Item, expectedKey []byte) (io.Reader, Relea
 		return nil, Releaser{}, fmt.Errorf("storage: invalid header: %w", err)
 	}
 
-	// Verify key matches
+	// Verify key matches (skip if expectedKey is nil - TrustHash mode)
 	keyEnd := record.HeaderSize + int(hdr.KeyLen)
-	if !bytes.Equal(buf[record.HeaderSize:keyEnd], expectedKey) {
+	if expectedKey != nil && !bytes.Equal(buf[record.HeaderSize:keyEnd], expectedKey) {
 		handle.Release()
 		return nil, Releaser{}, record.ErrKeyMismatch
 	}
@@ -175,7 +175,7 @@ func (a *Archivist) getSegmentFile(segmentID uint32) (*os.File, error) {
 
 // HolePunchBlob releases disk space for an evicted blob.
 func (a *Archivist) HolePunchBlob(
-	segmentID uint32, offset uint32, physicalLen uint32,
+		segmentID uint32, offset uint32, physicalLen uint32,
 ) (int64, error) {
 	sf, err := a.getSegmentFile(segmentID)
 	if err != nil {

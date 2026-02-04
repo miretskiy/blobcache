@@ -5,6 +5,7 @@ import (
 	"sync/atomic"
 
 	"github.com/miretskiy/blobcache/base"
+	"github.com/miretskiy/blobcache/bloom"
 	"github.com/miretskiy/blobcache/compression"
 	"github.com/miretskiy/blobcache/internal/record"
 	"github.com/miretskiy/blobcache/internal/sys"
@@ -27,6 +28,7 @@ type SlabEntry struct {
 type SharedSlab struct {
 	buf   *MmapBuffer
 	index *xmap.Map[SlabEntry, xmap.Pad32]
+	bloom *bloom.Filter // Fast rejection filter (frozen when slab retired)
 }
 
 // Releaser is a zero-allocation handle for releasing a read lock or buffer.
@@ -58,6 +60,11 @@ func (r *Releaser) Release() {
 // NB: This is a low level method where the caller is expected to quickly consume
 // the returned data and promptly release it via Releaser.
 func (s *SharedSlab) Acquire(key Key) ([]byte, []byte, Releaser, bool, base.BlobErrno) {
+	// 0. Bloom filter fast rejection (lock-free)
+	if s.bloom != nil && !s.bloom.Test(key) {
+		return nil, nil, Releaser{}, false, base.ErrNone
+	}
+
 	// 1. Lock-free lookup
 	rec, ok := s.index.Get(key)
 	if !ok {

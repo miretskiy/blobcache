@@ -67,6 +67,7 @@ type config struct {
 	Compression        CompressionConfig
 	WAL                WALConfig
 	DegradedMode       DegradedMode // How to handle degraded mode (default: memory-only)
+	TrustHash          bool         // Skip key verification on reads (cache mode optimization)
 
 	knobs *TestingKnobs
 }
@@ -177,7 +178,8 @@ func WithTestingKnobs(knobs *TestingKnobs) Option {
 func WithWAL() Option {
 	return funcOpt(func(c *config) {
 		c.WAL.Enabled = true
-		c.IO.FDataSync = true // If using wal, not using data sync is lying to yourself.
+		c.IO.FDataSync = true  // If using wal, not using data sync is lying to yourself.
+		c.TrustHash = false    // CAS mode: verify keys to detect hash collisions.
 	})
 }
 
@@ -197,6 +199,16 @@ func WithDegradedMode(mode DegradedMode) Option {
 	return funcOpt(func(c *config) { c.DegradedMode = mode })
 }
 
+// WithTrustHash controls whether to skip key verification on reads.
+// When true, the cache trusts hash collisions are rare enough that verifying
+// the stored key matches the requested key is unnecessary.
+// Default: true for cache mode, false for CAS mode (WAL enabled).
+// Cache mode: hash collision = wrong data served (acceptable for cache)
+// CAS mode: hash collision = data corruption (must verify)
+func WithTrustHash(enabled bool) Option {
+	return funcOpt(func(c *config) { c.TrustHash = enabled })
+}
+
 func defaultConfig(path string) config {
 	return config{
 		Path:               path,
@@ -209,6 +221,7 @@ func defaultConfig(path string) config {
 		BloomFPRate:        0.01,
 		BloomEstimatedKeys: 1_000_000,
 		DegradedMode:       DegradedMemoryOnly,
+		TrustHash:          true, // Cache mode: trust hash, skip key verification
 		IO: IOConfig{
 			FDataSync:     false,
 			Fadvise:       sys.UseFadvise,

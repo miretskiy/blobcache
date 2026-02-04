@@ -568,7 +568,8 @@ func TestCache_PutChecksummed_IncorrectChecksum(t *testing.T) {
 
 func TestCache_KeyCollisionDetection(t *testing.T) {
 	tmpDir := t.TempDir()
-	cache, err := New(tmpDir, WithMaxCachedSlabs(0)) // Force disk path
+	// TrustHash=false enables collision detection (default is true in cache mode)
+	cache, err := New(tmpDir, WithMaxCachedSlabs(0), WithTrustHash(false)) // Force disk path
 	require.NoError(t, err)
 	defer cache.Close()
 
@@ -602,7 +603,7 @@ func TestCache_KeyCollisionDetection(t *testing.T) {
 	require.NoError(t, segFile.Close())
 
 	// Reopen cache and try to read - should fail with key mismatch
-	cache2, err := New(tmpDir, WithMaxCachedSlabs(0))
+	cache2, err := New(tmpDir, WithMaxCachedSlabs(0), WithTrustHash(false))
 	require.NoError(t, err)
 	defer cache2.Close()
 
@@ -660,22 +661,22 @@ func TestCache_BloomGhostTracking(t *testing.T) {
 	// 1. Manually inject a key into the Bloom filter that isn't in the index
 	key := []byte("ghost-key")
 	h := xxh3.Hash128(key)
-	cache.bloom.Load().AddHash(h)
+	cache.hot.bloom.Load().AddHash(h)
 
 	// 2. Perform Get. Bloom says YES, Index says NO.
 	_, found := cache.Get(key)
 	require.False(t, found)
 
 	// 3. Verify ghost hit was tracked
-	require.Equal(t, uint64(1), cache.bloom.ghosts.Load(), "Ghost hit should be recorded")
-	require.Equal(t, uint64(1), cache.bloom.hits.Load(), "Hit should also be recorded")
+	require.Equal(t, uint64(1), cache.bloomStats.ghosts.Load(), "Ghost hit should be recorded")
+	require.Equal(t, uint64(1), cache.bloomStats.hits.Load(), "Hit should also be recorded")
 }
 
 func TestCache_Eviction_Headroom(t *testing.T) {
 	tmpDir := t.TempDir()
 	// Small cache with eviction enabled
 	cache, err := New(tmpDir,
-		WithMaxSize(20*1024),        // 20KB limit
+		WithMaxSize(20*1024), // 20KB limit
 		WithWriteBufferSize(2*1024)) // Small buffer to ensure flush
 	require.NoError(t, err)
 	defer cache.Close()
@@ -694,7 +695,7 @@ func TestCache_Eviction_Headroom(t *testing.T) {
 	var deletions int64
 	for time.Now().Before(deadline) {
 		finalSize = cache.approxSize.Load()
-		deletions = cache.bloom.deletions.Load()
+		deletions = cache.bloomStats.deletions.Load()
 		if finalSize < 20*1024 && deletions > 0 {
 			break
 		}

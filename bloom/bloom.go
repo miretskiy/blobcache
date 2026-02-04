@@ -23,12 +23,16 @@ type Key = xmap.Key
 //
 // This prevents correlated failures where both block selection AND probe pattern
 // collide for different keys, which happens at scale with truncated hashes.
+//
+// Lifecycle: Filter starts unfrozen (concurrent Add/Test safe via atomics).
+// Call Freeze() when no more Add() calls will occur to enable faster Test() path.
 type Filter struct {
-	data      []uint32 // Bit vector (accessed atomically)
+	data      []uint32 // Bit vector (accessed atomically when unfrozen)
 	m         uint     // Filter size in bits (aligned to 512)
 	k         uint     // Number of hash functions (probes)
 	numBlocks uint32   // Number of 64-byte blocks
 
+	frozen    atomic.Bool // When true, Test uses direct reads (no atomics)
 	recording atomic.Pointer[recording]
 }
 
@@ -128,6 +132,8 @@ func (f *Filter) AddHash(k Key) {
 }
 
 // Test checks if a key might be in the set (lock-free).
+// Uses atomic loads when unfrozen (safe for concurrent Add).
+// Uses direct reads when frozen (faster, no atomic overhead).
 func (f *Filter) Test(k Key) bool {
 	// Block selection using Hi (same as AddHash)
 	blockIdx, _ := bits.Mul64(k.Hi, uint64(f.numBlocks))
@@ -137,6 +143,28 @@ func (f *Filter) Test(k Key) bool {
 	h32 := uint32(k.Lo)
 	delta := uint32(k.Lo>>17) | uint32(k.Lo<<15)
 
+	// Bounds check hint (helps compiler remove checks inside loop)
+	// f.data is numBlocks*16. idx max is (numBlocks-1)*16 + 15.
+	// If we prove len(data) is large enough, we save checks.
+	if len(f.data) < int(f.numBlocks)<<4 {
+		return false // Should never happen
+	}
+
+	if f.frozen.Load() {
+		// Fast path: direct reads (no atomic overhead)
+		for i := uint(0); i < f.k; i++ {
+			bitInBlock := h32 & 511
+			idx := baseIdx + (bitInBlock >> 5)
+			mask := uint32(1 << (bitInBlock & 31))
+			if (f.data[idx] & mask) == 0 {
+				return false
+			}
+			h32 += delta
+		}
+		return true
+	}
+
+	// Slow path: atomic loads (safe for concurrent Add)
 	for i := uint(0); i < f.k; i++ {
 		bitInBlock := h32 & 511
 		idx := baseIdx + (bitInBlock >> 5)
@@ -156,8 +184,8 @@ type KeyConsumer func(k Key)
 // RecordAdditions arranges for this filter to record all added keys until
 // stopRecording or consumeRecording function is invoked.
 func (f *Filter) RecordAdditions() (
-	stopRecording func(),
-	consumeRecording func(consumer KeyConsumer),
+		stopRecording func(),
+		consumeRecording func(consumer KeyConsumer),
 ) {
 	// Pre-allocate 256k slots (4MB for 128-bit keys). This is "large" for 8KB blobs.
 	r := &recording{
@@ -198,4 +226,12 @@ func optimalK(p float64) uint {
 		k = 1
 	}
 	return uint(k)
+}
+
+// Freeze transitions the filter to read-only mode.
+// After Freeze(), Test() uses direct reads without atomic overhead.
+// Add() should not be called after Freeze() - behavior is undefined.
+// This is a one-way transition; there is no Unfreeze().
+func (f *Filter) Freeze() {
+	f.frozen.Store(true)
 }

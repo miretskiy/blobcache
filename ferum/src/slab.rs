@@ -453,7 +453,7 @@ mod tests {
 
     #[test]
     fn test_active_slab_alloc() {
-        let buf = MmapBuffer::new(4096);
+        let buf = MmapBuffer::new(4096).unwrap();
         let slab = ActiveSlab::new(buf);
 
         // First allocation
@@ -472,7 +472,7 @@ mod tests {
 
     #[test]
     fn test_active_slab_full() {
-        let buf = MmapBuffer::new(4096);
+        let buf = MmapBuffer::new(4096).unwrap();
         let slab = ActiveSlab::new(buf);
 
         // Allocate most of the buffer
@@ -487,7 +487,7 @@ mod tests {
 
     #[test]
     fn test_active_slab_align() {
-        let buf = MmapBuffer::new(8192);
+        let buf = MmapBuffer::new(8192).unwrap();
         let slab = ActiveSlab::new(buf);
 
         slab.alloc(100).unwrap();

@@ -258,19 +258,19 @@ mod tests {
 
         // Create a buffer with a record
         let record_size = HEADER_SIZE + key.len() + value.len();
-        let buf = MmapBuffer::new(record_size);
+        let buf = MmapBuffer::new(record_size).unwrap();
 
         // Write header
         let header = Header::new(1, key.len() as u16, value.len() as i64, value.len() as i64);
         let mut header_bytes = [0u8; HEADER_SIZE];
         header.encode(&mut header_bytes).unwrap();
-        buf.write_at(&header_bytes, 0);
+        buf.write_at(0, &header_bytes);
 
         // Write key
-        buf.write_at(key, HEADER_SIZE);
+        buf.write_at(HEADER_SIZE, key);
 
         // Write value
-        buf.write_at(value, HEADER_SIZE + key.len());
+        buf.write_at(HEADER_SIZE + key.len(), value);
 
         // Create index entry
         let index = Arc::new(SlabIndex::new());

@@ -7,6 +7,7 @@ import (
 	"slices"
 	"sync"
 
+	"github.com/miretskiy/blobcache/bloom"
 	"github.com/miretskiy/blobcache/compression"
 	"github.com/miretskiy/blobcache/internal/record"
 	"github.com/miretskiy/blobcache/internal/sys"
@@ -65,8 +66,8 @@ type MemTable struct {
 }
 
 func NewMemTable(
-	cfg config, b Batcher, reporter ErrorReporter, pub Publisher, w *wal.WAL,
-	segIDs SegmentIDProvider,
+		cfg config, b Batcher, reporter ErrorReporter, pub Publisher, w *wal.WAL,
+		segIDs SegmentIDProvider,
 ) *MemTable {
 	poolCapacity := cfg.MaxCachedSlabs + cfg.MaxInflightSlabs + 2
 
@@ -113,6 +114,7 @@ func (mt *MemTable) newActiveSlab(size int) *ActiveSlab {
 		SharedSlab: SharedSlab{
 			buf:   buf,
 			index: xmap.New[SlabEntry, xmap.Pad32](xmap.WithShardShift(4)), // 16 shards for slab index
+			bloom: bloom.New(32_000, 0.01),                                 // 32k entries, 1% FPR
 		},
 		// Reserve first 8 bytes for file header (magic + version).
 		// processFlush fills this in before writing, making every segment
@@ -163,13 +165,13 @@ func (mt *MemTable) Put(seqID uint64, hash Key, keyBytes, value []byte) error {
 }
 
 func (mt *MemTable) PutChecksummed(
-	seqID uint64, hash Key, keyBytes, value []byte, checksum uint32,
+		seqID uint64, hash Key, keyBytes, value []byte, checksum uint32,
 ) error {
 	return mt.putActive(seqID, hash, keyBytes, value, &checksum)
 }
 
 func (mt *MemTable) putActive(
-	seqID uint64, hash Key, keyBytes, value []byte, checksum *uint32,
+		seqID uint64, hash Key, keyBytes, value []byte, checksum *uint32,
 ) error {
 	// 1. Compress before lock (parallel compression) - only on first call
 	c := mt.maybeCompress(value)
@@ -178,7 +180,7 @@ func (mt *MemTable) putActive(
 }
 
 func (mt *MemTable) putActiveCompressed(
-	seqID uint64, hash Key, keyBytes, value []byte, checksum *uint32, compressed *BufferHandle,
+		seqID uint64, hash Key, keyBytes, value []byte, checksum *uint32, compressed *BufferHandle,
 ) error {
 	// 1. Build record BEFORE lock (pure computation, no lock needed)
 	valueBytes := value
@@ -308,6 +310,10 @@ func (mt *MemTable) writeToSlab(seqID uint64, hash Key, rec record.Record) error
 	shard := hash.Lo & indexShardMask
 	mt.indexLocks[shard].Lock()
 	if existing, ok := active.index.Get(hash); !ok || seqID > existing.SeqID {
+		// CRITICAL: Add to bloom BEFORE index to prevent false negatives.
+		// If index is visible before bloom, a concurrent reader could:
+		// 1. Find key in index, 2. Check bloom (not yet populated) → false negative
+		active.bloom.Add(hash)
 		active.index.Put(hash, entry)
 	}
 	mt.indexLocks[shard].Unlock()
@@ -338,6 +344,7 @@ func (mt *MemTable) prepareRotationLocked() func() {
 
 	// 3. Retire Old Slab
 	old.retired.Store(true)
+	old.bloom.Freeze()
 
 	// 4. Detach Active (Set to nil so nobody touches it while we allocate)
 	mt.mu.active = nil
@@ -622,7 +629,7 @@ func (mt *MemTable) ioFlags() sys.OpenFlag {
 
 // finalizeFlush updates the index and writes the footer file.
 func (mt *MemTable) finalizeFlush(
-	segmentID uint32, segmentPath string, entries []record.FooterEntry, maxSeqID uint64,
+		segmentID uint32, segmentPath string, entries []record.FooterEntry, maxSeqID uint64,
 ) error {
 	if mt.Knobs != nil && mt.Knobs.InjectIndexErr != nil {
 		if err := mt.Knobs.InjectIndexErr(); err != nil {
@@ -657,10 +664,10 @@ func (mt *MemTable) finalizeFlush(
 // break O_DIRECT alignment (the remaining data wouldn't start at a page boundary).
 // The 8 bytes of "waste" per XL write is acceptable given the simplicity.
 func writeSegmentWithXLPayloads(
-	segmentPath string,
-	flags sys.OpenFlag,
-	alignedData []byte,
-	xlWrites []SlabEntry,
+		segmentPath string,
+		flags sys.OpenFlag,
+		alignedData []byte,
+		xlWrites []SlabEntry,
 ) (retErr error) {
 	var xlSize int64
 	for _, w := range xlWrites {
@@ -719,9 +726,9 @@ func writeSegmentWithXLPayloads(
 //
 // Preconditions: entries and xlWrites must both be sorted by (Pos, SeqID).
 func adjustFilePositionsForXLWrites(
-	entries []record.FooterEntry,
-	xlWrites []SlabEntry,
-	xlSeqIDs map[uint64]int,
+		entries []record.FooterEntry,
+		xlWrites []SlabEntry,
+		xlSeqIDs map[uint64]int,
 ) {
 	var cumulativeXLSize int64
 	xlIdx := 0
@@ -776,6 +783,8 @@ func (mt *MemTable) ReplayRecord(hash Key, rec record.Record) error {
 		active.currentMaxSeq = rec.SeqID
 	}
 
+	// CRITICAL: Add to bloom BEFORE index to prevent false negatives.
+	active.bloom.Add(hash)
 	active.index.Put(hash, SlabEntry{Header: rec.Header, Pos: wPos})
 	return nil
 }

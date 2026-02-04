@@ -150,12 +150,10 @@ pub fn align_for_hole_punch(offset: i64, length: i64) -> (i64, i64, bool) {
 /// The returned pointer is page-aligned and suitable for Direct I/O.
 /// Memory is pre-warmed to force physical RAM commitment.
 ///
-/// # Panics
-///
-/// Panics if mmap fails (out of memory).
-pub fn mmap_anon(size: usize) -> *mut u8 {
+/// Returns an error if mmap fails (out of memory).
+pub fn mmap_anon(size: usize) -> Result<*mut u8> {
     if size == 0 {
-        return std::ptr::null_mut();
+        return Ok(std::ptr::null_mut());
     }
 
     let ptr = unsafe {
@@ -170,14 +168,10 @@ pub fn mmap_anon(size: usize) -> *mut u8 {
     };
 
     if ptr == libc::MAP_FAILED {
-        panic!(
-            "failed to mmap {} bytes: {}",
-            size,
-            io::Error::last_os_error()
-        );
+        return Err(Error::io("mmap anonymous memory", io::Error::last_os_error()));
     }
 
-    ptr as *mut u8
+    Ok(ptr as *mut u8)
 }
 
 /// Unmaps a memory region previously allocated with `mmap_anon`.
@@ -212,18 +206,15 @@ pub fn munmap(ptr: *mut u8, size: usize) {
 /// The returned buffer size is rounded UP to the nearest page boundary.
 /// This is optimal for O_DIRECT I/O which requires page-aligned memory.
 ///
-/// # Safety
-///
-/// The buffer is managed by Rust's ownership system. When dropped, the memory
-/// is automatically unmapped.
-pub fn alloc_aligned(size: usize) -> AlignedBuffer {
+/// Returns an error if mmap fails (out of memory).
+pub fn alloc_aligned(size: usize) -> Result<AlignedBuffer> {
     let aligned_size = page_align(size);
     if aligned_size == 0 {
-        return AlignedBuffer {
+        return Ok(AlignedBuffer {
             ptr: std::ptr::null_mut(),
             len: 0,
             capacity: 0,
-        };
+        });
     }
 
     let ptr = unsafe {
@@ -238,11 +229,7 @@ pub fn alloc_aligned(size: usize) -> AlignedBuffer {
     };
 
     if ptr == libc::MAP_FAILED {
-        panic!(
-            "failed to allocate {} aligned bytes: {}",
-            aligned_size,
-            io::Error::last_os_error()
-        );
+        return Err(Error::io("mmap aligned buffer", io::Error::last_os_error()));
     }
 
     // Pre-warm: force physical RAM commitment
@@ -251,11 +238,11 @@ pub fn alloc_aligned(size: usize) -> AlignedBuffer {
         slice[i] = 0;
     }
 
-    AlignedBuffer {
+    Ok(AlignedBuffer {
         ptr: ptr as *mut u8,
         len: 0,
         capacity: aligned_size,
-    }
+    })
 }
 
 /// A buffer backed by mmap'd memory with 4KB alignment.
@@ -690,7 +677,7 @@ mod tests {
 
     #[test]
     fn test_aligned_buffer() {
-        let mut buf = alloc_aligned(1000);
+        let mut buf = alloc_aligned(1000).unwrap();
         assert!(is_aligned(buf.spare_capacity_mut()));
         assert_eq!(buf.capacity(), BLOCK_SIZE); // Rounded up
 
@@ -733,4 +720,5 @@ mod tests {
         file.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, data);
     }
+
 }

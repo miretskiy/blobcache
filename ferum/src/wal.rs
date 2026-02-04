@@ -73,7 +73,7 @@ impl FileHeader {
             flags: 0,
             created_at: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_nanos() as i64,
             reserved: 0,
         }
@@ -204,6 +204,52 @@ impl Request {
 }
 
 // =============================================================================
+// RequestGuard - Panic safety for group commit
+// =============================================================================
+
+/// RAII guard ensuring a Request pointer is removed from pending/flushing
+/// if the thread unwinds before the request is processed.
+///
+/// This prevents use-after-free when a thread panics after pushing its
+/// stack-allocated Request pointer but before the leader processes it.
+struct RequestGuard<'a> {
+    state: &'a Mutex<WalState>,
+    cond: &'a Condvar,
+    req_ptr: *mut Request,
+}
+
+impl<'a> RequestGuard<'a> {
+    fn new(state: &'a Mutex<WalState>, cond: &'a Condvar, req_ptr: *mut Request) -> Self {
+        RequestGuard { state, cond, req_ptr }
+    }
+}
+
+impl<'a> Drop for RequestGuard<'a> {
+    fn drop(&mut self) {
+        // Safety: req_ptr points to our stack-allocated Request.
+        // If done is true, the leader has already processed our request
+        // and we don't need to clean up.
+        let req = unsafe { &*self.req_ptr };
+        if req.done {
+            return; // Already processed, no cleanup needed
+        }
+
+        // Request not processed yet - we're panicking or dropping early.
+        // Remove our pointer from both buffers to prevent use-after-free.
+        let mut state = self.state.lock();
+        state.pending.retain(|&ptr| ptr != self.req_ptr);
+        state.flushing.retain(|&ptr| ptr != self.req_ptr);
+
+        // If we were the leader (writer_busy was set by us), clear it
+        // and wake waiters so they can elect a new leader.
+        if state.writer_busy && std::thread::panicking() {
+            state.writer_busy = false;
+            self.cond.notify_all();
+        }
+    }
+}
+
+// =============================================================================
 // Stats
 // =============================================================================
 
@@ -269,6 +315,7 @@ impl Wal {
 
         let buf_size = config.max_batch_size + FILE_HEADER_SIZE;
         let aligned_size = sys::page_align(buf_size);
+        let encode_buf = sys::alloc_aligned(aligned_size)?;
 
         let wal = Arc::new(Wal {
             config,
@@ -281,7 +328,7 @@ impl Wal {
                 pending: Vec::with_capacity(4096),
                 flushing: Vec::with_capacity(4096),
                 writer_busy: false,
-                encode_buf: sys::alloc_aligned(aligned_size),
+                encode_buf,
             }),
             cond: Condvar::new(),
             closed: AtomicBool::new(false),
@@ -329,7 +376,13 @@ impl Wal {
         // Add our request to pending queue
         // Safety: req lives on caller's stack until this function returns,
         // and we only access it while holding the mutex or after done=true
-        state.pending.push(req as *mut Request);
+        let req_ptr = req as *mut Request;
+        state.pending.push(req_ptr);
+
+        // PANIC SAFETY: Create guard AFTER pushing. If this thread panics
+        // before our request is processed (done=true), the guard removes
+        // our pointer from pending/flushing to prevent use-after-free.
+        let _guard = RequestGuard::new(&self.state, &self.cond, req_ptr);
 
         loop {
             // Check if our request is done
@@ -655,7 +708,8 @@ impl Wal {
         let write_size = sys::page_align(total_payload);
 
         // Allocate temporary aligned buffer
-        let mut buf = sys::alloc_aligned(write_size);
+        let mut buf = sys::alloc_aligned(write_size)?;
+        buf.set_len(write_size); // Enable full capacity access
 
         // Track file offset for WriteResult (before writing)
         let record_offset = if include_header {

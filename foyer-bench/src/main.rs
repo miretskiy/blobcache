@@ -35,6 +35,48 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use sysinfo::{ProcessRefreshKind, System};
 
+/// Rate limiter to provide backpressure for writes.
+/// Foyer has no internal backpressure, so we add it externally.
+struct Pacer {
+    start: Instant,
+    bytes_written: AtomicU64,
+    target_bytes_per_sec: u64,
+}
+
+impl Pacer {
+    fn new(target_mb_per_sec: usize) -> Self {
+        Self {
+            start: Instant::now(),
+            bytes_written: AtomicU64::new(0),
+            target_bytes_per_sec: (target_mb_per_sec as u64) * 1024 * 1024,
+        }
+    }
+
+    /// Called after each write. Returns how long to sleep (if any) to stay on pace.
+    fn pace(&self, bytes: u64) -> Duration {
+        if self.target_bytes_per_sec == 0 {
+            return Duration::ZERO; // Unlimited
+        }
+
+        let total = self.bytes_written.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        let elapsed = self.start.elapsed();
+
+        // Calculate how far ahead we are
+        let expected_duration_ns = (total as u128 * 1_000_000_000) / self.target_bytes_per_sec as u128;
+        let actual_ns = elapsed.as_nanos();
+
+        if expected_duration_ns > actual_ns {
+            Duration::from_nanos((expected_duration_ns - actual_ns) as u64)
+        } else {
+            Duration::ZERO
+        }
+    }
+
+    fn total_bytes(&self) -> u64 {
+        self.bytes_written.load(Ordering::Relaxed)
+    }
+}
+
 // --- WORKLOAD CONFIGURATION (matches BlobCache 40/40/10/10) ---
 // Higher write percentage to saturate NVMe bandwidth
 const WRITE_WEIGHT: u32 = 40;
@@ -71,8 +113,9 @@ struct Args {
     #[arg(short, long, default_value_t = 400)]
     capacity_gb: usize,
 
-    /// Rate limit writes (MB/s, 0 = unlimited)
-    #[arg(long, default_value_t = 0)]
+    /// Rate limit writes (MB/s, default 1100 = ~1.1 GB/s to match NVMe throughput)
+    /// Set to 0 for unlimited (will likely OOM without backpressure)
+    #[arg(long, default_value_t = 1100)]
     write_rate_limit_mb: usize,
 }
 
@@ -106,6 +149,7 @@ async fn run_worker(
     worker_id: usize,
     cache: Arc<HybridCache<Vec<u8>, Vec<u8>>>,
     stats: Arc<WorkerStats>,
+    pacer: Arc<Pacer>,
     iterations_per_worker: u64,
     entropy: Arc<Vec<u8>>,
 ) {
@@ -153,6 +197,13 @@ async fn run_worker(
                     .total_bytes_written
                     .fetch_add(blob_size as u64, Ordering::Relaxed);
                 local_put.record(start.elapsed().as_nanos() as u64).ok();
+
+                // Apply backpressure - sleep if we're writing faster than disk can flush
+                let sleep_duration = pacer.pace(blob_size as u64);
+                if !sleep_duration.is_zero() {
+                    tokio::time::sleep(sleep_duration).await;
+                }
+
                 data_written = true;
             } else if adjusted_op < HOT_READ_BOUND {
                 // 40% Hot Read - Zipfian distribution targeting recent keys
@@ -333,7 +384,7 @@ async fn main() -> anyhow::Result<()> {
     let num_workers = args.workers.unwrap_or_else(num_cpus::get);
     let iterations_per_worker = args.iterations / num_workers as u64;
 
-    println!("=== Foyer Benchmark (BlobCache-aligned workload) ===");
+    println!("=== Foyer Benchmark (Ferum/BlobCache-aligned config) ===");
     println!("Iterations: {} (writes)", args.iterations);
     println!("Workers: {}", num_workers);
     println!("Cache path: {:?}", args.path);
@@ -342,6 +393,22 @@ async fn main() -> anyhow::Result<()> {
         "Expected data: ~{:.1} GB (avg 1MB/write)",
         args.iterations as f64 / 1024.0
     );
+    println!();
+    println!("Configuration (matching Ferum/Go):");
+    println!("  Memory tier: 12GB (matches Ferum slab pool)");
+    println!("  Buffer pool: 12GB");
+    println!("  Block size: 128MB (matches write_buffer_size)");
+    println!("  Flushers: 6 (matches flush_concurrency)");
+    println!("  Policy: WriteOnInsertion (all writes go to disk)");
+    println!("  Direct I/O: ENABLED (bypass page cache)");
+    if args.write_rate_limit_mb > 0 {
+        println!(
+            "  Rate limit: {} MB/s (external backpressure)",
+            args.write_rate_limit_mb
+        );
+    } else {
+        println!("  Rate limit: NONE (may OOM without backpressure!)");
+    }
     println!();
     println!("Workload distribution (40/40/10/10 - write-heavy):");
     println!("  40% Write  (100KB - 2MB per blob)");
@@ -362,22 +429,35 @@ async fn main() -> anyhow::Result<()> {
     let entropy = Arc::new(entropy);
 
     // Build foyer cache
-    // Using WriteOnInsertion to ensure data goes to disk (not just memory)
+    // Configuration to match Ferum/Go BlobCache for fair comparison:
+    // - WriteOnInsertion: Every write goes to disk (like Ferum/Go)
+    // - 12GB memory: Matches Ferum's slab pool (98 slabs × 128MB)
+    // - 12GB buffer pool: Prevents data drops under load
+    // - 6 flushers: Matches Ferum's flush_concurrency
+    // - 128MB block size: Matches Ferum's write_buffer_size
     let device = FsDeviceBuilder::new(&args.path)
         .with_capacity((args.capacity_gb + 100) * 1024 * 1024 * 1024) // usize capacity
         .with_throttle(Throttle::new()) // Unlimited
+        .with_direct(true) // Enable Direct I/O to bypass page cache
         .build()?;
 
+    // Match Ferum configuration:
+    // - flush_concurrency: 6
+    // - write_buffer_size: 128MB
+    // - max_inflight_slabs: 32 (32 × 128MB = 4GB inflight)
+    // - max_cached_slabs: 64 (64 × 128MB = 8GB cached)
+    // Total slab pool: ~12GB
     let engine = BlockEngineBuilder::new(device)
-        .with_flushers(8)
-        .with_buffer_pool_size(8 * 1024 * 1024 * 1024) // 8GB buffer pool
-        .with_submit_queue_size_threshold(8 * 1024 * 1024 * 1024);
+        .with_flushers(6)                                    // Match flush_concurrency
+        .with_block_size(128 * 1024 * 1024)                  // 128MB blocks (match write_buffer_size)
+        .with_buffer_pool_size(12 * 1024 * 1024 * 1024)      // 12GB buffer pool (match slab pool)
+        .with_submit_queue_size_threshold(12 * 1024 * 1024 * 1024); // 12GB queue threshold
 
     let cache: Arc<HybridCache<Vec<u8>, Vec<u8>>> = Arc::new(
         HybridCacheBuilder::new()
             .with_name("foyer-bench")
-            .with_policy(HybridCachePolicy::WriteOnInsertion)
-            .memory(100 * 1024 * 1024) // 100MB memory tier (minimal, emphasize disk)
+            .with_policy(HybridCachePolicy::WriteOnInsertion) // Write to disk on every insert
+            .memory(12 * 1024 * 1024 * 1024)                  // 12GB memory (match Ferum's slab pool)
             .with_weighter(|_k: &Vec<u8>, v: &Vec<u8>| v.len())
             .storage()
             .with_engine_config(engine)
@@ -429,7 +509,19 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // --- MAIN BENCHMARK ---
-    println!("Starting benchmark ({} iterations)...", args.iterations);
+    // Create pacer to provide backpressure (Foyer has none internally)
+    let pacer = Arc::new(Pacer::new(args.write_rate_limit_mb));
+    if args.write_rate_limit_mb > 0 {
+        println!(
+            "Starting benchmark ({} iterations, rate-limited to {} MB/s)...",
+            args.iterations, args.write_rate_limit_mb
+        );
+    } else {
+        println!(
+            "Starting benchmark ({} iterations, UNLIMITED rate - may OOM)...",
+            args.iterations
+        );
+    }
     let benchmark_start = Instant::now();
 
     // Spawn workers
@@ -437,6 +529,7 @@ async fn main() -> anyhow::Result<()> {
     for worker_id in 0..num_workers {
         let cache_clone = Arc::clone(&cache);
         let stats_clone = Arc::clone(&stats);
+        let pacer_clone = Arc::clone(&pacer);
         let entropy_clone = Arc::clone(&entropy);
 
         let handle = tokio::spawn(async move {
@@ -444,6 +537,7 @@ async fn main() -> anyhow::Result<()> {
                 worker_id,
                 cache_clone,
                 stats_clone,
+                pacer_clone,
                 iterations_per_worker,
                 entropy_clone,
             )

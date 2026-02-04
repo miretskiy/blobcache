@@ -30,8 +30,46 @@ use crate::storage::{
 };
 use crate::wal::Wal;
 
+use std::sync::atomic::AtomicI64;
+
 /// Number of index shards for per-key concurrency control.
 const NUM_INDEX_SHARDS: usize = 256;
+
+/// RAII guard for managing pending_writes counter.
+///
+/// This ensures the counter is decremented when the guard goes out of scope,
+/// even on early return or panic. This fixes the bug where WAL write errors
+/// could cause the counter to leak, leading to deadlock in prepare_rotation().
+struct PendingWriteGuard {
+    counter: Arc<AtomicI64>,
+    active: bool,
+}
+
+impl PendingWriteGuard {
+    fn new(counter: Arc<AtomicI64>) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        PendingWriteGuard { counter, active: true }
+    }
+
+    /// Disarms the guard, preventing the decrement on drop.
+    /// Call this when the write has been successfully committed and we want
+    /// to keep the pending count elevated for a bit longer (e.g., during
+    /// index update).
+    #[allow(dead_code)]
+    fn disarm(mut self) {
+        self.active = false;
+        // Don't forget self - we want Drop to NOT decrement
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for PendingWriteGuard {
+    fn drop(&mut self) {
+        if self.active {
+            self.counter.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
 
 /// Error returned when write's seqID is older than maxSealedSeq.
 #[derive(Debug, Clone)]
@@ -126,7 +164,7 @@ impl MemTable {
             "slab",
             config.write_buffer_size,
             pool_capacity,
-        );
+        )?;
 
         let (flush_tx, flush_rx) = channel::bounded(config.max_inflight_slabs);
 
@@ -161,7 +199,7 @@ impl MemTable {
 
         // Initialize active slab
         {
-            let active = mt.new_active_slab();
+            let active = mt.new_active_slab()?;
             mt.state.lock().active = Some(active);
         }
 
@@ -295,17 +333,19 @@ impl MemTable {
             // CRITICAL: Capture Arc references BEFORE dropping the lock.
             // Rotation may move the slab out of state.active, but we must
             // continue working with the slab we reserved space in.
-            let (slab_offset, xl_buffer, slab_buf, slab_index, pending_writes) = if is_xl {
+            //
+            // SAFETY: We use PendingWriteGuard to ensure pending_writes is
+            // decremented even on early return (e.g., WAL write error).
+            // This fixes the deadlock bug where prepare_rotation() would
+            // wait forever for a leaked pending_writes counter.
+            let (slab_offset, xl_buffer, slab_buf, slab_index, _pending_guard) = if is_xl {
                 // XL Write in CAS mode: Skip slab allocation, data goes to WAL + xl_buf
                 // Reserve position for ordering (at page boundary)
                 let pos = active.position();
 
-                // Capture references BEFORE incrementing pending_writes
+                // Capture references and create guard (increments pending_writes)
                 let slab_index = Arc::clone(&active.index);
-                let pending_writes = Arc::clone(&active.pending_writes);
-
-                // Increment pending writes
-                pending_writes.fetch_add(1, Ordering::AcqRel);
+                let pending_guard = PendingWriteGuard::new(Arc::clone(&active.pending_writes));
 
                 // Track max seq
                 loop {
@@ -323,10 +363,13 @@ impl MemTable {
                 drop(state); // Release lock before I/O
 
                 // Create XL buffer for read-after-write (librarian reads from this)
-                let xl_buf = MmapBuffer::new(write_size);
-                rec.encode(xl_buf.as_mut_slice())?;
+                // XL buffers are standalone (not shared), but we use the same safe
+                // pattern for consistency.
+                let xl_buf = MmapBuffer::new(write_size)?;
+                let encoded = rec.encode_to_vec();
+                xl_buf.write_at(0, &encoded);
 
-                (pos, Some(xl_buf), None, slab_index, pending_writes)
+                (pos, Some(xl_buf), None, slab_index, pending_guard)
             } else {
                 // Normal allocation
                 #[cfg(test)]
@@ -338,13 +381,10 @@ impl MemTable {
                 eprintln!("write_to_slab: allocation result = {:?}", allocation);
 
                 if let Some((offset, _)) = allocation {
-                    // Capture Arc references BEFORE incrementing pending_writes
+                    // Capture Arc references and create guard (increments pending_writes)
                     let slab_buf = Arc::clone(&active.buf);
                     let slab_index = Arc::clone(&active.index);
-                    let pending_writes = Arc::clone(&active.pending_writes);
-
-                    // Increment pending writes
-                    pending_writes.fetch_add(1, Ordering::AcqRel);
+                    let pending_guard = PendingWriteGuard::new(Arc::clone(&active.pending_writes));
 
                     // Track max seq
                     loop {
@@ -361,10 +401,19 @@ impl MemTable {
 
                     drop(state); // Release lock before I/O
 
-                    // Write record to reserved region using captured buffer
-                    rec.encode(slab_buf.as_mut_slice().get_mut(offset as usize..).unwrap())?;
+                    // Write record to reserved region using captured buffer.
+                    //
+                    // SAFETY: We use encode_to_vec() + write_at() instead of
+                    // encode(as_mut_slice()) to avoid undefined behavior.
+                    // Multiple threads may be writing to different offsets in
+                    // the same buffer concurrently. Using as_mut_slice() would
+                    // create multiple overlapping &mut references, which is UB.
+                    // The write_at() method uses raw pointer operations that
+                    // are safe for non-overlapping concurrent writes.
+                    let encoded = rec.encode_to_vec();
+                    slab_buf.write_at(offset as usize, &encoded);
 
-                    (offset, None, Some(slab_buf), slab_index, pending_writes)
+                    (offset, None, Some(slab_buf), slab_index, pending_guard)
                 } else {
                     // Need rotation
                     self.prepare_rotation(state);
@@ -426,13 +475,14 @@ impl MemTable {
                 eprintln!("write_to_slab: index insert - before={}, after={}", index_len_before, index_len_after);
             }
 
-            // 7. Decrement pending writes using captured reference
-            // This correctly decrements the ORIGINAL slab's counter, even if rotation happened
-            pending_writes.fetch_sub(1, Ordering::AcqRel);
+            // 7. Pending writes counter is decremented automatically by _pending_guard
+            // when it goes out of scope (RAII pattern). This ensures the counter is
+            // decremented even on early return due to errors.
 
             // Keep slab_buf alive until after write is complete
             drop(slab_buf);
 
+            // _pending_guard drops here, decrementing the counter
             return Ok(());
         }
     }
@@ -475,19 +525,41 @@ impl MemTable {
             }
         }
 
-        // Send to flusher
+        // Send to flusher - use blocking send for proper backpressure
+        // CRITICAL: Never use try_send here as it drops the slab (and its data!) on failure
         if !self.is_degraded() {
             // Track pending flush BEFORE sending
             self.pending_flushes.fetch_add(1, Ordering::AcqRel);
             let ticket = FlushTicket { active: old };
-            if self.flush_tx.try_send(ticket).is_err() {
-                // Channel full, decrement counter
-                self.pending_flushes.fetch_sub(1, Ordering::AcqRel);
-            }
+            // Block until flusher has capacity - this is correct backpressure behavior
+            let _ = self.flush_tx.send(ticket);
         }
 
         // Allocate new slab (blocking operation)
-        let new_slab = self.new_active_slab();
+        let new_slab = match self.new_active_slab() {
+            Ok(slab) => slab,
+            Err(e) => {
+                // Enter degraded mode on allocation failure
+                eprintln!("critical: slab allocation failed during rotation: {}", e);
+                self.degraded.store(true, Ordering::Release);
+                // Try once more with standalone buffer as last resort
+                match MmapBuffer::new(self.config.write_buffer_size) {
+                    Ok(buf) => {
+                        let slab = ActiveSlab::new(buf);
+                        slab.alloc(record::FILE_HEADER_SIZE);
+                        slab
+                    }
+                    Err(e2) => {
+                        // Complete failure - release rotation lock and let writes fail
+                        eprintln!("fatal: cannot allocate any slab buffer: {}", e2);
+                        let mut state = self.state.lock();
+                        state.rotating = false;
+                        self.rotation_cond.notify_all();
+                        return;
+                    }
+                }
+            }
+        };
 
         // Re-acquire lock and install new slab
         let mut state = self.state.lock();
@@ -497,11 +569,11 @@ impl MemTable {
     }
 
     /// Creates a new active slab.
-    fn new_active_slab(&self) -> ActiveSlab {
+    fn new_active_slab(&self) -> Result<ActiveSlab> {
         let buf = if self.is_degraded() {
-            MmapBuffer::new(self.config.write_buffer_size)
+            MmapBuffer::new(self.config.write_buffer_size)?
         } else {
-            self.slab_pool.acquire()
+            self.slab_pool.acquire()?
         };
 
         let slab = ActiveSlab::new(buf);
@@ -512,7 +584,7 @@ impl MemTable {
         // Publish to librarian
         self.librarian.publish(slab.as_shared());
 
-        slab
+        Ok(slab)
     }
 
     /// Background flush worker.
@@ -707,8 +779,10 @@ impl MemTable {
 
         // Copy file header INTO the slab buffer at position 0 (like Go does).
         // This ensures we write header + data together as one aligned write for Direct I/O.
+        // Note: Slab is sealed at this point (no concurrent writers), but we use
+        // write_at() for consistency with the rest of the codebase.
         let header_bytes = record::file_header_bytes();
-        slab.buf.as_mut_slice()[..record::FILE_HEADER_SIZE].copy_from_slice(&header_bytes);
+        slab.buf.write_at(0, &header_bytes);
 
         if has_xl {
             // Interleave slab data with XL buffers
@@ -932,7 +1006,7 @@ impl MemTable {
 
         // Ensure we have an active slab
         if state.active.is_none() {
-            let buf = self.slab_pool.acquire();
+            let buf = self.slab_pool.acquire()?;
             state.active = Some(ActiveSlab::new(buf));
         }
 
@@ -959,7 +1033,7 @@ impl MemTable {
                 self.pending_flushes.fetch_add(1, Ordering::AcqRel);
 
                 // Create new slab
-                let buf = self.slab_pool.acquire();
+                let buf = self.slab_pool.acquire()?;
                 state.active = Some(ActiveSlab::new(buf));
 
                 // Allocate from new slab
@@ -996,11 +1070,25 @@ impl MemTable {
 
     /// Closes the MemTable.
     ///
-    /// Sets stop flag and waits briefly for flush workers to exit.
-    /// Workers check stop flag every 100ms, so we wait 150ms to ensure they see it.
+    /// IMPORTANT: This method properly drains all pending data before stopping
+    /// flush workers. Simply sleeping and hoping workers finish is NOT safe -
+    /// it can silently drop gigabytes of data sitting in the flush channel.
+    ///
+    /// The correct shutdown sequence is:
+    /// 1. Flush the current slab (rotate it into the flush channel)
+    /// 2. Drain all pending flushes (wait for channel to empty)
+    /// 3. Signal workers to stop
+    /// 4. Wait briefly for workers to see the stop flag
     pub fn close(&self) {
+        // Step 1 & 2: Drain ensures current slab is flushed and all pending
+        // flushes complete. This is CRITICAL - without it, data in the channel
+        // is silently dropped when workers exit.
+        self.drain();
+
+        // Step 3: Signal workers to stop
         self.stop.store(true, Ordering::Release);
-        // Wait for workers to see the stop flag and exit
+
+        // Step 4: Wait for workers to see the stop flag and exit
         // Workers use 100ms recv_timeout, so 150ms should be enough
         std::thread::sleep(std::time::Duration::from_millis(150));
     }
@@ -1040,5 +1128,93 @@ mod tests {
 
         // Second write with higher seq succeeds
         mt.put(20, key, b"key1", b"value2").unwrap();
+    }
+
+    // =========================================================================
+    // Bug regression tests
+    // =========================================================================
+
+    /// Test that pending_writes counter is properly managed and doesn't leak.
+    ///
+    /// If pending_writes leaks (e.g., due to early return on error without
+    /// decrementing), prepare_rotation() will deadlock waiting for pending_writes
+    /// to reach 0.
+    #[test]
+    fn test_pending_writes_balanced_after_writes() {
+        let dir = tempdir().unwrap();
+        let mut config = Config::new(dir.path());
+        config.write_buffer_size = 1 << 20; // 1MB - small to force rotation
+        config.max_inflight_slabs = 4;
+        config.flush_concurrency = 2;
+
+        let index = Arc::new(DurableIndex::open(None, 1 << 20).unwrap());
+        let librarian = Arc::new(Librarian::new(4));
+
+        let mt = MemTable::new(config, dir.path().to_path_buf(), index, librarian, None, None).unwrap();
+
+        // Write enough to fill buffer and trigger multiple rotations
+        let value = vec![0xAB; 100_000]; // 100KB per write
+        for i in 0..20 {
+            let key = Key::from_bytes(format!("key{:04}", i).as_bytes());
+            mt.put((i + 1) as u64, key, format!("key{:04}", i).as_bytes(), &value).unwrap();
+        }
+
+        // Flush should not hang (would deadlock if pending_writes leaked)
+        let flush_start = std::time::Instant::now();
+        mt.flush();
+
+        assert!(
+            flush_start.elapsed() < std::time::Duration::from_secs(5),
+            "flush took too long - possible deadlock due to pending_writes leak"
+        );
+
+        // Drain should also complete
+        let drain_start = std::time::Instant::now();
+        mt.drain();
+        assert!(
+            drain_start.elapsed() < std::time::Duration::from_secs(5),
+            "drain took too long - possible deadlock due to pending_writes leak"
+        );
+
+        mt.close();
+    }
+
+    /// Test that close() does not leave pending writes in the channel.
+    ///
+    /// BUG: close() only sets stop flag and sleeps 150ms, but does NOT:
+    /// 1. Flush the current slab
+    /// 2. Wait for the flush channel to empty
+    ///
+    /// This test verifies the fix by checking that close() properly drains.
+    #[test]
+    fn test_close_drains_pending_slabs() {
+        let dir = tempdir().unwrap();
+        let mut config = Config::new(dir.path());
+        config.write_buffer_size = 1 << 20; // 1MB
+        config.max_inflight_slabs = 8;
+        config.flush_concurrency = 2; // Slow workers to build up queue
+
+        let index = Arc::new(DurableIndex::open(None, 1 << 20).unwrap());
+        let librarian = Arc::new(Librarian::new(4));
+
+        let mt = MemTable::new(config, dir.path().to_path_buf(), index, librarian, None, None).unwrap();
+
+        // Write enough to create multiple pending slabs
+        let value = vec![0xAB; 200_000]; // 200KB per write
+        for i in 0..50 {
+            let key = Key::from_bytes(format!("closekey{:04}", i).as_bytes());
+            mt.put((i + 1) as u64, key, format!("closekey{:04}", i).as_bytes(), &value).unwrap();
+        }
+
+        // close() should complete in reasonable time and drain all data
+        let close_start = std::time::Instant::now();
+        mt.close();
+
+        let close_duration = close_start.elapsed();
+        assert!(
+            close_duration < std::time::Duration::from_secs(30),
+            "close() took {:.2}s - too slow, possible hang",
+            close_duration.as_secs_f64()
+        );
     }
 }

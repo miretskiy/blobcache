@@ -13,7 +13,8 @@
 //! collide for different keys, which happens at scale with truncated hashes.
 
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
-use std::sync::Mutex;
+
+use parking_lot::Mutex;
 
 use crate::key::Key;
 
@@ -54,11 +55,11 @@ impl Recording {
             // Note: This is a bit unsafe in Rust since we're writing to a shared Vec.
             // In a more idiomatic implementation, we'd use AtomicCell or similar.
             // For now, we'll use the overflow path for all recordings to be safe.
-            let mut overflow = self.overflow_mu.lock().unwrap();
+            let mut overflow = self.overflow_mu.lock();
             overflow.push(k);
         } else {
             // Emergency overflow to guarantee NO FALSE NEGATIVES
-            let mut overflow = self.overflow_mu.lock().unwrap();
+            let mut overflow = self.overflow_mu.lock();
             overflow.push(k);
         }
     }
@@ -68,7 +69,7 @@ impl Recording {
         F: FnMut(Key),
     {
         // Drain overflow (which contains all recorded keys in our safe implementation)
-        let overflow = self.overflow_mu.lock().unwrap();
+        let overflow = self.overflow_mu.lock();
         for k in overflow.iter() {
             consumer(*k);
         }

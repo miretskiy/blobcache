@@ -95,6 +95,10 @@ pub enum Error {
     /// Data corruption detected.
     #[error("data corruption: {message}")]
     Corruption { message: String },
+
+    /// Resource exhaustion / backpressure (e.g., pool depleted, queue full).
+    #[error("backpressure: {message}")]
+    Backpressure { message: String },
 }
 
 impl Error {

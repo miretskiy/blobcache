@@ -37,8 +37,13 @@ type Cache struct {
 	archivist *Archivist
 	wal       *wal.WAL // nil if WAL disabled
 	segIDs    SegmentIDProvider
-	bloom     struct {
-		atomic.Pointer[bloom.Filter]
+	hot       struct {
+		bloom     atomic.Pointer[bloom.Filter]
+		trustHash bool
+		_         [64]byte // force next member to start on another cache line.
+	}
+
+	bloomStats struct {
 		hits        atomic.Uint64             // Bloom filter said "yes"
 		ghosts      atomic.Uint64             // Bloom said yes, but index said no.
 		deletions   atomic.Int64              // Track cumulative deletions since last rebuild
@@ -246,7 +251,8 @@ func open(cfg config) (*Cache, bool, error) {
 	c.globalSeq.Store(uint64(time.Now().UnixNano()))
 
 	c.librarian = NewLibrarian(cfg.MaxCachedSlabs, c)
-	c.bloom.Store(filter)
+	c.hot.bloom.Store(filter)
+	c.hot.trustHash = c.TrustHash
 	c.approxSize.Store(totalSize)
 	c.oldestLiveSegmentID.Store(oldestSegID)
 	c.Knobs = cfg.knobs
@@ -361,104 +367,97 @@ func checkOrInitialize(cfg config) (*index.DurableIndex, error) {
 
 // --- UNIFIED LOOKUP PIPELINE ---
 
-// search attempts to locate the blob in RAM (returning data) or Disk (returning r).
+// search attempts to locate the blob in RAM or Disk, returning raw bytes.
+// For RAM hits, returns zero-copy slice into the slab buffer.
+// For disk hits, reads the entire blob into memory.
 // It acts as the Single Source of Truth for Bloom metrics (Hits vs Ghosts).
 // Key verification happens on both paths to detect 128-bit hash collisions.
-func (c *Cache) search(key []byte) (data []byte, r io.Reader, rel Releaser, ok bool) {
+func (c *Cache) search(key []byte) (data []byte, rel Releaser, ok bool) {
 	h := xxh3.Hash128(key)
 
 	// 1. Bloom Filter Gate (full 128-bit key)
-	if !c.bloom.Load().Test(h) {
-		return nil, nil, Releaser{}, false
+	if !c.hot.bloom.Load().Test(h) {
+		return nil, Releaser{}, false
 	}
-	c.bloom.hits.Add(1) // Bloom said "yes"
+
+	if h.Lo&127 == 0 {
+		c.bloomStats.hits.Add(128)
+	}
 
 	// 2. RAM Hit (Librarian)
 	if ramData, storedKey, releaser, found := c.librarian.Acquire(h); found {
 		// Verify key to detect hash collision
-		if !bytes.Equal(storedKey, key) {
+		if !c.hot.trustHash && !bytes.Equal(storedKey, key) {
 			releaser.Release()
-			c.bloom.ghosts.Add(1) // Hash collision: bloom said yes, wrong key
-			return nil, nil, Releaser{}, false
+			c.bloomStats.ghosts.Add(1) // Hash collision: bloom said yes, wrong key
+			return nil, Releaser{}, false
 		}
-		return ramData, nil, releaser, true
+		return ramData, releaser, true
 	}
 
 	// 3. Disk Hit (Storage)
 	entry, found := c.index.Get(h)
 	if !found || entry.IsDeleted() {
 		// BLOOM GHOST: Bloom said yes, Index said no (or item is deleted).
-		c.bloom.ghosts.Add(1)
-		return nil, nil, Releaser{}, false
+		c.bloomStats.ghosts.Add(1)
+		return nil, Releaser{}, false
 	}
 
 	// 4. Check corruption flag
 	if entry.HasError() {
 		log.Debug("blob marked as corrupt", "hash", h, "errno", entry.Errno())
-		return nil, nil, Releaser{}, false
+		return nil, Releaser{}, false
 	}
 
 	// 5. Read from disk (with key verification for collision detection)
-	diskReader, diskReleaser, err := c.archivist.ReadBlob(entry, key)
+	// Pass nil key when TrustHash enabled to skip verification
+	verifyKey := key
+	if c.TrustHash {
+		verifyKey = nil
+	}
+	diskReader, diskReleaser, err := c.archivist.ReadBlob(entry, verifyKey)
 	if err != nil {
 		c.handleStorageError(h, entry, err)
-		return nil, nil, Releaser{}, false
+		return nil, Releaser{}, false
 	}
 
-	return nil, diskReader, diskReleaser, true
+	// 6. Read disk data into buffer
+	buf, err := io.ReadAll(diskReader)
+	if err != nil {
+		diskReleaser.Release()
+		return nil, Releaser{}, false
+	}
+	return buf, diskReleaser, true
 }
 
 // ZeroCopyView provides a unified reader for both RAM and Disk hits.
 // If found is true, the caller MUST call the returned Releaser expediently.
 func (c *Cache) ZeroCopyView(key []byte) (io.Reader, Releaser, bool) {
-	data, r, rel, ok := c.search(key)
+	data, rel, ok := c.search(key)
 	if !ok {
 		return nil, Releaser{}, false
 	}
-
-	if data != nil {
-		// RAM Hit: Wrap raw bytes in a reader.
-		return bytes.NewReader(data), rel, true
-	}
-
-	// Disk Hit: Reader is already set.
-	return r, rel, true
+	return bytes.NewReader(data), rel, true
 }
 
 func (c *Cache) Read(key []byte, dst []byte) ([]byte, bool) {
-	data, r, rel, ok := c.search(key)
+	data, rel, ok := c.search(key)
 	if !ok {
 		return dst, false
 	}
 	defer rel.Release()
-
-	if data != nil {
-		// Fast Path: Direct append (Zero Alloc)
-		return append(dst, data...), true
-	}
-
-	// Slow Path: Disk Reader
-	buf := bytes.NewBuffer(dst)
-	buf.Reset()
-	if _, err := io.Copy(buf, r); err != nil {
-		return dst, false
-	}
-	return buf.Bytes(), true
+	return append(dst, data...), true
 }
 
-// View provides scoped access to a value via an io.Reader.
-func (c *Cache) View(key []byte, fn func(r io.Reader)) bool {
-	data, r, rel, ok := c.search(key)
+// View provides scoped access to a value's raw bytes.
+// The data slice is valid only for the duration of fn.
+func (c *Cache) View(key []byte, fn func(data []byte)) bool {
+	data, rel, ok := c.search(key)
 	if !ok {
 		return false
 	}
 	defer rel.Release()
-
-	if data != nil {
-		fn(bytes.NewReader(data))
-	} else {
-		fn(r)
-	}
+	fn(data)
 	return true
 }
 
@@ -484,7 +483,7 @@ func (c *Cache) Delete(key []byte) error {
 
 	// Verify the key exists and matches (handles hash collision detection).
 	// search() checks both RAM and disk paths with key verification.
-	_, _, rel, found := c.search(key)
+	_, rel, found := c.search(key)
 	if !found {
 		return nil // Not found or hash collision - idempotent
 	}
@@ -545,7 +544,7 @@ func (c *Cache) deleteInCASMode(key []byte, h Key, item index.Item) error {
 		return fmt.Errorf("write tombstone: %w", err)
 	}
 
-	c.bloom.deletions.Add(1)
+	c.bloomStats.deletions.Add(1)
 	return nil
 }
 
@@ -577,7 +576,7 @@ func (c *Cache) deleteInCacheMode(key []byte, h Key, item index.Item) error {
 		return fmt.Errorf("write tombstone: %w", err)
 	}
 
-	c.bloom.deletions.Add(1)
+	c.bloomStats.deletions.Add(1)
 	return nil
 }
 
@@ -586,7 +585,7 @@ func (c *Cache) Put(key []byte, value []byte) error {
 		return ErrEmptyKey
 	}
 	h := xxh3.Hash128(key)
-	c.bloom.Load().Add(h)
+	c.hot.bloom.Load().Add(h)
 	c.putWithRetry(h, key, value, nil)
 	return nil
 }
@@ -596,7 +595,7 @@ func (c *Cache) PutChecksummed(key []byte, value []byte, checksum uint32) error 
 		return ErrEmptyKey
 	}
 	h := xxh3.Hash128(key)
-	c.bloom.Load().Add(h)
+	c.hot.bloom.Load().Add(h)
 	c.putWithRetry(h, key, value, &checksum)
 	return nil
 }
@@ -690,7 +689,7 @@ func (c *Cache) rebuildBloom() error {
 	var stopRecording func()
 	var consumeRecording func(bloom.KeyConsumer)
 
-	if oldFilter := c.bloom.Load(); oldFilter != nil {
+	if oldFilter := c.hot.bloom.Load(); oldFilter != nil {
 		stopRecording, consumeRecording = oldFilter.RecordAdditions()
 	}
 
@@ -709,23 +708,23 @@ func (c *Cache) rebuildBloom() error {
 		return err
 	}
 
-	oldFilter := c.bloom.Swap(newFilter)
+	oldFilter := c.hot.bloom.Swap(newFilter)
 
 	if oldFilter != nil && stopRecording != nil {
 		stopRecording()
 		consumeRecording(newFilter.AddHash)
 	}
 
-	c.bloom.deletions.Store(0)
+	c.bloomStats.deletions.Store(0)
 	now := time.Now()
-	c.bloom.lastRebuild.Store(&now)
+	c.bloomStats.lastRebuild.Store(&now)
 
 	return nil
 }
 
 func (c *Cache) maybeTriggerBloomRebuild() error {
 	// 1. Cooldown Guard (e.g., 5 minutes)
-	last := c.bloom.lastRebuild.Load()
+	last := c.bloomStats.lastRebuild.Load()
 	if last != nil && time.Since(*last) < 5*time.Minute {
 		return nil
 	}
@@ -733,7 +732,7 @@ func (c *Cache) maybeTriggerBloomRebuild() error {
 	shouldRebuild := false
 
 	// 2. Proactive: Cumulative Staleness check
-	staleCount := c.bloom.deletions.Load()
+	staleCount := c.bloomStats.deletions.Load()
 	threshold := int64(float64(c.BloomEstimatedKeys) * 0.10)
 	if staleCount > threshold {
 		shouldRebuild = true
@@ -741,8 +740,8 @@ func (c *Cache) maybeTriggerBloomRebuild() error {
 
 	// 3. Reactive: Observed FPR check
 	if !shouldRebuild {
-		hits := c.bloom.hits.Load()
-		ghosts := c.bloom.ghosts.Load()
+		hits := c.bloomStats.hits.Load()
+		ghosts := c.bloomStats.ghosts.Load()
 		if hits > 2000 {
 			observedFPR := float64(ghosts) / float64(hits)
 			if observedFPR > (c.config.BloomFPRate * 5.0) {
@@ -786,13 +785,13 @@ func (r *cacheReplayer) ReplayRecord(rec record.Record) error {
 			if err := r.cache.index.DeleteBlobs(item); err != nil {
 				return fmt.Errorf("replay delete: %w", err)
 			}
-			r.cache.bloom.deletions.Add(1)
+			r.cache.bloomStats.deletions.Add(1)
 		}
 		return nil
 	}
 
 	// Update bloom filter for puts
-	r.cache.bloom.Load().Add(h)
+	r.cache.hot.bloom.Load().Add(h)
 
 	// Replay the Put directly:
 	// - Use original SeqID (not new sequence)
@@ -937,7 +936,7 @@ func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
 		"reclaim_pct", 100*float64(physicallyReclaimed)/float64(evictedBytes),
 		"remaining_mb", c.approxSize.Load()/(1024*1024))
 
-	c.bloom.deletions.Add(int64(evictedCount))
+	c.bloomStats.deletions.Add(int64(evictedCount))
 
 	if err := c.maybeTriggerBloomRebuild(); err != nil {
 		log.Error("bloom rebuild failed", "error", err)

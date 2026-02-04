@@ -369,12 +369,25 @@ fn bench_parallel_blobcache(c: &mut Criterion) {
     let entropy: Arc<Vec<u8>> = Arc::new(random_data(32 << 20));
 
     // Constants matching Go (updated weights: 40/40/10/10)
+    // Can override write percentage via BENCH_WRITE_PCT env var (e.g., 100 for write-only)
     const BLOB_SIZE_LO: usize = 100_000;
     const BLOB_SIZE_HI_RNG: usize = 1_900_000;
-    const WRITE_BOUND: u32 = 40;      // 40% writes
-    const HOT_READ_BOUND: u32 = 80;   // 40% hot reads (40 + 40)
-    const COLD_READ_BOUND: u32 = 90;  // 10% cold reads (80 + 10)
-    // Remaining 10% = misses
+    // Write percentage (default 40%, set BENCH_WRITE_PCT=100 for write-only Direct I/O test)
+    let write_pct: u32 = std::env::var("BENCH_WRITE_PCT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(40)
+        .min(100);  // Cap at 100%
+    let write_bound = write_pct;
+    // Scale reads into remaining percentage
+    let remaining = 100u32.saturating_sub(write_pct);
+    let hot_read_bound = write_bound + (remaining * 40 / 60).min(remaining);
+    let cold_read_bound = hot_read_bound + (remaining * 10 / 60).min(remaining.saturating_sub(hot_read_bound - write_bound));
+    println!(">>> Workload: {}% writes, {}% hot reads, {}% cold reads, {}% misses",
+        write_pct,
+        hot_read_bound - write_bound,
+        cold_read_bound - hot_read_bound,
+        100u32.saturating_sub(cold_read_bound));
     const WARMUP_KEYS: u64 = 10_000;
     const READ_MIN_KEYS: u64 = 5_000;
 
@@ -558,7 +571,7 @@ fn bench_parallel_blobcache(c: &mut Criterion) {
                                 }
                             }
 
-                            if op < WRITE_BOUND {
+                            if op < write_bound {
                                 // Write with latency tracking
                                 let start = Instant::now();
                                 let id = write_head.fetch_add(1, Ordering::Relaxed);
@@ -575,7 +588,7 @@ fn bench_parallel_blobcache(c: &mut Criterion) {
                                 total_bytes.fetch_add(blob_size as u64, Ordering::Relaxed);
                                 total_writes.fetch_add(1, Ordering::Relaxed);
                                 data_written = true;
-                            } else if op < HOT_READ_BOUND {
+                            } else if op < hot_read_bound {
                                 // Hot read with latency tracking (target newest keys for Librarian hits)
                                 let start = Instant::now();
                                 let zipf_val = (zipf.sample(&mut rng) as u64) % max_id;
@@ -584,7 +597,7 @@ fn bench_parallel_blobcache(c: &mut Criterion) {
                                 black_box(cache.get(key));
                                 let elapsed = start.elapsed().as_micros() as u64;
                                 let _ = local_get_hist.record(elapsed);
-                            } else if op < COLD_READ_BOUND {
+                            } else if op < cold_read_bound {
                                 // Cold read
                                 let start = Instant::now();
                                 let base_id = rng.gen_range(0..max_id.saturating_sub(4).max(1));
@@ -627,6 +640,13 @@ fn bench_parallel_blobcache(c: &mut Criterion) {
     cache.drain();
     let drain_elapsed = drain_start.elapsed();
     println!(">>> Drain completed in {:.2}s", drain_elapsed.as_secs_f64());
+
+    // Debug: print cache stats to check for unflushed data
+    let stats = cache.stats();
+    println!(">>> Cache stats: items={}, approx_size={:.2} GB, librarian_slabs={}",
+        stats.items,
+        stats.approx_size as f64 / (1024.0 * 1024.0 * 1024.0),
+        stats.librarian_cached_slabs);
 
     let bench_elapsed = bench_start.elapsed();
 
@@ -686,8 +706,9 @@ fn bench_parallel_blobcache(c: &mut Criterion) {
     // drain() already called above before timing stopped
     cache.close().unwrap();
 
-    // Cleanup
-    let _ = std::fs::remove_dir_all(&bench_path);
+    // Don't cleanup - leave data for inspection
+    // let _ = std::fs::remove_dir_all(&bench_path);
+    println!(">>> Data left at: {:?}", bench_path);
 }
 
 /// Benchmark bloom filter fast rejection.

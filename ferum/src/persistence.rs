@@ -484,7 +484,7 @@ impl Persistence {
             segment_id: seg_id,
             ctime: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs() as i64,
             max_seq_id,
             items: items.to_vec(),
@@ -525,7 +525,7 @@ impl Persistence {
     pub fn tombstone(&self, seg_id: u32, key: Key) -> Result<()> {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
 
         let write_txn = self.db.begin_write().map_redb_err("begin write txn")?;

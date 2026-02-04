@@ -4,7 +4,6 @@ import (
 	"context"
 	crand "crypto/rand" // Aliased to avoid collision with math/rand/v2
 	"fmt"
-	"io"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
@@ -145,6 +144,14 @@ func BenchmarkBlobCache(b *testing.B) {
 		localPut := hdrhistogram.New(10, 10_000_000_000, 3)
 		localGet := hdrhistogram.New(10, 10_000_000_000, 3)
 
+		// Hoist closure outside loop to avoid per-iteration allocation.
+		// Touch memory to prove we got it, but don't allocate.
+		viewFn := func(b []byte) {
+			if len(b) > 0 {
+				_ = b[0]
+			}
+		}
+
 		// Each pb.Next() iteration = one write (with interspersed reads)
 		for pb.Next() {
 			dataWritten := false
@@ -178,9 +185,7 @@ func BenchmarkBlobCache(b *testing.B) {
 					zipfVal := zipf.Uint64() % maxID
 					id := maxID - 1 - zipfVal
 					k := fastFormatKey(keyBuf, "key-", id)
-					found := cache.View(k, func(r io.Reader) {
-						io.CopyN(io.Discard, r, 64) // Force page fault
-					})
+					found := cache.View(k, viewFn)
 					localGet.RecordValue(time.Since(start).Nanoseconds())
 					numReads.Add(1)
 					if found {
@@ -190,7 +195,7 @@ func BenchmarkBlobCache(b *testing.B) {
 					baseID := rng.Uint64() % (maxID - 4)
 					for i := uint64(0); i < 4; i++ {
 						k := fastFormatKey(keyBuf, "key-", baseID+i)
-						cache.View(k, func(r io.Reader) {})
+						cache.View(k, viewFn)
 					}
 					numReads.Add(4)
 				} else {
@@ -219,6 +224,107 @@ func BenchmarkBlobCache(b *testing.B) {
 	b.ReportMetric(warmupThroughput, "warmup-GB/s")
 	b.ReportMetric(finalMetrics.PeakRSS, "Peak-RSS-GB")
 	b.ReportMetric(finalMetrics.AvgUtil, "Disk-Util-%")
+}
+
+func BenchmarkBlobCacheLookupMemory(b *testing.B) {
+	tmpDir := os.TempDir() + "/bench-blobcache"
+	if _, err := os.Stat("/instance_storage"); err == nil {
+		tmpDir = "/instance_storage/bench-blobcache"
+	}
+	os.RemoveAll(tmpDir)
+	defer os.RemoveAll(tmpDir)
+
+	// lo/high markers for blob size
+	const blobSizeLo = 100_000
+	const blobSizeHiRng = 1_900_000
+
+	// Toggle DirectIO via environment variable for A/B testing
+	directIO := os.Getenv("BLOBCACHE_BUFFERED_IO") != "1"
+
+	cache, err := New(tmpDir,
+		WithMaxSize(400<<30),
+		WithWriteBufferSize(128<<20),
+		WithMaxInflightSlabs(32),
+		WithMaxCachedSlabs(64),
+		WithFlushConcurrency(6),
+		WithDirectIOWrite(directIO),
+		// WithWAL(),
+		WithFDataSync(true),
+		WithDegradedMode(DegradedPanic), // Crash on errors during benchmarks
+	)
+	if err != nil {
+		b.Fatal(err)
+	}
+	cache.Start()
+	defer cache.Close()
+
+	entropy := make([]byte, 32<<20)
+	crand.Read(entropy)
+
+	var (
+		numReads, numFound atomic.Int64
+		workerID           atomic.Int64
+
+		mu sync.Mutex
+		// HDR Range: 10ns to 10s. Nanoseconds are required for M4 Max resolution.
+		globalGet = hdrhistogram.New(10, 10_000_000_000, 3)
+	)
+
+	// --- BOOTSTRAP PHASE ---
+	const warmupKeys = 5000
+	fmt.Printf(">>> Warmup: Writing %d keys to reach steady-state...\n", warmupKeys)
+	var warmupBytes int64
+
+	rng := rand.New(rand.NewPCG(uint64(time.Now().UnixNano()), uint64(42)))
+	for i := 0; i < warmupKeys; i++ {
+		blobSize := blobSizeLo + rng.IntN(blobSizeHiRng)
+		k := fastFormatKey(make([]byte, 32), "key-", uint64(i))
+		if err := cache.Put(k, entropy[:blobSize]); err != nil {
+			b.Fatal(err)
+		}
+		warmupBytes += int64(blobSize)
+	}
+	// Important: Do not drain the cache; keep things in memory.
+
+	// Reinterpret b.N: each iteration = one write
+	// e.g., -benchtime=1000000x means 1M writes (~1TB at 1MB/write)
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		wid := workerID.Add(1)
+		rng := rand.New(rand.NewPCG(uint64(time.Now().UnixNano()), uint64(wid)))
+
+		keyBuf := make([]byte, 64)
+		localGet := hdrhistogram.New(10, 10_000_000_000, 3)
+
+		// Hoist closure outside loop to avoid per-iteration allocation.
+		viewFn := func(b []byte) {
+			if len(b) > 0 {
+				_ = b[0]
+			}
+		}
+
+		for pb.Next() {
+			// Target newest keys so hot reads hit the Librarian (recent slabs)
+			id := rng.IntN(warmupKeys)
+			k := fastFormatKey(keyBuf, "key-", uint64(id))
+			start := time.Now()
+			found := cache.View(k, viewFn)
+			localGet.RecordValue(time.Since(start).Nanoseconds())
+			numReads.Add(1)
+			if found {
+				numFound.Add(1)
+			}
+		} // End pb.Next()
+
+		mu.Lock()
+		globalGet.Merge(localGet)
+		mu.Unlock()
+	})
+
+	cache.Drain()
+	b.StopTimer()
+	fmt.Printf("\n--- FINAL LATENCY (clat) REPORT (ns) ---\n")
+	reportLatency(b, "GET", globalGet)
 }
 
 func reportLatency(b *testing.B, name string, h *hdrhistogram.Histogram) {

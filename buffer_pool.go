@@ -6,30 +6,54 @@ import (
 )
 
 // handle is the internal pooled buffer structure.
-// Only accessed through BufferHandle to prevent aliasing bugs.
 type handle struct {
 	buf   []byte
-	inUse int32 // Atomic poison pill: 0=in pool, 1=in use
+	pool  *sync.Pool
+	inUse int32
 }
 
-// bufferPool stores *handle to prevent sub-slice aliasing bugs.
-// Public API returns BufferHandle (by value) which holds *handle pointer.
-var bufferPool = sync.Pool{
-	New: func() any {
+// Size constants
+const (
+	sizeSmall  = 4 * 1024   // 4KB
+	sizeMedium = 64 * 1024  // 64KB
+	sizeLarge  = 256 * 1024 // 256KB
+)
+
+// 1. Declare the pools (zero-value is safe, New will be assigned in init)
+var (
+	poolSmall  sync.Pool
+	poolMedium sync.Pool
+	poolLarge  sync.Pool
+)
+
+// 2. Initialize the New functions in init() to break the cyclic dependency
+func init() {
+	poolSmall.New = func() any {
 		return &handle{
-			buf: make([]byte, 0, 64*1024),
+			buf:  make([]byte, 0, sizeSmall),
+			pool: &poolSmall,
 		}
-	},
+	}
+	poolMedium.New = func() any {
+		return &handle{
+			buf:  make([]byte, 0, sizeMedium),
+			pool: &poolMedium,
+		}
+	}
+	poolLarge.New = func() any {
+		return &handle{
+			buf:  make([]byte, 0, sizeLarge),
+			pool: &poolLarge,
+		}
+	}
 }
 
-// BufferHandle is a handle to a pooled buffer that must be released after use.
-// Returned by value with embedded *handle pointer for idempotent Release().
+// BufferHandle is the public wrapper
 type BufferHandle struct {
-	h *handle // Internal handle (nil after first Release for idempotency)
+	h *handle
 	_ noCopy
 }
 
-// Bytes returns the current buffer slice.
 func (bh *BufferHandle) Bytes() []byte {
 	if bh.h == nil {
 		return nil
@@ -37,69 +61,76 @@ func (bh *BufferHandle) Bytes() []byte {
 	return bh.h.buf
 }
 
-// SetBytes updates the buffer view (e.g., to a sub-slice after compression).
 func (bh *BufferHandle) SetBytes(b []byte) {
 	if bh.h != nil {
 		bh.h.buf = b
 	}
 }
 
-// IsZero returns true if the handle is uninitialized (no compression applied).
 func (bh *BufferHandle) IsZero() bool {
 	return bh.h == nil
 }
 
-// Release returns the buffer to the pool with full capacity reset.
-// Idempotent: first call returns buffer to pool, subsequent calls are no-ops.
-// Safe to call on nil or zero-value BufferHandle.
 func (bh *BufferHandle) Release() {
 	if bh.h == nil {
-		return // Already released or never acquired
+		return
 	}
 
-	// Poison pill: detect double-release
+	// Poison pill
 	if !atomic.CompareAndSwapInt32(&bh.h.inUse, 1, 0) {
-		panic("bufferpool: DOUBLE RELEASE! handle.inUse was not 1 (either already released or never acquired)")
+		panic("bufferpool: DOUBLE RELEASE detected")
 	}
 
-	// Reset to zero length with full capacity preserved
+	// Reset length, keep capacity
 	bh.h.buf = bh.h.buf[:0:cap(bh.h.buf)]
-	bufferPool.Put(bh.h)
 
-	// Clear pointer - makes subsequent Release() calls no-ops
+	// Return to home pool
+	if bh.h.pool != nil {
+		bh.h.pool.Put(bh.h)
+	}
+
 	bh.h = nil
 }
 
-// AcquireBuffer gets a buffer from the pool with specified length and capacity.
-// Returns BufferHandle by value (contains *handle). MUST call Release() after use.
+// AcquireBuffer selects the right bucket
 func AcquireBuffer(length, capacity int) BufferHandle {
-	h := bufferPool.Get().(*handle)
+	var h *handle
 
-	// Poison pill: detect double-release aliasing
-	if !atomic.CompareAndSwapInt32(&h.inUse, 0, 1) {
-		panic("bufferpool: ALIASING DETECTED! Acquired a handle that is already inUse=1. " +
-				"This means Release() was called twice, putting the same *handle in the pool multiple times, " +
-				"and now two goroutines have the same pointer.")
+	// Select Pool
+	if capacity <= sizeSmall {
+		h = poolSmall.Get().(*handle)
+	} else if capacity <= sizeMedium {
+		h = poolMedium.Get().(*handle)
+	} else if capacity <= sizeLarge {
+		h = poolLarge.Get().(*handle)
+	} else {
+		// Fallback for huge allocs
+		h = &handle{
+			buf:  make([]byte, 0, capacity),
+			pool: nil,
+		}
 	}
 
-	// Reallocate if pooled buffer is too small
+	// Detect Aliasing / Set Use
+	if !atomic.CompareAndSwapInt32(&h.inUse, 0, 1) {
+		if h.pool != nil {
+			panic("bufferpool: ALIASING DETECTED! Pool returned in-use handle.")
+		}
+		h.inUse = 1
+	}
+
+	// Safety Valve: Grow if needed (should be rare/impossible with correct logic)
 	if cap(h.buf) < capacity {
 		h.buf = make([]byte, 0, capacity)
+		h.pool = nil
 	}
 
-	// Always set to requested length
 	h.buf = h.buf[:length]
 
 	return BufferHandle{h: h}
 }
 
-// noCopy may be embedded into structs which must not be copied
-// after the first use.
-//
-// See https://golang.org/issues/8005#issuecomment-190753527
-// for details.
 type noCopy struct{}
 
-// Lock is a no-op used by -copylocks checker from go vet.
 func (*noCopy) Lock()   {}
 func (*noCopy) Unlock() {}

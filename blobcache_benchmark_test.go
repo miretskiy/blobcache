@@ -75,10 +75,10 @@ func BenchmarkBlobCache(b *testing.B) {
 
 	cache, err := New(tmpDir,
 		WithMaxSize(400<<30),
-		WithWriteBufferSize(128<<20),
+		WithWriteBufferSize(64<<20),
 		WithMaxInflightSlabs(32),
 		WithMaxCachedSlabs(64),
-		WithFlushConcurrency(6),
+		WithFlushConcurrency(2),
 		WithDirectIOWrite(directIO),
 		// WithWAL(),
 		WithFDataSync(true),
@@ -287,9 +287,6 @@ func BenchmarkBlobCacheLookupMemory(b *testing.B) {
 		warmupBytes += int64(blobSize)
 	}
 	// Important: Do not drain the cache; keep things in memory.
-	if err := http.ListenAndServe("localhost:6060", nil); err != nil {
-		b.Fatal(err)
-	}
 
 	// Reinterpret b.N: each iteration = one write
 	// e.g., -benchtime=1000000x means 1M writes (~1TB at 1MB/write)
@@ -547,4 +544,10 @@ func BenchmarkEviction_SieveVictimSelection(b *testing.B) {
 	b.Logf("Identified %d victims (%.2f GB worth) in %.3f sec → %.0f victims/sec",
 		b.N, float64(totalBytes)/(1<<30), elapsed.Seconds(),
 		float64(b.N)/elapsed.Seconds())
+}
+
+func init() {
+	go func() {
+		_ = http.ListenAndServe("localhost:6060", nil)
+	}()
 }

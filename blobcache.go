@@ -415,19 +415,12 @@ func (c *Cache) search(key []byte) (data []byte, rel Releaser, ok bool) {
 	if c.TrustHash {
 		verifyKey = nil
 	}
-	diskReader, diskReleaser, err := c.archivist.ReadBlob(entry, verifyKey)
+	data, diskReleaser, err := c.archivist.ReadBlob(entry, verifyKey)
 	if err != nil {
 		c.handleStorageError(h, entry, err)
 		return nil, Releaser{}, false
 	}
-
-	// 6. Read disk data into buffer
-	buf, err := io.ReadAll(diskReader)
-	if err != nil {
-		diskReleaser.Release()
-		return nil, Releaser{}, false
-	}
-	return buf, diskReleaser, true
+	return data, diskReleaser, true
 }
 
 // ZeroCopyView provides a unified reader for both RAM and Disk hits.

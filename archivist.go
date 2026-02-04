@@ -45,7 +45,7 @@ func (a *Archivist) Close() error {
 // ReadBlobRaw reads raw record bytes from a segment. No interpretation.
 // Caller is responsible for any validation or parsing.
 // Used by Compactor for copying blobs during compaction.
-func (a *Archivist) ReadBlobRaw(e index.Item) (io.Reader, Releaser, error) {
+func (a *Archivist) ReadBlobRaw(e index.Item) ([]byte, Releaser, error) {
 	sf, err := a.getSegmentFile(e.SegmentID)
 	if err != nil {
 		return nil, Releaser{}, fmt.Errorf("storage: segment %d not found: %w", e.SegmentID, err)
@@ -57,15 +57,15 @@ func (a *Archivist) ReadBlobRaw(e index.Item) (io.Reader, Releaser, error) {
 		return nil, Releaser{}, fmt.Errorf("storage: read failed: %w", err)
 	}
 
-	return bytes.NewReader(handle.Bytes()), Releaser{bh: &handle}, nil
+	return handle.Bytes(), Releaser{bh: &handle}, nil
 }
 
-// ReadBlob returns an io.Reader for the specified index entry.
+// ReadBlob returns the value bytes for the specified index entry.
 // It handles decompression and checksum verification.
-// The caller MUST call the returned Releaser when done with the reader.
+// The caller MUST call the returned Releaser when done with the data.
 //
 // expectedKey is used to verify the stored key matches (detects 128-bit hash collisions).
-func (a *Archivist) ReadBlob(e index.Item, expectedKey []byte) (io.Reader, Releaser, error) {
+func (a *Archivist) ReadBlob(e index.Item, expectedKey []byte) ([]byte, Releaser, error) {
 	sf, err := a.getSegmentFile(e.SegmentID)
 	if err != nil {
 		return nil, Releaser{}, fmt.Errorf("storage: segment %d not found: %w", e.SegmentID, err)
@@ -95,7 +95,6 @@ func (a *Archivist) ReadBlob(e index.Item, expectedKey []byte) (io.Reader, Relea
 
 	// Extract value
 	valueData := buf[keyEnd:]
-	var reader io.Reader = bytes.NewReader(valueData)
 	releaser := Releaser{bh: &handle}
 
 	if e.IsCompressed() {
@@ -116,16 +115,19 @@ func (a *Archivist) ReadBlob(e index.Item, expectedKey []byte) (io.Reader, Relea
 			return nil, Releaser{}, err
 		}
 		handle.Release()
-		reader = bytes.NewReader(decompressedHandle.Bytes())
+		valueData = decompressedHandle.Bytes()
 		releaser = Releaser{bh: &decompressedHandle}
 	}
 
 	// Optional Integrity Layer
 	if a.Resilience.VerifyOnRead && hdr.HasValidCRC() && a.Resilience.ChecksumHasher != nil {
-		reader = newChecksumVerifyingReader(reader, a.Resilience.ChecksumHasher, hdr.CRC())
+		if err := verifyChecksum(valueData, a.Resilience.ChecksumHasher, hdr.CRC()); err != nil {
+			releaser.Release()
+			return nil, Releaser{}, err
+		}
 	}
 
-	return reader, releaser, nil
+	return valueData, releaser, nil
 }
 
 // getSegmentPath returns the path for a segment file

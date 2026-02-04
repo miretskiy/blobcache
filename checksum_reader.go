@@ -10,6 +10,20 @@ import (
 
 type Hasher func() hash.Hash32
 
+// verifyChecksum computes the checksum of data and compares it to expected.
+func verifyChecksum(data []byte, hasher Hasher, expected uint32) error {
+	h := hasher()
+	_, _ = h.Write(data) // hash.Hash implementations never return an error
+	computed := h.Sum32()
+	if computed != expected {
+		return &base.ChecksumError{
+			Expected: expected,
+			Got:      computed,
+		}
+	}
+	return nil
+}
+
 // checksumVerifyingReader wraps a reader and verifies checksum on final read
 type checksumVerifyingReader struct {
 	r        io.Reader

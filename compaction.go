@@ -3,7 +3,6 @@ package blobcache
 import (
 	"errors"
 	"fmt"
-	"io"
 
 	"github.com/miretskiy/blobcache/internal/index"
 	"github.com/miretskiy/blobcache/internal/record"
@@ -14,7 +13,7 @@ import (
 // SegmentReader provides read access to segment files.
 type SegmentReader interface {
 	// ReadBlobRaw reads raw record bytes from a segment. No interpretation.
-	ReadBlobRaw(e index.Item) (io.Reader, Releaser, error)
+	ReadBlobRaw(e index.Item) ([]byte, Releaser, error)
 
 	// DropSegmentCache closes and removes a segment's cached file handle.
 	// Called before deleting segment files.
@@ -307,7 +306,7 @@ func (c *Compactor) writeCompactedSegment(
 		ri := &toRelocate[i]
 
 		// Read raw record from old segment
-		reader, releaser, err := c.reader.ReadBlobRaw(ri.item)
+		data, releaser, err := c.reader.ReadBlobRaw(ri.item)
 		if err != nil {
 			releaser.Release()
 			return nil, errors.Join(
@@ -316,19 +315,10 @@ func (c *Compactor) writeCompactedSegment(
 			)
 		}
 
-		// Read all bytes so we can parse header for footer entry
-		data, err := io.ReadAll(reader)
-		releaser.Release()
-		if err != nil {
-			return nil, errors.Join(
-				fmt.Errorf("compaction: read blob data from segment %d: %w", ri.oldSeg, err),
-				w.Close(),
-			)
-		}
-
 		// Parse header to extract footer metadata
 		hdr, err := record.DecodeHeader(data[:record.HeaderSize])
 		if err != nil {
+			releaser.Release()
 			return nil, errors.Join(
 				fmt.Errorf("compaction: decode header from segment %d: %w", ri.oldSeg, err),
 				w.Close(),
@@ -337,8 +327,10 @@ func (c *Compactor) writeCompactedSegment(
 
 		// Write to new segment
 		if _, err := w.File().Write(data); err != nil {
+			releaser.Release()
 			return nil, errors.Join(fmt.Errorf("compaction: write blob: %w", err), w.Close())
 		}
+		releaser.Release()
 
 		// Update item with new location
 		ri.item.SegmentID = newSegID

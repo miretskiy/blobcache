@@ -77,7 +77,9 @@ func AcquireBuffer(length, capacity int) BufferHandle {
 
 	// Poison pill: detect double-release aliasing
 	if !atomic.CompareAndSwapInt32(&h.inUse, 0, 1) {
-		panic("bufferpool: ALIASING DETECTED! Acquired a handle that is already inUse=1. This means Release() was called twice, putting the same *handle in the pool multiple times, and now two goroutines have the same pointer.")
+		panic("bufferpool: ALIASING DETECTED! Acquired a handle that is already inUse=1. " +
+				"This means Release() was called twice, putting the same *handle in the pool multiple times, " +
+				"and now two goroutines have the same pointer.")
 	}
 
 	// Reallocate if pooled buffer is too small

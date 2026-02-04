@@ -36,6 +36,10 @@ type poolProvider interface {
 //
 // The footer file path is derived from dataPath by replacing .seg extension with .meta.
 // Example: /data/segments/0001/123.seg -> /data/segments/0001/123.meta
+//
+// Note: O_DIRECT is stripped for metadata writes. The complexity/risk of alignment
+// constraints on small metadata files (~2-8MB) outweighs any performance benefit
+// from bypassing the page cache. Buffered I/O is robust and fast for this scale.
 func WriteFooter(
 	segmentID uint32,
 	entries []record.FooterEntry,
@@ -43,6 +47,8 @@ func WriteFooter(
 	pool poolProvider,
 	flags sys.OpenFlag,
 ) error {
+	// Strip O_DIRECT for metadata - buffered I/O is safer and sufficient for small files.
+	flags &^= sys.FlDirectIO
 	// 1. Compute min/max SeqID
 	var minSeq, maxSeq uint64
 	if len(entries) > 0 {

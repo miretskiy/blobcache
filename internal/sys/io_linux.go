@@ -58,6 +58,8 @@ func Fadvise(fd uintptr, offset Offset_t, length int64, hint FadviseHint) error 
 		// If you want to be extra aggressive, you can also call NOREUSE,
 		// but DONTNEED is the standard for releasing Page Cache.
 		linuxHint = unix.FADV_DONTNEED
+	case FadvRandom:
+		linuxHint = unix.FADV_RANDOM
 	default:
 		return nil
 	}

@@ -109,6 +109,7 @@ type FadviseHint int
 const (
 	FadvSequential FadviseHint = iota
 	FadvDontNeed
+	FadvRandom
 )
 
 type Offset_t int64

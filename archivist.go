@@ -71,13 +71,6 @@ func (a *Archivist) ReadBlob(e index.Item, expectedKey []byte) (io.Reader, Relea
 		return nil, Releaser{}, fmt.Errorf("storage: segment %d not found: %w", e.SegmentID, err)
 	}
 
-	// Kernel Hinting - advisory, errors logged but not fatal
-	if a.IO.Fadvise {
-		if err := sys.Fadvise(sf.Fd(), sys.Offset_t(e.Offset), int64(e.PhysicalLen), sys.FadvSequential); err != nil {
-			log.Warn("fadvise failed", "segID", e.SegmentID, "err", err)
-		}
-	}
-
 	// Single read of entire record
 	handle := AcquireBuffer(int(e.PhysicalLen), int(e.PhysicalLen))
 	buf := handle.Bytes()
@@ -161,6 +154,12 @@ func (a *Archivist) getSegmentFile(segmentID uint32) (*os.File, error) {
 	f, err := os.OpenFile(path, os.O_RDWR, 0644)
 	if err != nil {
 		return nil, err
+	}
+
+	if a.IO.Fadvise {
+		if err := sys.Fadvise(f.Fd(), 0, 0, sys.FadvRandom); err != nil {
+			log.Warn("fadvise failed", "segID", segmentID, "err", err)
+		}
 	}
 
 	// 2. Cache the handle

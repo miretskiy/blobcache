@@ -108,24 +108,30 @@ func PunchHole(f *os.File, offset, length int64) (int64, error) {
 // Fadvise on darwin is less flexible than linux in that it's a global, file descriptor
 // based operation.  But we keep the same signature as linux (ignoring offset and the length).
 func Fadvise(fd uintptr, _ Offset_t, _ int64, hint FadviseHint) error {
+	var cmd, enable int
 	switch hint {
 	case FadvDontNeed:
 		// F_NOCACHE: 1 turns off, 0 turns on
-		_, _, errno := syscall.Syscall(syscall.SYS_FCNTL, fd, uintptr(syscall.F_NOCACHE), 1)
-		if errno != 0 {
-			return errno
-		}
-		return nil
+		cmd = syscall.F_NOCACHE
+		enable = 1
 	case FadvSequential:
 		// F_RDAHEAD turns on/off the read-ahead engine.
-		_, _, errno := syscall.Syscall(syscall.SYS_FCNTL, fd, uintptr(syscall.F_RDAHEAD), 1)
-		if errno != 0 {
-			return errno
-		}
-		return nil
+		cmd = syscall.F_RDAHEAD
+		enable = 1
+	case FadvRandom:
+		// F_RDAHEAD 0: Turn Read-Ahead OFF.
+		// This is the equivalent of FADV_RANDOM.
+		cmd = syscall.F_RDAHEAD
+		enable = 0
 	default:
 		return nil // Unsupported hints are ignored on Darwin
 	}
+
+	_, _, errno := syscall.Syscall(syscall.SYS_FCNTL, fd, uintptr(cmd), uintptr(enable))
+	if errno != 0 {
+		return errno
+	}
+	return nil
 }
 
 // RequiresExplicitSync indicates whether explicit sync calls are needed for durable writes.

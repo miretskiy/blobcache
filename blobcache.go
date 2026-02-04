@@ -286,11 +286,9 @@ func open(cfg config) (*Cache, bool, error) {
 		}
 	}
 
-	// Allocate heap ballast to reduce GC frequency.
-	// Size matches total slab pool (inflight + cached) to keep GC threshold high.
-	if !cfg.DisableBallast {
-		ballastSize := int64(cfg.MaxInflightSlabs+cfg.MaxCachedSlabs) * cfg.WriteBufferSize
-		c.ballast = make([]byte, ballastSize)
+	// Allocate heap ballast to reduce GC frequency (default: 1GB).
+	if cfg.BallastSize > 0 {
+		c.ballast = make([]byte, cfg.BallastSize)
 	}
 
 	return c, recovered, nil

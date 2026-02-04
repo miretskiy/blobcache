@@ -66,9 +66,9 @@ type config struct {
 	Resilience         ResilienceConfig
 	Compression        CompressionConfig
 	WAL                WALConfig
-	DegradedMode       DegradedMode // How to handle degraded mode (default: memory-only)
-	TrustHash          bool         // Skip key verification on reads (cache mode optimization)
-	DisableBallast     bool         // Disable heap ballast allocation (default: enabled)
+	DegradedMode DegradedMode // How to handle degraded mode (default: memory-only)
+	TrustHash    bool         // Skip key verification on reads (cache mode optimization)
+	BallastSize  int          // Heap ballast size in bytes (default: 1GB, 0 = disabled)
 
 	knobs *TestingKnobs
 }
@@ -210,13 +210,12 @@ func WithTrustHash(enabled bool) Option {
 	return funcOpt(func(c *config) { c.TrustHash = enabled })
 }
 
-// WithDisableBallast disables heap ballast allocation.
-// By default, the cache allocates a ballast (make([]byte, N)) at startup
-// where N = (MaxInflightSlabs + MaxCachedSlabs) * WriteBufferSize.
+// WithBallast sets the heap ballast size in bytes.
+// By default, the cache allocates a 1GB ballast at startup.
 // This keeps the heap larger so GC triggers less frequently, reducing GC overhead.
-// Disable this if you want tighter memory control or are running multiple caches.
-func WithDisableBallast() Option {
-	return funcOpt(func(c *config) { c.DisableBallast = true })
+// Use WithBallast(0) to disable, or WithBallast(10<<30) for 10GB, etc.
+func WithBallast(size int) Option {
+	return funcOpt(func(c *config) { c.BallastSize = max(0, size) })
 }
 
 func defaultConfig(path string) config {
@@ -226,12 +225,13 @@ func defaultConfig(path string) config {
 		Shards:             0,
 		WriteBufferSize:    64 << 20, // 64MB
 		MaxInflightSlabs:   6,
-		MaxCachedSlabs:     8, // Keep ~1GB of recently written data in RAM
+		MaxCachedSlabs:     8,        // Keep ~1GB of recently written data in RAM
 		FlushConcurrency:   2,
 		BloomFPRate:        0.01,
 		BloomEstimatedKeys: 1_000_000,
 		DegradedMode:       DegradedMemoryOnly,
-		TrustHash:          true, // Cache mode: trust hash, skip key verification
+		TrustHash:          true,    // Cache mode: trust hash, skip key verification
+		BallastSize:        1 << 30, // 1GB heap ballast to reduce GC frequency
 		IO: IOConfig{
 			FDataSync:     false,
 			Fadvise:       sys.UseFadvise,

@@ -5,6 +5,8 @@ import (
 	crand "crypto/rand" // Aliased to avoid collision with math/rand/v2
 	"fmt"
 	"math/rand/v2"
+	"net/http"
+	_ "net/http/pprof" // Register pprof handlers
 	"os"
 	"path/filepath"
 	"strconv"
@@ -243,10 +245,10 @@ func BenchmarkBlobCacheLookupMemory(b *testing.B) {
 
 	cache, err := New(tmpDir,
 		WithMaxSize(400<<30),
-		WithWriteBufferSize(128<<20),
+		WithWriteBufferSize(64<<20),
 		WithMaxInflightSlabs(32),
 		WithMaxCachedSlabs(64),
-		WithFlushConcurrency(6),
+		WithFlushConcurrency(2),
 		WithDirectIOWrite(directIO),
 		// WithWAL(),
 		WithFDataSync(true),
@@ -285,6 +287,9 @@ func BenchmarkBlobCacheLookupMemory(b *testing.B) {
 		warmupBytes += int64(blobSize)
 	}
 	// Important: Do not drain the cache; keep things in memory.
+	if err := http.ListenAndServe("localhost:6060", nil); err != nil {
+		b.Fatal(err)
+	}
 
 	// Reinterpret b.N: each iteration = one write
 	// e.g., -benchtime=1000000x means 1M writes (~1TB at 1MB/write)

@@ -178,8 +178,8 @@ func WithTestingKnobs(knobs *TestingKnobs) Option {
 func WithWAL() Option {
 	return funcOpt(func(c *config) {
 		c.WAL.Enabled = true
-		c.IO.FDataSync = true  // If using wal, not using data sync is lying to yourself.
-		c.TrustHash = false    // CAS mode: verify keys to detect hash collisions.
+		c.IO.FDataSync = true // If using wal, not using data sync is lying to yourself.
+		c.TrustHash = false   // CAS mode: verify keys to detect hash collisions.
 	})
 }
 
@@ -214,10 +214,10 @@ func defaultConfig(path string) config {
 		Path:               path,
 		MaxSize:            0,
 		Shards:             0,
-		WriteBufferSize:    128 << 20, // 128MB
+		WriteBufferSize:    64 << 20, // 64MB
 		MaxInflightSlabs:   6,
 		MaxCachedSlabs:     8, // Keep ~1GB of recently written data in RAM
-		FlushConcurrency:   6,
+		FlushConcurrency:   2,
 		BloomFPRate:        0.01,
 		BloomEstimatedKeys: 1_000_000,
 		DegradedMode:       DegradedMemoryOnly,

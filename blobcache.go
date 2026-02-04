@@ -861,7 +861,7 @@ func (c *Cache) evictionWorker() {
 			// Periodic compaction
 			if !c.IsDegraded() {
 				if err := c.maybeCompactSegments(); err != nil {
-					log.Warn("compaction failed", "error", err)
+					c.ReportError(fmt.Errorf("compaction: %w", err))
 				}
 			}
 
@@ -946,18 +946,19 @@ func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
 }
 
 func (c *Cache) maybeCompactSegments() error {
+	var errs []error
+
 	// Phase 1: Tombstone compaction (metadata cleanup + hole punching)
 	if err := c.maybeCompactTombstones(); err != nil {
-		log.Warn("tombstone compaction failed", "error", err)
-		// Continue to merge compaction even if tombstone compaction fails
+		errs = append(errs, fmt.Errorf("tombstone compaction: %w", err))
 	}
 
 	// Phase 2: Merge compaction (combine sparse segments)
 	if err := c.maybeMergeSegments(); err != nil {
-		return err
+		errs = append(errs, fmt.Errorf("merge compaction: %w", err))
 	}
 
-	return nil
+	return errors.Join(errs...)
 }
 
 // maybeMergeSegments identifies sparse segments and merges contiguous ranges.
@@ -976,7 +977,6 @@ func (c *Cache) maybeMergeSegments() error {
 	log.Debug("merge compaction starting", "range_count", len(ranges))
 
 	oldestSegID := c.OldestLiveSegmentID()
-	var errs []error
 
 	for _, segmentIDs := range ranges {
 		// Determine if this is a tail compaction (includes oldest segment)
@@ -985,8 +985,9 @@ func (c *Cache) maybeMergeSegments() error {
 
 		result, err := c.compactor.Compact(segmentIDs, dropTombstones)
 		if err != nil {
-			errs = append(errs, fmt.Errorf("compact segments %v: %w", segmentIDs, err))
-			continue
+			// Fail fast: if one compaction fails, stop trying more.
+			// Avoids accumulating repeated errors for the same underlying issue.
+			return fmt.Errorf("compact segments %v: %w", segmentIDs, err)
 		}
 
 		log.Info("segment merge completed",
@@ -999,10 +1000,10 @@ func (c *Cache) maybeMergeSegments() error {
 
 	// Recalculate oldest segment after dropping segments
 	if err := c.recalculateOldestSegmentID(); err != nil {
-		errs = append(errs, fmt.Errorf("recalculate oldest segment: %w", err))
+		return fmt.Errorf("recalculate oldest segment: %w", err)
 	}
 
-	return errors.Join(errs...)
+	return nil
 }
 
 // maybeCompactTombstones identifies segments with many tombstones and compacts them.
@@ -1020,7 +1021,6 @@ func (c *Cache) maybeCompactTombstones() error {
 
 	log.Debug("tombstone compaction starting", "segment_count", len(segments))
 
-	var errs []error
 	for _, segID := range segments {
 		// Acquire segment lock (shared with compaction, exclusive from Delete)
 		shard := c.index.SegmentMetaShard(segID)
@@ -1029,11 +1029,12 @@ func (c *Cache) maybeCompactTombstones() error {
 		shard.Unlock()
 
 		if err != nil {
-			errs = append(errs, err)
+			// Fail fast on first error to avoid accumulating repeated errors
+			return err
 		}
 	}
 
-	return errors.Join(errs...)
+	return nil
 }
 
 // compactSegmentTombstones performs tombstone compaction on a single segment.

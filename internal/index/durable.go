@@ -218,21 +218,17 @@ func (idx *DurableIndex) DeleteBlobs(items ...Item) error {
 		return nil
 	}
 
-	var errs []error
-
-	// Write tombstones (without user keys - eviction case)
-	for _, item := range items {
-		if err := idx.segments.tombstone(item.SegmentID, item.Key, nil); err != nil {
-			errs = append(errs, fmt.Errorf("tombstone seg=%d: %w", item.SegmentID, err))
-		}
+	// Write ALL tombstones in one transaction (avoids N lock acquisitions + radix clones)
+	if err := idx.segments.tombstoneBatch(items); err != nil {
+		return fmt.Errorf("batch tombstone: %w", err)
 	}
 
-	// Mark deleted in RAM
+	// Mark deleted in RAM (fast loop)
 	for _, item := range items {
 		idx.markDeleted(item.Key)
 	}
 
-	return errors.Join(errs...)
+	return nil
 }
 
 // Close releases all resources held by the index.

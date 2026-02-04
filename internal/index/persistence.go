@@ -474,6 +474,31 @@ func (p *persistence) tombstone(segID uint32, keyHash Key, userKey []byte) error
 	return p.db.Put(key, value)
 }
 
+// tombstoneBatch writes multiple tombstones in a single transaction.
+// Used by eviction where we delete many items at once - batching avoids
+// acquiring the Bitcask lock and cloning the radix tree N times.
+func (p *persistence) tombstoneBatch(items []Item) error {
+	if len(items) == 0 {
+		return nil
+	}
+
+	txn := p.db.Transaction()
+	defer txn.Discard()
+
+	// Value: timestamp for observability (when was this deleted?)
+	var value [8]byte
+	binary.LittleEndian.PutUint64(value[:], uint64(time.Now().Unix()))
+
+	for _, item := range items {
+		// Eviction tombstones have no user key (nil)
+		key := p.makeTombstoneKey(item.SegmentID, item.Key, nil)
+		if err := txn.Put(key, value[:]); err != nil {
+			return err
+		}
+	}
+	return txn.Commit()
+}
+
 // compactTombstones merges the tombstone incremental log into the segment manifest.
 // This is a metadata cleanup operation that also enables space reclamation.
 //

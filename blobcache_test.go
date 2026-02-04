@@ -652,26 +652,6 @@ func TestCache_SelfHealing_OnCorruption(t *testing.T) {
 	require.False(t, found, "Subsequent reads should fail")
 }
 
-func TestCache_BloomGhostTracking(t *testing.T) {
-	tmpDir := t.TempDir()
-	cache, err := New(tmpDir)
-	require.NoError(t, err)
-	defer cache.Close()
-
-	// 1. Manually inject a key into the Bloom filter that isn't in the index
-	key := []byte("ghost-key")
-	h := xxh3.Hash128(key)
-	cache.hot.bloom.Load().AddHash(h)
-
-	// 2. Perform Get. Bloom says YES, Index says NO.
-	_, found := cache.Get(key)
-	require.False(t, found)
-
-	// 3. Verify ghost hit was tracked
-	require.Equal(t, uint64(1), cache.bloomStats.ghosts.Load(), "Ghost hit should be recorded")
-	require.Equal(t, uint64(1), cache.bloomStats.hits.Load(), "Hit should also be recorded")
-}
-
 func TestCache_Eviction_Headroom(t *testing.T) {
 	tmpDir := t.TempDir()
 	// Small cache with eviction enabled

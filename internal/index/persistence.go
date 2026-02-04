@@ -1,49 +1,53 @@
 package index
 
 import (
+	"bufio"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log/slog"
+	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/miretskiy/blobcache/internal/record"
+	"github.com/miretskiy/blobcache/internal/sys"
 	"github.com/miretskiy/blobcache/internal/xmap"
-	"go.mills.io/bitcask/v2"
 )
 
-// Persistence format constants.
+// Persistence format constants for the unified .meta file.
+//
+// File layout:
+//   [SegmentFooter block (page-aligned, written by WriteFooter)]
+//   [Tombstone batch 1 (appended on delete)]
+//   [Tombstone batch 2 (appended on delete)]
+//   ...
+//
+// The SegmentFooter serves as the "Base Manifest" containing all items.
+// Tombstones are appended as items are deleted, then merged on read.
 const (
-	// ItemSize is the serialized size of an Item (32 bytes).
-	// Wire format: Key.Lo(8) + Key.Hi(8) + SegmentID(4) + Offset(4) + PhysicalLen(4) + Flags(4)
-	ItemSize = 32
+	// TombstoneHeaderSize is the header for each tombstone batch.
+	// Wire format: Magic(1) + Count(4) + Timestamp(8)
+	TombstoneHeaderSize = 13
 
-	// ManifestHeaderSize is the header before items.
-	// Wire format: SegmentID(4) + CTime(8) + MaxSeqID(8)
-	ManifestHeaderSize = 20
+	// TombstoneKeySize is the serialized size of a tombstone key (16 bytes).
+	// Wire format: Key.Lo(8) + Key.Hi(8)
+	TombstoneKeySize = 16
 
-	// Key namespace prefixes for disjoint Bitcask keyspaces
-	prefixRegular   byte = 0x00 // Regular segment data chunks
-	prefixTombstone byte = 0xFF // Tombstone entries
-
-	// ChunkType values (2 bytes in composite key)
-	chunkTypeRegular uint16 = 0x0000
+	// TombstoneMagic identifies a tombstone batch (distinguishes from footer data).
+	TombstoneMagic byte = 0xDD
 )
 
-// maxChunkSize is the maximum size for a Bitcask value (default 256KB).
-var maxChunkSize uint64 = 256 << 10
-
-// DurableBatch holds lean Items for a batch in persistent storage.
-// This is what gets serialized to Bitcask.
+// DurableBatch holds items read from a segment's .meta file.
+// Items are converted from the SegmentFooter's FooterEntry array.
 type DurableBatch struct {
 	SegmentID uint32
 	CTime     int64
 	MaxSeqID  uint64 // Highest SeqID in this segment (WAL recovery checkpoint)
 	Items     []Item
-
-	// IndexKey is the bitcask key for this record (not serialized).
-	// Populated when reading from bitcask, nil when creating new records.
-	IndexKey []byte
 }
 
 // ScanBatchFn is the callback for scanning segment manifests.
@@ -79,8 +83,23 @@ type SegmentMetadata struct {
 	_              [8]byte      // Padding to 32 bytes
 }
 
+// metaFile manages append-only tombstone operations for a segment's .meta file.
+type metaFile struct {
+	mu              sync.Mutex
+	path            string
+	w               *bufio.Writer
+	f               *os.File
+	footerBlockSize int64 // Size of the footer block (tombstones start after this)
+}
+
+// persistence manages all .meta files for durable segment metadata storage.
 type persistence struct {
-	db *bitcask.Bitcask
+	basePath string
+	shards   int // Number of directory shards for segment files
+
+	// Open .meta file handles (keyed by segment ID).
+	// Lazy-opened on first tombstone write for that segment.
+	files sync.Map // map[uint32]*metaFile
 
 	// Segment metadata with built-in sharded locking (via xmap).
 	// Dual purpose:
@@ -95,555 +114,707 @@ type persistence struct {
 	segmentMeta *xmap.Map[SegmentMetadata, xmap.Pad32]
 }
 
-func newPersistence(basePath string) (*persistence, error) {
-	dbPath := filepath.Join(basePath, "db")
-	db, err := bitcask.Open(dbPath, bitcask.WithMaxValueSize(maxChunkSize))
-	if err != nil {
-		return nil, fmt.Errorf("failed to open bitcask: %w", err)
-	}
-
+func newPersistence(basePath string, shards int) (*persistence, error) {
 	return &persistence{
-		db:          db,
+		basePath:    basePath,
+		shards:      shards,
 		segmentMeta: xmap.New[SegmentMetadata, xmap.Pad32](xmap.WithShardShift(8)), // 256 shards
 	}, nil
 }
 
-// --- Serialization ---
-
-// AppendItem appends an encoded Item to dst.
-func AppendItem(dst []byte, item Item) []byte {
-	dst = binary.LittleEndian.AppendUint64(dst, item.Key.Lo)
-	dst = binary.LittleEndian.AppendUint64(dst, item.Key.Hi)
-	dst = binary.LittleEndian.AppendUint32(dst, item.SegmentID)
-	dst = binary.LittleEndian.AppendUint32(dst, item.Offset)
-	dst = binary.LittleEndian.AppendUint32(dst, item.PhysicalLen)
-	dst = binary.LittleEndian.AppendUint32(dst, item.Flags)
-	return dst
+// metaPath returns the path to a segment's .meta file.
+// Uses same shard directory as segment files: basePath/segments/SHARD/SEGID.meta
+func (p *persistence) metaPath(segID uint32) string {
+	shardNo := segID % uint32(max(1, p.shards))
+	return filepath.Join(p.basePath, "segments",
+		fmt.Sprintf("%04d", shardNo),
+		fmt.Sprintf("%d.meta", segID),
+	)
 }
 
-// DecodeItem decodes an Item from src.
-func DecodeItem(src []byte) (Item, error) {
-	if len(src) < ItemSize {
-		return Item{}, errors.New("buffer too small for Item")
+// --- Footer to Item Conversion ---
+
+// footerEntryToItem converts a FooterEntry to an Item.
+func footerEntryToItem(segID uint32, e *record.FooterEntry) Item {
+	physicalLen := int64(record.HeaderSize) + int64(e.KeyLen) + e.PhysicalSize
+	item := Item{
+		Key:         e.Key,
+		SegmentID:   segID,
+		Offset:      uint32(e.Pos),
+		PhysicalLen: uint32(physicalLen),
 	}
-	return Item{
-		Key: Key{
-			Lo: binary.LittleEndian.Uint64(src[0:8]),
-			Hi: binary.LittleEndian.Uint64(src[8:16]),
-		},
-		SegmentID:   binary.LittleEndian.Uint32(src[16:20]),
-		Offset:      binary.LittleEndian.Uint32(src[20:24]),
-		PhysicalLen: binary.LittleEndian.Uint32(src[24:28]),
-		Flags:       binary.LittleEndian.Uint32(src[28:32]),
-	}, nil
+	item.SetCompression(e.Compression())
+	if e.IsDeleted() {
+		item.SetDeleted()
+	}
+	return item
 }
 
-// AppendBatch appends an encoded DurableBatch to dst.
-func AppendBatch(dst []byte, m DurableBatch) []byte {
-	dst = binary.LittleEndian.AppendUint32(dst, m.SegmentID)
-	dst = binary.LittleEndian.AppendUint64(dst, uint64(m.CTime))
-	dst = binary.LittleEndian.AppendUint64(dst, m.MaxSeqID)
-	for i := range m.Items {
-		dst = AppendItem(dst, m.Items[i])
+// --- File Operations ---
+
+// findFooterBlockSize determines the size of the footer block in a .meta file.
+// The footer block is page-aligned and ends with the tail magic.
+func findFooterBlockSize(path string) (int64, error) {
+	stat, err := os.Stat(path)
+	if err != nil {
+		return 0, err
 	}
-	return dst
-}
+	fileSize := stat.Size()
 
-// DecodeBatch decodes a DurableBatch from src.
-func DecodeBatch(src []byte) (DurableBatch, error) {
-	if len(src) < ManifestHeaderSize {
-		return DurableBatch{}, errors.New("buffer too small for manifest header")
-	}
-
-	segmentID := binary.LittleEndian.Uint32(src[0:4])
-	ctime := int64(binary.LittleEndian.Uint64(src[4:12]))
-	maxSeqID := binary.LittleEndian.Uint64(src[12:20])
-
-	itemsData := src[ManifestHeaderSize:]
-	if len(itemsData)%ItemSize != 0 {
-		return DurableBatch{}, errors.New("invalid manifest size")
-	}
-
-	numItems := len(itemsData) / ItemSize
-	items := make([]Item, numItems)
-	for i := 0; i < numItems; i++ {
-		offset := i * ItemSize
-		item, err := DecodeItem(itemsData[offset : offset+ItemSize])
+	// Try reading the tail from the end of file first (no tombstones case)
+	if fileSize >= record.TailSize {
+		f, err := os.Open(path)
 		if err != nil {
-			return DurableBatch{}, err
+			return 0, err
 		}
-		items[i] = item
-	}
+		defer f.Close()
 
-	return DurableBatch{
-		SegmentID: segmentID,
-		CTime:     ctime,
-		MaxSeqID:  maxSeqID,
-		Items:     items,
-	}, nil
-}
-
-// --- Persistence Operations ---
-
-// maxChunkIdx is the largest possible chunk index (uint16).
-const maxChunkIdx = 0xFFFF
-
-// makeKey creates a 9-byte BigEndian composite key: [Prefix:1][SegmentID:4][ChunkType:2][ChunkIdx:2].
-// This structure supports:
-// - 4B segments (4 billion)
-// - 65K chunks per segment (far more than needed: 128MB / 256KB = 512 chunks max)
-// - Separate namespaces for regular data vs tombstones via ChunkType
-func (p *persistence) makeKey(segID uint32, chunkType uint16, chunkIdx uint16) []byte {
-	key := make([]byte, 9)
-	key[0] = prefixRegular // Regular data prefix
-	binary.BigEndian.PutUint32(key[1:5], segID)
-	binary.BigEndian.PutUint16(key[5:7], chunkType)
-	binary.BigEndian.PutUint16(key[7:9], chunkIdx)
-	return key
-}
-
-// makeRegularKey creates a key for regular segment data chunks.
-func (p *persistence) makeRegularKey(segID uint32, chunkIdx uint16) []byte {
-	return p.makeKey(segID, chunkTypeRegular, chunkIdx)
-}
-
-// makeTombstoneKey creates a key for a tombstone entry.
-//
-// Structure (two variants):
-//   - Without user key (eviction): [0xFF][SegmentID:4][KeyHash.Lo:8][KeyHash.Hi:8]
-//     Total: 21 bytes
-//   - With user key (explicit Delete): [0xFF][SegmentID:4][KeyHash.Lo:8][KeyHash.Hi:8][UserKey:variable]
-//     Total: 21 + len(userKey) bytes
-//
-// The user key is optional:
-//   - Eviction: userKey is nil (no disk read needed, accepts hash collision risk in cache mode)
-//   - Delete: userKey provided (enables collision detection in CAS mode)
-//
-// Benefits:
-// - Separate namespace from regular keys (0xFF prefix)
-// - Natural grouping by segment for range scans
-// - Transient memory overhead (tombstones dropped during compaction)
-func (p *persistence) makeTombstoneKey(segID uint32, keyHash Key, userKey []byte) []byte {
-	keyLen := 21 + len(userKey)
-	key := make([]byte, keyLen)
-
-	key[0] = prefixTombstone
-	binary.BigEndian.PutUint32(key[1:5], segID)
-	binary.BigEndian.PutUint64(key[5:13], keyHash.Lo)
-	binary.BigEndian.PutUint64(key[13:21], keyHash.Hi)
-
-	if len(userKey) > 0 {
-		copy(key[21:], userKey)
-	}
-
-	return key
-}
-
-func (p *persistence) writeBatch(segID uint32, items []Item, maxSeqID uint64) error {
-	if len(items) == 0 {
-		return nil
-	}
-
-	txn := p.db.Transaction()
-	defer txn.Discard()
-
-	currentManifest := DurableBatch{
-		SegmentID: segID,
-		CTime:     time.Now().Unix(),
-		MaxSeqID:  maxSeqID,
-	}
-
-	var chunkIdx uint16
-	currentSize := ManifestHeaderSize
-
-	flush := func() error {
-		if len(currentManifest.Items) == 0 {
-			return nil
-		}
-		data := AppendBatch(nil, currentManifest)
-		if err := txn.Put(p.makeRegularKey(segID, chunkIdx), data); err != nil {
-			return err
-		}
-		currentManifest.Items = currentManifest.Items[:0]
-		currentSize = ManifestHeaderSize
-		chunkIdx++
-		return nil
-	}
-
-	for i := range items {
-		// Check if adding this item would exceed the limit
-		if uint64(currentSize+ItemSize) > maxChunkSize && len(currentManifest.Items) > 0 {
-			if err := flush(); err != nil {
-				return err
+		tailBuf := make([]byte, record.TailSize)
+		if _, err := f.ReadAt(tailBuf, fileSize-record.TailSize); err == nil {
+			if tail, err := record.DecodeSegmentTail(tailBuf); err == nil {
+				// Valid tail at end - footer block is the entire file
+				return sys.PageAlign(tail.DataLen + record.TailSize), nil
 			}
-			currentManifest.CTime = time.Now().Unix()
+		}
+	}
+
+	// Tombstones were appended - scan for tail magic
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+
+	// Read file in chunks looking for tail magic
+	// The tail magic is at offset (footerBlockSize - 8)
+	const pageSize = 4096
+	buf := make([]byte, pageSize)
+
+	for offset := int64(0); offset < fileSize; offset += pageSize {
+		n, err := f.ReadAt(buf, offset)
+		if err != nil && n == 0 {
+			break
 		}
 
-		currentManifest.Items = append(currentManifest.Items, items[i])
-		currentSize += ItemSize
+		// Look for tail magic in this page
+		for i := 0; i <= n-record.TailSize; i++ {
+			// Check if this looks like a valid tail position
+			magic := binary.LittleEndian.Uint64(buf[i+12 : i+20])
+			if magic == record.TailMagic {
+				// Found tail magic - verify by reading the full tail
+				tailOffset := offset + int64(i)
+				possibleBlockEnd := tailOffset + record.TailSize
+				roundedEnd := sys.PageAlign(possibleBlockEnd)
+
+				// The footer block should end at a page boundary
+				if roundedEnd <= fileSize {
+					tailBuf := make([]byte, record.TailSize)
+					if _, err := f.ReadAt(tailBuf, tailOffset); err == nil {
+						if tail, err := record.DecodeSegmentTail(tailBuf); err == nil {
+							// Verify: data length should match position
+							expectedStart := tailOffset - tail.DataLen
+							if expectedStart >= 0 {
+								return sys.PageAlign(tail.DataLen + record.TailSize), nil
+							}
+						}
+					}
+				}
+			}
+		}
 	}
 
-	if err := flush(); err != nil {
-		return err
-	}
-	return txn.Commit()
+	return 0, fmt.Errorf("could not find footer block in %s", path)
 }
 
-func (p *persistence) scanAll(fn ScanBatchFn) error {
-	// Use transaction for consistent snapshot
-	txn := p.db.Transaction()
-	defer txn.Discard()
+// openMetaFile opens a .meta file for appending tombstones.
+func (p *persistence) openMetaFile(segID uint32) (*metaFile, error) {
+	// Check if already open
+	if v, ok := p.files.Load(segID); ok {
+		return v.(*metaFile), nil
+	}
 
-	// Load ALL tombstones first (across all segments)
-	allTombstones := make(map[Key]struct{})
+	path := p.metaPath(segID)
 
-	// Use ForEach and filter by prefix (can't use Range with 0xFF+1 end bound)
-	err := p.db.ForEach(func(key bitcask.Key) error {
-		// Skip non-tombstone keys
-		if len(key) == 0 || key[0] != prefixTombstone {
-			return nil
-		}
-		// Decode Key hash from bytes [5:21]
-		if len(key) >= 21 {
-			k := Key{
-				Lo: binary.BigEndian.Uint64(key[5:13]),
-				Hi: binary.BigEndian.Uint64(key[13:21]),
-			}
-			allTombstones[k] = struct{}{}
-		}
-		return nil
-	})
+	// Find footer block size (tombstones start after this)
+	footerBlockSize, err := findFooterBlockSize(path)
+	if err != nil {
+		return nil, fmt.Errorf("find footer block size for %s: %w", path, err)
+	}
+
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_APPEND, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("open meta file %s: %w", path, err)
+	}
+
+	mf := &metaFile{
+		path:            path,
+		f:               f,
+		w:               bufio.NewWriterSize(f, 4096), // 4KB buffer for tombstone batching
+		footerBlockSize: footerBlockSize,
+	}
+
+	// Store or return existing (race-safe)
+	actual, loaded := p.files.LoadOrStore(segID, mf)
+	if loaded {
+		// Another goroutine beat us - close our file and use theirs
+		_ = f.Close()
+		return actual.(*metaFile), nil
+	}
+
+	return mf, nil
+}
+
+// tombstone writes a single tombstone to the segment's .meta file.
+// Tombstones are buffered and NOT fsynced for performance.
+func (p *persistence) tombstone(segID uint32, keyHash Key, _ []byte) error {
+	mf, err := p.openMetaFile(segID)
 	if err != nil {
 		return err
 	}
 
-	// Scan regular data, merging tombstones
-	return p.db.ForEach(func(key bitcask.Key) error {
-		// Skip tombstone keys (already processed)
-		if len(key) > 0 && key[0] == prefixTombstone {
-			return nil
-		}
+	mf.mu.Lock()
+	defer mf.mu.Unlock()
 
-		buf, err := p.db.Get(key)
-		if err != nil {
-			return fmt.Errorf("failed to get chunk %v: %w", key, err)
-		}
+	// Write tombstone batch header (single tombstone)
+	var hdr [TombstoneHeaderSize]byte
+	hdr[0] = TombstoneMagic
+	binary.LittleEndian.PutUint32(hdr[1:5], 1) // count = 1
+	binary.LittleEndian.PutUint64(hdr[5:13], uint64(time.Now().Unix()))
 
-		manifest, err := DecodeBatch(buf)
-		if err != nil {
-			return fmt.Errorf("failed to decode chunk %v: %w", key, err)
-		}
-
-		// Merge tombstones into items
-		for i := range manifest.Items {
-			if _, isTombstone := allTombstones[manifest.Items[i].Key]; isTombstone {
-				manifest.Items[i].SetDeleted()
-			}
-		}
-
-		manifest.IndexKey = key
-		if !fn(manifest) {
-			return nil
-		}
-		return nil
-	})
-}
-
-func (p *persistence) scanSegment(segID uint32, fn ScanBatchFn) error {
-	// Use explicit transaction to get consistent snapshot of both tombstones and data
-	txn := p.db.Transaction()
-	defer txn.Discard()
-
-	// 1. Load tombstones first (consistent view within transaction)
-	tombstones := make(map[Key]struct{})
-	tombstoneStart := make([]byte, 5)
-	tombstoneStart[0] = prefixTombstone
-	binary.BigEndian.PutUint32(tombstoneStart[1:5], segID)
-
-	tombstoneEnd := make([]byte, 5)
-	tombstoneEnd[0] = prefixTombstone
-	binary.BigEndian.PutUint32(tombstoneEnd[1:5], segID+1)
-
-	err := txn.Range(tombstoneStart, tombstoneEnd, func(key bitcask.Key) error {
-		if len(key) >= 21 {
-			k := Key{
-				Lo: binary.BigEndian.Uint64(key[5:13]),
-				Hi: binary.BigEndian.Uint64(key[13:21]),
-			}
-			tombstones[k] = struct{}{}
-		}
-		return nil
-	})
-	if err != nil {
+	if _, err := mf.w.Write(hdr[:]); err != nil {
 		return err
 	}
 
-	// 2. Scan regular data chunks (same transaction = consistent view)
-	start := p.makeRegularKey(segID, 0)
-	end := p.makeRegularKey(segID, maxChunkIdx)
+	// Write tombstone key
+	var key [TombstoneKeySize]byte
+	binary.LittleEndian.PutUint64(key[0:8], keyHash.Lo)
+	binary.LittleEndian.PutUint64(key[8:16], keyHash.Hi)
 
-	return txn.Range(start, end, func(key bitcask.Key) error {
-		buf, err := txn.Get(key)
-		if err != nil {
-			return fmt.Errorf("failed to get chunk %v: %w", key, err)
-		}
-
-		manifest, err := DecodeBatch(buf)
-		if err != nil {
-			return fmt.Errorf("failed to decode chunk %v: %w", key, err)
-		}
-
-		// Merge tombstones into items
-		for i := range manifest.Items {
-			if _, isTombstone := tombstones[manifest.Items[i].Key]; isTombstone {
-				manifest.Items[i].SetDeleted()
-			}
-		}
-
-		manifest.IndexKey = key
-		if !fn(manifest) {
-			return nil
-		}
-		return nil
-	})
+	_, err = mf.w.Write(key[:])
+	return err
 }
 
-// scanRange scans all chunks across multiple segments [startSegID, endSegID] (inclusive).
-// Used for gap detection during compaction validation.
-func (p *persistence) scanRange(startSegID, endSegID uint32, fn ScanBatchFn) error {
-	start := p.makeRegularKey(startSegID, 0)
-	end := p.makeRegularKey(endSegID, maxChunkIdx)
-
-	return p.db.Range(start, end, func(key bitcask.Key) error {
-		return p.loadAndInvoke(key, fn)
-	})
-}
-
-// dropSegment deletes all Bitcask entries for a segment.
-// Used after compaction when segment data has been moved to a new segment.
-func (p *persistence) dropSegment(segID uint32) error {
-	start := p.makeRegularKey(segID, 0)
-	end := p.makeRegularKey(segID, maxChunkIdx)
-
-	txn := p.db.Transaction()
-	defer txn.Discard()
-
-	err := p.db.Range(start, end, func(key bitcask.Key) error {
-		return txn.Delete(key)
-	})
-	if err != nil {
-		return err
-	}
-
-	return txn.Commit()
-}
-
-func (p *persistence) loadAndInvoke(key bitcask.Key, fn ScanBatchFn) error {
-	buf, err := p.db.Get(key)
-	if err != nil {
-		return fmt.Errorf("failed to get chunk %v: %w", key, err)
-	}
-
-	manifest, err := DecodeBatch(buf)
-	if err != nil {
-		return fmt.Errorf("failed to decode chunk %v: %w", key, err)
-	}
-
-	manifest.IndexKey = key
-	if !fn(manifest) {
-		// Stop requested by caller
-		return nil
-	}
-	return nil
-}
-
-// --- Tombstone Operations ---
-
-// tombstone writes a single tombstone to the incremental log.
-// Tombstones are stored in a separate namespace (0xFF prefix) with full user key.
-//
-// This is a simple synchronous write (no transaction coordination needed).
-// Returns immediately - tombstones are merged during scanSegment().
-func (p *persistence) tombstone(segID uint32, keyHash Key, userKey []byte) error {
-	key := p.makeTombstoneKey(segID, keyHash, userKey)
-
-	// Value: timestamp for observability (when was this deleted?)
-	value := make([]byte, 8)
-	binary.LittleEndian.PutUint64(value, uint64(time.Now().Unix()))
-
-	return p.db.Put(key, value)
-}
-
-// tombstoneBatch writes multiple tombstones in a single transaction.
-// Used by eviction where we delete many items at once - batching avoids
-// acquiring the Bitcask lock and cloning the radix tree N times.
+// tombstoneBatch writes multiple tombstones in a single batch.
+// Used by eviction where we delete many items at once.
 func (p *persistence) tombstoneBatch(items []Item) error {
 	if len(items) == 0 {
 		return nil
 	}
 
-	txn := p.db.Transaction()
-	defer txn.Discard()
-
-	// Value: timestamp for observability (when was this deleted?)
-	var value [8]byte
-	binary.LittleEndian.PutUint64(value[:], uint64(time.Now().Unix()))
-
+	// Group items by segment ID
+	bySegment := make(map[uint32][]Item)
 	for _, item := range items {
-		// Eviction tombstones have no user key (nil)
-		key := p.makeTombstoneKey(item.SegmentID, item.Key, nil)
-		if err := txn.Put(key, value[:]); err != nil {
+		bySegment[item.SegmentID] = append(bySegment[item.SegmentID], item)
+	}
+
+	// Write tombstone batch for each segment
+	for segID, segItems := range bySegment {
+		mf, err := p.openMetaFile(segID)
+		if err != nil {
 			return err
 		}
+
+		mf.mu.Lock()
+
+		// Write tombstone batch header
+		var hdr [TombstoneHeaderSize]byte
+		hdr[0] = TombstoneMagic
+		binary.LittleEndian.PutUint32(hdr[1:5], uint32(len(segItems)))
+		binary.LittleEndian.PutUint64(hdr[5:13], uint64(time.Now().Unix()))
+
+		if _, err := mf.w.Write(hdr[:]); err != nil {
+			mf.mu.Unlock()
+			return err
+		}
+
+		// Write all tombstone keys
+		for _, item := range segItems {
+			var key [TombstoneKeySize]byte
+			binary.LittleEndian.PutUint64(key[0:8], item.Key.Lo)
+			binary.LittleEndian.PutUint64(key[8:16], item.Key.Hi)
+
+			if _, err := mf.w.Write(key[:]); err != nil {
+				mf.mu.Unlock()
+				return err
+			}
+		}
+
+		mf.mu.Unlock()
 	}
-	return txn.Commit()
+
+	return nil
 }
 
-// compactTombstones merges the tombstone incremental log into the segment manifest.
-// This is a metadata cleanup operation that also enables space reclamation.
-//
-// The onTombstone callback is invoked for each tombstone with its associated item.
-// Caller can use this to hole punch the blob (idempotent operation):
-// - CAS mode deletes: First hole punch happens here
-// - Cache mode deletes/eviction: Already hole-punched, this is a no-op
-//
-// All operations in a single transaction for atomicity.
-func (p *persistence) compactTombstones(segID uint32, onTombstone TombstoneFn) error {
-	txn := p.db.Transaction()
-	defer txn.Discard()
-
-	// 1. Load tombstones within transaction
-	tombstones := make(map[Key]bool)
-	tombStart := make([]byte, 5)
-	tombStart[0] = prefixTombstone
-	binary.BigEndian.PutUint32(tombStart[1:5], segID)
-
-	tombEnd := make([]byte, 5)
-	tombEnd[0] = prefixTombstone
-	binary.BigEndian.PutUint32(tombEnd[1:5], segID+1)
-
-	err := txn.Range(tombStart, tombEnd, func(key bitcask.Key) error {
-		if len(key) >= 21 {
-			k := Key{
-				Lo: binary.BigEndian.Uint64(key[5:13]),
-				Hi: binary.BigEndian.Uint64(key[13:21]),
-			}
-			tombstones[k] = true
-		}
+// flushMetaFile flushes buffered writes for a segment's .meta file.
+func (p *persistence) flushMetaFile(segID uint32) error {
+	v, ok := p.files.Load(segID)
+	if !ok {
 		return nil
-	})
+	}
+	mf := v.(*metaFile)
+
+	mf.mu.Lock()
+	defer mf.mu.Unlock()
+
+	return mf.w.Flush()
+}
+
+// readMetaFile reads a segment's .meta file and returns items with merged tombstones.
+func (p *persistence) readMetaFile(segID uint32) (DurableBatch, error) {
+	// Flush any pending buffered writes for this segment before reading
+	if v, ok := p.files.Load(segID); ok {
+		mf := v.(*metaFile)
+		mf.mu.Lock()
+		if err := mf.w.Flush(); err != nil {
+			mf.mu.Unlock()
+			return DurableBatch{}, fmt.Errorf("flush pending meta for segment %d: %w", segID, err)
+		}
+		mf.mu.Unlock()
+	}
+
+	path := p.metaPath(segID)
+	f, err := os.Open(path)
 	if err != nil {
-		return err
+		if os.IsNotExist(err) {
+			return DurableBatch{}, nil
+		}
+		return DurableBatch{}, fmt.Errorf("open meta file %s: %w", path, err)
 	}
+	defer f.Close()
 
-	if len(tombstones) == 0 {
-		return nil // Nothing to compact
-	}
-
-	// 2. Read segment manifest
-	var allItems []Item
-	var cTime int64
-	var maxSeqID uint64
-	var originalKeys [][]byte
-
-	dataStart := p.makeRegularKey(segID, 0)
-	dataEnd := p.makeRegularKey(segID, maxChunkIdx)
-
-	err = txn.Range(dataStart, dataEnd, func(key bitcask.Key) error {
-		buf, err := txn.Get(key)
-		if err != nil {
-			return err
-		}
-
-		manifest, err := DecodeBatch(buf)
-		if err != nil {
-			return err
-		}
-
-		originalKeys = append(originalKeys, []byte(key))
-		if cTime == 0 {
-			cTime = manifest.CTime
-		}
-		if manifest.MaxSeqID > maxSeqID {
-			maxSeqID = manifest.MaxSeqID
-		}
-
-		allItems = append(allItems, manifest.Items...)
-		return nil
-	})
+	stat, err := f.Stat()
 	if err != nil {
-		return err
+		return DurableBatch{}, err
+	}
+	fileSize := stat.Size()
+
+	if fileSize < record.TailSize {
+		return DurableBatch{}, fmt.Errorf("meta file %s too small: %d bytes", path, fileSize)
 	}
 
-	// 3. Invoke callback for each tombstone (caller can hole punch)
-	if onTombstone != nil {
-		for i := range allItems {
-			if tombstones[allItems[i].Key] && !allItems[i].IsDeleted() {
-				onTombstone(TombstoneRecord{
-					KeyHash: allItems[i].Key,
-					Item:    allItems[i],
-				})
+	// Find footer block size
+	footerBlockSize, err := findFooterBlockSize(path)
+	if err != nil {
+		return DurableBatch{}, err
+	}
+
+	// Read SegmentFooter using record package
+	footer, _, err := record.ReadFooterBlock(f, footerBlockSize, int64(segID))
+	if err != nil {
+		return DurableBatch{}, fmt.Errorf("read footer from %s: %w", path, err)
+	}
+
+	// Convert FooterEntries to Items
+	items := make([]Item, len(footer.Entries))
+	for i := range footer.Entries {
+		items[i] = footerEntryToItem(uint32(footer.SegmentID), &footer.Entries[i])
+	}
+
+	// Read tombstones (appended after footer block)
+	tombstones := make(map[Key]struct{})
+
+	if fileSize > footerBlockSize {
+		// Read tombstone data
+		tombstoneData := make([]byte, fileSize-footerBlockSize)
+		if _, err := f.ReadAt(tombstoneData, footerBlockSize); err != nil {
+			return DurableBatch{}, fmt.Errorf("read tombstones from %s: %w", path, err)
+		}
+
+		// Parse tombstone batches
+		pos := 0
+		for pos < len(tombstoneData) {
+			if pos+TombstoneHeaderSize > len(tombstoneData) {
+				break // Truncated header (crash during write)
+			}
+
+			magic := tombstoneData[pos]
+			if magic != TombstoneMagic {
+				break // Unknown data (corruption or end of tombstones)
+			}
+
+			count := binary.LittleEndian.Uint32(tombstoneData[pos+1 : pos+5])
+			// timestamp at pos+5..pos+13 (unused during read)
+
+			pos += TombstoneHeaderSize
+
+			// Read tombstone keys
+			for range count {
+				if pos+TombstoneKeySize > len(tombstoneData) {
+					break // Truncated key (crash during write)
+				}
+				k := Key{
+					Lo: binary.LittleEndian.Uint64(tombstoneData[pos : pos+8]),
+					Hi: binary.LittleEndian.Uint64(tombstoneData[pos+8 : pos+16]),
+				}
+				tombstones[k] = struct{}{}
+				pos += TombstoneKeySize
 			}
 		}
 	}
 
-	// 4. Mark items as deleted
-	for i := range allItems {
-		if tombstones[allItems[i].Key] {
-			allItems[i].SetDeleted()
+	// Apply tombstones to items
+	for i := range items {
+		if _, deleted := tombstones[items[i].Key]; deleted {
+			items[i].SetDeleted()
 		}
 	}
 
-	// 5. Delete old manifest keys
-	for _, k := range originalKeys {
-		if err := txn.Delete(k); err != nil {
-			return err
+	return DurableBatch{
+		SegmentID: uint32(footer.SegmentID),
+		CTime:     footer.CTime,
+		MaxSeqID:  footer.MaxSeqID,
+		Items:     items,
+	}, nil
+}
+
+// scanAll iterates over all segment files and invokes fn for each manifest.
+// It is resilient to missing/corrupt .meta files by scanning .seg files directly.
+//
+// The scan process for each .seg file:
+//  1. Try to read the corresponding .meta file (fast path)
+//  2. If .meta is missing or corrupt, scan the .seg file record-by-record
+//  3. Optionally rebuild .meta from scanned records for future fast startup
+func (p *persistence) scanAll(fn ScanBatchFn) error {
+	segmentsDir := filepath.Join(p.basePath, "segments")
+
+	// Iterate over shard directories
+	shardDirs, err := os.ReadDir(segmentsDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // No segments yet
+		}
+		return fmt.Errorf("read segments dir: %w", err)
+	}
+
+	for _, shardEntry := range shardDirs {
+		if !shardEntry.IsDir() {
+			continue
+		}
+
+		shardPath := filepath.Join(segmentsDir, shardEntry.Name())
+		entries, err := os.ReadDir(shardPath)
+		if err != nil {
+			continue // Skip unreadable directories
+		}
+
+		for _, entry := range entries {
+			// Look for .seg files (the actual data), not .meta files
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".seg") {
+				continue
+			}
+
+			var segID uint32
+			if _, err := fmt.Sscanf(entry.Name(), "%d.seg", &segID); err != nil {
+				continue // Skip non-conforming files
+			}
+
+			segPath := filepath.Join(shardPath, entry.Name())
+			manifest, err := p.loadSegmentManifest(segID, segPath)
+			if err != nil {
+				slog.Warn("failed to load segment manifest, skipping",
+					"segment", segID, "path", segPath, "error", err)
+				continue
+			}
+
+			if len(manifest.Items) == 0 {
+				continue
+			}
+
+			if !fn(manifest) {
+				return nil // Caller requested stop
+			}
 		}
 	}
 
-	// 6. Write updated manifest with tombstones collapsed
-	newManifest := DurableBatch{
+	// Also scan for orphan .meta files (where .seg is missing)
+	// These should be cleaned up.
+	for _, shardEntry := range shardDirs {
+		if !shardEntry.IsDir() {
+			continue
+		}
+
+		shardPath := filepath.Join(segmentsDir, shardEntry.Name())
+		entries, _ := os.ReadDir(shardPath)
+
+		for _, entry := range entries {
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".meta") {
+				continue
+			}
+
+			var segID uint32
+			if _, err := fmt.Sscanf(entry.Name(), "%d.meta", &segID); err != nil {
+				continue
+			}
+
+			// Check if corresponding .seg exists
+			segPath := filepath.Join(shardPath, fmt.Sprintf("%d.seg", segID))
+			if _, err := os.Stat(segPath); os.IsNotExist(err) {
+				metaPath := filepath.Join(shardPath, entry.Name())
+				slog.Warn("removing orphan .meta file (no corresponding .seg)",
+					"path", metaPath)
+				_ = os.Remove(metaPath)
+			}
+		}
+	}
+
+	return nil
+}
+
+// loadSegmentManifest loads a segment's manifest, trying .meta first then falling back to scanning.
+func (p *persistence) loadSegmentManifest(segID uint32, segPath string) (DurableBatch, error) {
+	// Check if .meta file exists
+	metaPath := p.metaPath(segID)
+	metaExists := true
+	if _, err := os.Stat(metaPath); os.IsNotExist(err) {
+		metaExists = false
+	}
+
+	// Try to read .meta file first (fast path)
+	manifest, err := p.readMetaFile(segID)
+	if err == nil && metaExists {
+		// .meta exists and was read successfully - use it even if empty
+		// (empty means all items were tombstoned)
+		return manifest, nil
+	}
+
+	// .meta missing or corrupt - scan the .seg file directly
+	slog.Info("recovering segment by scanning (meta unavailable)",
+		"segment", segID, "meta_exists", metaExists, "meta_error", err)
+
+	f, err := os.Open(segPath)
+	if err != nil {
+		return DurableBatch{}, fmt.Errorf("open segment file: %w", err)
+	}
+	defer f.Close()
+
+	stat, err := f.Stat()
+	if err != nil {
+		return DurableBatch{}, fmt.Errorf("stat segment file: %w", err)
+	}
+
+	footer, err := record.ScanSegmentFile(f, stat.Size(), segID)
+	if err != nil {
+		return DurableBatch{}, fmt.Errorf("scan segment file: %w", err)
+	}
+
+	// Convert FooterEntries to Items
+	items := make([]Item, 0, len(footer.Entries))
+	for i := range footer.Entries {
+		e := &footer.Entries[i]
+		if e.IsDeleted() {
+			continue // Skip tombstoned items
+		}
+		items = append(items, footerEntryToItem(segID, e))
+	}
+
+	// Rebuild .meta file for future fast startup
+	if len(items) > 0 {
+		if err := p.rebuildMetaFile(segPath, footer); err != nil {
+			slog.Warn("failed to rebuild .meta file (non-fatal)",
+				"segment", segID, "error", err)
+		} else {
+			slog.Info("rebuilt .meta file from segment scan",
+				"segment", segID, "items", len(items))
+		}
+	}
+
+	return DurableBatch{
 		SegmentID: segID,
-		CTime:     cTime,
-		MaxSeqID:  maxSeqID,
-	}
+		CTime:     footer.CTime,
+		MaxSeqID:  footer.MaxSeqID,
+		Items:     items,
+	}, nil
+}
 
-	var chunkIdx uint16
-	currentSize := ManifestHeaderSize
+// rebuildMetaFile writes a .meta file from a scanned SegmentFooter.
+func (p *persistence) rebuildMetaFile(segPath string, footer record.SegmentFooter) error {
+	metaPath := segPath[:len(segPath)-4] + ".meta" // .seg -> .meta
 
-	for i := range allItems {
-		if uint64(currentSize+ItemSize) > maxChunkSize && len(newManifest.Items) > 0 {
-			data := AppendBatch(nil, newManifest)
-			if err := txn.Put(p.makeRegularKey(segID, chunkIdx), data); err != nil {
-				return err
-			}
-			chunkIdx++
-			newManifest.Items = newManifest.Items[:0]
-			currentSize = ManifestHeaderSize
-		}
+	// Build the footer block
+	buf := record.AppendFooterBlock(nil, footer)
 
-		newManifest.Items = append(newManifest.Items, allItems[i])
-		currentSize += ItemSize
+	// Write atomically
+	return sys.WriteFile(metaPath, buf, 0)
+}
 
-		if i == len(allItems)-1 {
-			data := AppendBatch(nil, newManifest)
-			if err := txn.Put(p.makeRegularKey(segID, chunkIdx), data); err != nil {
-				return err
-			}
-		}
-	}
-
-	// 7. Drop tombstone log entries
-	err = p.db.Range(tombStart, tombEnd, func(key bitcask.Key) error {
-		return txn.Delete(key)
-	})
+// scanSegment reads a single segment's .meta file.
+func (p *persistence) scanSegment(segID uint32, fn ScanBatchFn) error {
+	manifest, err := p.readMetaFile(segID)
 	if err != nil {
 		return err
 	}
 
-	return txn.Commit()
+	if len(manifest.Items) > 0 {
+		fn(manifest)
+	}
+	return nil
 }
 
+// scanRange scans all segments in [startSegID, endSegID] (inclusive).
+// Used for gap detection during compaction validation.
+func (p *persistence) scanRange(startSegID, endSegID uint32, fn ScanBatchFn) error {
+	for segID := startSegID; segID <= endSegID; segID++ {
+		manifest, err := p.readMetaFile(segID)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return err
+		}
+
+		if len(manifest.Items) == 0 {
+			continue
+		}
+
+		if !fn(manifest) {
+			return nil // Caller requested stop
+		}
+	}
+	return nil
+}
+
+// dropSegment deletes a segment's .meta file.
+// Used after compaction when segment data has been moved.
+func (p *persistence) dropSegment(segID uint32) error {
+	// Close and remove from cache if open
+	if v, ok := p.files.LoadAndDelete(segID); ok {
+		mf := v.(*metaFile)
+		mf.mu.Lock()
+		if err := mf.w.Flush(); err != nil {
+			slog.Warn("flush meta file before drop", "segID", segID, "error", err)
+		}
+		if err := mf.f.Close(); err != nil {
+			slog.Warn("close meta file before drop", "segID", segID, "error", err)
+		}
+		mf.mu.Unlock()
+	}
+
+	path := p.metaPath(segID)
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove meta file %s: %w", path, err)
+	}
+	return nil
+}
+
+// compactTombstones rewrites the .meta file with tombstones collapsed into footer entries.
+// The onTombstone callback is invoked for each tombstone from the tombstone batches.
+// If there are no tombstone batches (only baked-in deleted items), this is a no-op.
+func (p *persistence) compactTombstones(segID uint32, onTombstone TombstoneFn) error {
+	// Flush any pending buffered writes for this segment
+	if v, ok := p.files.Load(segID); ok {
+		mf := v.(*metaFile)
+		mf.mu.Lock()
+		if err := mf.w.Flush(); err != nil {
+			mf.mu.Unlock()
+			return fmt.Errorf("flush pending meta for segment %d: %w", segID, err)
+		}
+		mf.mu.Unlock()
+	}
+
+	path := p.metaPath(segID)
+	stat, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+
+	// Find footer block size
+	footerBlockSize, err := findFooterBlockSize(path)
+	if err != nil {
+		return err
+	}
+
+	// If file size equals footer block size, no tombstone batches exist
+	if stat.Size() == footerBlockSize {
+		return nil // Nothing to compact - no tombstones appended
+	}
+
+	// Read full manifest with merged tombstones
+	manifest, err := p.readMetaFile(segID)
+	if err != nil {
+		return err
+	}
+
+	// Invoke callback for each deleted item (these came from tombstone batches)
+	for i := range manifest.Items {
+		if manifest.Items[i].IsDeleted() && onTombstone != nil {
+			onTombstone(TombstoneRecord{
+				KeyHash: manifest.Items[i].Key,
+				Item:    manifest.Items[i],
+			})
+		}
+	}
+
+	// Close file handle if open
+	if v, ok := p.files.LoadAndDelete(segID); ok {
+		mf := v.(*metaFile)
+		mf.mu.Lock()
+		_ = mf.w.Flush()
+		_ = mf.f.Close()
+		mf.mu.Unlock()
+	}
+
+	// Read original footer to rewrite with updated entries
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	footer, _, err := record.ReadFooterBlock(f, footerBlockSize, int64(segID))
+	f.Close()
+	if err != nil {
+		return err
+	}
+
+	// Update footer entries with deleted flags
+	tombstoneKeys := make(map[Key]struct{})
+	for i := range manifest.Items {
+		if manifest.Items[i].IsDeleted() {
+			tombstoneKeys[manifest.Items[i].Key] = struct{}{}
+		}
+	}
+	for i := range footer.Entries {
+		if _, deleted := tombstoneKeys[footer.Entries[i].Key]; deleted {
+			footer.Entries[i].SetDeleted()
+		}
+	}
+
+	// Rewrite footer block without tombstone appendages
+	// We need a pool-like buffer for alignment - use a simple allocation here
+	physicalSize := record.SegmentFooterAlignedSize(len(footer.Entries))
+	buf := make([]byte, physicalSize)
+	data := record.AppendFooterBlock(buf, footer)
+
+	tmpPath := path + ".compact.tmp"
+	if err := os.WriteFile(tmpPath, data, 0o644); err != nil {
+		return fmt.Errorf("write compacted meta: %w", err)
+	}
+
+	if err := os.Rename(tmpPath, path); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("rename compacted meta: %w", err)
+	}
+
+	return nil
+}
+
+// close closes all open .meta file handles and flushes buffers.
 func (p *persistence) close() error {
-	return p.db.Close()
+	var errs []error
+
+	p.files.Range(func(key, value any) bool {
+		mf := value.(*metaFile)
+		mf.mu.Lock()
+		if err := mf.w.Flush(); err != nil {
+			errs = append(errs, fmt.Errorf("flush meta %d: %w", key.(uint32), err))
+		}
+		if err := mf.f.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("close meta %d: %w", key.(uint32), err))
+		}
+		mf.mu.Unlock()
+		return true
+	})
+
+	return errors.Join(errs...)
 }

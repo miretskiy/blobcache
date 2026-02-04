@@ -1,15 +1,25 @@
 package blobcache
 
 import (
+	"path/filepath"
 	"time"
 
 	"github.com/miretskiy/blobcache/internal/record"
 	"github.com/miretskiy/blobcache/internal/sys"
 )
 
-// IndexSegmentExtension is the file extension for segment index files.
-// These contain the SegmentFooter data written separately from the data segment.
-const IndexSegmentExtension = ".iseg"
+// IndexSegmentExtension is the file extension for segment metadata files.
+// These files contain the Base Manifest (SegmentFooter struct at offset 0)
+// followed by a stream of Tombstone Batches appended on delete operations.
+// The base manifest is written by WriteFooter during segment flush.
+const IndexSegmentExtension = ".meta"
+
+// SegmentMetaPath converts a segment data path to its metadata path.
+// Example: "/data/segments/0001/123.seg" -> "/data/segments/0001/123.meta"
+func SegmentMetaPath(segmentPath string) string {
+	ext := filepath.Ext(segmentPath)
+	return segmentPath[:len(segmentPath)-len(ext)] + IndexSegmentExtension
+}
 
 // poolProvider allows WriteFooter to acquire hardware-aligned buffers
 // for footer serialization without heap allocations.
@@ -17,15 +27,15 @@ type poolProvider interface {
 	AcquireAligned(size int64) *MmapBuffer
 }
 
-// WriteFooter writes a segment footer to a separate .iseg file.
+// WriteFooter writes a segment footer to a separate .meta file.
 // This is a stateless function that:
 // 1. Computes min/max SeqID from entries
 // 2. Builds SegmentFooter struct
 // 3. Serializes to 4KB-aligned buffer
 // 4. Writes atomically using WriteFile
 //
-// The footer file path is derived from dataPath by adding .iseg extension.
-// Example: /data/segments/0001/00000001.seg -> /data/segments/0001/00000001.seg.iseg
+// The footer file path is derived from dataPath by replacing .seg extension with .meta.
+// Example: /data/segments/0001/123.seg -> /data/segments/0001/123.meta
 func WriteFooter(
 	segmentID uint32,
 	entries []record.FooterEntry,
@@ -65,7 +75,7 @@ func WriteFooter(
 
 	data := record.AppendFooterBlock(buf.Bytes(), sf)
 
-	// 4. Write atomically to .iseg file
-	indexPath := dataPath + IndexSegmentExtension
+	// 4. Write atomically to .meta file
+	indexPath := SegmentMetaPath(dataPath)
 	return sys.WriteFile(indexPath, data, flags)
 }

@@ -139,9 +139,9 @@ func getSegmentPath(basePath string, numShards int, segmentID uint32) string {
 	)
 }
 
-// GetFooterPath returns the path for a segment's footer file (.iseg).
+// GetFooterPath returns the path for a segment's metadata file (.meta).
 func GetFooterPath(basePath string, numShards int, segmentID uint32) string {
-	return getSegmentPath(basePath, numShards, segmentID) + IndexSegmentExtension
+	return SegmentMetaPath(getSegmentPath(basePath, numShards, segmentID))
 }
 
 // getSegmentFile returns cached SegmentFile or opens it

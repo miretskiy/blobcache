@@ -8,7 +8,7 @@ import (
 	"github.com/miretskiy/blobcache/internal/xmap"
 )
 
-// DurableIndex wraps BlobIndex with Bitcask persistence.
+// DurableIndex wraps BlobIndex with append-only .meta file persistence.
 // It provides durable storage for blob metadata while leveraging the
 // GC-optimized in-memory index for fast lookups.
 type DurableIndex struct {
@@ -17,9 +17,9 @@ type DurableIndex struct {
 }
 
 // OpenIndex creates a DurableIndex by loading persisted metadata from disk.
-// The basePath should contain a "db" subdirectory for Bitcask storage.
-func OpenIndex(basePath string, initialCapacity int) (*DurableIndex, error) {
-	p, err := newPersistence(basePath)
+// The basePath should contain a "segments" subdirectory with .meta files.
+func OpenIndex(basePath string, shards int, initialCapacity int) (*DurableIndex, error) {
+	p, err := newPersistence(basePath, shards)
 	if err != nil {
 		return nil, err
 	}
@@ -120,16 +120,15 @@ func (idx *DurableIndex) GetSegmentManifest(segmentID uint32) (DurableBatch, boo
 	return fullManifest, true
 }
 
-// IngestBatch writes a batch of items for a segment to both RAM and disk.
-func (idx *DurableIndex) IngestBatch(segID uint32, items []Item, maxSeqID uint64) error {
-	if err := idx.segments.writeBatch(segID, items, maxSeqID); err != nil {
-		return err
-	}
-
+// IngestBatch adds a batch of items to the RAM index (RAM-only operation).
+//
+// Persistence is handled separately via .meta files:
+//   - During flush: WriteFooter writes the .meta file before this is called
+//   - During recovery: .meta files are read and items passed to this method
+func (idx *DurableIndex) IngestBatch(items []Item) {
 	for _, item := range items {
 		idx.Put(item)
 	}
-	return nil
 }
 
 // Evict removes the coldest item using SIEVE and returns it.
@@ -144,17 +143,13 @@ func (idx *DurableIndex) Evict() (Item, error) {
 
 // DeleteSegment removes all entries for a segment from both RAM and disk.
 func (idx *DurableIndex) DeleteSegment(segmentID uint32) error {
-	var keys [][]byte
-
+	// Load manifest to get items for RAM deletion
 	err := idx.segments.scanSegment(segmentID, func(m DurableBatch) bool {
 		if m.SegmentID != segmentID {
 			panic(fmt.Sprintf("scanSegment(%d) returned entries for segment %d", segmentID, m.SegmentID))
 		}
 		for _, item := range m.Items {
 			idx.Delete(item.Key)
-		}
-		if len(m.IndexKey) > 0 {
-			keys = append(keys, m.IndexKey)
 		}
 		return true
 	})
@@ -163,22 +158,8 @@ func (idx *DurableIndex) DeleteSegment(segmentID uint32) error {
 		return fmt.Errorf("scan segment %d failed: %w", segmentID, err)
 	}
 
-	if len(keys) == 0 {
-		return nil
-	}
-
-	// Delete manifest keys from Bitcask
-	txn := idx.segments.db.Transaction()
-	defer txn.Discard()
-	for _, key := range keys {
-		if err := txn.Delete(key); err != nil {
-			return fmt.Errorf("failed to delete segment %d key: %w", segmentID, err)
-		}
-	}
-	if err := txn.Commit(); err != nil {
-		return fmt.Errorf("failed to commit segment %d deletion: %w", segmentID, err)
-	}
-	return nil
+	// Delete the .meta file
+	return idx.segments.dropSegment(segmentID)
 }
 
 // Tombstone writes a tombstone to the incremental log and marks item as deleted in RAM.
@@ -262,17 +243,10 @@ type DurableStats struct {
 	SegmentCount int // Number of segments on disk
 }
 
-// DropSegment deletes all Bitcask entries for a segment without touching RAM.
+// DropSegment deletes the .meta file for a segment without touching RAM.
 // Used after compaction when segment data has been fully relocated to a new segment.
 func (idx *DurableIndex) DropSegment(segID uint32) error {
 	return idx.segments.dropSegment(segID)
-}
-
-// CompactBatch writes compacted items to a new segment in Bitcask.
-// Unlike IngestBatch, this does NOT update the in-memory index.
-// The caller must use Relocate to atomically update item locations after writing.
-func (idx *DurableIndex) CompactBatch(segID uint32, items []Item, maxSeqID uint64) error {
-	return idx.segments.writeBatch(segID, items, maxSeqID)
 }
 
 // SegmentMetaShard returns the xmap shard for a given segment ID.
@@ -291,8 +265,8 @@ func (idx *DurableIndex) SegmentMetaShard(segID uint32) *xmap.Shard[SegmentMetad
 // perform I/O operations (e.g., hole punching) before the metadata is updated.
 //
 // This is a metadata cleanup operation:
-// - Collapses tombstone log entries into the segment Items (marked as deleted)
-// - Drops tombstone log entries from Bitcask
+// - Collapses tombstone batches into the segment Items (marked as deleted)
+// - Rewrites the .meta file without tombstone batches
 // - Allows caller to reclaim space via callback
 //
 // The caller must hold the segment lock before calling this method.

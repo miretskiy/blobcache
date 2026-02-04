@@ -351,7 +351,7 @@ func checkOrInitialize(cfg config) (*index.DurableIndex, error) {
 
 	// Check if already initialized
 	if _, err := os.Stat(markerPath); err == nil {
-		return index.OpenIndex(cfg.Path, capacityHint)
+		return index.OpenIndex(cfg.Path, cfg.Shards, capacityHint)
 	}
 
 	// Not initialized - create directory structure
@@ -362,7 +362,7 @@ func checkOrInitialize(cfg config) (*index.DurableIndex, error) {
 		}
 	}
 
-	idx, err := index.OpenIndex(cfg.Path, capacityHint)
+	idx, err := index.OpenIndex(cfg.Path, cfg.Shards, capacityHint)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open index: %w", err)
 	}
@@ -642,11 +642,9 @@ type Batcher interface {
 	PutBatch(segID uint32, items []index.Item, maxSeqID uint64) error
 }
 
-func (c *Cache) PutBatch(segID uint32, items []index.Item, maxSeqID uint64) error {
+func (c *Cache) PutBatch(_ uint32, items []index.Item, _ uint64) error {
 	// Phase 1: Ingest into Index
-	if err := c.index.IngestBatch(segID, items, maxSeqID); err != nil {
-		return err
-	}
+	c.index.IngestBatch(items)
 
 	// Phase 2: Update size tracking (using PhysicalLen = on-disk size)
 	var addedBytes int64

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/miretskiy/blobcache/internal/sys"
@@ -104,10 +105,14 @@ func TestRecovery_CorruptSegment(t *testing.T) {
 		t.Fatalf("failed to read segments directory: %v", err)
 	}
 
-	// Find the first segment file and truncate it
+	// Find the first .seg file and truncate it (also remove its .meta file)
 	for _, entry := range entries {
-		if !entry.IsDir() {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".seg") {
 			segmentPath := filepath.Join(segmentsDir, entry.Name())
+
+			// Remove the .meta file first so recovery doesn't fail on it
+			metaPath := SegmentMetaPath(segmentPath)
+			_ = os.Remove(metaPath)
 
 			// Truncate to make it corrupt (remove footer)
 			file, err := os.OpenFile(segmentPath, os.O_WRONLY, 0644)
@@ -213,6 +218,67 @@ func TestRecovery_InvalidSegmentID(t *testing.T) {
 	if _, found := recovered.Get([]byte("key1")); !found {
 		t.Error("key1 not found after recovery")
 	}
+}
+
+// TestRecovery_MissingMetaFile tests recovery when .meta file is missing but .seg exists.
+// This simulates a crash after writing segment data but before writing the .meta file.
+func TestRecovery_MissingMetaFile(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Create cache and write data
+	cache, err := New(tmpDir, WithMaxSize(100<<20))
+	require.NoError(t, err)
+
+	testData := map[string][]byte{
+		"key1": []byte("value1-recovery-test"),
+		"key2": []byte("value2-recovery-test"),
+		"key3": []byte("value3-recovery-test"),
+	}
+
+	for key, value := range testData {
+		require.NoError(t, cache.Put([]byte(key), value))
+	}
+	cache.Drain()
+	require.NoError(t, cache.Close())
+
+	// Remove all .meta files (simulating crash before .meta write)
+	segmentsDir := filepath.Join(tmpDir, "segments", "0000")
+	entries, err := os.ReadDir(segmentsDir)
+	require.NoError(t, err)
+
+	metaFilesRemoved := 0
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".meta") {
+			metaPath := filepath.Join(segmentsDir, entry.Name())
+			require.NoError(t, os.Remove(metaPath))
+			metaFilesRemoved++
+		}
+	}
+	require.Greater(t, metaFilesRemoved, 0, "expected to remove at least one .meta file")
+
+	// Recovery should scan .seg files directly
+	recovered, err := RecoverIndex(tmpDir, WithMaxSize(100<<20))
+	require.NoError(t, err)
+	defer recovered.Close()
+
+	// All data should be recovered by scanning .seg files
+	for key, expectedValue := range testData {
+		actualValue, found := recovered.Get([]byte(key))
+		require.True(t, found, "key %q not found after recovery", key)
+		require.Equal(t, expectedValue, actualValue, "value mismatch for key %q", key)
+	}
+
+	// .meta files should be rebuilt
+	entries, err = os.ReadDir(segmentsDir)
+	require.NoError(t, err)
+
+	metaFilesFound := 0
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".meta") {
+			metaFilesFound++
+		}
+	}
+	require.Greater(t, metaFilesFound, 0, "expected .meta files to be rebuilt")
 }
 
 // TestWAL_FileLifecycle verifies WAL files are created during Put and

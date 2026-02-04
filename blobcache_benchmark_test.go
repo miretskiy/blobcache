@@ -470,7 +470,7 @@ func BenchmarkEviction_SieveVictimSelection(b *testing.B) {
 	tmpDir := b.TempDir()
 	defer os.RemoveAll(tmpDir)
 
-	idx, err := index.OpenIndex(tmpDir, 1_000_000)
+	idx, err := index.OpenIndex(tmpDir, 0, 1_000_000)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -499,9 +499,7 @@ func BenchmarkEviction_SieveVictimSelection(b *testing.B) {
 
 		// Flush segment when it reaches 2GB
 		if currentSegSize >= segmentSize {
-			if err := idx.IngestBatch(currentSegID, batch, 0); err != nil {
-				b.Fatal(err)
-			}
+			idx.IngestBatch(batch)
 			currentSegID++
 			currentSegSize = 0
 			batch = batch[:0]
@@ -510,9 +508,7 @@ func BenchmarkEviction_SieveVictimSelection(b *testing.B) {
 
 	// Flush final partial segment
 	if len(batch) > 0 {
-		if err := idx.IngestBatch(currentSegID, batch, 0); err != nil {
-			b.Fatal(err)
-		}
+		idx.IngestBatch(batch)
 	}
 
 	// Mark some as visited to exercise Sieve skipping logic

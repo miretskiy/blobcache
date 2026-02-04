@@ -116,7 +116,7 @@ func (c *Compactor) Compact(segmentIDs []uint32, dropTombstones bool) (CompactRe
 	}()
 
 	// Collect items from all segments, checking contiguity as we go
-	toRelocate, tombstones, maxSeqID, err := c.collectItems(segmentIDs)
+	toRelocate, tombstones, _, err := c.collectItems(segmentIDs)
 	if err != nil {
 		return result, err
 	}
@@ -135,12 +135,6 @@ func (c *Compactor) Compact(segmentIDs []uint32, dropTombstones bool) (CompactRe
 		return result, err
 	}
 
-	// Build new items list
-	newItems := make([]index.Item, 0, len(toRelocate)+len(tombstones))
-	for i := range toRelocate {
-		newItems = append(newItems, toRelocate[i].item)
-	}
-
 	// Handle tombstones based on dropTombstones flag
 	if dropTombstones {
 		// Tail segment: GC tombstones (safe - no older data can conflict)
@@ -153,23 +147,23 @@ func (c *Compactor) Compact(segmentIDs []uint32, dropTombstones bool) (CompactRe
 		tombstones = nil // Now safe to clear - won't relocate them
 	} else {
 		// Non-tail segment: Preserve tombstones (required for crash safety)
+		// Add tombstone entries to footer so they survive crash recovery.
 		for _, ts := range tombstones {
-			ts.SegmentID = newSegID
-			ts.Offset = 0 // Tombstones have no data
-			newItems = append(newItems, ts)
-			result.TombstonesKept++
+			entry := record.FooterEntry{
+				Key:   ts.Key,
+				Pos:   0, // Tombstones have no physical location
+				Flags: 0,
+			}
+			entry.SetDeleted()
+			footerEntries = append(footerEntries, entry)
 		}
+		result.TombstonesKept = len(tombstones)
 	}
 
-	// Write footer file for crash recovery
+	// Write .meta file (footer with all items) for crash recovery
 	segPath := getSegmentPath(c.basePath, c.shards, newSegID)
 	if err := WriteFooter(newSegID, footerEntries, segPath, c.footerPool, c.ioFlags); err != nil {
 		return result, fmt.Errorf("compaction: write footer: %w", err)
-	}
-
-	// Write index entries to Bitcask
-	if err := c.index.CompactBatch(newSegID, newItems, maxSeqID); err != nil {
-		return result, fmt.Errorf("compaction: write index: %w", err)
 	}
 
 	// Build relocation requests for batch processing
@@ -275,7 +269,7 @@ func (c *Compactor) collectItems(segmentIDs []uint32) ([]relocInfo, []index.Item
 }
 
 // writeCompactedSegment creates the new segment file and writes all live blobs.
-// Returns footer entries for the .iseg file.
+// Returns footer entries for the .meta file.
 func (c *Compactor) writeCompactedSegment(
 	newSegID uint32,
 	toRelocate []relocInfo,

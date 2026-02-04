@@ -23,7 +23,7 @@ func TestCompactor_LeapfrogHazard(t *testing.T) {
 	tmpDir := t.TempDir()
 	setupTestDirs(t, tmpDir)
 
-	idx, err := index.OpenIndex(tmpDir, 100)
+	idx, err := index.OpenIndex(tmpDir, 0, 100)
 	require.NoError(t, err)
 	defer idx.Close()
 
@@ -37,9 +37,12 @@ func TestCompactor_LeapfrogHazard(t *testing.T) {
 
 	// Case 1: Gap with segment present - should fail
 	// Create segment 2 (exists in gap between 1 and 3)
-	require.NoError(t, idx.IngestBatch(2, []index.Item{
+	seg2Items := []index.Item{
 		{Key: index.Key{Lo: 200, Hi: 0}, SegmentID: 2, Offset: 0, PhysicalLen: 100},
-	}, 0))
+	}
+	// Write .meta file so the gap check can find it
+	writeTestMeta(t, GetFooterPath(tmpDir, 0, 2), 2, seg2Items)
+	idx.IngestBatch(seg2Items)
 
 	_, err = c.Compact([]uint32{1, 3}, false)
 	require.Error(t, err, "should fail when segment exists in gap")
@@ -58,7 +61,7 @@ func TestCompactor_ContiguityValidation(t *testing.T) {
 	tmpDir := t.TempDir()
 	setupTestDirs(t, tmpDir)
 
-	idx, err := index.OpenIndex(tmpDir, 100)
+	idx, err := index.OpenIndex(tmpDir, 0, 100)
 	require.NoError(t, err)
 	defer idx.Close()
 
@@ -105,7 +108,7 @@ func TestCompactor_EmptySegments(t *testing.T) {
 	tmpDir := t.TempDir()
 	setupTestDirs(t, tmpDir)
 
-	idx, err := index.OpenIndex(tmpDir, 100)
+	idx, err := index.OpenIndex(tmpDir, 0, 100)
 	require.NoError(t, err)
 	defer idx.Close()
 
@@ -117,8 +120,8 @@ func TestCompactor_EmptySegments(t *testing.T) {
 	c := NewCompactor(idx, archivist, segIDs, tmpDir, 0, sys.SyncNone, nil)
 
 	// Ingest empty batches to create segment manifests with no items
-	require.NoError(t, idx.IngestBatch(1, nil, 0))
-	require.NoError(t, idx.IngestBatch(2, nil, 0))
+	idx.IngestBatch(nil)
+	idx.IngestBatch(nil)
 
 	result, err := c.Compact([]uint32{1, 2}, false)
 	require.NoError(t, err)
@@ -136,7 +139,7 @@ func TestCompactor_StalenessFiltering(t *testing.T) {
 	pool := NewMmapPool("test-footer", 256<<10, 2)
 	defer pool.Close()
 
-	idx, err := index.OpenIndex(tmpDir, 100)
+	idx, err := index.OpenIndex(tmpDir, 0, 100)
 	require.NoError(t, err)
 	defer idx.Close()
 
@@ -162,7 +165,9 @@ func TestCompactor_StalenessFiltering(t *testing.T) {
 		{Key: key1, SegmentID: sourceSegID, Offset: record.FileHeaderSize, PhysicalLen: uint32(len(blob1))},
 		{Key: key2, SegmentID: sourceSegID, Offset: uint32(record.FileHeaderSize + len(blob1)), PhysicalLen: uint32(len(blob2))},
 	}
-	require.NoError(t, idx.IngestBatch(sourceSegID, items, 10))
+	// Write .meta file so compaction can read the manifest
+	writeTestMeta(t, SegmentMetaPath(segPath), sourceSegID, items)
+	idx.IngestBatch(items)
 
 	// Simulate key2 being overwritten to a future segment by updating RAM index
 	// The manifest still has key2 at sourceSegID, but RAM index says segment 99
@@ -195,7 +200,7 @@ func TestCompactor_TombstonePreservation(t *testing.T) {
 	pool := NewMmapPool("test-footer", 256<<10, 2)
 	defer pool.Close()
 
-	idx, err := index.OpenIndex(tmpDir, 100)
+	idx, err := index.OpenIndex(tmpDir, 0, 100)
 	require.NoError(t, err)
 	defer idx.Close()
 
@@ -223,7 +228,9 @@ func TestCompactor_TombstonePreservation(t *testing.T) {
 		{Key: key1, SegmentID: sourceSegID, Offset: record.FileHeaderSize, PhysicalLen: uint32(len(blob1))},
 		deletedItem,
 	}
-	require.NoError(t, idx.IngestBatch(sourceSegID, items, 10))
+	// Write .meta file so compaction can read the manifest
+	writeTestMeta(t, SegmentMetaPath(segPath), sourceSegID, items)
+	idx.IngestBatch(items)
 
 	// Remove the deleted key from RAM (tombstones don't stay in RAM index for lookups)
 	idx.Delete(keyDeleted)
@@ -260,7 +267,7 @@ func TestCompactor_TombstoneDropping(t *testing.T) {
 	pool := NewMmapPool("test-footer", 256<<10, 2)
 	defer pool.Close()
 
-	idx, err := index.OpenIndex(tmpDir, 100)
+	idx, err := index.OpenIndex(tmpDir, 0, 100)
 	require.NoError(t, err)
 	defer idx.Close()
 
@@ -288,7 +295,9 @@ func TestCompactor_TombstoneDropping(t *testing.T) {
 		{Key: key1, SegmentID: sourceSegID, Offset: record.FileHeaderSize, PhysicalLen: uint32(len(blob1))},
 		deletedItem,
 	}
-	require.NoError(t, idx.IngestBatch(sourceSegID, items, 10))
+	// Write .meta file so compaction can read the manifest
+	writeTestMeta(t, SegmentMetaPath(segPath), sourceSegID, items)
+	idx.IngestBatch(items)
 
 	// Simulate real deletion scenario: markDeleted sets the flag but KEEPS item in RAM.
 	// This is what happens when Delete() is called - the item stays in RAM with IsDeleted=true.
@@ -330,7 +339,7 @@ func TestCompactor_ConcurrentWriteRace(t *testing.T) {
 	pool := NewMmapPool("test-footer", 256<<10, 2)
 	defer pool.Close()
 
-	idx, err := index.OpenIndex(tmpDir, 100)
+	idx, err := index.OpenIndex(tmpDir, 0, 100)
 	require.NoError(t, err)
 	defer idx.Close()
 
@@ -350,7 +359,9 @@ func TestCompactor_ConcurrentWriteRace(t *testing.T) {
 	items := []index.Item{
 		{Key: key1, SegmentID: sourceSegID, Offset: record.FileHeaderSize, PhysicalLen: uint32(len(blob1))},
 	}
-	require.NoError(t, idx.IngestBatch(sourceSegID, items, 10))
+	// Write .meta file so compaction can read the manifest
+	writeTestMeta(t, SegmentMetaPath(segPath), sourceSegID, items)
+	idx.IngestBatch(items)
 
 	c := NewCompactor(idx, archivist, segIDs, tmpDir, 0, sys.SyncNone, pool)
 
@@ -496,6 +507,53 @@ func writeTestSegment(t *testing.T, path string, blobs ...[]byte) {
 		_, err = f.Write(blob)
 		require.NoError(t, err)
 	}
+}
+
+// writeTestMeta writes a .meta file (SegmentFooter format) for testing.
+func writeTestMeta(t *testing.T, metaPath string, segID uint32, items []index.Item) {
+	t.Helper()
+
+	entries := make([]record.FooterEntry, len(items))
+	for i, item := range items {
+		// Convert Item to FooterEntry
+		// PhysicalLen in Item = HeaderSize + KeyLen + PhysicalSize
+		const keyLen = 16
+		physicalSize := int64(item.PhysicalLen) - record.HeaderSize - keyLen
+		if physicalSize < 0 {
+			physicalSize = 0
+		}
+		entries[i] = record.FooterEntry{
+			Key:          item.Key,
+			Pos:          int64(item.Offset),
+			LogicalSize:  int64(item.PhysicalLen),
+			PhysicalSize: physicalSize,
+			SeqID:        0,
+			Flags:        0, // Flags are set separately below
+			KeyLen:       keyLen,
+		}
+		// Note: index.Item and record.FooterEntry use different flag bit positions
+		// for the deleted marker, so we must use the setter method.
+		if item.IsDeleted() {
+			entries[i].SetDeleted()
+		}
+		entries[i].SetCompression(item.Compression())
+	}
+
+	footer := record.SegmentFooter{
+		SegmentID:   int64(segID),
+		CTime:       0,
+		MinSeqID:    0,
+		MaxSeqID:    0,
+		RecordCount: int64(len(entries)),
+		Entries:     entries,
+	}
+
+	physicalSize := record.SegmentFooterAlignedSize(len(entries))
+	buf := make([]byte, physicalSize)
+	data := record.AppendFooterBlock(buf, footer)
+
+	require.NoError(t, os.MkdirAll(filepath.Dir(metaPath), 0o755))
+	require.NoError(t, os.WriteFile(metaPath, data, 0o644))
 }
 
 func makeTestBlob(t *testing.T, key index.Key, value []byte, seqID uint64) []byte {

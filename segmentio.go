@@ -75,7 +75,7 @@ func DeleteSegmentFiles(basePath string, shards int, segmentID uint32) error {
 	if err := os.Remove(segPath); err != nil && !os.IsNotExist(err) {
 		errs = append(errs, fmt.Errorf("delete segment %d file: %w", segmentID, err))
 	}
-	if err := os.Remove(segPath + IndexSegmentExtension); err != nil && !os.IsNotExist(err) {
+	if err := os.Remove(SegmentMetaPath(segPath)); err != nil && !os.IsNotExist(err) {
 		errs = append(errs, fmt.Errorf("delete segment %d footer: %w", segmentID, err))
 	}
 
@@ -152,9 +152,9 @@ func (w *segmentWriter) Path() string {
 	return getSegmentPath(w.basePath, w.shards, w.segmentID)
 }
 
-// FooterPath returns the path for this segment's footer file (.iseg).
+// FooterPath returns the path for this segment's metadata file (.meta).
 func (w *segmentWriter) FooterPath() string {
-	return w.Path() + IndexSegmentExtension
+	return SegmentMetaPath(w.Path())
 }
 
 // File returns the underlying file handle for writing.
@@ -168,7 +168,7 @@ func (w *segmentWriter) WriteHeader() error {
 	return err
 }
 
-// WriteFooter writes this segment's footer (.iseg) file for crash recovery.
+// WriteFooter writes this segment's footer (.meta) file for crash recovery.
 func (w *segmentWriter) WriteFooter(entries []record.FooterEntry) error {
 	return WriteFooter(w.segmentID, entries, w.Path(), w.footerPool, w.ioFlags)
 }

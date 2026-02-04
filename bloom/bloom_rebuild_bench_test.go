@@ -22,7 +22,7 @@ func Benchmark_BloomRebuild(b *testing.B) {
 			}
 			defer os.RemoveAll(tmpDir)
 
-			idx, err := index.OpenIndex(tmpDir, numKeys)
+			idx, err := index.OpenIndex(tmpDir, 0, numKeys)
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -43,9 +43,7 @@ func Benchmark_BloomRebuild(b *testing.B) {
 						PhysicalLen: 1024,
 					}
 				}
-				if err := idx.IngestBatch(uint32(i/batchSize), items, 0); err != nil {
-					b.Fatal(err)
-				}
+				idx.IngestBatch(items)
 			}
 
 			// Pre-calculate filter specs

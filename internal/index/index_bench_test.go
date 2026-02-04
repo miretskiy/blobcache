@@ -22,7 +22,7 @@ func Benchmark_IndexLookup(b *testing.B) {
 			}
 			defer os.RemoveAll(tmpDir)
 
-			idx, err := OpenIndex(tmpDir, numKeys)
+			idx, err := OpenIndex(tmpDir, 0, numKeys)
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -49,9 +49,7 @@ func Benchmark_IndexLookup(b *testing.B) {
 				if end > numKeys {
 					end = numKeys
 				}
-				if err := idx.IngestBatch(uint32(i/batchSize), items[i:end], 0); err != nil {
-					b.Fatal(err)
-				}
+				idx.IngestBatch(items[i:end])
 			}
 			b.ReportMetric(float64(numKeys)/time.Since(start).Seconds(), "ingest-keys/sec")
 

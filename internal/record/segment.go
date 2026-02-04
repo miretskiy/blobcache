@@ -324,7 +324,7 @@ func DecodeSegmentFooter(src []byte) (SegmentFooter, error) {
 	}
 
 	entries := make([]FooterEntry, numEntries)
-	for i := 0; i < numEntries; i++ {
+	for i := range numEntries {
 		offset := i * FooterEntrySize
 		e, err := DecodeInode(entriesData[offset : offset+FooterEntrySize])
 		if err != nil {
@@ -426,6 +426,148 @@ func AppendFooterBlock(buf []byte, sf SegmentFooter) []byte {
 func roundToPage(size int64) int64 {
 	const pageSize = 4096
 	return (size + pageSize - 1) &^ (pageSize - 1)
+}
+
+// ScanSegmentFile scans a segment file record-by-record, returning FooterEntries.
+// This is used for recovery when the .meta file is missing or corrupt.
+// It handles holes (from punch-hole eviction) by scanning for the next valid record.
+//
+// The scan algorithm:
+//  1. Validate file header (8 bytes)
+//  2. For each offset, try to decode a record header
+//  3. If valid magic + HeaderCRC, extract FooterEntry and advance by record size
+//  4. If hole (zeros), scan forward for next valid magic
+//  5. If corrupt, try to find next valid magic (best-effort recovery)
+func ScanSegmentFile(
+	file interface {
+		ReadAt([]byte, int64) (int, error)
+	},
+	fileSize int64,
+	segmentID uint32,
+) (SegmentFooter, error) {
+	if fileSize < FileHeaderSize {
+		return SegmentFooter{}, errors.New("record: file too small for header")
+	}
+
+	// 1. Validate file header
+	headerBuf := make([]byte, FileHeaderSize)
+	if _, err := file.ReadAt(headerBuf, 0); err != nil {
+		return SegmentFooter{}, fmt.Errorf("record: read file header: %w", err)
+	}
+	if err := ValidateFileHeader(headerBuf); err != nil {
+		return SegmentFooter{}, fmt.Errorf("record: invalid file header: %w", err)
+	}
+
+	// 2. Scan records
+	var entries []FooterEntry
+	var minSeqID, maxSeqID uint64
+	offset := int64(FileHeaderSize)
+	recordHeaderBuf := make([]byte, HeaderSize)
+
+	for offset < fileSize {
+		// Read record header
+		n, err := file.ReadAt(recordHeaderBuf, offset)
+		if err != nil || n < HeaderSize {
+			break // EOF or read error
+		}
+
+		// Check magic first (before CRC verification)
+		magic := binary.LittleEndian.Uint32(recordHeaderBuf[offMagic:])
+
+		switch magic {
+		case RecordMagic:
+			// Potentially valid record - verify HeaderCRC
+			hdr, err := DecodeHeader(recordHeaderBuf)
+			if err != nil {
+				// Corrupt header - try to find next valid record
+				offset = scanForMagic(file, offset+1, fileSize)
+				continue
+			}
+
+			// Valid record - extract key hash for FooterEntry
+			keyLen := int64(hdr.KeyLen)
+			keyBuf := make([]byte, keyLen)
+			if _, err := file.ReadAt(keyBuf, offset+HeaderSize); err != nil {
+				offset = scanForMagic(file, offset+1, fileSize)
+				continue
+			}
+
+			// Compute key hash (XXH3-128)
+			keyHash := xxh3.Hash128(keyBuf)
+
+			entry := FooterEntry{
+				Key:          keyHash,
+				Pos:          offset,
+				LogicalSize:  hdr.LogicalSize,
+				PhysicalSize: hdr.PhysicalSize,
+				SeqID:        hdr.SeqID,
+				Flags:        hdr.Flags,
+				KeyLen:       hdr.KeyLen,
+			}
+			entries = append(entries, entry)
+
+			// Track min/max SeqID
+			if len(entries) == 1 || hdr.SeqID < minSeqID {
+				minSeqID = hdr.SeqID
+			}
+			if hdr.SeqID > maxSeqID {
+				maxSeqID = hdr.SeqID
+			}
+
+			// Advance to next record
+			recordSize := int64(HeaderSize) + keyLen + hdr.PhysicalSize
+			offset += recordSize
+
+		case HoleMagic:
+			// Hole - scan for next non-zero
+			offset = scanForMagic(file, offset+4, fileSize)
+
+		default:
+			// Unknown magic - could be padding or corruption
+			// Scan for next valid magic
+			offset = scanForMagic(file, offset+1, fileSize)
+		}
+	}
+
+	return SegmentFooter{
+		Version:     FooterVersion,
+		SegmentID:   int64(segmentID),
+		MinSeqID:    minSeqID,
+		MaxSeqID:    maxSeqID,
+		RecordCount: int64(len(entries)),
+		Entries:     entries,
+	}, nil
+}
+
+// scanForMagic scans forward from offset looking for RecordMagic.
+// Returns the offset of the magic, or fileSize if not found.
+func scanForMagic(
+	file interface {
+		ReadAt([]byte, int64) (int, error)
+	},
+	offset, fileSize int64,
+) int64 {
+	// Read in chunks to avoid too many syscalls
+	const chunkSize = 4096
+	buf := make([]byte, chunkSize)
+
+	for offset < fileSize {
+		readSize := min(chunkSize, int(fileSize-offset))
+		n, err := file.ReadAt(buf[:readSize], offset)
+		if err != nil || n < 4 {
+			return fileSize
+		}
+
+		// Scan for RecordMagic in chunk
+		for i := 0; i <= n-4; i++ {
+			magic := binary.LittleEndian.Uint32(buf[i:])
+			if magic == RecordMagic {
+				return offset + int64(i)
+			}
+		}
+		offset += int64(n - 3) // Overlap by 3 bytes to catch magic at chunk boundary
+	}
+	return fileSize
 }
 
 // ReadFooterBlock reads and validates a segment envelope from file.

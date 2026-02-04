@@ -1,11 +1,11 @@
 package blobcache
 
 import (
+	"os"
 	"path/filepath"
 	"time"
 
 	"github.com/miretskiy/blobcache/internal/record"
-	"github.com/miretskiy/blobcache/internal/sys"
 )
 
 // IndexSegmentExtension is the file extension for segment metadata files.
@@ -21,34 +21,24 @@ func SegmentMetaPath(segmentPath string) string {
 	return segmentPath[:len(segmentPath)-len(ext)] + IndexSegmentExtension
 }
 
-// poolProvider allows WriteFooter to acquire hardware-aligned buffers
-// for footer serialization without heap allocations.
-type poolProvider interface {
-	AcquireAligned(size int64) *MmapBuffer
-}
-
 // WriteFooter writes a segment footer to a separate .meta file.
 // This is a stateless function that:
 // 1. Computes min/max SeqID from entries
 // 2. Builds SegmentFooter struct
-// 3. Serializes to 4KB-aligned buffer
-// 4. Writes atomically using WriteFile
+// 3. Serializes to buffer
+// 4. Writes atomically using WriteFile (buffered I/O)
 //
 // The footer file path is derived from dataPath by replacing .seg extension with .meta.
 // Example: /data/segments/0001/123.seg -> /data/segments/0001/123.meta
 //
-// Note: O_DIRECT is stripped for metadata writes. The complexity/risk of alignment
-// constraints on small metadata files (~2-8MB) outweighs any performance benefit
-// from bypassing the page cache. Buffered I/O is robust and fast for this scale.
+// Note: Uses buffered I/O (not O_DIRECT) for metadata writes. The complexity/risk
+// of alignment constraints on small metadata files (~2-8MB) outweighs any benefit
+// from bypassing the page cache.
 func WriteFooter(
 	segmentID uint32,
 	entries []record.FooterEntry,
 	dataPath string,
-	pool poolProvider,
-	flags sys.OpenFlag,
 ) error {
-	// Strip O_DIRECT for metadata - buffered I/O is safer and sufficient for small files.
-	flags &^= sys.FlDirectIO
 	// 1. Compute min/max SeqID
 	var minSeq, maxSeq uint64
 	if len(entries) > 0 {
@@ -74,14 +64,12 @@ func WriteFooter(
 		Entries:     entries,
 	}
 
-	// 3. Serialize into aligned buffer
+	// 3. Serialize into buffer
 	physicalSize := record.SegmentFooterAlignedSize(len(entries))
-	buf := pool.AcquireAligned(physicalSize)
-	defer buf.Unpin()
+	buf := make([]byte, physicalSize)
+	data := record.AppendFooterBlock(buf, sf)
 
-	data := record.AppendFooterBlock(buf.Bytes(), sf)
-
-	// 4. Write atomically to .meta file
+	// 4. Write atomically to .meta file (buffered I/O)
 	indexPath := SegmentMetaPath(dataPath)
-	return sys.WriteFile(indexPath, data, flags)
+	return os.WriteFile(indexPath, data, 0o644)
 }

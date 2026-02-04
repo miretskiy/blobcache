@@ -111,6 +111,11 @@ func footerEntriesToIndexItems(segmentID uint32, entries []record.FooterEntry) (
 	return items, nil
 }
 
+// poolProvider allows acquiring hardware-aligned buffers for O_DIRECT writes.
+type poolProvider interface {
+	AcquireAligned(size int64) *MmapBuffer
+}
+
 // segmentWriter manages I/O for a single segment file.
 // It encapsulates file creation, footer writing, and index updates.
 type segmentWriter struct {
@@ -179,7 +184,7 @@ func (w *segmentWriter) WriteHeader() error {
 
 // WriteFooter writes this segment's footer (.meta) file for crash recovery.
 func (w *segmentWriter) WriteFooter(entries []record.FooterEntry) error {
-	return WriteFooter(w.segmentID, entries, w.Path(), w.footerPool, w.ioFlags)
+	return WriteFooter(w.segmentID, entries, w.Path())
 }
 
 // Close syncs and closes the segment file.

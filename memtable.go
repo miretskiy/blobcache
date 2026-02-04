@@ -36,10 +36,9 @@ type MemTable struct {
 	ErrorReporter
 	Knobs *TestingKnobs
 
-	segIDs     SegmentIDProvider
-	slabPool   *MmapPool
-	footerPool *MmapPool
-	publisher  Publisher
+	segIDs    SegmentIDProvider
+	slabPool  *MmapPool
+	publisher Publisher
 	wal        *wal.WAL // nil if WAL disabled
 
 	mu struct {
@@ -79,7 +78,6 @@ func NewMemTable(
 		wal:           w, // nil if WAL disabled
 		segIDs:        segIDs,
 		slabPool:      NewMmapPool("slab", cfg.WriteBufferSize, poolCapacity),
-		footerPool:    NewMmapPool("footer", 256<<10, cfg.MaxInflightSlabs+1),
 		flushCh:       make(chan FlushTicket, cfg.MaxInflightSlabs),
 		stopCh:        make(chan struct{}),
 	}
@@ -646,7 +644,7 @@ func (mt *MemTable) finalizeFlush(
 	// Write footer BEFORE updating index.
 	// This ensures .meta file exists before items become evictable.
 	// Eviction needs the .meta file to write tombstones.
-	if err := WriteFooter(segmentID, entries, segmentPath, mt.footerPool, mt.ioFlags()); err != nil {
+	if err := WriteFooter(segmentID, entries, segmentPath); err != nil {
 		return fmt.Errorf("write footer: %w", err)
 	}
 
@@ -761,7 +759,6 @@ func (mt *MemTable) Close() {
 // Must be called AFTER Librarian.Close() returns slabs to pools.
 func (mt *MemTable) ClosePools() {
 	mt.slabPool.Close()
-	mt.footerPool.Close()
 }
 
 // ReplayRecord is called during WAL recovery to replay a record as-is.

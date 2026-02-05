@@ -42,24 +42,6 @@ func (a *Archivist) Close() error {
 	return errors.Join(errs...)
 }
 
-// ReadBlobRaw reads raw record bytes from a segment. No interpretation.
-// Caller is responsible for any validation or parsing.
-// Used by Compactor for copying blobs during compaction.
-func (a *Archivist) ReadBlobRaw(e index.Item) ([]byte, Releaser, error) {
-	sf, err := a.getSegmentFile(e.SegmentID)
-	if err != nil {
-		return nil, Releaser{}, fmt.Errorf("storage: segment %d not found: %w", e.SegmentID, err)
-	}
-
-	handle := AcquireBuffer(int(e.PhysicalLen), int(e.PhysicalLen))
-	if _, err := sf.ReadAt(handle.Bytes(), int64(e.Offset)); err != nil {
-		handle.Release()
-		return nil, Releaser{}, fmt.Errorf("storage: read failed: %w", err)
-	}
-
-	return handle.Bytes(), Releaser{bh: &handle}, nil
-}
-
 // ReadBlob returns the value bytes for the specified index entry.
 // It handles decompression and checksum verification.
 // The caller MUST call the returned Releaser when done with the data.

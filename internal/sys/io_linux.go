@@ -3,6 +3,7 @@
 package sys
 
 import (
+	"fmt"
 	"os"
 
 	"golang.org/x/sys/unix"
@@ -80,4 +81,27 @@ const RequiresExplicitSync = false
 func CreateFile(path string, flags OpenFlag) (*os.File, error) {
 	osFlags := os.O_CREATE | os.O_WRONLY | os.O_TRUNC | flags.OpenFlags()
 	return os.OpenFile(path, osFlags, 0644)
+}
+
+// OpenFileForRead opens an existing file for reading with optional O_DIRECT.
+func OpenFileForRead(path string, flags OpenFlag) (*os.File, error) {
+	osFlags := os.O_RDONLY | flags.OpenFlags()
+	return os.OpenFile(path, osFlags, 0)
+}
+
+// PreadAligned reads from a file at an aligned offset into an aligned buffer.
+// For O_DIRECT, offset and len(buf) must be multiples of BlockSize.
+func PreadAligned(f *os.File, buf []byte, offset int64, flags OpenFlag) (int, error) {
+	if flags&FlDirectIO != 0 {
+		if !IsAligned(buf) {
+			return 0, ErrAlignment
+		}
+		if offset&BlockMask != 0 {
+			return 0, fmt.Errorf("offset %d not aligned to %d: %w", offset, BlockSize, ErrAlignment)
+		}
+		if int64(len(buf))&BlockMask != 0 {
+			return 0, fmt.Errorf("length %d not aligned to %d: %w", len(buf), BlockSize, ErrAlignment)
+		}
+	}
+	return f.ReadAt(buf, offset)
 }

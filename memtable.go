@@ -39,7 +39,7 @@ type MemTable struct {
 	segIDs    SegmentIDProvider
 	slabPool  *MmapPool
 	publisher Publisher
-	wal        *wal.WAL // nil if WAL disabled
+	wal       *wal.WAL // nil if WAL disabled
 
 	mu struct {
 		sync.Mutex
@@ -239,7 +239,7 @@ func (mt *MemTable) writeToSlab(seqID uint64, hash Key, rec record.Record) error
 			// Reserve position and increment xlSize under lock.
 			// Actual buffer allocation happens after unlock to avoid mmap syscall under lock.
 			wPos = active.AlignPosToPageBoundary()
-			active.xlSize += int64(sys.PageAlign(record.FileHeaderSize + int64(writeSize)))
+			active.xlSize += sys.PageAlign(record.FileHeaderSize + int64(writeSize))
 		} else {
 			needRotation = true
 		}

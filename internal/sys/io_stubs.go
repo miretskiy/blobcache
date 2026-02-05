@@ -42,3 +42,15 @@ const RequiresExplicitSync = true
 func CreateFile(path string, _ OpenFlag) (*os.File, error) {
 	return os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 }
+
+// OpenFileForRead opens an existing file for reading.
+// FlDirectIO is ignored on unsupported platforms.
+func OpenFileForRead(path string, _ OpenFlag) (*os.File, error) {
+	return os.OpenFile(path, os.O_RDONLY, 0)
+}
+
+// PreadAligned reads from a file at the specified offset.
+// No alignment enforcement on unsupported platforms.
+func PreadAligned(f *os.File, buf []byte, offset int64, _ OpenFlag) (int, error) {
+	return f.ReadAt(buf, offset)
+}

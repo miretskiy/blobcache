@@ -155,3 +155,28 @@ func CreateFile(path string, flags OpenFlag) (*os.File, error) {
 	}
 	return f, nil
 }
+
+// OpenFileForRead opens an existing file for reading with optional F_NOCACHE.
+func OpenFileForRead(path string, flags OpenFlag) (*os.File, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY, 0)
+	if err != nil {
+		return nil, err
+	}
+	if flags&FlDirectIO != 0 {
+		if _, err := unix.FcntlInt(f.Fd(), unix.F_NOCACHE, 1); err != nil {
+			_ = f.Close()
+			return nil, err
+		}
+	}
+	return f, nil
+}
+
+// PreadAligned reads from a file at the specified offset.
+// Darwin's F_NOCACHE does not require strict alignment like Linux O_DIRECT,
+// but we validate for API consistency when FlDirectIO is set.
+func PreadAligned(f *os.File, buf []byte, offset int64, flags OpenFlag) (int, error) {
+	if flags&FlDirectIO != 0 && !IsAligned(buf) {
+		return 0, ErrAlignment
+	}
+	return f.ReadAt(buf, offset)
+}

@@ -33,7 +33,7 @@ func TestCompactor_LeapfrogHazard(t *testing.T) {
 	segIDs := &segmentIDProvider{}
 	segIDs.counter.Store(100)
 
-	c := NewCompactor(idx, archivist, segIDs, tmpDir, 0, sys.SyncNone, nil)
+	c := NewCompactor(idx, segIDs, tmpDir, 0, sys.SyncNone, 0, archivist.DropSegmentCache)
 
 	// Case 1: Gap with segment present - should fail
 	// Create segment 2 (exists in gap between 1 and 3)
@@ -71,7 +71,7 @@ func TestCompactor_ContiguityValidation(t *testing.T) {
 	segIDs := &segmentIDProvider{}
 	segIDs.counter.Store(100)
 
-	c := NewCompactor(idx, archivist, segIDs, tmpDir, 0, sys.SyncNone, nil)
+	c := NewCompactor(idx, segIDs, tmpDir, 0, sys.SyncNone, 0, archivist.DropSegmentCache)
 
 	testCases := []struct {
 		name      string
@@ -117,7 +117,7 @@ func TestCompactor_EmptySegments(t *testing.T) {
 
 	segIDs := &segmentIDProvider{}
 
-	c := NewCompactor(idx, archivist, segIDs, tmpDir, 0, sys.SyncNone, nil)
+	c := NewCompactor(idx, segIDs, tmpDir, 0, sys.SyncNone, 0, archivist.DropSegmentCache)
 
 	// Ingest empty batches to create segment manifests with no items
 	idx.IngestBatch(nil)
@@ -136,8 +136,6 @@ func TestCompactor_StalenessFiltering(t *testing.T) {
 
 	tmpDir := t.TempDir()
 	setupTestDirs(t, tmpDir)
-	pool := NewMmapPool("test-footer", 256<<10, 2)
-	defer pool.Close()
 
 	idx, err := index.OpenIndex(tmpDir, 0, 100)
 	require.NoError(t, err)
@@ -149,7 +147,7 @@ func TestCompactor_StalenessFiltering(t *testing.T) {
 	segIDs := &segmentIDProvider{}
 	sourceSegID := segIDs.NextSegmentID() // Allocate source segment ID
 
-	c := NewCompactor(idx, archivist, segIDs, tmpDir, 0, sys.SyncNone, pool)
+	c := NewCompactor(idx, segIDs, tmpDir, 0, sys.SyncNone, 0, archivist.DropSegmentCache)
 
 	key1 := index.Key{Lo: 1, Hi: 1}
 	key2 := index.Key{Lo: 2, Hi: 2}
@@ -197,8 +195,6 @@ func TestCompactor_TombstonePreservation(t *testing.T) {
 
 	tmpDir := t.TempDir()
 	setupTestDirs(t, tmpDir)
-	pool := NewMmapPool("test-footer", 256<<10, 2)
-	defer pool.Close()
 
 	idx, err := index.OpenIndex(tmpDir, 0, 100)
 	require.NoError(t, err)
@@ -210,7 +206,7 @@ func TestCompactor_TombstonePreservation(t *testing.T) {
 	segIDs := &segmentIDProvider{}
 	sourceSegID := segIDs.NextSegmentID() // Allocate source segment ID
 
-	c := NewCompactor(idx, archivist, segIDs, tmpDir, 0, sys.SyncNone, pool)
+	c := NewCompactor(idx, segIDs, tmpDir, 0, sys.SyncNone, 0, archivist.DropSegmentCache)
 
 	key1 := index.Key{Lo: 1, Hi: 1}
 	keyDeleted := index.Key{Lo: 2, Hi: 2}
@@ -264,8 +260,6 @@ func TestCompactor_TombstoneDropping(t *testing.T) {
 
 	tmpDir := t.TempDir()
 	setupTestDirs(t, tmpDir)
-	pool := NewMmapPool("test-footer", 256<<10, 2)
-	defer pool.Close()
 
 	idx, err := index.OpenIndex(tmpDir, 0, 100)
 	require.NoError(t, err)
@@ -277,7 +271,7 @@ func TestCompactor_TombstoneDropping(t *testing.T) {
 	segIDs := &segmentIDProvider{}
 	sourceSegID := segIDs.NextSegmentID()
 
-	c := NewCompactor(idx, archivist, segIDs, tmpDir, 0, sys.SyncNone, pool)
+	c := NewCompactor(idx, segIDs, tmpDir, 0, sys.SyncNone, 0, archivist.DropSegmentCache)
 
 	key1 := index.Key{Lo: 1, Hi: 1}
 	keyDeleted := index.Key{Lo: 2, Hi: 2}
@@ -336,8 +330,6 @@ func TestCompactor_ConcurrentWriteRace(t *testing.T) {
 
 	tmpDir := t.TempDir()
 	setupTestDirs(t, tmpDir)
-	pool := NewMmapPool("test-footer", 256<<10, 2)
-	defer pool.Close()
 
 	idx, err := index.OpenIndex(tmpDir, 0, 100)
 	require.NoError(t, err)
@@ -363,7 +355,7 @@ func TestCompactor_ConcurrentWriteRace(t *testing.T) {
 	writeTestMeta(t, SegmentMetaPath(segPath), sourceSegID, items)
 	idx.IngestBatch(items)
 
-	c := NewCompactor(idx, archivist, segIDs, tmpDir, 0, sys.SyncNone, pool)
+	c := NewCompactor(idx, segIDs, tmpDir, 0, sys.SyncNone, 0, archivist.DropSegmentCache)
 
 	// Use testing knobs to inject concurrent write during relocation
 	c.Knobs = &CompactorKnobs{
@@ -386,6 +378,111 @@ func TestCompactor_ConcurrentWriteRace(t *testing.T) {
 	item, found := idx.Get(key1)
 	require.True(t, found)
 	require.Equal(t, uint32(99), item.SegmentID, "relocation should fail, RAM should point to concurrent write location")
+}
+
+func TestCompactor_XLBlobHandling(t *testing.T) {
+	// Test compaction of blobs that are larger than the compaction buffer.
+	// This mirrors how MemTable handles XL writes - blobs exceeding WriteBufferSize
+	// get special handling (interleaved at page boundaries).
+	//
+	// For compaction, when a blob is larger than the buffer, we must:
+	// 1. Flush any pending data in the buffer
+	// 2. Read the XL blob directly and write it directly (bypass buffer)
+
+	tmpDir := t.TempDir()
+	setupTestDirs(t, tmpDir)
+
+	idx, err := index.OpenIndex(tmpDir, 0, 100)
+	require.NoError(t, err)
+	defer idx.Close()
+
+	archivist := NewArchivist(config{Path: tmpDir}, idx)
+	defer archivist.Close()
+
+	segIDs := &segmentIDProvider{}
+	sourceSegID := segIDs.NextSegmentID()
+
+	// Create test data:
+	// - Small blob: 1KB (fits in buffer)
+	// - XL blob: 32KB (larger than our 8KB test buffer)
+	// - Another small blob: 1KB
+	key1 := index.Key{Lo: 1, Hi: 1}
+	key2 := index.Key{Lo: 2, Hi: 2} // XL
+	key3 := index.Key{Lo: 3, Hi: 3}
+
+	smallValue := bytes.Repeat([]byte("A"), 1024)
+	xlValue := bytes.Repeat([]byte("X"), 32*1024) // 32KB - larger than 8KB buffer
+	smallValue2 := bytes.Repeat([]byte("B"), 1024)
+
+	blob1 := makeTestBlob(t, key1, smallValue, 1)
+	blob2 := makeTestBlob(t, key2, xlValue, 2)
+	blob3 := makeTestBlob(t, key3, smallValue2, 3)
+
+	// Write source segment with all three blobs
+	segPath := getSegmentPath(tmpDir, 0, sourceSegID)
+	f, err := os.Create(segPath)
+	require.NoError(t, err)
+
+	// Write file header
+	_, err = f.Write(record.FileHeaderBytes[:])
+	require.NoError(t, err)
+
+	offset1 := record.FileHeaderSize
+	_, err = f.Write(blob1)
+	require.NoError(t, err)
+
+	offset2 := offset1 + len(blob1)
+	_, err = f.Write(blob2)
+	require.NoError(t, err)
+
+	offset3 := offset2 + len(blob2)
+	_, err = f.Write(blob3)
+	require.NoError(t, err)
+
+	require.NoError(t, f.Close())
+
+	items := []index.Item{
+		{Key: key1, SegmentID: sourceSegID, Offset: uint32(offset1), PhysicalLen: uint32(len(blob1))},
+		{Key: key2, SegmentID: sourceSegID, Offset: uint32(offset2), PhysicalLen: uint32(len(blob2))},
+		{Key: key3, SegmentID: sourceSegID, Offset: uint32(offset3), PhysicalLen: uint32(len(blob3))},
+	}
+	writeTestMeta(t, SegmentMetaPath(segPath), sourceSegID, items)
+	idx.IngestBatch(items)
+
+	// Create compactor with tiny buffer (8KB) - smaller than the XL blob (32KB)
+	tinyBufSize := 8 * 1024
+	c := NewCompactor(idx, segIDs, tmpDir, 0, sys.SyncNone, tinyBufSize, archivist.DropSegmentCache)
+	defer c.Close()
+
+	// This should succeed - compactor must handle XL blobs that exceed buffer size
+	result, err := c.Compact([]uint32{sourceSegID}, false)
+	require.NoError(t, err, "compaction should handle XL blobs larger than buffer")
+	require.Equal(t, 3, result.ItemsCompacted, "all three blobs should be compacted")
+
+	// Verify all items are accessible in the new segment
+	for _, key := range []index.Key{key1, key2, key3} {
+		item, found := idx.Get(key)
+		require.True(t, found, "key %v should exist after compaction", key)
+		require.Equal(t, result.NewSegmentID, item.SegmentID, "key %v should be in new segment", key)
+	}
+
+	// Verify XL blob data integrity by reading from new segment
+	xlItem, _ := idx.Get(key2)
+	newSegPath := getSegmentPath(tmpDir, 0, xlItem.SegmentID)
+	newSegFile, err := os.Open(newSegPath)
+	require.NoError(t, err)
+	defer newSegFile.Close()
+
+	readBuf := make([]byte, xlItem.PhysicalLen)
+	_, err = newSegFile.ReadAt(readBuf, int64(xlItem.Offset))
+	require.NoError(t, err)
+
+	// Decode and verify the value
+	hdr, err := record.DecodeHeader(readBuf[:record.HeaderSize])
+	require.NoError(t, err)
+	valueStart := record.HeaderSize + int(hdr.KeyLen)
+	recoveredValue := readBuf[valueStart : valueStart+int(hdr.PhysicalSize)]
+	require.Equal(t, xlValue, recoveredValue, "XL blob data should be preserved")
 }
 
 // --- Integration Tests ---

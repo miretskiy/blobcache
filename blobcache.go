@@ -270,7 +270,6 @@ func open(cfg config) (*Cache, bool, error) {
 	c.memTable.Knobs = c.Knobs
 
 	// Initialize compactor for segment merge operations
-	compactFooterPool := NewMmapPool("compact-footer", 256<<10, 2)
 	ioFlags := sys.SyncNone
 	if cfg.IO.DirectIOWrite {
 		ioFlags |= sys.FlDirectIO
@@ -278,7 +277,7 @@ func open(cfg config) (*Cache, bool, error) {
 	if cfg.IO.FDataSync {
 		ioFlags |= sys.SyncData
 	}
-	c.compactor = NewCompactor(idx, c.archivist, c.segIDs, cfg.Path, cfg.Shards, ioFlags, compactFooterPool)
+	c.compactor = NewCompactor(idx, c.segIDs, cfg.Path, cfg.Shards, ioFlags, int(cfg.WriteBufferSize), c.archivist.DropSegmentCache)
 
 	// Run WAL recovery after memtable is initialized
 	var recovered bool

@@ -19,6 +19,18 @@ func PageAlign(size int64) int64 {
 	return (size + BlockMask) &^ BlockMask
 }
 
+// AlignRange computes O_DIRECT-compliant read parameters for a byte range.
+// Returns (alignedOffset, alignedLength) where:
+//   - alignedOffset is offset rounded DOWN to 4KB boundary
+//   - alignedLength covers [offset, offset+length) and is rounded UP to 4KB
+//
+// The caller can compute the lead padding as: offset - alignedOffset
+func AlignRange(offset int64, length int) (alignedOffset, alignedLength int64) {
+	alignedOffset = offset &^ BlockMask
+	alignedEnd := PageAlign(offset + int64(length))
+	return alignedOffset, alignedEnd - alignedOffset
+}
+
 // AllocAligned allocates a byte slice with 4KB-aligned memory address.
 // Uses mmap with MAP_ANONYMOUS for guaranteed alignment (mmap always returns
 // page-aligned memory). The returned slice is pre-warmed to force physical

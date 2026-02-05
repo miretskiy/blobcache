@@ -180,16 +180,6 @@ func (c *Compactor) Compact(segmentIDs []uint32, dropTombstones bool) (_ Compact
 	newSegID := c.segIDs.NextSegmentID()
 	result.NewSegmentID = newSegID
 
-	// Cleanup orphaned segment files on error.
-	// If writeCompactedSegment or WriteFooter fails, the .seg file may exist
-	// without a valid header or .meta file, causing "invalid file magic" on recovery.
-	defer func() {
-		if retErr != nil && newSegID != 0 {
-			// Best-effort cleanup - don't mask the original error
-			_ = DeleteSegmentFiles(c.basePath, c.shards, newSegID)
-		}
-	}()
-
 	footerEntries, err := c.writeCompactedSegment(newSegID, toRelocate, &result)
 	if err != nil {
 		return result, err

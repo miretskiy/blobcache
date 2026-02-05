@@ -327,6 +327,11 @@ func (c *Cache) Close() error {
 
 	c.wg.Wait()
 
+	// Release compactor buffer
+	if c.compactor != nil {
+		c.compactor.Close()
+	}
+
 	// Collect all close errors (WAL may be nil if disabled)
 	var walErr error
 	if c.wal != nil {

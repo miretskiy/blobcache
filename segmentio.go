@@ -168,17 +168,18 @@ func (w *segmentWriter) File() *os.File {
 }
 
 // WriteHeader writes the segment file header using an aligned buffer.
-// The global FileHeaderBytes array is not aligned for O_DIRECT, so we
-// must copy it into an aligned buffer before writing.
+// O_DIRECT requires both buffer address AND write size to be page-aligned.
+// We write a full page (4KB) with the 8-byte header at the start.
 func (w *segmentWriter) WriteHeader() error {
-	// Acquire page-aligned buffer for O_DIRECT compatibility
-	buf := w.footerPool.AcquireAligned(record.FileHeaderSize)
+	// Acquire page-aligned buffer (minimum 4KB for O_DIRECT write size alignment)
+	buf := w.footerPool.AcquireAligned(sys.BlockSize)
 	defer buf.Unpin()
 
-	// Copy header bytes into aligned buffer
+	// Copy header bytes into aligned buffer (rest is zero-padded)
 	copy(buf.Bytes(), record.FileHeaderBytes[:])
 
-	_, err := sys.WriteAligned(buf.Bytes()[:record.FileHeaderSize], w.file, w.ioFlags)
+	// Write full page - O_DIRECT requires aligned write size
+	_, err := sys.WriteAligned(buf.Bytes()[:sys.BlockSize], w.file, w.ioFlags)
 	return err
 }
 

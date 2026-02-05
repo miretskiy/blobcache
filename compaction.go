@@ -151,9 +151,9 @@ func (c *Compactor) Compact(segmentIDs []uint32, dropTombstones bool) (_ Compact
 
 	// Acquire shared locks (RLock allows concurrent compactions, blocks Delete)
 	// Multiple segments may map to same shard - multiple RLocks is fine
-	var shards []*xmap.Shard[index.SegmentMetadata, xmap.Pad32]
+	var shards []*xmap.Shard[struct{}, xmap.Pad32]
 	for _, segID := range segmentIDs {
-		shard := c.index.SegmentMetaShard(segID)
+		shard := c.index.SegmentLockShard(segID)
 		shard.RLock()
 		shards = append(shards, shard)
 	}

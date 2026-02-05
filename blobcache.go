@@ -541,7 +541,7 @@ func (c *Cache) deleteInCASMode(key []byte, h Key, item index.Item) error {
 	segID := item.SegmentID
 
 	// Acquire exclusive segment lock (blocks compaction of this segment)
-	shard := c.index.SegmentMetaShard(segID)
+	shard := c.index.SegmentLockShard(segID)
 	shard.Lock()
 	defer shard.Unlock()
 
@@ -570,6 +570,9 @@ func (c *Cache) deleteInCASMode(key []byte, h Key, item index.Item) error {
 		return fmt.Errorf("write tombstone: %w", err)
 	}
 
+	// Update segment metadata (for compaction selection)
+	c.index.UpdateSegmentOnDelete(segID, 1, int64(item.PhysicalLen))
+
 	c.bloomStats.deletions.Add(1)
 	return nil
 }
@@ -582,7 +585,7 @@ func (c *Cache) deleteInCacheMode(key []byte, h Key, item index.Item) error {
 	segID := item.SegmentID
 
 	// Acquire exclusive segment lock (blocks compaction of this segment)
-	shard := c.index.SegmentMetaShard(segID)
+	shard := c.index.SegmentLockShard(segID)
 	shard.Lock()
 	defer shard.Unlock()
 
@@ -601,6 +604,9 @@ func (c *Cache) deleteInCacheMode(key []byte, h Key, item index.Item) error {
 	if err := c.index.Tombstone(segID, h, key); err != nil {
 		return fmt.Errorf("write tombstone: %w", err)
 	}
+
+	// Update segment metadata (for compaction selection)
+	c.index.UpdateSegmentOnDelete(segID, 1, int64(item.PhysicalLen))
 
 	c.bloomStats.deletions.Add(1)
 	return nil
@@ -1019,6 +1025,18 @@ func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
 		return fmt.Errorf("eviction durability sync failed: %w", err)
 	}
 
+	// Update segment metadata for compaction selection (group by segment)
+	segmentDeletes := make(map[uint32]struct{ count int32; bytes int64 })
+	for _, v := range victims {
+		sd := segmentDeletes[v.SegmentID]
+		sd.count++
+		sd.bytes += int64(v.PhysicalLen)
+		segmentDeletes[v.SegmentID] = sd
+	}
+	for segID, sd := range segmentDeletes {
+		c.index.UpdateSegmentOnDelete(segID, sd.count, sd.bytes)
+	}
+
 	// 3. RECLAMATION PHASE
 	// Coalesce adjacent holes to reduce filesystem journal commits by ~98%.
 	// This turns "Swiss cheese" (thousands of tiny holes) into "stripes"
@@ -1094,11 +1112,7 @@ func (c *Cache) maybeMergeSegments() error {
 	targetOutputSize := c.WriteBufferSize + c.WriteBufferSize/2
 
 	// Select candidate ranges using sliding window accumulator
-	candidates, err := c.selectSegmentsForMerge(targetOutputSize, gravity)
-	if err != nil {
-		return fmt.Errorf("select segments for merge: %w", err)
-	}
-
+	candidates := c.selectSegmentsForMerge(targetOutputSize, gravity)
 	if len(candidates) == 0 {
 		return nil
 	}
@@ -1189,11 +1203,7 @@ func (c *Cache) maybeMergeSegments() error {
 // This collapses the tombstone incremental log into the segment manifest and
 // reclaims space via hole punching.
 func (c *Cache) maybeCompactTombstones() error {
-	segments, err := c.selectSegmentsForTombstoneCompaction(DefaultTombstoneCompactionThreshold)
-	if err != nil {
-		return fmt.Errorf("select segments for tombstone compaction: %w", err)
-	}
-
+	segments := c.selectSegmentsForTombstoneCompaction(DefaultTombstoneCompactionThreshold)
 	if len(segments) == 0 {
 		return nil
 	}
@@ -1202,7 +1212,7 @@ func (c *Cache) maybeCompactTombstones() error {
 
 	for _, segID := range segments {
 		// Acquire segment lock (shared with compaction, exclusive from Delete)
-		shard := c.index.SegmentMetaShard(segID)
+		shard := c.index.SegmentLockShard(segID)
 		shard.Lock()
 		err := c.compactSegmentTombstones(segID)
 		shard.Unlock()

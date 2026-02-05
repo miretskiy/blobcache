@@ -191,8 +191,7 @@ func TestSelectSegmentsForTombstoneCompaction(t *testing.T) {
 	defer cache.Close()
 
 	// Initially no segments
-	segments, err := cache.selectSegmentsForTombstoneCompaction(10)
-	require.NoError(t, err)
+	segments := cache.selectSegmentsForTombstoneCompaction(10)
 	require.Empty(t, segments, "should be empty with no segments")
 
 	// Write data to create a segment
@@ -204,8 +203,7 @@ func TestSelectSegmentsForTombstoneCompaction(t *testing.T) {
 	cache.Drain()
 
 	// No tombstones yet, should select nothing with threshold=10
-	segments, err = cache.selectSegmentsForTombstoneCompaction(10)
-	require.NoError(t, err)
+	segments = cache.selectSegmentsForTombstoneCompaction(10)
 	require.Empty(t, segments, "should be empty with no tombstones")
 
 	// Delete 15 keys to create tombstones
@@ -223,12 +221,10 @@ func TestSelectSegmentsForTombstoneCompaction(t *testing.T) {
 	}
 
 	// Now should select the segment with threshold=10
-	segments, err = cache.selectSegmentsForTombstoneCompaction(10)
-	require.NoError(t, err)
+	segments = cache.selectSegmentsForTombstoneCompaction(10)
 	require.Len(t, segments, 1, "should select one segment with 15 tombstones")
 
 	// Higher threshold should not select
-	segments, err = cache.selectSegmentsForTombstoneCompaction(20)
-	require.NoError(t, err)
+	segments = cache.selectSegmentsForTombstoneCompaction(20)
 	require.Empty(t, segments, "should not select with threshold=20 when we have 15 tombstones")
 }

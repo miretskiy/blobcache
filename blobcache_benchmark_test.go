@@ -63,8 +63,12 @@ func BenchmarkBlobCache(b *testing.B) {
 	if _, err := os.Stat("/instance_storage"); err == nil {
 		tmpDir = "/instance_storage/bench-blobcache"
 	}
+	fmt.Printf("DEBUG: BenchmarkBlobCache starting, removing %s\n", tmpDir)
 	os.RemoveAll(tmpDir)
-	defer os.RemoveAll(tmpDir)
+	defer func() {
+		fmt.Printf("DEBUG: BenchmarkBlobCache defer cleanup running for %s\n", tmpDir)
+		os.RemoveAll(tmpDir)
+	}()
 
 	// lo/high markers for blob size
 	const blobSizeLo = 100_000

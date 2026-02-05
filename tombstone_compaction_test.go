@@ -66,7 +66,7 @@ func TestTombstoneCompaction_Basic(t *testing.T) {
 	punchedKeys := make(map[index.Key]bool)
 
 	// Run tombstone compaction with callback
-	shard := cache.index.SegmentMetaShard(segID)
+	shard := cache.index.SegmentLockShard(segID)
 	shard.Lock()
 	err = cache.index.CompactTombstones(segID, func(tr index.TombstoneRecord) {
 		punchedKeys[tr.KeyHash] = true
@@ -127,7 +127,7 @@ func TestTombstoneCompaction_Idempotent(t *testing.T) {
 	require.NoError(t, cache.Delete(key))
 
 	// Run tombstone compaction twice
-	shard := cache.index.SegmentMetaShard(segID)
+	shard := cache.index.SegmentLockShard(segID)
 
 	shard.Lock()
 	err = cache.index.CompactTombstones(segID, func(tr index.TombstoneRecord) {

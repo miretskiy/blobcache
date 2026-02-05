@@ -13,10 +13,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestSegmentMetadata_Alignment verifies SegmentMetadata is properly aligned for xmap.
-func TestSegmentMetadata_Alignment(t *testing.T) {
-	err := xmap.VerifyAlignment[uint32, SegmentMetadata]()
-	require.NoError(t, err, "SegmentMetadata must be properly aligned for xmap usage")
+// TestSegmentLocks_Alignment verifies segmentLocks xmap is properly aligned.
+// The xmap stores struct{} as values (only used for locking coordination).
+func TestSegmentLocks_Alignment(t *testing.T) {
+	err := xmap.VerifyAlignment[struct{}, xmap.Pad32]()
+	require.NoError(t, err, "segmentLocks must be properly aligned for xmap usage")
 }
 
 // writeTestFooter writes a SegmentFooter to a .meta file for testing.
@@ -198,14 +199,20 @@ func TestHasOlderShadow(t *testing.T) {
 	keyB := Key{Lo: 0x2222222222222222, Hi: 0xBBBBBBBBBBBBBBBB}
 	keyC := Key{Lo: 0x3333333333333333, Hi: 0xCCCCCCCCCCCCCCCC}
 
-	// Helper to create and register a frozen bloom filter with specific keys
-	registerSegment := func(segID uint32, keys ...Key) {
+	// Helper to create and register a segment with specific keys
+	registerSeg := func(segID uint32, keys ...Key) {
 		filter := bloom.New(1000, 0.03)
 		for _, k := range keys {
 			filter.AddHash(k)
 		}
 		filter.Freeze()
-		p.registerSnapshot(segID, filter)
+		p.registerSegment(SegmentMetadata{
+			ID:             segID,
+			LiveItemCount:  int32(len(keys)),
+			TombstoneCount: 0,
+			LiveBytes:      int64(len(keys) * 1000),
+			SegmentKeys:    filter,
+		})
 	}
 
 	t.Run("NoSegments", func(t *testing.T) {
@@ -215,9 +222,9 @@ func TestHasOlderShadow(t *testing.T) {
 	})
 
 	// Register segments: 3 has keyA, 5 has keyB, 7 has keyC
-	registerSegment(3, keyA)
-	registerSegment(5, keyB)
-	registerSegment(7, keyC)
+	registerSeg(3, keyA)
+	registerSeg(5, keyB)
+	registerSeg(7, keyC)
 
 	t.Run("KeyOnlyInOlderSegment", func(t *testing.T) {
 		// keyA is in segment 3
@@ -249,7 +256,7 @@ func TestHasOlderShadow(t *testing.T) {
 
 	t.Run("KeyInMultipleSegments", func(t *testing.T) {
 		// Add keyA to segment 5 as well (key exists in both 3 and 5)
-		registerSegment(5, keyA, keyB) // Overwrite segment 5 filter
+		registerSeg(5, keyA, keyB) // Overwrite segment 5 filter
 
 		// When floor=5, segment 3 has keyA (3 < 5), so should return true
 		require.True(t, p.hasOlderShadow(keyA, 5))
@@ -260,19 +267,19 @@ func TestHasOlderShadow(t *testing.T) {
 
 	t.Run("UnregisterSegment", func(t *testing.T) {
 		// Unregister segment 3
-		p.unregisterSnapshot(3)
+		p.unregisterSegment(3)
 
 		// Now keyA only exists in segment 5
 		// When floor=5, no segment < 5 has keyA anymore
 		require.False(t, p.hasOlderShadow(keyA, 5))
 
 		// Re-register segment 3 for other tests
-		registerSegment(3, keyA)
+		registerSeg(3, keyA)
 	})
 
 	t.Run("UnregisterMultipleSegments", func(t *testing.T) {
 		// Unregister segments 3 and 5
-		p.unregisterSnapshots([]uint32{3, 5})
+		p.unregisterSegments([]uint32{3, 5})
 
 		// Now only segment 7 remains
 		require.False(t, p.hasOlderShadow(keyA, 10))
@@ -280,84 +287,90 @@ func TestHasOlderShadow(t *testing.T) {
 		require.True(t, p.hasOlderShadow(keyC, 10)) // keyC in segment 7, 7 < 10
 
 		// Re-register for cleanup
-		registerSegment(3, keyA)
-		registerSegment(5, keyB)
+		registerSeg(3, keyA)
+		registerSeg(5, keyB)
 	})
 }
 
-// TestSnapshotRegistry tests the segment snapshot lifecycle.
-func TestSnapshotRegistry(t *testing.T) {
+// TestSegmentRegistry tests the segment registry lifecycle.
+func TestSegmentRegistry(t *testing.T) {
 	tmp := t.TempDir()
 
 	p, err := newPersistence(tmp, 1)
 	require.NoError(t, err)
 	defer p.close()
 
-	createFilter := func(keys ...Key) *bloom.Filter {
+	createMeta := func(segID uint32, keys ...Key) SegmentMetadata {
 		filter := bloom.New(1000, 0.03)
 		for _, k := range keys {
 			filter.AddHash(k)
 		}
 		filter.Freeze()
-		return filter
+		return SegmentMetadata{
+			ID:             segID,
+			LiveItemCount:  int32(len(keys)),
+			TombstoneCount: 0,
+			LiveBytes:      int64(len(keys) * 1000),
+			SegmentKeys:    filter,
+		}
 	}
 
 	t.Run("RegisterInOrder", func(t *testing.T) {
-		p.registerSnapshot(1, createFilter(Key{Lo: 1}))
-		p.registerSnapshot(2, createFilter(Key{Lo: 2}))
-		p.registerSnapshot(3, createFilter(Key{Lo: 3}))
+		p.registerSegment(createMeta(1, Key{Lo: 1}))
+		p.registerSegment(createMeta(2, Key{Lo: 2}))
+		p.registerSegment(createMeta(3, Key{Lo: 3}))
 
-		p.snapshots.RLock()
-		require.Len(t, p.snapshots.entries, 3)
-		require.Equal(t, uint32(1), p.snapshots.entries[0].ID)
-		require.Equal(t, uint32(2), p.snapshots.entries[1].ID)
-		require.Equal(t, uint32(3), p.snapshots.entries[2].ID)
-		p.snapshots.RUnlock()
+		p.segments.RLock()
+		require.Len(t, p.segments.entries, 3)
+		require.Equal(t, uint32(1), p.segments.entries[0].ID)
+		require.Equal(t, uint32(2), p.segments.entries[1].ID)
+		require.Equal(t, uint32(3), p.segments.entries[2].ID)
+		p.segments.RUnlock()
 
 		// Cleanup
-		p.unregisterSnapshots([]uint32{1, 2, 3})
+		p.unregisterSegments([]uint32{1, 2, 3})
 	})
 
 	t.Run("RegisterOutOfOrder", func(t *testing.T) {
 		// Register in reverse order
-		p.registerSnapshot(30, createFilter(Key{Lo: 30}))
-		p.registerSnapshot(10, createFilter(Key{Lo: 10}))
-		p.registerSnapshot(20, createFilter(Key{Lo: 20}))
+		p.registerSegment(createMeta(30, Key{Lo: 30}))
+		p.registerSegment(createMeta(10, Key{Lo: 10}))
+		p.registerSegment(createMeta(20, Key{Lo: 20}))
 
-		p.snapshots.RLock()
-		require.Len(t, p.snapshots.entries, 3)
+		p.segments.RLock()
+		require.Len(t, p.segments.entries, 3)
 		// Should be sorted
-		require.Equal(t, uint32(10), p.snapshots.entries[0].ID)
-		require.Equal(t, uint32(20), p.snapshots.entries[1].ID)
-		require.Equal(t, uint32(30), p.snapshots.entries[2].ID)
-		p.snapshots.RUnlock()
+		require.Equal(t, uint32(10), p.segments.entries[0].ID)
+		require.Equal(t, uint32(20), p.segments.entries[1].ID)
+		require.Equal(t, uint32(30), p.segments.entries[2].ID)
+		p.segments.RUnlock()
 
 		// Cleanup
-		p.unregisterSnapshots([]uint32{10, 20, 30})
+		p.unregisterSegments([]uint32{10, 20, 30})
 	})
 
 	t.Run("IdempotentRegistration", func(t *testing.T) {
-		filter1 := createFilter(Key{Lo: 1})
-		filter2 := createFilter(Key{Lo: 2})
+		meta1 := createMeta(5, Key{Lo: 1})
+		meta2 := createMeta(5, Key{Lo: 2})
 
-		p.registerSnapshot(5, filter1)
-		p.registerSnapshot(5, filter2) // Should update, not duplicate
+		p.registerSegment(meta1)
+		p.registerSegment(meta2) // Should update, not duplicate
 
-		p.snapshots.RLock()
-		require.Len(t, p.snapshots.entries, 1)
-		require.Equal(t, uint32(5), p.snapshots.entries[0].ID)
+		p.segments.RLock()
+		require.Len(t, p.segments.entries, 1)
+		require.Equal(t, uint32(5), p.segments.entries[0].ID)
 		// Should be the second filter (updated)
-		require.True(t, p.snapshots.entries[0].SegmentKeys.Test(Key{Lo: 2}))
-		p.snapshots.RUnlock()
+		require.True(t, p.segments.entries[0].SegmentKeys.Test(Key{Lo: 2}))
+		p.segments.RUnlock()
 
 		// Cleanup
-		p.unregisterSnapshot(5)
+		p.unregisterSegment(5)
 	})
 
 	t.Run("UnregisterNonexistent", func(t *testing.T) {
 		// Should not panic when unregistering non-existent segment
-		p.unregisterSnapshot(999)
-		p.unregisterSnapshots([]uint32{998, 999})
+		p.unregisterSegment(999)
+		p.unregisterSegments([]uint32{998, 999})
 	})
 }
 

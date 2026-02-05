@@ -120,21 +120,40 @@ func (idx *DurableIndex) GetSegmentManifest(segmentID uint32) (DurableBatch, boo
 }
 
 // AddSegment registers a new segment with its items.
-// Creates a frozen Bloom filter snapshot (for tombstone dissolution queries)
-// and ingests live items into the RAM index.
+// Creates a frozen Bloom filter snapshot (for tombstone dissolution queries),
+// computes initial metadata, and ingests live items into the RAM index.
 //
 // Persistence is handled separately via .meta files:
 //   - During flush: WriteFooter writes the .meta file before this is called
 //   - During recovery: .meta files are read and items passed to this method
 func (idx *DurableIndex) AddSegment(segmentID uint32, items []Item) {
+	// Compute initial metadata from items
+	var liveCount int32
+	var tombstoneCount int32
+	var liveBytes int64
+
 	// Create frozen Bloom filter snapshot from ALL items (including deleted).
 	// This enables hasOlderShadow queries for tombstone dissolution.
 	filter := bloom.New(32_000, 0.03) // 32k items, 3% FPR (~29KB)
 	for _, item := range items {
 		filter.AddHash(item.Key)
+		if item.IsDeleted() {
+			tombstoneCount++
+		} else {
+			liveCount++
+			liveBytes += int64(item.PhysicalLen)
+		}
 	}
 	filter.Freeze()
-	idx.segments.registerSnapshot(segmentID, filter)
+
+	// Register segment with metadata
+	idx.segments.registerSegment(SegmentMetadata{
+		ID:             segmentID,
+		LiveItemCount:  liveCount,
+		TombstoneCount: tombstoneCount,
+		LiveBytes:      liveBytes,
+		SegmentKeys:    filter,
+	})
 
 	// Ingest all items into RAM index (including tombstones for proper Delete tracking)
 	for _, item := range items {
@@ -257,7 +276,7 @@ type DurableStats struct {
 // DropSegment deletes the .meta file for a segment without touching RAM.
 // Used after compaction when segment data has been fully relocated to a new segment.
 func (idx *DurableIndex) DropSegment(segID uint32) error {
-	idx.segments.unregisterSnapshot(segID)
+	idx.segments.unregisterSegment(segID)
 	return idx.segments.dropSegment(segID)
 }
 
@@ -265,20 +284,13 @@ func (idx *DurableIndex) DropSegment(segID uint32) error {
 // More efficient than multiple DropSegment calls when dropping merged segments.
 // Stops on first error.
 func (idx *DurableIndex) DropSegments(segIDs []uint32) error {
-	idx.segments.unregisterSnapshots(segIDs)
+	idx.segments.unregisterSegments(segIDs)
 	for _, segID := range segIDs {
 		if err := idx.segments.dropSegment(segID); err != nil {
 			return err
 		}
 	}
 	return nil
-}
-
-// RegisterSegmentSnapshot registers a frozen Bloom filter for a segment.
-// Called after segment flush completes successfully.
-// The filter must be Freeze()'d before registration.
-func (idx *DurableIndex) RegisterSegmentSnapshot(segID uint32, filter *bloom.Filter) {
-	idx.segments.registerSnapshot(segID, filter)
 }
 
 // HasOlderShadow checks if any segment with ID < floorID might contain the key.
@@ -291,15 +303,27 @@ func (idx *DurableIndex) HasOlderShadow(key Key, floorID uint32) bool {
 	return idx.segments.hasOlderShadow(key, floorID)
 }
 
-// SegmentMetaShard returns the xmap shard for a given segment ID.
+// SegmentLockShard returns the xmap shard for a given segment ID.
 // Exposes the shard's RWMutex for coordinating Delete and Compaction.
 //
 // Locking protocol:
 // - Delete: shard.Lock() (exclusive, blocks compaction)
 // - Compaction: shard.RLock() (shared, multiple compactions allowed)
-func (idx *DurableIndex) SegmentMetaShard(segID uint32) *xmap.Shard[SegmentMetadata, xmap.Pad32] {
+func (idx *DurableIndex) SegmentLockShard(segID uint32) *xmap.Shard[struct{}, xmap.Pad32] {
 	key := Key{Lo: uint64(segID), Hi: 0}
-	return idx.segments.segmentMeta.Shard(key)
+	return idx.segments.segmentLocks.Shard(key)
+}
+
+// ForEachSegmentMeta iterates over all registered segments in ID order.
+// Used for computing segment statistics without scanning disk files.
+func (idx *DurableIndex) ForEachSegmentMeta(fn func(meta SegmentMetadata) bool) {
+	idx.segments.forEachSegment(fn)
+}
+
+// UpdateSegmentOnDelete updates a segment's metadata after items are deleted.
+// Called during eviction or explicit delete to track tombstone accumulation.
+func (idx *DurableIndex) UpdateSegmentOnDelete(segID uint32, deletedCount int32, deletedBytes int64) {
+	idx.segments.updateSegmentOnDelete(segID, deletedCount, deletedBytes)
 }
 
 // CompactTombstones merges the tombstone incremental log into the segment manifest.

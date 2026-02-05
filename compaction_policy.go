@@ -69,43 +69,29 @@ func (c *Cache) isEligibleForCompaction(segID uint32) bool {
 	return segID < currentSegID-coolingGap
 }
 
-// computeSegmentStats scans all segments and computes statistics.
-// Returns a map from SegmentID to stats.
-func (c *Cache) computeSegmentStats() (map[uint32]*SegmentStats, error) {
+// computeSegmentStats returns statistics for all registered segments.
+// Uses in-memory segment metadata (no disk scanning).
+func (c *Cache) computeSegmentStats() map[uint32]*SegmentStats {
 	stats := make(map[uint32]*SegmentStats)
 
-	err := c.index.ForEachSegment(func(m index.DurableBatch) bool {
-		ss, ok := stats[m.SegmentID]
-		if !ok {
-			ss = &SegmentStats{SegmentID: m.SegmentID}
-			stats[m.SegmentID] = ss
-		}
-
-		for _, item := range m.Items {
-			if item.IsDeleted() {
-				ss.TombstoneCount++
-			} else {
-				ss.LiveItemCount++
-				ss.LiveBytes += int64(item.PhysicalLen)
-			}
+	c.index.ForEachSegmentMeta(func(meta index.SegmentMetadata) bool {
+		stats[meta.ID] = &SegmentStats{
+			SegmentID:      meta.ID,
+			TombstoneCount: int(meta.TombstoneCount),
+			LiveItemCount:  int(meta.LiveItemCount),
+			LiveBytes:      meta.LiveBytes,
 		}
 		return true
 	})
-	if err != nil {
-		return nil, err
-	}
 
-	return stats, nil
+	return stats
 }
 
 // selectSegmentsForTombstoneCompaction returns segment IDs that exceed the tombstone threshold.
 // Returns segments sorted by SegmentID (ascending) for deterministic processing.
 // Segments still in the "hot zone" (Librarian cache) are excluded via cooling period check.
-func (c *Cache) selectSegmentsForTombstoneCompaction(minTombstones int) ([]uint32, error) {
-	stats, err := c.computeSegmentStats()
-	if err != nil {
-		return nil, err
-	}
+func (c *Cache) selectSegmentsForTombstoneCompaction(minTombstones int) []uint32 {
+	stats := c.computeSegmentStats()
 
 	var selected []uint32
 	for _, ss := range stats {
@@ -117,7 +103,7 @@ func (c *Cache) selectSegmentsForTombstoneCompaction(minTombstones int) ([]uint3
 	// Sort for deterministic processing order
 	slices.Sort(selected)
 
-	return selected, nil
+	return selected
 }
 
 // selectContiguousRanges groups segment IDs into contiguous ranges for merge compaction.
@@ -170,11 +156,8 @@ type MergeCandidate struct {
 //   - minRangeSize: Minimum number of segments required (dynamic gravity)
 //
 // Returns slices of contiguous segment IDs that can be passed to Compactor.Compact().
-func (c *Cache) selectSegmentsForMerge(targetOutputSize int64, minRangeSize int) ([]MergeCandidate, error) {
-	stats, err := c.computeSegmentStats()
-	if err != nil {
-		return nil, err
-	}
+func (c *Cache) selectSegmentsForMerge(targetOutputSize int64, minRangeSize int) []MergeCandidate {
+	stats := c.computeSegmentStats()
 
 	// Collect segments with high waste ratio that have cooled
 	type sparseSegment struct {
@@ -189,7 +172,7 @@ func (c *Cache) selectSegmentsForMerge(targetOutputSize int64, minRangeSize int)
 	}
 
 	if len(sparse) == 0 {
-		return nil, nil
+		return nil
 	}
 
 	// Sort by segment ID for contiguity analysis
@@ -259,7 +242,7 @@ func (c *Cache) selectSegmentsForMerge(targetOutputSize int64, minRangeSize int)
 	// Don't forget the last range
 	finalizeRange()
 
-	return result, nil
+	return result
 }
 
 // calculateDynamicGravity computes the minimum segment count based on system sparseness.

@@ -162,7 +162,7 @@ func (c *Compactor) Compact(segmentIDs []uint32, dropTombstones bool) (CompactRe
 
 	// Write .meta file (footer with all items) for crash recovery
 	segPath := getSegmentPath(c.basePath, c.shards, newSegID)
-	if err := WriteFooter(newSegID, footerEntries, segPath); err != nil {
+	if err := WriteFooter(newSegID, footerEntries, segPath, c.ioFlags); err != nil {
 		return result, fmt.Errorf("compaction: write footer: %w", err)
 	}
 

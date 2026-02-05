@@ -347,7 +347,7 @@ func startSystemMonitor(
 		var (
 			maxRSS, totalQD float64
 			samples         int
-			interval        = 10 * time.Second
+			interval        = 60 * time.Second // Reduced frequency to minimize GC pressure
 			ticker          = time.NewTicker(interval)
 			proc, _         = process.NewProcess(int32(os.Getpid()))
 			v1, _           = disk.IOCounters()

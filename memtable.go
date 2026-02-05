@@ -644,7 +644,7 @@ func (mt *MemTable) finalizeFlush(
 	// Write footer BEFORE updating index.
 	// This ensures .meta file exists before items become evictable.
 	// Eviction needs the .meta file to write tombstones.
-	if err := WriteFooter(segmentID, entries, segmentPath); err != nil {
+	if err := WriteFooter(segmentID, entries, segmentPath, mt.ioFlags()); err != nil {
 		return fmt.Errorf("write footer: %w", err)
 	}
 

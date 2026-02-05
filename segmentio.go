@@ -184,7 +184,7 @@ func (w *segmentWriter) WriteHeader() error {
 
 // WriteFooter writes this segment's footer (.meta) file for crash recovery.
 func (w *segmentWriter) WriteFooter(entries []record.FooterEntry) error {
-	return WriteFooter(w.segmentID, entries, w.Path())
+	return WriteFooter(w.segmentID, entries, w.Path(), w.ioFlags)
 }
 
 // Close syncs and closes the segment file.

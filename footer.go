@@ -1,11 +1,11 @@
 package blobcache
 
 import (
-	"os"
 	"path/filepath"
 	"time"
 
 	"github.com/miretskiy/blobcache/internal/record"
+	"github.com/miretskiy/blobcache/internal/sys"
 )
 
 // IndexSegmentExtension is the file extension for segment metadata files.
@@ -26,19 +26,22 @@ func SegmentMetaPath(segmentPath string) string {
 // 1. Computes min/max SeqID from entries
 // 2. Builds SegmentFooter struct
 // 3. Serializes to buffer
-// 4. Writes atomically using WriteFile (buffered I/O)
+// 4. Writes atomically using WriteFile (buffered I/O, preserves durability flags)
 //
 // The footer file path is derived from dataPath by replacing .seg extension with .meta.
 // Example: /data/segments/0001/123.seg -> /data/segments/0001/123.meta
 //
-// Note: Uses buffered I/O (not O_DIRECT) for metadata writes. The complexity/risk
-// of alignment constraints on small metadata files (~2-8MB) outweighs any benefit
-// from bypassing the page cache.
+// Note: O_DIRECT is stripped for metadata writes (alignment complexity outweighs benefit
+// for small files), but durability flags (O_DSYNC) are preserved.
 func WriteFooter(
 	segmentID uint32,
 	entries []record.FooterEntry,
 	dataPath string,
+	flags sys.OpenFlag,
 ) error {
+	// Strip O_DIRECT but preserve durability flags (O_DSYNC)
+	safeFlags := flags &^ sys.FlDirectIO
+
 	// 1. Compute min/max SeqID
 	var minSeq, maxSeq uint64
 	if len(entries) > 0 {
@@ -69,7 +72,7 @@ func WriteFooter(
 	buf := make([]byte, physicalSize)
 	data := record.AppendFooterBlock(buf, sf)
 
-	// 4. Write atomically to .meta file (buffered I/O)
+	// 4. Write atomically to .meta file (buffered I/O with durability)
 	indexPath := SegmentMetaPath(dataPath)
-	return os.WriteFile(indexPath, data, 0o644)
+	return sys.WriteFile(indexPath, data, safeFlags)
 }

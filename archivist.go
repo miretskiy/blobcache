@@ -185,6 +185,25 @@ func (a *Archivist) HolePunchBlob(
 	return sys.PunchHole(sf, int64(offset), int64(physicalLen))
 }
 
+// HoleRange represents a contiguous range to punch within a segment.
+// Used by CoalesceVictims to merge adjacent evicted blobs into single syscalls.
+type HoleRange struct {
+	SegmentID uint32
+	Offset    int64
+	Length    int64
+}
+
+// HolePunchRange releases disk space for a pre-coalesced range.
+// This is the batched version of HolePunchBlob, used after CoalesceVictims
+// merges adjacent holes to reduce filesystem journal commits.
+func (a *Archivist) HolePunchRange(segmentID uint32, offset, length int64) (int64, error) {
+	sf, err := a.getSegmentFile(segmentID)
+	if err != nil {
+		return 0, err
+	}
+	return sys.PunchHole(sf, offset, length)
+}
+
 // DropSegmentCache closes and removes a segment's cached file handle.
 // Called before deleting segment files during compaction.
 func (a *Archivist) DropSegmentCache(segmentID uint32) {

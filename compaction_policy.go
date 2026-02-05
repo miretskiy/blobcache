@@ -211,9 +211,13 @@ func (c *Cache) selectSegmentsForMerge(targetOutputSize int64, minRangeSize int)
 	var currentBytes int64
 
 	finalizeRange := func() {
+		// Only accept ranges meeting minimum gravity.
+		// Ranges below minRangeSize are dropped: this prevents micro-merges but means
+		// very sparse segments wait until enough contiguous sparse neighbors accumulate.
+		// This is intentional - the I/O cost of merging 2-3 sparse segments doesn't pay off.
 		if len(currentIDs) >= minRangeSize {
 			result = append(result, MergeCandidate{
-				SegmentIDs:       currentIDs,
+				SegmentIDs:         currentIDs,
 				EstimatedLiveBytes: currentBytes,
 			})
 		}

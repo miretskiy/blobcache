@@ -70,6 +70,10 @@ type config struct {
 	TrustHash    bool         // Skip key verification on reads (cache mode optimization)
 	BallastSize  int          // Heap ballast size in bytes (default: 1GB, 0 = disabled)
 
+	// Compaction bandwidth limit in bytes/sec (default: 200 MB/s)
+	// Throttles merge compaction to avoid saturating the I/O bus during ingestion.
+	CompactionBandwidth int64
+
 	knobs *TestingKnobs
 }
 
@@ -218,20 +222,29 @@ func WithBallast(size int) Option {
 	return funcOpt(func(c *config) { c.BallastSize = max(0, size) })
 }
 
+// WithCompactionBandwidth sets the maximum bytes/sec for merge compaction I/O.
+// This throttles compaction to avoid saturating the I/O bus during ingestion.
+// Default: 200 MB/s (allows ~1 GB/s remaining for foreground I/O).
+// Set to 0 to disable throttling (not recommended for production).
+func WithCompactionBandwidth(bytesPerSec int64) Option {
+	return funcOpt(func(c *config) { c.CompactionBandwidth = bytesPerSec })
+}
+
 func defaultConfig(path string) config {
 	return config{
-		Path:               path,
-		MaxSize:            0,
-		Shards:             0,
-		WriteBufferSize:    64 << 20, // 64MB
-		MaxInflightSlabs:   6,
-		MaxCachedSlabs:     8,        // Keep ~1GB of recently written data in RAM
-		FlushConcurrency:   2,
-		BloomFPRate:        0.01,
-		BloomEstimatedKeys: 1_000_000,
-		DegradedMode:       DegradedMemoryOnly,
-		TrustHash:          true,    // Cache mode: trust hash, skip key verification
-		BallastSize:        1 << 30, // 1GB heap ballast to reduce GC frequency
+		Path:                path,
+		MaxSize:             0,
+		Shards:              0,
+		WriteBufferSize:     64 << 20,  // 64MB
+		MaxInflightSlabs:    6,
+		MaxCachedSlabs:      8,         // Keep ~1GB of recently written data in RAM
+		FlushConcurrency:    2,
+		BloomFPRate:         0.01,
+		BloomEstimatedKeys:  1_000_000,
+		DegradedMode:        DegradedMemoryOnly,
+		TrustHash:           true,      // Cache mode: trust hash, skip key verification
+		BallastSize:         1 << 30,   // 1GB heap ballast to reduce GC frequency
+		CompactionBandwidth: 200 << 20, // 200 MB/s for merge compaction throttling
 		IO: IOConfig{
 			FDataSync:     false,
 			Fadvise:       sys.UseFadvise,

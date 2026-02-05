@@ -22,6 +22,7 @@ import (
 	"github.com/miretskiy/blobcache/internal/sys"
 	"github.com/miretskiy/blobcache/internal/wal"
 	"github.com/zeebo/xxh3"
+	"golang.org/x/time/rate"
 )
 
 // Key is the 128-bit hash of a blob key.
@@ -54,9 +55,10 @@ type Cache struct {
 	}
 
 	// --- ARCHITECTURE COMPONENTS ---
-	memTable  *MemTable  // The Write Engine (Producer)
-	librarian *Librarian // The Read Cache (Consumer)
-	compactor *Compactor // Segment merge compaction
+	memTable          *MemTable     // The Write Engine (Producer)
+	librarian         *Librarian    // The Read Cache (Consumer)
+	compactor         *Compactor    // Segment merge compaction
+	compactionLimiter *rate.Limiter // Token bucket for compaction I/O throttling
 
 	// Global monotonic sequence counter for operation ordering.
 	// Initialized to time.Now().UnixNano() for continuity across restarts.
@@ -77,9 +79,9 @@ type Cache struct {
 	bgError atomic.Pointer[error] // First background error (nil = healthy)
 
 	// Background workers
-	evictionTrigger chan struct{} // Capacity 1: trigger eviction, blocks when eviction running
-	stopCh          chan struct{}
-	wg              sync.WaitGroup
+	maintenanceTrigger chan struct{} // Capacity 1: trigger eviction + compaction cycle
+	stopCh             chan struct{}
+	wg                 sync.WaitGroup
 
 	// Knobs provides testing hooks. Set directly in tests: c.Knobs = &TestingKnobs{...}
 	Knobs *TestingKnobs
@@ -237,12 +239,12 @@ func open(cfg config) (*Cache, bool, error) {
 	}
 
 	c := &Cache{
-		config:          cfg,
-		index:           idx,
-		archivist:       NewArchivist(cfg, idx),
-		segIDs:          newSegmentIDProvider(cfg.Path, cfg.Shards),
-		evictionTrigger: make(chan struct{}, 1),
-		stopCh:          make(chan struct{}),
+		config:             cfg,
+		index:              idx,
+		archivist:          NewArchivist(cfg, idx),
+		segIDs:             newSegmentIDProvider(cfg.Path, cfg.Shards),
+		maintenanceTrigger: make(chan struct{}, 1),
+		stopCh:             make(chan struct{}),
 	}
 
 	// Initialize WAL if enabled
@@ -280,6 +282,17 @@ func open(cfg config) (*Cache, bool, error) {
 	}
 	c.compactor = NewCompactor(idx, c.segIDs, cfg.Path, cfg.Shards, ioFlags, int(cfg.WriteBufferSize), c.archivist.DropSegmentCache)
 
+	// Initialize compaction rate limiter for I/O throttling.
+	// Token bucket: refills at CompactionBandwidth bytes/sec, burst = 1 segment worth.
+	if cfg.CompactionBandwidth > 0 {
+		// Burst allows writing one full segment without waiting
+		burst := int(cfg.WriteBufferSize * 2) // 2x buffer for safety
+		if burst < 1 {
+			burst = 1
+		}
+		c.compactionLimiter = rate.NewLimiter(rate.Limit(cfg.CompactionBandwidth), burst)
+	}
+
 	// Run WAL recovery after memtable is initialized
 	var recovered bool
 	if c.wal != nil {
@@ -300,10 +313,10 @@ func open(cfg config) (*Cache, bool, error) {
 	return c, recovered, nil
 }
 
-// Start begins background operations (eviction worker).
+// Start begins background operations (maintenance worker for eviction + compaction).
 func (c *Cache) Start() {
 	c.wg.Add(1)
-	go c.evictionWorker()
+	go c.maintenanceWorker()
 }
 
 // Close gracefully shuts down all background workers and saves state
@@ -653,6 +666,10 @@ type Batcher interface {
 	PutBatch(segID uint32, items []index.Item, maxSeqID uint64) error
 }
 
+// maintenanceSegmentInterval determines how often segment production triggers maintenance.
+// Every N segments, an eviction + compaction check is triggered.
+const maintenanceSegmentInterval = 10
+
 func (c *Cache) PutBatch(segID uint32, items []index.Item, _ uint64) error {
 	// Phase 1: Ingest into Index (also registers segment snapshot for tombstone dissolution)
 	c.index.AddSegment(segID, items)
@@ -664,16 +681,23 @@ func (c *Cache) PutBatch(segID uint32, items []index.Item, _ uint64) error {
 	}
 	newSize := c.approxSize.Add(addedBytes)
 
-	// Phase 3: Trigger eviction if over limit
-	if c.MaxSize > 0 && newSize > c.MaxSize && !c.IsDegraded() {
-		c.triggerEviction()
+	// Phase 3: Trigger maintenance (eviction + compaction) when needed
+	// Triggers when: over size limit OR every N segments for compaction
+	overSizeLimit := c.MaxSize > 0 && newSize > c.MaxSize
+	segmentInterval := segID%maintenanceSegmentInterval == 0
+
+	if (overSizeLimit || segmentInterval) && !c.IsDegraded() {
+		c.triggerMaintenance()
 	}
+
 	return nil
 }
 
-func (c *Cache) triggerEviction() {
+// triggerMaintenance signals the background worker to run eviction + compaction.
+// Non-blocking: if maintenance is already pending, this is a no-op.
+func (c *Cache) triggerMaintenance() {
 	select {
-	case c.evictionTrigger <- struct{}{}:
+	case c.maintenanceTrigger <- struct{}{}:
 	default:
 	}
 }
@@ -913,26 +937,29 @@ func CoalesceVictims(victims []index.Item, dst []HoleRange) []HoleRange {
 	return dst
 }
 
-// evictionWorker handles eviction requests and periodic compaction
-func (c *Cache) evictionWorker() {
+// maintenanceWorker handles eviction and compaction in a unified event-driven loop.
+//
+// Lifecycle (no timers):
+//   - maintenanceTrigger: Fired by PutBatch when over size limit OR every N segments
+//
+// Each cycle: (1) evict if over size, (2) compact sparse segments.
+// This ensures "Swiss cheese" holes from eviction are promptly defragmented,
+// and segment production naturally triggers merge compaction.
+func (c *Cache) maintenanceWorker() {
 	defer c.wg.Done()
-
-	compactionTicker := time.NewTicker(10 * time.Minute)
-	defer compactionTicker.Stop()
 
 	for {
 		select {
-		case <-c.evictionTrigger:
-			// Eviction requested (triggered by PutBatch)
-			if c.MaxSize > 0 && !c.IsDegraded() {
+		case <-c.maintenanceTrigger:
+			// Phase 1: Eviction (if needed)
+			if c.MaxSize > 0 && c.approxSize.Load() > c.MaxSize && !c.IsDegraded() {
 				if err := c.runEvictionSieve(c.MaxSize); err != nil {
 					c.ReportError(err)
 					return // Stop worker permanently
 				}
 			}
 
-		case <-compactionTicker.C:
-			// Periodic compaction
+			// Phase 2: Compaction (always check after eviction or segment production)
 			if !c.IsDegraded() {
 				if err := c.maybeCompactSegments(); err != nil {
 					c.ReportError(fmt.Errorf("compaction: %w", err))
@@ -1063,7 +1090,8 @@ func (c *Cache) maybeMergeSegments() error {
 	physicalSize := logicalSize // TODO: Track actual physical size via stat.Blocks
 
 	gravity := calculateDynamicGravity(physicalSize, logicalSize)
-	targetOutputSize := c.WriteBufferSize
+	// Target 1.5x WriteBufferSize (~96MB for default 64MB buffer) for efficient sequential I/O
+	targetOutputSize := c.WriteBufferSize + c.WriteBufferSize/2
 
 	// Select candidate ranges using sliding window accumulator
 	candidates, err := c.selectSegmentsForMerge(targetOutputSize, gravity)
@@ -1082,13 +1110,7 @@ func (c *Cache) maybeMergeSegments() error {
 
 	oldestSegID := c.OldestLiveSegmentID()
 
-	for i, candidate := range candidates {
-		// Yield between merges to protect foreground read throughput
-		// This ensures Archivist (reads) and MemTable (writes) have priority
-		if i > 0 {
-			time.Sleep(10 * time.Millisecond)
-		}
-
+	for _, candidate := range candidates {
 		segmentIDs := candidate.SegmentIDs
 
 		// Determine if this is a tail compaction (includes oldest segment)
@@ -1138,6 +1160,21 @@ func (c *Cache) maybeMergeSegments() error {
 			"read_mbps", fmt.Sprintf("%.1f", readMBps),
 			"write_mbps", fmt.Sprintf("%.1f", writeMBps),
 			"avg_read_kb", avgReadKB)
+
+		// Token bucket rate limiting: throttle based on bytes written.
+		// This protects foreground I/O (Archivist reads, MemTable writes) from
+		// compaction saturating the I/O bus. The limiter refills at CompactionBandwidth
+		// bytes/sec, so heavy compaction spreads out over time.
+		if c.compactionLimiter != nil && result.WriteBytes > 0 {
+			// WaitN blocks until we've earned tokens for the bytes we just wrote.
+			// This is more precise than fixed sleep: large merges wait longer.
+			tokens := int(result.WriteBytes)
+			if tokens > c.compactionLimiter.Burst() {
+				// If write exceeds burst, use burst size (limiter's max allowance)
+				tokens = c.compactionLimiter.Burst()
+			}
+			_ = c.compactionLimiter.WaitN(context.Background(), tokens)
+		}
 	}
 
 	// Recalculate oldest segment after dropping segments

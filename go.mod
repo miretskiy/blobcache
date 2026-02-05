@@ -10,6 +10,7 @@ require (
 	github.com/shirou/gopsutil/v3 v3.24.5
 	github.com/stretchr/testify v1.11.1
 	github.com/zeebo/xxh3 v1.0.2
+	golang.org/x/time v0.14.0
 )
 
 require (
@@ -23,7 +24,6 @@ require (
 	github.com/tklauser/numcpus v0.6.1 // indirect
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
 	github.com/zhangyunhao116/fastrand v0.3.0 // indirect
-	golang.org/x/time v0.14.0 // indirect
 )
 
 require (

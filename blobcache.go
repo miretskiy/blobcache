@@ -990,12 +990,37 @@ func (c *Cache) maybeMergeSegments() error {
 			return fmt.Errorf("compact segments %v: %w", segmentIDs, err)
 		}
 
+		// Calculate derived I/O metrics
+		var readAmp, readMBps, writeMBps float64
+		var avgReadKB int64
+		if result.WriteBytes > 0 {
+			readAmp = float64(result.ReadBytes) / float64(result.WriteBytes)
+		}
+		if result.DurationMs > 0 {
+			durSec := float64(result.DurationMs) / 1000.0
+			readMBps = float64(result.ReadBytes) / durSec / (1024 * 1024)
+			writeMBps = float64(result.WriteBytes) / durSec / (1024 * 1024)
+		}
+		if result.ReadOps > 0 {
+			avgReadKB = result.ReadBytes / int64(result.ReadOps) / 1024
+		}
+
 		log.Info("segment merge completed",
 			"old_segments", result.OldSegmentIDs,
 			"new_segment", result.NewSegmentID,
 			"items_compacted", result.ItemsCompacted,
+			"stale_skipped", result.StaleSkipped,
 			"tombstones_kept", result.TombstonesKept,
-			"tombstones_dropped", result.TombstonesDropped)
+			"tombstones_dropped", result.TombstonesDropped,
+			"duration_ms", result.DurationMs,
+			"read_ops", result.ReadOps,
+			"read_bytes", result.ReadBytes,
+			"write_ops", result.WriteOps,
+			"write_bytes", result.WriteBytes,
+			"read_amp", fmt.Sprintf("%.2f", readAmp),
+			"read_mbps", fmt.Sprintf("%.1f", readMBps),
+			"write_mbps", fmt.Sprintf("%.1f", writeMBps),
+			"avg_read_kb", avgReadKB)
 	}
 
 	// Recalculate oldest segment after dropping segments

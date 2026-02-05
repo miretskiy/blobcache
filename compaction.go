@@ -3,6 +3,7 @@ package blobcache
 import (
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/miretskiy/blobcache/internal/index"
 	"github.com/miretskiy/blobcache/internal/record"
@@ -71,6 +72,14 @@ type CompactResult struct {
 	ItemsCompacted    int      // Number of live items written to new segment
 	TombstonesKept    int      // Number of tombstones preserved
 	TombstonesDropped int      // Number of tombstones garbage collected (tail only)
+	StaleSkipped      int      // Number of stale entries skipped (superseded by newer writes)
+
+	// I/O stats for bandwidth analysis
+	ReadOps    int   // Number of read operations
+	ReadBytes  int64 // Total bytes read from old segments
+	WriteOps   int   // Number of write operations
+	WriteBytes int64 // Total bytes written to new segment
+	DurationMs int64 // Total compaction duration in milliseconds
 }
 
 // relocInfo tracks an item being relocated during compaction.
@@ -101,6 +110,8 @@ func (c *Compactor) Compact(segmentIDs []uint32, dropTombstones bool) (CompactRe
 		return result, nil
 	}
 
+	startTime := time.Now()
+
 	// Acquire shared locks (RLock allows concurrent compactions, blocks Delete)
 	// Multiple segments may map to same shard - multiple RLocks is fine
 	var shards []*xmap.Shard[index.SegmentMetadata, xmap.Pad32]
@@ -116,10 +127,11 @@ func (c *Compactor) Compact(segmentIDs []uint32, dropTombstones bool) (CompactRe
 	}()
 
 	// Collect items from all segments, checking contiguity as we go
-	toRelocate, tombstones, _, err := c.collectItems(segmentIDs)
+	toRelocate, tombstones, _, staleCount, err := c.collectItems(segmentIDs)
 	if err != nil {
 		return result, err
 	}
+	result.StaleSkipped = staleCount
 
 	if len(toRelocate) == 0 && len(tombstones) == 0 {
 		// Nothing to compact, just drop the old segments
@@ -203,22 +215,25 @@ func (c *Compactor) Compact(segmentIDs []uint32, dropTombstones bool) (CompactRe
 		return result, err
 	}
 
+	result.DurationMs = time.Since(startTime).Milliseconds()
 	return result, nil
 }
 
 // collectItems gathers live items and tombstones from the given segments.
 // It validates contiguity as it processes each segment.
-func (c *Compactor) collectItems(segmentIDs []uint32) ([]relocInfo, []index.Item, uint64, error) {
+// Returns: live items to relocate, tombstones, max seqID, stale count, error.
+func (c *Compactor) collectItems(segmentIDs []uint32) ([]relocInfo, []index.Item, uint64, int, error) {
 	var toRelocate []relocInfo
 	var tombstones []index.Item
 	var maxSeqID uint64
+	var staleCount int
 	var prevSegID uint32
 
 	for i, segID := range segmentIDs {
 		// Validate ascending order
 		if i > 0 {
 			if segID <= prevSegID {
-				return nil, nil, 0, fmt.Errorf("compaction: segment IDs must be in ascending order, got %d after %d",
+				return nil, nil, 0, 0, fmt.Errorf("compaction: segment IDs must be in ascending order, got %d after %d",
 					segID, prevSegID)
 			}
 
@@ -228,7 +243,7 @@ func (c *Compactor) collectItems(segmentIDs []uint32) ([]relocInfo, []index.Item
 				// This prevents the Leapfrog Hazard where compacting [10, 15] while
 				// segment 12 exists would skip segment 12's data.
 				if err := c.index.VerifyNoSegmentsInRange(prevSegID, segID); err != nil {
-					return nil, nil, 0, err
+					return nil, nil, 0, 0, err
 				}
 			}
 		}
@@ -254,6 +269,7 @@ func (c *Compactor) collectItems(segmentIDs []uint32) ([]relocInfo, []index.Item
 			ramItem, found := c.index.Get(item.Key)
 			if !found || ramItem.SegmentID != item.SegmentID || ramItem.Offset != item.Offset {
 				// Stale: RAM has newer version or item was deleted
+				staleCount++
 				continue
 			}
 
@@ -265,7 +281,7 @@ func (c *Compactor) collectItems(segmentIDs []uint32) ([]relocInfo, []index.Item
 		}
 	}
 
-	return toRelocate, tombstones, maxSeqID, nil
+	return toRelocate, tombstones, maxSeqID, staleCount, nil
 }
 
 // writeCompactedSegment creates the new segment file and writes all live blobs.
@@ -286,10 +302,12 @@ func (c *Compactor) writeCompactedSegment(
 		return nil, fmt.Errorf("compaction: create segment file: %w", err)
 	}
 
-	// Write file header
+	// Write file header (counts as 1 write op, sys.BlockSize bytes for O_DIRECT alignment)
 	if err := w.WriteHeader(); err != nil {
 		return nil, errors.Join(fmt.Errorf("compaction: write header: %w", err), w.Close())
 	}
+	result.WriteOps++
+	result.WriteBytes += sys.BlockSize
 
 	offset := uint32(record.FileHeaderSize)
 	footerEntries := make([]record.FooterEntry, 0, len(toRelocate))
@@ -308,6 +326,8 @@ func (c *Compactor) writeCompactedSegment(
 				w.Close(),
 			)
 		}
+		result.ReadOps++
+		result.ReadBytes += int64(len(data))
 
 		// Parse header to extract footer metadata
 		hdr, err := record.DecodeHeader(data[:record.HeaderSize])
@@ -320,10 +340,13 @@ func (c *Compactor) writeCompactedSegment(
 		}
 
 		// Write to new segment
-		if _, err := w.File().Write(data); err != nil {
+		n, err := w.File().Write(data)
+		if err != nil {
 			releaser.Release()
 			return nil, errors.Join(fmt.Errorf("compaction: write blob: %w", err), w.Close())
 		}
+		result.WriteOps++
+		result.WriteBytes += int64(n)
 		releaser.Release()
 
 		// Update item with new location

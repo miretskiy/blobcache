@@ -108,6 +108,10 @@ type CompactResult struct {
 	WriteOps   int   // Number of write operations
 	WriteBytes int64 // Total bytes written to new segment
 	DurationMs int64 // Total compaction duration in milliseconds
+
+	// Targeted Gravity metrics
+	EstimatedInputMB float64 // Pre-compaction estimate of live data (from policy)
+	ActualOutputMB   float64 // Actual output size (WriteBytes / 1MB)
 }
 
 // relocInfo tracks an item being relocated during compaction.

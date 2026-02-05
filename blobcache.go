@@ -1050,22 +1050,47 @@ func (c *Cache) maybeCompactSegments() error {
 
 // maybeMergeSegments identifies sparse segments and merges contiguous ranges.
 // This reclaims space by combining multiple sparse segments into fewer dense segments.
+//
+// Uses the "Targeted Gravity" model:
+//   - Dynamic minimum range size based on system sparseness (physical/logical ratio)
+//   - Size-based accumulator targeting WriteBufferSize output
+//   - Yielding between merges to protect foreground read throughput
 func (c *Cache) maybeMergeSegments() error {
-	// Select candidate ranges: segments with >75% waste, ranges of at least 2 segments
-	ranges, err := c.selectSegmentsForMerge(0.75, 2)
+	// Calculate dynamic gravity based on system sparseness
+	// physicalSize approximated by approxSize (tracks logical after hole punching)
+	// For now, use a fixed gravity until we have proper physical size tracking
+	logicalSize := c.approxSize.Load()
+	physicalSize := logicalSize // TODO: Track actual physical size via stat.Blocks
+
+	gravity := calculateDynamicGravity(physicalSize, logicalSize)
+	targetOutputSize := c.WriteBufferSize
+
+	// Select candidate ranges using sliding window accumulator
+	candidates, err := c.selectSegmentsForMerge(targetOutputSize, gravity)
 	if err != nil {
 		return fmt.Errorf("select segments for merge: %w", err)
 	}
 
-	if len(ranges) == 0 {
+	if len(candidates) == 0 {
 		return nil
 	}
 
-	log.Debug("merge compaction starting", "range_count", len(ranges))
+	log.Debug("merge compaction starting",
+		"candidate_count", len(candidates),
+		"gravity", gravity,
+		"target_mb", targetOutputSize/(1024*1024))
 
 	oldestSegID := c.OldestLiveSegmentID()
 
-	for _, segmentIDs := range ranges {
+	for i, candidate := range candidates {
+		// Yield between merges to protect foreground read throughput
+		// This ensures Archivist (reads) and MemTable (writes) have priority
+		if i > 0 {
+			time.Sleep(10 * time.Millisecond)
+		}
+
+		segmentIDs := candidate.SegmentIDs
+
 		// Determine if this is a tail compaction (includes oldest segment)
 		// Safe to drop tombstones if we're compacting the oldest segment
 		dropTombstones := len(segmentIDs) > 0 && segmentIDs[0] == oldestSegID
@@ -1076,6 +1101,10 @@ func (c *Cache) maybeMergeSegments() error {
 			// Avoids accumulating repeated errors for the same underlying issue.
 			return fmt.Errorf("compact segments %v: %w", segmentIDs, err)
 		}
+
+		// Populate Targeted Gravity metrics
+		result.EstimatedInputMB = float64(candidate.EstimatedLiveBytes) / (1024 * 1024)
+		result.ActualOutputMB = float64(result.WriteBytes) / (1024 * 1024)
 
 		// Calculate derived I/O metrics
 		var readAmp, readMBps, writeMBps float64
@@ -1099,11 +1128,12 @@ func (c *Cache) maybeMergeSegments() error {
 			"stale_skipped", result.StaleSkipped,
 			"tombstones_kept", result.TombstonesKept,
 			"tombstones_dropped", result.TombstonesDropped,
+			"tombstones_dissolved", result.TombstonesDissolved,
+			"estimated_input_mb", fmt.Sprintf("%.1f", result.EstimatedInputMB),
+			"actual_output_mb", fmt.Sprintf("%.1f", result.ActualOutputMB),
 			"duration_ms", result.DurationMs,
 			"read_ops", result.ReadOps,
-			"read_bytes", result.ReadBytes,
 			"write_ops", result.WriteOps,
-			"write_bytes", result.WriteBytes,
 			"read_amp", fmt.Sprintf("%.2f", readAmp),
 			"read_mbps", fmt.Sprintf("%.1f", readMBps),
 			"write_mbps", fmt.Sprintf("%.1f", writeMBps),

@@ -108,6 +108,77 @@ func TestSegmentStats_WasteRatio(t *testing.T) {
 	}
 }
 
+func TestCalculateDynamicGravity(t *testing.T) {
+	tests := []struct {
+		name         string
+		physicalSize int64
+		logicalSize  int64
+		expected     int
+	}{
+		{
+			name:         "zero_logical",
+			physicalSize: 1000,
+			logicalSize:  0,
+			expected:     minGravity, // 4
+		},
+		{
+			name:         "zero_physical",
+			physicalSize: 0,
+			logicalSize:  1000,
+			expected:     minGravity, // 4
+		},
+		{
+			name:         "fully_dense",
+			physicalSize: 1000,
+			logicalSize:  1000,
+			expected:     minGravity, // ratio=1.0, gravity=1, clamped to 4
+		},
+		{
+			name:         "50_percent_sparse",
+			physicalSize: 500,
+			logicalSize:  1000,
+			expected:     minGravity, // ratio=0.5, gravity=2, clamped to 4
+		},
+		{
+			name:         "75_percent_sparse",
+			physicalSize: 250,
+			logicalSize:  1000,
+			expected:     4, // ratio=0.25, gravity=4
+		},
+		{
+			name:         "87_percent_sparse",
+			physicalSize: 125,
+			logicalSize:  1000,
+			expected:     8, // ratio=0.125, gravity=8
+		},
+		{
+			name:         "90_percent_sparse",
+			physicalSize: 100,
+			logicalSize:  1000,
+			expected:     10, // ratio=0.1, gravity=10
+		},
+		{
+			name:         "97_percent_sparse",
+			physicalSize: 30,
+			logicalSize:  1000,
+			expected:     maxGravity, // ratio=0.03, gravity=34, clamped to 32
+		},
+		{
+			name:         "99_percent_sparse",
+			physicalSize: 10,
+			logicalSize:  1000,
+			expected:     maxGravity, // ratio=0.01, gravity=100, clamped to 32
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gravity := calculateDynamicGravity(tt.physicalSize, tt.logicalSize)
+			require.Equal(t, tt.expected, gravity)
+		})
+	}
+}
+
 func TestSelectSegmentsForTombstoneCompaction(t *testing.T) {
 	tmpDir := t.TempDir()
 

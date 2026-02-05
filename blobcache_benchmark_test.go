@@ -499,7 +499,7 @@ func BenchmarkEviction_SieveVictimSelection(b *testing.B) {
 
 		// Flush segment when it reaches 2GB
 		if currentSegSize >= segmentSize {
-			idx.IngestBatch(batch)
+			idx.AddSegment(0, batch)
 			currentSegID++
 			currentSegSize = 0
 			batch = batch[:0]
@@ -508,7 +508,7 @@ func BenchmarkEviction_SieveVictimSelection(b *testing.B) {
 
 	// Flush final partial segment
 	if len(batch) > 0 {
-		idx.IngestBatch(batch)
+		idx.AddSegment(0, batch)
 	}
 
 	// Mark some as visited to exercise Sieve skipping logic

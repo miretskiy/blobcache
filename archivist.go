@@ -2,6 +2,7 @@ package blobcache
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -13,18 +14,26 @@ import (
 	"github.com/miretskiy/blobcache/internal/index"
 	"github.com/miretskiy/blobcache/internal/record"
 	"github.com/miretskiy/blobcache/internal/sys"
+	"golang.org/x/time/rate"
 )
 
 // Archivist manages read-only access to persisted segments.
 // It uses the Index Item contract: Offset points to Magic, PhysicalLen = 42 + KeyLen + PhysSize.
 type Archivist struct {
 	config
-	index *index.DurableIndex
-	cache sync.Map // segmentID (uint32) -> *os.File
+	index         *index.DurableIndex
+	cache         sync.Map      // segmentID (uint32) -> *os.File
+	punchLimiter  *rate.Limiter // Rate limiter for hole punch syscalls
 }
 
 func NewArchivist(cfg config, idx *index.DurableIndex) *Archivist {
-	return &Archivist{config: cfg, index: idx}
+	return &Archivist{
+		config: cfg,
+		index:  idx,
+		// Rate limit hole punching to 2000 syscalls/sec with burst of 100.
+		// Protects foreground read throughput from "Metadata Storms" during heavy eviction.
+		punchLimiter: rate.NewLimiter(rate.Limit(2000), 100),
+	}
 }
 
 // Close closes all cached segment mu
@@ -178,7 +187,14 @@ type HoleRange struct {
 // HolePunchRange releases disk space for a pre-coalesced range.
 // This is the batched version of HolePunchBlob, used after CoalesceVictims
 // merges adjacent holes to reduce filesystem journal commits.
-func (a *Archivist) HolePunchRange(segmentID uint32, offset, length int64) (int64, error) {
+//
+// Rate-limited to 2000 syscalls/sec to protect foreground read throughput
+// from "Metadata Storms" during heavy eviction.
+func (a *Archivist) HolePunchRange(ctx context.Context, segmentID uint32, offset, length int64) (int64, error) {
+	// Rate limit to protect foreground reads
+	if err := a.punchLimiter.Wait(ctx); err != nil {
+		return 0, err
+	}
 	sf, err := a.getSegmentFile(segmentID)
 	if err != nil {
 		return 0, err

@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/miretskiy/blobcache/bloom"
 	"github.com/miretskiy/blobcache/internal/record"
 	"github.com/miretskiy/blobcache/internal/xmap"
 	"github.com/stretchr/testify/require"
@@ -19,7 +20,9 @@ func TestSegmentMetadata_Alignment(t *testing.T) {
 }
 
 // writeTestFooter writes a SegmentFooter to a .meta file for testing.
-func writeTestFooter(t *testing.T, path string, segID uint32, entries []record.FooterEntry, maxSeqID uint64) {
+func writeTestFooter(
+		t *testing.T, path string, segID uint32, entries []record.FooterEntry, maxSeqID uint64,
+) {
 	t.Helper()
 
 	footer := record.SegmentFooter{
@@ -181,6 +184,183 @@ func TestPersistence(t *testing.T) {
 	})
 }
 
+// TestHasOlderShadow tests the tombstone dissolution query logic.
+// This is correctness-critical: false negatives could cause Leapfrog Hazard (data resurrection).
+func TestHasOlderShadow(t *testing.T) {
+	tmp := t.TempDir()
+
+	p, err := newPersistence(tmp, 1)
+	require.NoError(t, err)
+	defer p.close()
+
+	// Create test keys
+	keyA := Key{Lo: 0x1111111111111111, Hi: 0xAAAAAAAAAAAAAAAA}
+	keyB := Key{Lo: 0x2222222222222222, Hi: 0xBBBBBBBBBBBBBBBB}
+	keyC := Key{Lo: 0x3333333333333333, Hi: 0xCCCCCCCCCCCCCCCC}
+
+	// Helper to create and register a frozen bloom filter with specific keys
+	registerSegment := func(segID uint32, keys ...Key) {
+		filter := bloom.New(1000, 0.03)
+		for _, k := range keys {
+			filter.AddHash(k)
+		}
+		filter.Freeze()
+		p.registerSnapshot(segID, filter)
+	}
+
+	t.Run("NoSegments", func(t *testing.T) {
+		// With no segments registered, hasOlderShadow should always return false
+		require.False(t, p.hasOlderShadow(keyA, 5))
+		require.False(t, p.hasOlderShadow(keyA, 0))
+	})
+
+	// Register segments: 3 has keyA, 5 has keyB, 7 has keyC
+	registerSegment(3, keyA)
+	registerSegment(5, keyB)
+	registerSegment(7, keyC)
+
+	t.Run("KeyOnlyInOlderSegment", func(t *testing.T) {
+		// keyA is in segment 3
+		// When floor=5, segment 3 is older (3 < 5), so should return true
+		require.True(t, p.hasOlderShadow(keyA, 5))
+
+		// When floor=3, no segment is older (no segment < 3), so should return false
+		require.False(t, p.hasOlderShadow(keyA, 3))
+
+		// When floor=10, segment 3 is older, so should return true
+		require.True(t, p.hasOlderShadow(keyA, 10))
+	})
+
+	t.Run("KeyOnlyInNewerSegment", func(t *testing.T) {
+		// keyC is in segment 7
+		// When floor=5, segments 3 is older (3 < 5) but doesn't contain keyC
+		require.False(t, p.hasOlderShadow(keyC, 5))
+
+		// When floor=7, no segment < 7 contains keyC
+		require.False(t, p.hasOlderShadow(keyC, 7))
+	})
+
+	t.Run("KeyNotInAnySegment", func(t *testing.T) {
+		unknownKey := Key{Lo: 0xDEADBEEF, Hi: 0xCAFEBABE}
+		// Unknown key should not match any segment
+		require.False(t, p.hasOlderShadow(unknownKey, 10))
+		require.False(t, p.hasOlderShadow(unknownKey, 3))
+	})
+
+	t.Run("KeyInMultipleSegments", func(t *testing.T) {
+		// Add keyA to segment 5 as well (key exists in both 3 and 5)
+		registerSegment(5, keyA, keyB) // Overwrite segment 5 filter
+
+		// When floor=5, segment 3 has keyA (3 < 5), so should return true
+		require.True(t, p.hasOlderShadow(keyA, 5))
+
+		// When floor=3, no segment < 3, so should return false
+		require.False(t, p.hasOlderShadow(keyA, 3))
+	})
+
+	t.Run("UnregisterSegment", func(t *testing.T) {
+		// Unregister segment 3
+		p.unregisterSnapshot(3)
+
+		// Now keyA only exists in segment 5
+		// When floor=5, no segment < 5 has keyA anymore
+		require.False(t, p.hasOlderShadow(keyA, 5))
+
+		// Re-register segment 3 for other tests
+		registerSegment(3, keyA)
+	})
+
+	t.Run("UnregisterMultipleSegments", func(t *testing.T) {
+		// Unregister segments 3 and 5
+		p.unregisterSnapshots([]uint32{3, 5})
+
+		// Now only segment 7 remains
+		require.False(t, p.hasOlderShadow(keyA, 10))
+		require.False(t, p.hasOlderShadow(keyB, 10))
+		require.True(t, p.hasOlderShadow(keyC, 10)) // keyC in segment 7, 7 < 10
+
+		// Re-register for cleanup
+		registerSegment(3, keyA)
+		registerSegment(5, keyB)
+	})
+}
+
+// TestSnapshotRegistry tests the segment snapshot lifecycle.
+func TestSnapshotRegistry(t *testing.T) {
+	tmp := t.TempDir()
+
+	p, err := newPersistence(tmp, 1)
+	require.NoError(t, err)
+	defer p.close()
+
+	createFilter := func(keys ...Key) *bloom.Filter {
+		filter := bloom.New(1000, 0.03)
+		for _, k := range keys {
+			filter.AddHash(k)
+		}
+		filter.Freeze()
+		return filter
+	}
+
+	t.Run("RegisterInOrder", func(t *testing.T) {
+		p.registerSnapshot(1, createFilter(Key{Lo: 1}))
+		p.registerSnapshot(2, createFilter(Key{Lo: 2}))
+		p.registerSnapshot(3, createFilter(Key{Lo: 3}))
+
+		p.snapshots.RLock()
+		require.Len(t, p.snapshots.entries, 3)
+		require.Equal(t, uint32(1), p.snapshots.entries[0].ID)
+		require.Equal(t, uint32(2), p.snapshots.entries[1].ID)
+		require.Equal(t, uint32(3), p.snapshots.entries[2].ID)
+		p.snapshots.RUnlock()
+
+		// Cleanup
+		p.unregisterSnapshots([]uint32{1, 2, 3})
+	})
+
+	t.Run("RegisterOutOfOrder", func(t *testing.T) {
+		// Register in reverse order
+		p.registerSnapshot(30, createFilter(Key{Lo: 30}))
+		p.registerSnapshot(10, createFilter(Key{Lo: 10}))
+		p.registerSnapshot(20, createFilter(Key{Lo: 20}))
+
+		p.snapshots.RLock()
+		require.Len(t, p.snapshots.entries, 3)
+		// Should be sorted
+		require.Equal(t, uint32(10), p.snapshots.entries[0].ID)
+		require.Equal(t, uint32(20), p.snapshots.entries[1].ID)
+		require.Equal(t, uint32(30), p.snapshots.entries[2].ID)
+		p.snapshots.RUnlock()
+
+		// Cleanup
+		p.unregisterSnapshots([]uint32{10, 20, 30})
+	})
+
+	t.Run("IdempotentRegistration", func(t *testing.T) {
+		filter1 := createFilter(Key{Lo: 1})
+		filter2 := createFilter(Key{Lo: 2})
+
+		p.registerSnapshot(5, filter1)
+		p.registerSnapshot(5, filter2) // Should update, not duplicate
+
+		p.snapshots.RLock()
+		require.Len(t, p.snapshots.entries, 1)
+		require.Equal(t, uint32(5), p.snapshots.entries[0].ID)
+		// Should be the second filter (updated)
+		require.True(t, p.snapshots.entries[0].SegmentKeys.Test(Key{Lo: 2}))
+		p.snapshots.RUnlock()
+
+		// Cleanup
+		p.unregisterSnapshot(5)
+	})
+
+	t.Run("UnregisterNonexistent", func(t *testing.T) {
+		// Should not panic when unregistering non-existent segment
+		p.unregisterSnapshot(999)
+		p.unregisterSnapshots([]uint32{998, 999})
+	})
+}
+
 func TestDurableIndex(t *testing.T) {
 	tmp := t.TempDir()
 
@@ -211,7 +391,7 @@ func TestDurableIndex(t *testing.T) {
 	require.NoError(t, os.WriteFile(segPath, []byte{}, 0o644))
 
 	// Ingest into RAM
-	idx.IngestBatch(items)
+	idx.AddSegment(0, items)
 
 	// Verify in-memory data
 	item, ok := idx.Get(Key{Lo: 200})

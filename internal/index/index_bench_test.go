@@ -49,7 +49,7 @@ func Benchmark_IndexLookup(b *testing.B) {
 				if end > numKeys {
 					end = numKeys
 				}
-				idx.IngestBatch(items[i:end])
+				idx.AddSegment(0, items[i:end])
 			}
 			b.ReportMetric(float64(numKeys)/time.Since(start).Seconds(), "ingest-keys/sec")
 

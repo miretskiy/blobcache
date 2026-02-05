@@ -42,12 +42,19 @@ type Compactor struct {
 	// Lazily allocated on first use via sys.AllocAligned, reused across compaction cycles.
 	compactBuf []byte
 
-	// segmentFiles caches open O_DIRECT file handles for source segments.
+	// segmentFiles caches open O_DIRECT file handles and sizes for source segments.
 	// Populated during compaction, closed after each Compact() call.
-	segmentFiles map[uint32]*os.File
+	// Caching size avoids repeated Stat() syscalls during aligned reads.
+	segmentFiles map[uint32]segmentFileInfo
 
 	// Knobs provides testing hooks. Set directly in tests: c.Knobs = &CompactorKnobs{...}
 	Knobs *CompactorKnobs
+}
+
+// segmentFileInfo holds a cached segment file handle and its size.
+type segmentFileInfo struct {
+	file *os.File
+	size int64
 }
 
 // NewCompactor creates a Compactor with the given dependencies.
@@ -73,7 +80,7 @@ func NewCompactor(
 		ioFlags:           ioFlags,
 		bufSize:           bufSize,
 		releaseCachedFile: releaseCachedFile,
-		segmentFiles:      make(map[uint32]*os.File),
+		segmentFiles:      make(map[uint32]segmentFileInfo),
 	}
 }
 
@@ -87,12 +94,13 @@ func (c *Compactor) Close() {
 
 // CompactResult contains the outcome of a compaction operation.
 type CompactResult struct {
-	NewSegmentID      uint32   // ID of the newly created segment (0 if nothing written)
-	OldSegmentIDs     []uint32 // IDs of segments that were compacted
-	ItemsCompacted    int      // Number of live items written to new segment
-	TombstonesKept    int      // Number of tombstones preserved
-	TombstonesDropped int      // Number of tombstones garbage collected (tail only)
-	StaleSkipped      int      // Number of stale entries skipped (superseded by newer writes)
+	NewSegmentID        uint32   // ID of the newly created segment (0 if nothing written)
+	OldSegmentIDs       []uint32 // IDs of segments that were compacted
+	ItemsCompacted      int      // Number of live items written to new segment
+	TombstonesKept      int      // Number of tombstones preserved (older shadow exists)
+	TombstonesDropped   int      // Number of tombstones garbage collected (tail only)
+	TombstonesDissolved int      // Number of tombstones dissolved (no older shadow)
+	StaleSkipped        int      // Number of stale entries skipped (superseded by newer writes)
 
 	// I/O stats for bandwidth analysis
 	ReadOps    int   // Number of read operations
@@ -152,11 +160,12 @@ func (c *Compactor) Compact(segmentIDs []uint32, dropTombstones bool) (_ Compact
 	}()
 
 	// Collect items from all segments, checking contiguity as we go
-	toRelocate, tombstones, _, staleCount, err := c.collectItems(segmentIDs)
+	toRelocate, tombstones, _, staleCount, dissolvedCount, err := c.collectItems(segmentIDs)
 	if err != nil {
 		return result, err
 	}
 	result.StaleSkipped = staleCount
+	result.TombstonesDissolved = dissolvedCount
 
 	if len(toRelocate) == 0 && len(tombstones) == 0 {
 		// Nothing to compact, just drop the old segments
@@ -246,19 +255,24 @@ func (c *Compactor) Compact(segmentIDs []uint32, dropTombstones bool) (_ Compact
 
 // collectItems gathers live items and tombstones from the given segments.
 // It validates contiguity as it processes each segment.
-// Returns: live items to relocate, tombstones, max seqID, stale count, error.
-func (c *Compactor) collectItems(segmentIDs []uint32) ([]relocInfo, []index.Item, uint64, int, error) {
+// Tombstones are checked against HasOlderShadow for early dissolution.
+// Returns: live items to relocate, tombstones (to preserve), max seqID, stale count, dissolved count, error.
+func (c *Compactor) collectItems(segmentIDs []uint32) ([]relocInfo, []index.Item, uint64, int, int, error) {
 	var toRelocate []relocInfo
 	var tombstones []index.Item
 	var maxSeqID uint64
 	var staleCount int
+	var dissolvedCount int
 	var prevSegID uint32
+
+	// Floor segment ID (minimum being compacted) for tombstone dissolution decisions
+	floorID := segmentIDs[0]
 
 	for i, segID := range segmentIDs {
 		// Validate ascending order
 		if i > 0 {
 			if segID <= prevSegID {
-				return nil, nil, 0, 0, fmt.Errorf("compaction: segment IDs must be in ascending order, got %d after %d",
+				return nil, nil, 0, 0, 0, fmt.Errorf("compaction: segment IDs must be in ascending order, got %d after %d",
 					segID, prevSegID)
 			}
 
@@ -268,7 +282,7 @@ func (c *Compactor) collectItems(segmentIDs []uint32) ([]relocInfo, []index.Item
 				// This prevents the Leapfrog Hazard where compacting [10, 15] while
 				// segment 12 exists would skip segment 12's data.
 				if err := c.index.VerifyNoSegmentsInRange(prevSegID, segID); err != nil {
-					return nil, nil, 0, 0, err
+					return nil, nil, 0, 0, 0, err
 				}
 			}
 		}
@@ -285,7 +299,15 @@ func (c *Compactor) collectItems(segmentIDs []uint32) ([]relocInfo, []index.Item
 
 		for _, item := range manifest.Items {
 			if item.IsDeleted() {
-				// Preserve tombstones for crash safety
+				// Check if tombstone can be safely dissolved (no older shadow exists)
+				if !c.index.HasOlderShadow(item.Key, floorID) {
+					// No older version exists in any segment before floorID.
+					// Safe to dissolve immediately - remove from RAM index.
+					c.index.Delete(item.Key)
+					dissolvedCount++
+					continue
+				}
+				// Older version may exist - must preserve tombstone
 				tombstones = append(tombstones, item)
 				continue
 			}
@@ -306,7 +328,7 @@ func (c *Compactor) collectItems(segmentIDs []uint32) ([]relocInfo, []index.Item
 		}
 	}
 
-	return toRelocate, tombstones, maxSeqID, staleCount, nil
+	return toRelocate, tombstones, maxSeqID, staleCount, dissolvedCount, nil
 }
 
 // writeCompactedSegment creates the new segment file and writes all live blobs.
@@ -581,15 +603,15 @@ func (c *Compactor) finalFlush(
 }
 
 // readBlobAligned reads a blob into a page-aligned buffer using O_DIRECT.
-// Uses cached segment file handles to avoid opening/closing files for each blob.
+// Uses cached segment file handles and sizes to avoid opening files and Stat() syscalls.
 // Returns the number of blob bytes written to dst[0:].
 func (c *Compactor) readBlobAligned(e index.Item, dst []byte) (int, error) {
 	if int(e.PhysicalLen) > len(dst) {
 		return 0, fmt.Errorf("compaction: dst buffer too small (%d > %d)", e.PhysicalLen, len(dst))
 	}
 
-	// Get or open segment file with O_DIRECT
-	f, err := c.getSegmentFile(e.SegmentID)
+	// Get or open segment file with O_DIRECT (size is cached to avoid Stat() per blob)
+	seg, err := c.getSegmentFile(e.SegmentID)
 	if err != nil {
 		return 0, err
 	}
@@ -598,16 +620,11 @@ func (c *Compactor) readBlobAligned(e index.Item, dst []byte) (int, error) {
 	alignedOff, alignedLen := sys.AlignRange(int64(e.Offset), int(e.PhysicalLen))
 	padding := int64(e.Offset) - alignedOff
 
-	// Check file size - if aligned read would exceed file, use unaligned read
+	// Check cached file size - if aligned read would exceed file, use unaligned read
 	// (handles small test files that are < 4KB)
-	info, err := f.Stat()
-	if err != nil {
-		return 0, fmt.Errorf("compaction: stat segment %d: %w", e.SegmentID, err)
-	}
-
-	if alignedOff+alignedLen > info.Size() {
+	if alignedOff+alignedLen > seg.size {
 		// File too small for aligned read - fall back to exact read
-		n, err := f.ReadAt(dst[:e.PhysicalLen], int64(e.Offset))
+		n, err := seg.file.ReadAt(dst[:e.PhysicalLen], int64(e.Offset))
 		if err != nil {
 			return 0, fmt.Errorf("compaction: pread segment %d: %w", e.SegmentID, err)
 		}
@@ -619,7 +636,7 @@ func (c *Compactor) readBlobAligned(e index.Item, dst []byte) (int, error) {
 	}
 
 	// Perform aligned read
-	n, err := sys.PreadAligned(f, dst[:alignedLen], alignedOff, c.ioFlags)
+	n, err := sys.PreadAligned(seg.file, dst[:alignedLen], alignedOff, c.ioFlags)
 	if err != nil {
 		return 0, fmt.Errorf("compaction: aligned pread segment %d: %w", e.SegmentID, err)
 	}
@@ -636,27 +653,35 @@ func (c *Compactor) readBlobAligned(e index.Item, dst []byte) (int, error) {
 	return int(e.PhysicalLen), nil
 }
 
-// getSegmentFile returns a cached O_DIRECT file handle or opens a new one.
-func (c *Compactor) getSegmentFile(segmentID uint32) (*os.File, error) {
-	if f, ok := c.segmentFiles[segmentID]; ok {
-		return f, nil
+// getSegmentFile returns a cached O_DIRECT file handle and size, or opens a new one.
+// Caches Stat() result to avoid repeated syscalls during aligned reads.
+func (c *Compactor) getSegmentFile(segmentID uint32) (segmentFileInfo, error) {
+	if info, ok := c.segmentFiles[segmentID]; ok {
+		return info, nil
 	}
 
 	path := getSegmentPath(c.basePath, c.shards, segmentID)
 	f, err := sys.OpenFileForRead(path, c.ioFlags)
 	if err != nil {
-		return nil, fmt.Errorf("compaction: open segment %d: %w", segmentID, err)
+		return segmentFileInfo{}, fmt.Errorf("compaction: open segment %d: %w", segmentID, err)
 	}
 
-	c.segmentFiles[segmentID] = f
-	return f, nil
+	stat, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return segmentFileInfo{}, fmt.Errorf("compaction: stat segment %d: %w", segmentID, err)
+	}
+
+	info := segmentFileInfo{file: f, size: stat.Size()}
+	c.segmentFiles[segmentID] = info
+	return info, nil
 }
 
 // closeSegmentFiles closes all cached segment file handles.
 // Called after each compaction to avoid accumulating open files.
 func (c *Compactor) closeSegmentFiles() (retErr error) {
-	for segID, f := range c.segmentFiles {
-		if err := f.Close(); err != nil {
+	for segID, info := range c.segmentFiles {
+		if err := info.file.Close(); err != nil {
 			retErr = errors.Join(retErr, fmt.Errorf("close segment %d: %w", segID, err))
 		}
 		delete(c.segmentFiles, segID)

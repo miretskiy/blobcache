@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/miretskiy/blobcache/base"
+	"github.com/miretskiy/blobcache/bloom"
 	"github.com/miretskiy/blobcache/internal/xmap"
 )
 
@@ -29,13 +30,9 @@ func OpenIndex(basePath string, shards int, initialCapacity int) (*DurableIndex,
 		segments: p,
 	}
 
-	// Load all persisted items into memory
+	// Load all persisted items into memory and register segment snapshots
 	err = p.scanAll(func(m DurableBatch) bool {
-		for _, item := range m.Items {
-			if !item.IsDeleted() {
-				idx.Put(item)
-			}
-		}
+		idx.AddSegment(m.SegmentID, m.Items)
 		return true
 	})
 	if err != nil {
@@ -88,7 +85,9 @@ func (idx *DurableIndex) BlobStats() Stats {
 	return idx.blobs.Stats()
 }
 
-func (idx *DurableIndex) Relocate(k Key, oldSeg, newSeg SegmentID, oldOff, newOff Offset, mode RelocateMode) bool {
+func (idx *DurableIndex) Relocate(
+		k Key, oldSeg, newSeg SegmentID, oldOff, newOff Offset, mode RelocateMode,
+) bool {
 	return idx.blobs.Relocate(k, oldSeg, newSeg, oldOff, newOff, mode)
 }
 
@@ -120,12 +119,24 @@ func (idx *DurableIndex) GetSegmentManifest(segmentID uint32) (DurableBatch, boo
 	return fullManifest, true
 }
 
-// IngestBatch adds a batch of items to the RAM index (RAM-only operation).
+// AddSegment registers a new segment with its items.
+// Creates a frozen Bloom filter snapshot (for tombstone dissolution queries)
+// and ingests live items into the RAM index.
 //
 // Persistence is handled separately via .meta files:
 //   - During flush: WriteFooter writes the .meta file before this is called
 //   - During recovery: .meta files are read and items passed to this method
-func (idx *DurableIndex) IngestBatch(items []Item) {
+func (idx *DurableIndex) AddSegment(segmentID uint32, items []Item) {
+	// Create frozen Bloom filter snapshot from ALL items (including deleted).
+	// This enables hasOlderShadow queries for tombstone dissolution.
+	filter := bloom.New(32_000, 0.03) // 32k items, 3% FPR (~29KB)
+	for _, item := range items {
+		filter.AddHash(item.Key)
+	}
+	filter.Freeze()
+	idx.segments.registerSnapshot(segmentID, filter)
+
+	// Ingest all items into RAM index (including tombstones for proper Delete tracking)
 	for _, item := range items {
 		idx.Put(item)
 	}
@@ -246,7 +257,38 @@ type DurableStats struct {
 // DropSegment deletes the .meta file for a segment without touching RAM.
 // Used after compaction when segment data has been fully relocated to a new segment.
 func (idx *DurableIndex) DropSegment(segID uint32) error {
+	idx.segments.unregisterSnapshot(segID)
 	return idx.segments.dropSegment(segID)
+}
+
+// DropSegments removes multiple segments atomically.
+// More efficient than multiple DropSegment calls when dropping merged segments.
+// Stops on first error.
+func (idx *DurableIndex) DropSegments(segIDs []uint32) error {
+	idx.segments.unregisterSnapshots(segIDs)
+	for _, segID := range segIDs {
+		if err := idx.segments.dropSegment(segID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// RegisterSegmentSnapshot registers a frozen Bloom filter for a segment.
+// Called after segment flush completes successfully.
+// The filter must be Freeze()'d before registration.
+func (idx *DurableIndex) RegisterSegmentSnapshot(segID uint32, filter *bloom.Filter) {
+	idx.segments.registerSnapshot(segID, filter)
+}
+
+// HasOlderShadow checks if any segment with ID < floorID might contain the key.
+// Returns true if any older segment's Bloom filter tests positive.
+//
+// This is the core tombstone dissolution query:
+//   - If true: tombstone MUST be preserved (older version may exist)
+//   - If false: tombstone can be safely dissolved (no older version)
+func (idx *DurableIndex) HasOlderShadow(key Key, floorID uint32) bool {
+	return idx.segments.hasOlderShadow(key, floorID)
 }
 
 // SegmentMetaShard returns the xmap shard for a given segment ID.

@@ -3,6 +3,7 @@ package blobcache
 import (
 	"bytes"
 	"cmp"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -652,9 +653,9 @@ type Batcher interface {
 	PutBatch(segID uint32, items []index.Item, maxSeqID uint64) error
 }
 
-func (c *Cache) PutBatch(_ uint32, items []index.Item, _ uint64) error {
-	// Phase 1: Ingest into Index
-	c.index.IngestBatch(items)
+func (c *Cache) PutBatch(segID uint32, items []index.Item, _ uint64) error {
+	// Phase 1: Ingest into Index (also registers segment snapshot for tombstone dissolution)
+	c.index.AddSegment(segID, items)
 
 	// Phase 2: Update size tracking (using PhysicalLen = on-disk size)
 	var addedBytes int64
@@ -997,7 +998,7 @@ func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
 	// (few large contiguous ranges), significantly reducing metadata overhead.
 	c.reclaimBuf = CoalesceVictims(victims, c.reclaimBuf[:0])
 	for _, r := range c.reclaimBuf {
-		reclaimed, _ := c.archivist.HolePunchRange(r.SegmentID, r.Offset, r.Length)
+		reclaimed, _ := c.archivist.HolePunchRange(context.Background(), r.SegmentID, r.Offset, r.Length)
 		physicallyReclaimed += reclaimed
 	}
 

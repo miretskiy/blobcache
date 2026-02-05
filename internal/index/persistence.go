@@ -8,11 +8,13 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/miretskiy/blobcache/bloom"
 	"github.com/miretskiy/blobcache/internal/record"
 	"github.com/miretskiy/blobcache/internal/sys"
 	"github.com/miretskiy/blobcache/internal/xmap"
@@ -92,6 +94,15 @@ type metaFile struct {
 	footerBlockSize int64 // Size of the footer block (tombstones start after this)
 }
 
+// segmentSnapshot represents a sealed segment with its frozen Bloom filter.
+// The filter is a "frozen snapshot" of the segment's physical content at creation time.
+// It represents what keys were ever written to the segment, regardless of later deletions.
+// This immutability is critical for correct tombstone dissolution decisions.
+type segmentSnapshot struct {
+	ID          uint32
+	SegmentKeys *bloom.Filter // Frozen filter, ~29KB at 32k items / 3% FPR
+}
+
 // persistence manages all .meta files for durable segment metadata storage.
 type persistence struct {
 	basePath string
@@ -112,6 +123,14 @@ type persistence struct {
 	//
 	// Type params: V=SegmentMetadata (value in map), E=Pad32 (padding for alignment)
 	segmentMeta *xmap.Map[SegmentMetadata, xmap.Pad32]
+
+	// Per-segment Bloom filters for tombstone dissolution decisions.
+	// Used by HasOlderShadow() to determine if a key might exist in older segments.
+	// Filters are "frozen snapshots" representing physical segment content at creation.
+	snapshots struct {
+		sync.RWMutex
+		entries []segmentSnapshot // Sorted by ID ascending for binary search
+	}
 }
 
 func newPersistence(basePath string, shards int) (*persistence, error) {
@@ -797,6 +816,109 @@ func (p *persistence) compactTombstones(segID uint32, onTombstone TombstoneFn) e
 	}
 
 	return nil
+}
+
+// --- Segment Snapshot Registry ---
+
+// registerSnapshot adds a segment's frozen Bloom filter to the registry.
+// Called after segment flush completes successfully.
+// The filter must be Freeze()'d before registration.
+func (p *persistence) registerSnapshot(segID uint32, filter *bloom.Filter) {
+	p.snapshots.Lock()
+	defer p.snapshots.Unlock()
+
+	entry := segmentSnapshot{ID: segID, SegmentKeys: filter}
+
+	// Fast path: append at end (common case - segments created in order)
+	if len(p.snapshots.entries) == 0 || p.snapshots.entries[len(p.snapshots.entries)-1].ID < segID {
+		p.snapshots.entries = append(p.snapshots.entries, entry)
+		return
+	}
+
+	// Binary search for insertion point (rare case: out-of-order registration)
+	idx := sort.Search(len(p.snapshots.entries), func(i int) bool {
+		return p.snapshots.entries[i].ID >= segID
+	})
+
+	// Check for duplicate (idempotent registration)
+	if idx < len(p.snapshots.entries) && p.snapshots.entries[idx].ID == segID {
+		p.snapshots.entries[idx].SegmentKeys = filter // Update existing
+		return
+	}
+
+	// Insert at idx
+	p.snapshots.entries = append(p.snapshots.entries, segmentSnapshot{})
+	copy(p.snapshots.entries[idx+1:], p.snapshots.entries[idx:])
+	p.snapshots.entries[idx] = entry
+}
+
+// unregisterSnapshot removes a segment from the registry.
+// Called after compaction merges segments into a new one.
+func (p *persistence) unregisterSnapshot(segID uint32) {
+	p.snapshots.Lock()
+	defer p.snapshots.Unlock()
+
+	idx := sort.Search(len(p.snapshots.entries), func(i int) bool {
+		return p.snapshots.entries[i].ID >= segID
+	})
+
+	if idx < len(p.snapshots.entries) && p.snapshots.entries[idx].ID == segID {
+		p.snapshots.entries = append(p.snapshots.entries[:idx], p.snapshots.entries[idx+1:]...)
+	}
+}
+
+// unregisterSnapshots removes multiple segments from the registry atomically.
+// More efficient than multiple unregisterSnapshot calls when dropping merged segments.
+func (p *persistence) unregisterSnapshots(segIDs []uint32) {
+	if len(segIDs) == 0 {
+		return
+	}
+
+	p.snapshots.Lock()
+	defer p.snapshots.Unlock()
+
+	// Build lookup set for O(1) membership checks
+	toRemove := make(map[uint32]struct{}, len(segIDs))
+	for _, id := range segIDs {
+		toRemove[id] = struct{}{}
+	}
+
+	// Filter in place - preserves sorted order
+	n := 0
+	for _, entry := range p.snapshots.entries {
+		if _, remove := toRemove[entry.ID]; !remove {
+			p.snapshots.entries[n] = entry
+			n++
+		}
+	}
+	p.snapshots.entries = p.snapshots.entries[:n]
+}
+
+// hasOlderShadow checks if any segment with ID < floorID might contain the key.
+// Returns true if any older segment's Bloom filter tests positive.
+//
+// This is the core tombstone dissolution query:
+//   - If true: tombstone MUST be preserved (older version may exist)
+//   - If false: tombstone can be safely dissolved (no older version)
+//
+// Thread-safe for concurrent reads.
+func (p *persistence) hasOlderShadow(key Key, floorID uint32) bool {
+	p.snapshots.RLock()
+	defer p.snapshots.RUnlock()
+
+	// Binary search for first segment >= floorID
+	floorIdx := sort.Search(len(p.snapshots.entries), func(i int) bool {
+		return p.snapshots.entries[i].ID >= floorID
+	})
+
+	// Check all segments before floorIdx (ID < floorID)
+	for i := 0; i < floorIdx; i++ {
+		if p.snapshots.entries[i].SegmentKeys.Test(key) {
+			return true // Bloom says "maybe" - must preserve tombstone
+		}
+	}
+
+	return false // No older shadow - safe to dissolve
 }
 
 // close closes all open .meta file handles and flushes buffers.

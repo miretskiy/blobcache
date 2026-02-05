@@ -23,6 +23,7 @@ require (
 	github.com/tklauser/numcpus v0.6.1 // indirect
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
 	github.com/zhangyunhao116/fastrand v0.3.0 // indirect
+	golang.org/x/time v0.14.0 // indirect
 )
 
 require (

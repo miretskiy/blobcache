@@ -1039,20 +1039,43 @@ func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
 		delete(c.segmentDeleteBuf, segID) // Clear for reuse
 	}
 
-	// 3. RECLAMATION PHASE
-	// Coalesce adjacent holes to reduce filesystem journal commits by ~98%.
-	// This turns "Swiss cheese" (thousands of tiny holes) into "stripes"
-	// (few large contiguous ranges), significantly reducing metadata overhead.
+	// 3. RECLAMATION PHASE - Deferred Hole Punching
+	// Instead of punching every small hole immediately, we only punch segments
+	// whose DirtyBytes exceed the threshold (10% of WriteBufferSize). This
+	// transforms thousands of small metadata updates into fewer large "extent trims",
+	// reducing filesystem journal contention.
+	//
+	// Still coalesce for efficiency - but only punch dirty segments.
 	c.reclaimBuf = CoalesceVictims(victims, c.reclaimBuf[:0])
+
+	// Deferred punching threshold: 10% of segment size
+	dirtyThreshold := c.WriteBufferSize / 10
+	dirtySegments := c.index.GetDirtySegments(dirtyThreshold)
+
+	// Build set of segments that are dirty enough to punch
+	dirtySet := make(map[uint32]struct{}, len(dirtySegments))
+	for _, ds := range dirtySegments {
+		dirtySet[ds.ID] = struct{}{}
+	}
+
+	var syscallCount int
 	for _, r := range c.reclaimBuf {
-		reclaimed, _ := c.archivist.HolePunchRange(context.Background(), r.SegmentID, r.Offset, r.Length)
-		physicallyReclaimed += reclaimed
+		// Only punch if this segment crossed the dirty threshold
+		if _, dirty := dirtySet[r.SegmentID]; dirty {
+			reclaimed, _ := c.archivist.HolePunchRange(context.Background(), r.SegmentID, r.Offset, r.Length)
+			physicallyReclaimed += reclaimed
+			syscallCount++
+		}
+	}
+
+	// Reset DirtyBytes for segments we punched
+	for segID := range dirtySet {
+		c.index.ResetDirtyBytes(segID)
 	}
 
 	// 4. METRICS & MAINTENANCE
 	c.approxSize.Add(-evictedBytes)
 	evictedCount := len(victims)
-	syscallCount := len(c.reclaimBuf)
 
 	// Calculate batching efficiency: higher = more syscalls saved
 	var batchEfficiency float64

@@ -45,8 +45,9 @@ const (
 	minGravity = 4
 
 	// maxGravity is the maximum number of segments to merge (cap).
-	// Prevents excessive lock hold times during compaction.
-	maxGravity = 64
+	// Elastic window: at ratio 0.40 ("death zone"), gravity expands to bridge gaps
+	// between sparse segments, effectively "healing" the physical layout.
+	maxGravity = 256
 
 	// maxOutputMultiplier caps output size at 2x target to prevent "mega-segments".
 	maxOutputMultiplier = 2.0
@@ -209,18 +210,19 @@ func (c *Cache) selectSegmentsForMerge(targetOutputSize int64, minRangeSize int)
 
 // calculateDynamicGravity computes the minimum segment count based on system sparseness.
 //
-// The "gravity" increases as the system becomes sparser:
+// The "gravity" increases as the system becomes sparser (elastic window):
 //   - At 50% sparse (ratio=0.5): gravity = ceil(1/0.5) = 2, clamped to 4
 //   - At 75% sparse (ratio=0.25): gravity = ceil(1/0.25) = 4
 //   - At 87.5% sparse (ratio=0.125): gravity = ceil(1/0.125) = 8
 //   - At 97% sparse (ratio=0.03): gravity = ceil(1/0.03) = 34
-//   - At 99% sparse (ratio=0.01): gravity = ceil(1/0.01) = 100, clamped to 64
+//   - At 99% sparse (ratio=0.01): gravity = ceil(1/0.01) = 100
+//   - At 99.6% sparse (ratio=0.004): gravity = ceil(1/0.004) = 250, clamped to 256
 //
 // Parameters:
 //   - physicalSize: Actual disk usage (from stat or approxSize after hole punching)
 //   - logicalSize: Tracked logical size (sum of item.PhysicalLen)
 //
-// Returns a value between minGravity (4) and maxGravity (64).
+// Returns a value between minGravity (4) and maxGravity (256).
 func calculateDynamicGravity(physicalSize, logicalSize int64) int {
 	if logicalSize <= 0 || physicalSize <= 0 {
 		return minGravity
@@ -231,8 +233,9 @@ func calculateDynamicGravity(physicalSize, logicalSize int64) int {
 
 	// Invert to get gravity: sparser systems need more segments to form dense output
 	// Protect against division by zero and very small ratios
-	if ratio < 0.01 {
-		ratio = 0.01
+	// At ratio=0.004 (99.6% sparse), gravity = 250 (near maxGravity=256)
+	if ratio < 0.004 {
+		ratio = 0.004
 	}
 
 	gravity := int(1.0/ratio + 0.999) // Ceiling

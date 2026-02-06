@@ -73,6 +73,7 @@ type SegmentMetadata struct {
 	TombstoneCount int32
 	LiveItemCount  int32
 	LiveBytes      int64 // Sum of PhysicalLen for live (non-deleted) items
+	DirtyBytes     int64 // Accumulated waste since last hole punch (deferred reclamation)
 
 	// SegmentKeys is a frozen Bloom filter snapshot of all keys written to this segment.
 	// IMPORTANT: This is immutable after creation - it represents the physical content
@@ -948,6 +949,7 @@ func (p *persistence) updateSegmentOnDelete(segID uint32, deletedCount int32, de
 	entry.TombstoneCount += deletedCount
 	entry.LiveItemCount -= deletedCount
 	entry.LiveBytes -= deletedBytes
+	entry.DirtyBytes += deletedBytes // Accumulate for deferred hole punching
 
 	// Track when a segment crosses the tombstone threshold
 	if !wasAboveTombstoneThreshold && entry.TombstoneCount >= TombstoneCompactionThreshold {
@@ -1050,6 +1052,43 @@ func (p *persistence) getMergeCompactionCandidates(maxEligibleID uint32) []Spars
 	})
 
 	return candidates
+}
+
+// DirtySegment represents a segment with accumulated waste ready for hole punching.
+type DirtySegment struct {
+	ID         uint32
+	DirtyBytes int64
+}
+
+// getDirtySegments returns segments whose DirtyBytes exceed the threshold.
+// Used for deferred hole punching to batch many small deletes into fewer large punches.
+//
+// The threshold is typically 10% of segment size - punching smaller amounts
+// isn't worth the filesystem journal overhead.
+func (p *persistence) getDirtySegments(threshold int64) []DirtySegment {
+	p.segments.RLock()
+	defer p.segments.RUnlock()
+
+	var dirty []DirtySegment
+	for _, entry := range p.segments.sorted {
+		if entry.DirtyBytes >= threshold {
+			dirty = append(dirty, DirtySegment{
+				ID:         entry.ID,
+				DirtyBytes: entry.DirtyBytes,
+			})
+		}
+	}
+	return dirty
+}
+
+// resetDirtyBytes clears the DirtyBytes counter for a segment after hole punching.
+func (p *persistence) resetDirtyBytes(segID uint32) {
+	p.segments.Lock()
+	defer p.segments.Unlock()
+
+	if entry, ok := p.segments.byID[segID]; ok {
+		entry.DirtyBytes = 0
+	}
 }
 
 // hasOlderShadow checks if any segment with ID < floorID might contain the key.

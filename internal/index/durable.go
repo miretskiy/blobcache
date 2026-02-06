@@ -349,6 +349,17 @@ func (idx *DurableIndex) GetMergeCompactionCandidates(maxEligibleID uint32) []Sp
 	return idx.segments.getMergeCompactionCandidates(maxEligibleID)
 }
 
+// GetDirtySegments returns segments whose DirtyBytes exceed the threshold.
+// Used for deferred hole punching - batch many small deletes into fewer large punches.
+func (idx *DurableIndex) GetDirtySegments(threshold int64) []DirtySegment {
+	return idx.segments.getDirtySegments(threshold)
+}
+
+// ResetDirtyBytes clears the DirtyBytes counter for a segment after hole punching.
+func (idx *DurableIndex) ResetDirtyBytes(segID uint32) {
+	idx.segments.resetDirtyBytes(segID)
+}
+
 // CompactTombstones merges the tombstone incremental log into the segment manifest.
 // The onTombstone callback is invoked for each tombstone, allowing the caller to
 // perform I/O operations (e.g., hole punching) before the metadata is updated.

@@ -33,7 +33,7 @@ func TestCompactor_LeapfrogHazard(t *testing.T) {
 	segIDs := &segmentIDProvider{}
 	segIDs.counter.Store(100)
 
-	c := NewCompactor(idx, segIDs, tmpDir, 0, sys.SyncNone, 64<<20, archivist.DropSegmentCache)
+	c := NewCompactor(idx, segIDs, tmpDir, 0, sys.SyncNone, archivist.DropSegmentCache)
 
 	// Case 1: Gap with segment present - should fail
 	// Create segment 2 (exists in gap between 1 and 3)
@@ -71,7 +71,7 @@ func TestCompactor_ContiguityValidation(t *testing.T) {
 	segIDs := &segmentIDProvider{}
 	segIDs.counter.Store(100)
 
-	c := NewCompactor(idx, segIDs, tmpDir, 0, sys.SyncNone, 64<<20, archivist.DropSegmentCache)
+	c := NewCompactor(idx, segIDs, tmpDir, 0, sys.SyncNone, archivist.DropSegmentCache)
 
 	testCases := []struct {
 		name      string
@@ -117,7 +117,7 @@ func TestCompactor_EmptySegments(t *testing.T) {
 
 	segIDs := &segmentIDProvider{}
 
-	c := NewCompactor(idx, segIDs, tmpDir, 0, sys.SyncNone, 64<<20, archivist.DropSegmentCache)
+	c := NewCompactor(idx, segIDs, tmpDir, 0, sys.SyncNone, archivist.DropSegmentCache)
 
 	// Ingest empty batches to create segment manifests with no items
 	idx.AddSegment(0, nil)
@@ -147,7 +147,7 @@ func TestCompactor_StalenessFiltering(t *testing.T) {
 	segIDs := &segmentIDProvider{}
 	sourceSegID := segIDs.NextSegmentID() // Allocate source segment ID
 
-	c := NewCompactor(idx, segIDs, tmpDir, 0, sys.SyncNone, 64<<20, archivist.DropSegmentCache)
+	c := NewCompactor(idx, segIDs, tmpDir, 0, sys.SyncNone, archivist.DropSegmentCache)
 
 	key1 := index.Key{Lo: 1, Hi: 1}
 	key2 := index.Key{Lo: 2, Hi: 2}
@@ -240,7 +240,7 @@ func TestCompactor_TombstonePreservation(t *testing.T) {
 	writeTestMeta(t, SegmentMetaPath(segPath3), seg3ID, items3)
 	idx.AddSegment(seg3ID, items3)
 
-	c := NewCompactor(idx, segIDs, tmpDir, 0, sys.SyncNone, 64<<20, archivist.DropSegmentCache)
+	c := NewCompactor(idx, segIDs, tmpDir, 0, sys.SyncNone, archivist.DropSegmentCache)
 
 	// Compact only segment 3 — segment 1 is the older shadow
 	result, err := c.Compact([]uint32{seg3ID}, false)
@@ -286,7 +286,7 @@ func TestCompactor_TombstoneDissolution(t *testing.T) {
 		segIDs := &segmentIDProvider{}
 		sourceSegID := segIDs.NextSegmentID()
 
-		c := NewCompactor(idx, segIDs, tmpDir, 0, sys.SyncNone, 64<<20, archivist.DropSegmentCache)
+		c := NewCompactor(idx, segIDs, tmpDir, 0, sys.SyncNone, archivist.DropSegmentCache)
 
 		// Create source segment with one live item and one tombstone
 		keyLive := index.Key{Lo: 1, Hi: 1}
@@ -378,7 +378,7 @@ func TestCompactor_TombstoneDissolution(t *testing.T) {
 		idx.AddSegment(seg5ID, items5)
 		idx.MarkDeleted(keyDeleted)
 
-		c := NewCompactor(idx, segIDs, tmpDir, 0, sys.SyncNone, 64<<20, archivist.DropSegmentCache)
+		c := NewCompactor(idx, segIDs, tmpDir, 0, sys.SyncNone, archivist.DropSegmentCache)
 
 		// Compact only segment 5 - segment 3 is the older shadow
 		result, err := c.Compact([]uint32{seg5ID}, false)
@@ -463,7 +463,7 @@ func TestCompactor_TombstoneDissolution(t *testing.T) {
 		idx.AddSegment(seg5ID, items5)
 		idx.MarkDeleted(keyDeleted)
 
-		c := NewCompactor(idx, segIDs, tmpDir, 0, sys.SyncNone, 64<<20, archivist.DropSegmentCache)
+		c := NewCompactor(idx, segIDs, tmpDir, 0, sys.SyncNone, archivist.DropSegmentCache)
 
 		// Compact segments [3,4,5] - floor=3, no segment < 3 exists
 		result, err := c.Compact([]uint32{seg3ID, seg4ID, seg5ID}, false)
@@ -506,7 +506,7 @@ func TestCompactor_TombstoneDropping(t *testing.T) {
 	segIDs := &segmentIDProvider{}
 	sourceSegID := segIDs.NextSegmentID()
 
-	c := NewCompactor(idx, segIDs, tmpDir, 0, sys.SyncNone, 64<<20, archivist.DropSegmentCache)
+	c := NewCompactor(idx, segIDs, tmpDir, 0, sys.SyncNone, archivist.DropSegmentCache)
 
 	key1 := index.Key{Lo: 1, Hi: 1}
 	keyDeleted := index.Key{Lo: 2, Hi: 2}
@@ -594,7 +594,7 @@ func TestCompactor_ConcurrentWriteRace(t *testing.T) {
 	writeTestMeta(t, SegmentMetaPath(segPath), sourceSegID, items)
 	idx.AddSegment(0, items)
 
-	c := NewCompactor(idx, segIDs, tmpDir, 0, sys.SyncNone, 64<<20, archivist.DropSegmentCache)
+	c := NewCompactor(idx, segIDs, tmpDir, 0, sys.SyncNone, archivist.DropSegmentCache)
 
 	// Use testing knobs to inject concurrent write during relocation
 	c.Knobs = &CompactorKnobs{
@@ -688,14 +688,11 @@ func TestCompactor_XLBlobHandling(t *testing.T) {
 	writeTestMeta(t, SegmentMetaPath(segPath), sourceSegID, items)
 	idx.AddSegment(0, items)
 
-	// Create compactor with tiny buffer (8KB) - smaller than the XL blob (32KB)
-	tinyBufSize := 8 * 1024
-	c := NewCompactor(idx, segIDs, tmpDir, 0, sys.SyncNone, tinyBufSize, archivist.DropSegmentCache)
+	c := NewCompactor(idx, segIDs, tmpDir, 0, sys.SyncNone, archivist.DropSegmentCache)
 	defer c.Close()
 
-	// This should succeed - compactor must handle XL blobs that exceed buffer size
 	result, err := c.Compact([]uint32{sourceSegID}, false)
-	require.NoError(t, err, "compaction should handle XL blobs larger than buffer")
+	require.NoError(t, err, "compaction should handle XL blobs")
 	require.Equal(t, 3, result.ItemsCompacted, "all three blobs should be compacted")
 
 	// Verify all items are accessible in the new segment

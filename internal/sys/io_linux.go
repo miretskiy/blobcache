@@ -105,3 +105,14 @@ func PreadAligned(f *os.File, buf []byte, offset int64, flags OpenFlag) (int, er
 	}
 	return f.ReadAt(buf, offset)
 }
+
+// CopyFileRange copies data between file descriptors using the kernel's
+// copy_file_range(2) syscall. On XFS/btrfs with reflinks, this is a
+// metadata-only operation with zero physical I/O. On other filesystems,
+// the kernel performs a server-side copy without data entering userspace.
+//
+// srcOff and dstOff are updated by the kernel to reflect bytes copied.
+// May copy fewer bytes than requested; caller should loop until done.
+func CopyFileRange(srcFile, dstFile *os.File, srcOff, dstOff *int64, length int) (int, error) {
+	return unix.CopyFileRange(int(srcFile.Fd()), srcOff, int(dstFile.Fd()), dstOff, length, 0)
+}

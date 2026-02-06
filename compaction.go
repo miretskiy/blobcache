@@ -32,12 +32,11 @@ type Compactor struct {
 	basePath          string
 	shards            int
 	ioFlags           sys.OpenFlag
-	bufSize           int
 	releaseCachedFile SegmentCacheReleaseFn
 
-	// compactBuf is a reusable aligned buffer for O_DIRECT compaction I/O.
-	// Lazily allocated on first use via sys.AllocAligned, reused across compaction cycles.
-	compactBuf []byte
+	// headerBuf is a small aligned buffer (one block) for reading record headers.
+	// Lazily allocated on first use, reused across compaction cycles.
+	headerBuf []byte
 
 	// segmentFiles caches open O_DIRECT file handles and sizes for source segments.
 	// Populated during compaction, closed after each Compact() call.
@@ -55,7 +54,6 @@ type segmentFileInfo struct {
 }
 
 // NewCompactor creates a Compactor with the given dependencies.
-// bufSize must be positive (typically WriteBufferSize).
 // releaseCachedFile is called before deleting segment files to release cached handles.
 func NewCompactor(
 	idx *index.DurableIndex,
@@ -63,19 +61,14 @@ func NewCompactor(
 	basePath string,
 	shards int,
 	ioFlags sys.OpenFlag,
-	bufSize int,
 	releaseCachedFile SegmentCacheReleaseFn,
 ) *Compactor {
-	if bufSize <= 0 {
-		panic("NewCompactor: bufSize must be positive")
-	}
 	return &Compactor{
 		index:             idx,
 		segIDs:            segIDs,
 		basePath:          basePath,
 		shards:            shards,
 		ioFlags:           ioFlags,
-		bufSize:           bufSize,
 		releaseCachedFile: releaseCachedFile,
 		segmentFiles:      make(map[uint32]segmentFileInfo),
 	}
@@ -83,9 +76,9 @@ func NewCompactor(
 
 // Close releases resources held by the Compactor.
 func (c *Compactor) Close() {
-	if c.compactBuf != nil {
-		sys.FreeAligned(c.compactBuf)
-		c.compactBuf = nil
+	if c.headerBuf != nil {
+		sys.FreeAligned(c.headerBuf)
+		c.headerBuf = nil
 	}
 }
 
@@ -104,6 +97,8 @@ type CompactResult struct {
 	ReadBytes  int64 // Total bytes read from old segments
 	WriteOps   int   // Number of write operations
 	WriteBytes int64 // Total bytes written to new segment
+	SpliceOps  int   // Number of copy_file_range calls (zero-copy)
+	SpliceBytes int64 // Bytes copied via copy_file_range (not counted in ReadBytes)
 	DurationMs int64 // Total compaction duration in milliseconds
 
 	// Targeted Gravity metrics
@@ -336,328 +331,6 @@ func (c *Compactor) collectItems(segmentIDs []uint32) ([]relocInfo, []index.Item
 	return toRelocate, tombstones, maxSeqID, staleCount, dissolvedCount, nil
 }
 
-// writeCompactedSegment creates the new segment file and writes all live blobs.
-// Returns footer entries for the .meta file.
-//
-// Uses O_DIRECT for both reads and writes to avoid page cache pollution.
-// Reads use aligned-read-then-shift via readBlobAligned (caches segment file handles).
-// Writes accumulate in an aligned buffer and flush in 4KB chunks.
-func (c *Compactor) writeCompactedSegment(
-	newSegID uint32,
-	toRelocate []relocInfo,
-	result *CompactResult,
-) ([]record.FooterEntry, error) {
-	// Lazy-allocate compaction buffer on first use
-	if c.compactBuf == nil {
-		c.compactBuf = sys.AllocAligned(c.bufSize)
-	}
-	buf := c.compactBuf
-
-	// Calculate total size for fallocate
-	totalSize := int64(record.FileHeaderSize)
-	for i := range toRelocate {
-		totalSize += int64(toRelocate[i].item.PhysicalLen)
-	}
-	allocSize := (totalSize + sys.BlockMask) &^ sys.BlockMask
-
-	// Create segment file with O_DIRECT
-	segPath := getSegmentPath(c.basePath, c.shards, newSegID)
-	f, err := sys.CreateAndAllocateFile(segPath, c.ioFlags, allocSize)
-	if err != nil {
-		return nil, fmt.Errorf("compaction: create segment: %w", err)
-	}
-
-	bufPos := 0      // Bytes in buffer (not yet written to disk)
-	diskWritten := 0 // Bytes written to disk
-	footerEntries := make([]record.FooterEntry, 0, len(toRelocate))
-
-	// Copy file header into buffer
-	copy(buf[bufPos:], record.FileHeaderBytes[:])
-	bufPos += record.FileHeaderSize
-
-	// Process each blob using sliding window read/write
-	for i := range toRelocate {
-		ri := &toRelocate[i]
-		blobLen := int(ri.item.PhysicalLen)
-
-		// Calculate aligned read size needed for this blob
-		_, alignedReadSize := sys.AlignRange(0, blobLen+sys.BlockSize)
-
-		// Check if this is an XL blob (too large to fit in buffer even when empty)
-		isXL := int(alignedReadSize) > len(buf)
-
-		if isXL {
-			// XL blob: flush pending data, then read/write directly with temp buffer
-			xlRes, err := c.writeXLBlob(f, buf, bufPos, ri, diskWritten, newSegID, result)
-			if err != nil {
-				return nil, errors.Join(err, f.Close())
-			}
-			// Update position tracking
-			diskWritten += xlRes.flushWritten + xlRes.xlWritten
-			bufPos = 0 // Buffer was flushed
-
-			footerEntries = append(footerEntries, record.FooterEntry{
-				Key:          ri.item.Key,
-				Pos:          int64(ri.item.Offset),
-				LogicalSize:  xlRes.hdr.LogicalSize,
-				PhysicalSize: xlRes.hdr.PhysicalSize,
-				SeqID:        xlRes.hdr.SeqID,
-				Flags:        xlRes.hdr.Flags,
-				KeyLen:       xlRes.hdr.KeyLen,
-			})
-			result.ItemsCompacted++
-			continue
-		}
-
-		// Normal blob: use sliding window approach
-		// Ensure buffer has room for: current data + aligned landing zone + blob
-		landingZone := (bufPos + sys.BlockMask) &^ sys.BlockMask
-
-		if landingZone+int(alignedReadSize) > len(buf) {
-			// Flush full blocks to make room
-			written, err := c.flushFullBlocks(f, buf, bufPos)
-			if err != nil {
-				return nil, errors.Join(err, f.Close())
-			}
-			if written > 0 {
-				result.WriteOps++
-				result.WriteBytes += int64(written)
-				diskWritten += written
-			}
-			bufPos -= written // Shift position after flush moved tail to front
-			// Recalculate landing zone after flush
-			landingZone = (bufPos + sys.BlockMask) &^ sys.BlockMask
-		}
-
-		// Perform aligned read into landing zone; data is shifted to dst[0:] by readBlobAligned
-		n, err := c.readBlobAligned(ri.item, buf[landingZone:])
-		if err != nil {
-			return nil, errors.Join(err, f.Close())
-		}
-		result.ReadOps++
-		result.ReadBytes += int64(n)
-
-		// Parse header to extract footer metadata
-		hdr, err := record.DecodeHeader(buf[landingZone : landingZone+record.HeaderSize])
-		if err != nil {
-			return nil, errors.Join(
-				fmt.Errorf("compaction: decode header from segment %d: %w", ri.oldSeg, err),
-				f.Close(),
-			)
-		}
-
-		// Shift from landing zone to bufPos to keep data dense
-		if landingZone > bufPos {
-			copy(buf[bufPos:], buf[landingZone:landingZone+n])
-		}
-
-		// Update item with new location (disk position + buffer position)
-		ri.item.SegmentID = newSegID
-		ri.item.Offset = uint32(diskWritten + bufPos)
-
-		// Build footer entry
-		footerEntries = append(footerEntries, record.FooterEntry{
-			Key:          ri.item.Key,
-			Pos:          int64(diskWritten + bufPos),
-			LogicalSize:  hdr.LogicalSize,
-			PhysicalSize: hdr.PhysicalSize,
-			SeqID:        hdr.SeqID,
-			Flags:        hdr.Flags,
-			KeyLen:       hdr.KeyLen,
-		})
-
-		bufPos += n
-		result.ItemsCompacted++
-	}
-
-	// Final flush, truncate, sync, and close
-	// Actual file size is diskWritten + bufPos (before final flush padding)
-	actualSize := int64(diskWritten + bufPos)
-	if err := c.finalFlush(f, buf, bufPos, actualSize, result); err != nil {
-		return nil, errors.Join(err, f.Close())
-	}
-
-	if err := errors.Join(sys.SyncFile(f, c.ioFlags), f.Close()); err != nil {
-		return nil, fmt.Errorf("compaction: sync segment: %w", err)
-	}
-
-	return footerEntries, nil
-}
-
-// xlWriteResult contains the outcome of writing an XL blob.
-type xlWriteResult struct {
-	hdr          record.Header
-	flushWritten int // Bytes written during pre-flush (including padding)
-	xlWritten    int // Bytes written for XL blob (including padding)
-}
-
-// writeXLBlob handles blobs that are larger than the compaction buffer.
-// It flushes any pending data, allocates a temporary aligned buffer for the XL blob,
-// reads and writes it directly, then frees the temp buffer.
-//
-// Returns xlWriteResult so caller can update disk position tracking.
-// diskWritten is the bytes already written to disk (before buffer contents).
-func (c *Compactor) writeXLBlob(
-	f *os.File,
-	buf []byte,
-	bufPos int,
-	ri *relocInfo,
-	diskWritten int,
-	newSegID uint32,
-	result *CompactResult,
-) (xlWriteResult, error) {
-	var res xlWriteResult
-	blobLen := int(ri.item.PhysicalLen)
-
-	// 1. Flush any pending data in the main buffer first (preserve ordering)
-	if bufPos > 0 {
-		alignedEnd := (bufPos + sys.BlockMask) &^ sys.BlockMask
-		for i := bufPos; i < alignedEnd; i++ {
-			buf[i] = 0
-		}
-		n, err := sys.WriteAligned(buf[:alignedEnd], f, c.ioFlags)
-		if err != nil {
-			return res, fmt.Errorf("compaction: flush before XL: %w", err)
-		}
-		result.WriteOps++
-		result.WriteBytes += int64(n)
-		res.flushWritten = alignedEnd
-	}
-
-	// 2. Allocate temporary aligned buffer for XL blob
-	_, alignedSize := sys.AlignRange(0, blobLen+sys.BlockSize)
-	xlBuf := sys.AllocAligned(int(alignedSize))
-	defer sys.FreeAligned(xlBuf)
-
-	// 3. Read XL blob into temp buffer
-	n, err := c.readBlobAligned(ri.item, xlBuf)
-	if err != nil {
-		return res, err
-	}
-	result.ReadOps++
-	result.ReadBytes += int64(n)
-
-	// 4. Parse header for footer metadata
-	res.hdr, err = record.DecodeHeader(xlBuf[:record.HeaderSize])
-	if err != nil {
-		return res, fmt.Errorf("compaction: decode XL header: %w", err)
-	}
-
-	// 5. Update item location: XL blob starts after previous disk writes + flush
-	ri.item.SegmentID = newSegID
-	ri.item.Offset = uint32(diskWritten + res.flushWritten)
-
-	// 6. Write XL blob with padding (xlBuf is already zero-initialized from AllocAligned)
-	writeSize := int(sys.PageAlign(int64(n)))
-	written, err := sys.WriteAligned(xlBuf[:writeSize], f, c.ioFlags)
-	if err != nil {
-		return res, fmt.Errorf("compaction: write XL blob: %w", err)
-	}
-	result.WriteOps++
-	result.WriteBytes += int64(written)
-	res.xlWritten = writeSize
-
-	return res, nil
-}
-
-// flushFullBlocks writes complete 4KB blocks from the buffer, shifting the tail to front.
-// Returns the number of bytes written (multiple of 4KB), or error.
-func (c *Compactor) flushFullBlocks(f *os.File, buf []byte, bufPos int) (int, error) {
-	alignedLen := bufPos &^ sys.BlockMask
-	if alignedLen == 0 {
-		return 0, nil
-	}
-
-	n, err := sys.WriteAligned(buf[:alignedLen], f, c.ioFlags)
-	if err != nil {
-		return 0, fmt.Errorf("compaction: write aligned chunk: %w", err)
-	}
-
-	// Shift unaligned tail to front of buffer
-	tail := bufPos - alignedLen
-	if tail > 0 {
-		copy(buf[0:tail], buf[alignedLen:bufPos])
-	}
-
-	return n, nil
-}
-
-// finalFlush writes remaining data with padding, then truncates to exact size.
-func (c *Compactor) finalFlush(
-	f *os.File, buf []byte, bufPos int, totalSize int64, res *CompactResult,
-) error {
-	if bufPos == 0 {
-		return nil
-	}
-
-	alignedEnd := (bufPos + int(sys.BlockMask)) &^ int(sys.BlockMask)
-	// Zero padding bytes
-	for i := bufPos; i < alignedEnd; i++ {
-		buf[i] = 0
-	}
-
-	n, err := sys.WriteAligned(buf[:alignedEnd], f, c.ioFlags)
-	if err != nil {
-		return fmt.Errorf("compaction: write final chunk: %w", err)
-	}
-	res.WriteOps++
-	res.WriteBytes += int64(n)
-
-	// Truncate to exact logical size (removes padding)
-	return f.Truncate(totalSize)
-}
-
-// readBlobAligned reads a blob into a page-aligned buffer using O_DIRECT.
-// Uses cached segment file handles and sizes to avoid opening files and Stat() syscalls.
-// Returns the number of blob bytes written to dst[0:].
-func (c *Compactor) readBlobAligned(e index.Item, dst []byte) (int, error) {
-	if int(e.PhysicalLen) > len(dst) {
-		return 0, fmt.Errorf("compaction: dst buffer too small (%d > %d)", e.PhysicalLen, len(dst))
-	}
-
-	// Get or open segment file with O_DIRECT (size is cached to avoid Stat() per blob)
-	seg, err := c.getSegmentFile(e.SegmentID)
-	if err != nil {
-		return 0, err
-	}
-
-	// Calculate O_DIRECT compliant offsets and lengths using AlignRange
-	alignedOff, alignedLen := sys.AlignRange(int64(e.Offset), int(e.PhysicalLen))
-	padding := int64(e.Offset) - alignedOff
-
-	// Check cached file size - if aligned read would exceed file, use unaligned read
-	// (handles small test files that are < 4KB)
-	if alignedOff+alignedLen > seg.size {
-		// File too small for aligned read - fall back to exact read
-		n, err := seg.file.ReadAt(dst[:e.PhysicalLen], int64(e.Offset))
-		if err != nil {
-			return 0, fmt.Errorf("compaction: pread segment %d: %w", e.SegmentID, err)
-		}
-		return n, nil
-	}
-
-	if int(alignedLen) > len(dst) {
-		return 0, fmt.Errorf("compaction: dst buffer too small for aligned read (%d > %d)", alignedLen, len(dst))
-	}
-
-	// Perform aligned read
-	n, err := sys.PreadAligned(seg.file, dst[:alignedLen], alignedOff, c.ioFlags)
-	if err != nil {
-		return 0, fmt.Errorf("compaction: aligned pread segment %d: %w", e.SegmentID, err)
-	}
-	if int64(n) < padding+int64(e.PhysicalLen) {
-		return 0, fmt.Errorf("compaction: short read from segment %d: got %d, need %d",
-			e.SegmentID, n, padding+int64(e.PhysicalLen))
-	}
-
-	// Shift blob data from dst[padding:] to dst[0:]
-	if padding > 0 {
-		copy(dst, dst[padding:padding+int64(e.PhysicalLen)])
-	}
-
-	return int(e.PhysicalLen), nil
-}
-
 // getSegmentFile returns a cached O_DIRECT file handle and size, or opens a new one.
 // Caches Stat() result to avoid repeated syscalls during aligned reads.
 func (c *Compactor) getSegmentFile(segmentID uint32) (segmentFileInfo, error) {
@@ -692,6 +365,178 @@ func (c *Compactor) closeSegmentFiles() (retErr error) {
 		delete(c.segmentFiles, segID)
 	}
 	return retErr
+}
+
+// writeCompactedSegment uses copy_file_range(2) to move data between segment
+// files in-kernel, avoiding physical read I/O for the payload. On XFS with
+// reflinks, this is a metadata-only operation (zero NAND wear). On Darwin and
+// other platforms, CopyFileRange falls back to read/write.
+//
+// For each record:
+//  1. Read one 4KB block from the source to extract the record header (footer metadata).
+//  2. copy_file_range the entire record from source fd to destination fd.
+//
+// The destination is opened without O_DIRECT since copy_file_range operates
+// in-kernel. A single fdatasync at the end ensures durability.
+func (c *Compactor) writeCompactedSegment(
+	newSegID uint32,
+	toRelocate []relocInfo,
+	result *CompactResult,
+) ([]record.FooterEntry, error) {
+	// Lazy-allocate header read buffer (one block, reused across cycles)
+	if c.headerBuf == nil {
+		c.headerBuf = sys.AllocAligned(sys.BlockSize)
+	}
+
+	// Calculate total size for fallocate
+	totalSize := int64(record.FileHeaderSize)
+	for i := range toRelocate {
+		totalSize += int64(toRelocate[i].item.PhysicalLen)
+	}
+	allocSize := sys.PageAlign(totalSize)
+
+	// Create destination WITHOUT O_DIRECT — copy_file_range operates in-kernel.
+	// Sync flags are also stripped; we do a single fdatasync at the end.
+	segPath := getSegmentPath(c.basePath, c.shards, newSegID)
+	f, err := sys.CreateAndAllocateFile(segPath, 0, allocSize)
+	if err != nil {
+		return nil, fmt.Errorf("compaction: create segment (splice): %w", err)
+	}
+
+	// Write file header
+	if _, err := f.WriteAt(record.FileHeaderBytes[:], 0); err != nil {
+		return nil, errors.Join(
+			fmt.Errorf("compaction: write file header (splice): %w", err),
+			f.Close(),
+		)
+	}
+
+	dstOff := int64(record.FileHeaderSize)
+	footerEntries := make([]record.FooterEntry, 0, len(toRelocate))
+
+	for i := range toRelocate {
+		ri := &toRelocate[i]
+		blobLen := int64(ri.item.PhysicalLen)
+
+		// Step 1: Read record header (small aligned read) for footer metadata.
+		// This is the only physical read per record (~4KB instead of full blob).
+		hdr, hdrBytes, err := c.readRecordHeader(ri.item)
+		if err != nil {
+			return nil, errors.Join(err, f.Close())
+		}
+		result.ReadOps++
+		result.ReadBytes += int64(hdrBytes)
+
+		// Record where this item will land in the new segment
+		recordStart := dstOff
+
+		// Step 2: copy_file_range the entire record from source to destination.
+		seg, err := c.getSegmentFile(ri.oldSeg)
+		if err != nil {
+			return nil, errors.Join(err, f.Close())
+		}
+		srcOff := int64(ri.oldOff)
+		copied, err := copyFileRangeFull(seg.file, f, &srcOff, &dstOff, int(blobLen))
+		if err != nil {
+			return nil, errors.Join(
+				fmt.Errorf("compaction: copy_file_range segment %d offset %d: %w",
+					ri.oldSeg, ri.oldOff, err),
+				f.Close(),
+			)
+		}
+		result.SpliceOps++
+		result.SpliceBytes += int64(copied)
+
+		// Update item with new location
+		ri.item.SegmentID = newSegID
+		ri.item.Offset = uint32(recordStart)
+
+		// Build footer entry from parsed header
+		footerEntries = append(footerEntries, record.FooterEntry{
+			Key:          ri.item.Key,
+			Pos:          recordStart,
+			LogicalSize:  hdr.LogicalSize,
+			PhysicalSize: hdr.PhysicalSize,
+			SeqID:        hdr.SeqID,
+			Flags:        hdr.Flags,
+			KeyLen:       hdr.KeyLen,
+		})
+
+		result.ItemsCompacted++
+	}
+
+	// Truncate to exact logical size (removes fallocate padding)
+	if err := f.Truncate(totalSize); err != nil {
+		return nil, errors.Join(
+			fmt.Errorf("compaction: truncate (splice): %w", err),
+			f.Close(),
+		)
+	}
+
+	// Single fdatasync + close
+	if err := errors.Join(sys.Fdatasync(f), f.Close()); err != nil {
+		return nil, fmt.Errorf("compaction: sync segment (splice): %w", err)
+	}
+
+	return footerEntries, nil
+}
+
+// readRecordHeader reads just the record header from a source segment.
+// Returns the parsed header and the number of bytes physically read.
+// Uses a small aligned read (one block) to satisfy O_DIRECT requirements
+// on the source file descriptor.
+func (c *Compactor) readRecordHeader(e index.Item) (record.Header, int, error) {
+	seg, err := c.getSegmentFile(e.SegmentID)
+	if err != nil {
+		return record.Header{}, 0, err
+	}
+
+	buf := c.headerBuf
+
+	// Calculate aligned read parameters
+	alignedOff, alignedLen := sys.AlignRange(int64(e.Offset), record.HeaderSize)
+	padding := int64(e.Offset) - alignedOff
+
+	// Small file fallback (tests with files < 4KB)
+	if alignedOff+alignedLen > seg.size {
+		n, err := seg.file.ReadAt(buf[:record.HeaderSize], int64(e.Offset))
+		if err != nil {
+			return record.Header{}, 0, fmt.Errorf("compaction: read header segment %d: %w", e.SegmentID, err)
+		}
+		hdr, err := record.DecodeHeader(buf[:record.HeaderSize])
+		return hdr, n, err
+	}
+
+	// Aligned read (O_DIRECT compliant) — at most one block
+	readLen := min(alignedLen, int64(len(buf)))
+	n, err := sys.PreadAligned(seg.file, buf[:readLen], alignedOff, c.ioFlags)
+	if err != nil {
+		return record.Header{}, 0, fmt.Errorf("compaction: read header segment %d: %w", e.SegmentID, err)
+	}
+	if int64(n) < padding+int64(record.HeaderSize) {
+		return record.Header{}, 0, fmt.Errorf("compaction: short header read segment %d: got %d, need %d",
+			e.SegmentID, n, padding+int64(record.HeaderSize))
+	}
+
+	hdr, err := record.DecodeHeader(buf[padding : padding+int64(record.HeaderSize)])
+	return hdr, n, err
+}
+
+// copyFileRangeFull copies exactly `length` bytes using copy_file_range,
+// looping if the kernel returns a short copy.
+func copyFileRangeFull(src, dst *os.File, srcOff, dstOff *int64, length int) (int, error) {
+	var total int
+	for total < length {
+		n, err := sys.CopyFileRange(src, dst, srcOff, dstOff, length-total)
+		if err != nil {
+			return total, err
+		}
+		if n == 0 {
+			return total, fmt.Errorf("copy_file_range: zero bytes copied (want %d more)", length-total)
+		}
+		total += n
+	}
+	return total, nil
 }
 
 // dropSegments removes segment metadata from Bitcask and deletes segment files.

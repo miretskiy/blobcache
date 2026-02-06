@@ -13,8 +13,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"golang.org/x/time/rate"
-
 	"github.com/miretskiy/blobcache/base"
 	"github.com/miretskiy/blobcache/bloom"
 	"github.com/miretskiy/blobcache/internal/index"
@@ -56,8 +54,7 @@ type Cache struct {
 	// --- ARCHITECTURE COMPONENTS ---
 	memTable          *MemTable     // The Write Engine (Producer)
 	librarian         *Librarian    // The Read Cache (Consumer)
-	compactor         *Compactor    // Segment merge compaction
-	compactionLimiter *rate.Limiter // Token bucket for compaction I/O throttling
+	compactor *Compactor // Segment merge compaction
 
 	// Global monotonic sequence counter for operation ordering.
 	// Initialized to time.Now().UnixNano() for continuity across restarts.
@@ -274,18 +271,7 @@ func open(cfg config) (*Cache, bool, error) {
 	if cfg.IO.FDataSync {
 		ioFlags |= sys.SyncData
 	}
-	c.compactor = NewCompactor(idx, c.segIDs, cfg.Path, cfg.Shards, ioFlags, int(cfg.WriteBufferSize), c.archivist.DropSegmentCache)
-
-	// Initialize compaction rate limiter for I/O throttling.
-	// Token bucket: refills at CompactionBandwidth bytes/sec, burst = 1 segment worth.
-	if cfg.CompactionBandwidth > 0 {
-		// Burst allows writing one full segment without waiting
-		burst := int(cfg.WriteBufferSize * 2) // 2x buffer for safety
-		if burst < 1 {
-			burst = 1
-		}
-		c.compactionLimiter = rate.NewLimiter(rate.Limit(cfg.CompactionBandwidth), burst)
-	}
+	c.compactor = NewCompactor(idx, c.segIDs, cfg.Path, cfg.Shards, ioFlags, c.archivist.DropSegmentCache)
 
 	// Run WAL recovery after memtable is initialized
 	var recovered bool
@@ -1083,23 +1069,18 @@ func (c *Cache) maybeMergeSegments() error {
 			return fmt.Errorf("compact segments %v: %w", segmentIDs, err)
 		}
 
-		// Populate Targeted Gravity metrics
+		// Populate Targeted Gravity metrics.
+		// Total output = direct writes + data moved via copy_file_range.
+		totalOutputBytes := result.WriteBytes + result.SpliceBytes
 		result.EstimatedInputMB = float64(candidate.EstimatedLiveBytes) / (1024 * 1024)
-		result.ActualOutputMB = float64(result.WriteBytes) / (1024 * 1024)
+		result.ActualOutputMB = float64(totalOutputBytes) / (1024 * 1024)
 
 		// Calculate derived I/O metrics
-		var readAmp, readMBps, writeMBps float64
-		var avgReadKB int64
-		if result.WriteBytes > 0 {
-			readAmp = float64(result.ReadBytes) / float64(result.WriteBytes)
-		}
+		var spliceMBps, readMBps float64
 		if result.DurationMs > 0 {
 			durSec := float64(result.DurationMs) / 1000.0
 			readMBps = float64(result.ReadBytes) / durSec / (1024 * 1024)
-			writeMBps = float64(result.WriteBytes) / durSec / (1024 * 1024)
-		}
-		if result.ReadOps > 0 {
-			avgReadKB = result.ReadBytes / int64(result.ReadOps) / 1024
+			spliceMBps = float64(result.SpliceBytes) / durSec / (1024 * 1024)
 		}
 
 		log.Info("segment merge completed",
@@ -1113,30 +1094,10 @@ func (c *Cache) maybeMergeSegments() error {
 			"estimated_input_mb", fmt.Sprintf("%.1f", result.EstimatedInputMB),
 			"actual_output_mb", fmt.Sprintf("%.1f", result.ActualOutputMB),
 			"duration_ms", result.DurationMs,
-			"read_ops", result.ReadOps,
-			"write_ops", result.WriteOps,
-			"read_amp", fmt.Sprintf("%.2f", readAmp),
-			"read_mbps", fmt.Sprintf("%.1f", readMBps),
-			"write_mbps", fmt.Sprintf("%.1f", writeMBps),
-			"avg_read_kb", avgReadKB)
-
-		// Token bucket rate limiting: throttle based on bytes written.
-		// This protects foreground I/O (Archivist reads, MemTable writes) from
-		// compaction saturating the I/O bus. The limiter refills at CompactionBandwidth
-		// bytes/sec, so heavy compaction spreads out over time.
-		if c.compactionLimiter != nil && result.WriteBytes > 0 {
-			// WaitN blocks until we've earned tokens for the bytes we just wrote.
-			// This is more precise than fixed sleep: large merges wait longer.
-			//
-			// Caveat: WaitN requires tokens <= Burst. When a single merge writes
-			// more than Burst bytes (WriteBufferSize), we cap at Burst. This means
-			// very large merges are throttled less than ideal — they consume one
-			// burst-worth of tokens instead of proportional to their actual output.
-			// In practice this is acceptable: merges target ~1.5x WriteBufferSize
-			// and burst is set to WriteBufferSize, so the undershoot is ≤1.5x.
-			tokens := min(int(result.WriteBytes), c.compactionLimiter.Burst())
-			_ = c.compactionLimiter.WaitN(context.Background(), tokens)
-		}
+			"splice_ops", result.SpliceOps,
+			"splice_mbps", fmt.Sprintf("%.1f", spliceMBps),
+			"hdr_read_ops", result.ReadOps,
+			"hdr_read_mbps", fmt.Sprintf("%.1f", readMBps))
 	}
 
 	// Recalculate oldest segment after dropping segments (O(1) from in-memory registry)

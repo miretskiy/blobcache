@@ -180,3 +180,10 @@ func PreadAligned(f *os.File, buf []byte, offset int64, flags OpenFlag) (int, er
 	}
 	return f.ReadAt(buf, offset)
 }
+
+// CopyFileRange emulates copy_file_range(2) on Darwin using read/write.
+// On Linux, the real syscall provides zero-copy or kernel-side copies.
+// This fallback exists so compaction has a single code path everywhere.
+func CopyFileRange(srcFile, dstFile *os.File, srcOff, dstOff *int64, length int) (int, error) {
+	return copyFileRangeEmulated(srcFile, dstFile, srcOff, dstOff, length)
+}

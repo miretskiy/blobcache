@@ -54,3 +54,8 @@ func OpenFileForRead(path string, _ OpenFlag) (*os.File, error) {
 func PreadAligned(f *os.File, buf []byte, offset int64, _ OpenFlag) (int, error) {
 	return f.ReadAt(buf, offset)
 }
+
+// CopyFileRange emulates copy_file_range(2) using read/write.
+func CopyFileRange(srcFile, dstFile *os.File, srcOff, dstOff *int64, length int) (int, error) {
+	return copyFileRangeEmulated(srcFile, dstFile, srcOff, dstOff, length)
+}

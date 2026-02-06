@@ -80,10 +80,6 @@ type config struct {
 	// Set to 0 to disable spatial expansion (pure SIEVE, no bystanders).
 	MaxBystanderBytes int64
 
-	// Compaction bandwidth limit in bytes/sec (default: 200 MB/s)
-	// Throttles merge compaction to avoid saturating the I/O bus during ingestion.
-	CompactionBandwidth int64
-
 	knobs *TestingKnobs
 }
 
@@ -240,14 +236,6 @@ func WithMaxBystanderBytes(bytes int64) Option {
 	return funcOpt(func(c *config) { c.MaxBystanderBytes = bytes })
 }
 
-// WithCompactionBandwidth sets the maximum bytes/sec for merge compaction I/O.
-// This throttles compaction to avoid saturating the I/O bus during ingestion.
-// Default: 200 MB/s (allows ~1 GB/s remaining for foreground I/O).
-// Set to 0 to disable throttling (not recommended for production).
-func WithCompactionBandwidth(bytesPerSec int64) Option {
-	return funcOpt(func(c *config) { c.CompactionBandwidth = bytesPerSec })
-}
-
 func defaultConfig(path string) config {
 	return config{
 		Path:                path,
@@ -261,8 +249,7 @@ func defaultConfig(path string) config {
 		BloomEstimatedKeys:  1_000_000,
 		DegradedMode:        DegradedMemoryOnly,
 		TrustHash:           true,      // Cache mode: trust hash, skip key verification
-		BallastSize:         1 << 30,   // 1GB heap ballast to reduce GC frequency
-		CompactionBandwidth: 400 << 20, // 400 MB/s allows catch-up during high stress
+		BallastSize: 1 << 30, // 1GB heap ballast to reduce GC frequency
 		IO: IOConfig{
 			FDataSync:     false,
 			Fadvise:       sys.UseFadvise,

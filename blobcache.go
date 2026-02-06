@@ -1206,10 +1206,8 @@ func (c *Cache) maybeMergeSegments() error {
 		}
 	}
 
-	// Recalculate oldest segment after dropping segments
-	if err := c.recalculateOldestSegmentID(); err != nil {
-		return fmt.Errorf("recalculate oldest segment: %w", err)
-	}
+	// Recalculate oldest segment after dropping segments (O(1) from in-memory registry)
+	c.recalculateOldestSegmentID()
 
 	return nil
 }

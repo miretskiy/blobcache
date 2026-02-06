@@ -1057,6 +1057,19 @@ func (p *persistence) getMergeCompactionCandidates(maxEligibleID uint32) []Spars
 // hasOlderShadow checks if any segment with ID < floorID might contain the key.
 // Returns true if any older segment's Bloom filter tests positive.
 //
+// getOldestSegmentID returns the ID of the oldest registered segment, or 0 if none.
+// O(1) since the sorted slice is maintained in ascending ID order.
+// Thread-safe for concurrent reads.
+func (p *persistence) getOldestSegmentID() uint32 {
+	p.segments.RLock()
+	defer p.segments.RUnlock()
+
+	if len(p.segments.sorted) == 0 {
+		return 0
+	}
+	return p.segments.sorted[0].ID
+}
+
 // This is the core tombstone dissolution query:
 //   - If true: tombstone MUST be preserved (older version may exist)
 //   - If false: tombstone can be safely dissolved (no older version)

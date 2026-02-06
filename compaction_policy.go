@@ -240,23 +240,11 @@ func calculateDynamicGravity(physicalSize, logicalSize int64) int {
 	return gravity
 }
 
-// recalculateOldestSegmentID scans all segments and updates oldestLiveSegmentID.
+// recalculateOldestSegmentID updates oldestLiveSegmentID from the in-memory registry.
 // Should be called after segment merge compaction drops old segments.
 //
+// O(1) lookup from the segment registry (no disk scanning).
 // Thread-safety: Safe to call concurrently. Uses atomic store.
-func (c *Cache) recalculateOldestSegmentID() error {
-	var oldest uint32
-
-	err := c.index.ForEachSegment(func(m index.DurableBatch) bool {
-		if oldest == 0 || m.SegmentID < oldest {
-			oldest = m.SegmentID
-		}
-		return true
-	})
-	if err != nil {
-		return err
-	}
-
-	c.oldestLiveSegmentID.Store(oldest)
-	return nil
+func (c *Cache) recalculateOldestSegmentID() {
+	c.oldestLiveSegmentID.Store(c.index.GetOldestSegmentID())
 }

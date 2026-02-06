@@ -319,6 +319,12 @@ func (idx *DurableIndex) ForEachSegmentMeta(fn func(meta SegmentMetadata) bool) 
 	idx.segments.forEachSegment(fn)
 }
 
+// GetOldestSegmentID returns the ID of the oldest registered segment, or 0 if none.
+// O(1) lookup from the in-memory registry. Thread-safe for concurrent reads.
+func (idx *DurableIndex) GetOldestSegmentID() uint32 {
+	return idx.segments.getOldestSegmentID()
+}
+
 // UpdateSegmentOnDelete updates a segment's metadata after items are deleted.
 // Called during eviction or explicit delete to track tombstone accumulation.
 func (idx *DurableIndex) UpdateSegmentOnDelete(segID uint32, deletedCount int32, deletedBytes int64) {

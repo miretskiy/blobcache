@@ -178,109 +178,87 @@ func TestPersistence(t *testing.T) {
 }
 
 // TestHasOlderShadow tests the tombstone dissolution query logic.
-// This is correctness-critical: false negatives could cause Leapfrog Hazard (data resurrection).
+// HasOlderShadow uses direct RAM index lookup (not Bloom filters) to determine
+// if a key has a live version in any segment older than floorID.
+//
+// This is correctness-critical: false negatives could cause data resurrection
+// after a crash (benign in cache mode, impossible in CAS mode).
 func TestHasOlderShadow(t *testing.T) {
 	tmp := t.TempDir()
 
-	p, err := newPersistence(tmp, 1)
+	idx, err := OpenIndex(tmp, 0, 1000)
 	require.NoError(t, err)
-	defer p.close()
+	defer idx.Close()
 
-	// Create test keys
 	keyA := Key{Lo: 0x1111111111111111, Hi: 0xAAAAAAAAAAAAAAAA}
 	keyB := Key{Lo: 0x2222222222222222, Hi: 0xBBBBBBBBBBBBBBBB}
 	keyC := Key{Lo: 0x3333333333333333, Hi: 0xCCCCCCCCCCCCCCCC}
+	unknownKey := Key{Lo: 0xDEADBEEF, Hi: 0xCAFEBABE}
 
-	// Helper to create and register a segment with specific keys
-	registerSeg := func(segID uint32, keys ...Key) {
-		filter := bloom.New(1000, 0.03)
-		for _, k := range keys {
-			filter.AddHash(k)
-		}
-		filter.Freeze()
-		p.registerSegment(SegmentMetadata{
-			ID:             segID,
-			LiveItemCount:  int32(len(keys)),
-			TombstoneCount: 0,
-			LiveBytes:      int64(len(keys) * 1000),
-			SegmentKeys:    filter,
-		})
-	}
-
-	t.Run("NoSegments", func(t *testing.T) {
-		// With no segments registered, hasOlderShadow should always return false
-		require.False(t, p.hasOlderShadow(keyA, 5))
-		require.False(t, p.hasOlderShadow(keyA, 0))
+	t.Run("EmptyIndex", func(t *testing.T) {
+		// No keys in RAM → always false
+		require.False(t, idx.HasOlderShadow(keyA, 5))
+		require.False(t, idx.HasOlderShadow(keyA, 0))
 	})
 
-	// Register segments: 3 has keyA, 5 has keyB, 7 has keyC
-	registerSeg(3, keyA)
-	registerSeg(5, keyB)
-	registerSeg(7, keyC)
+	// Put keys into RAM index at specific segment locations
+	idx.Put(Item{Key: keyA, SegmentID: 3, Offset: 0, PhysicalLen: 100})
+	idx.Put(Item{Key: keyB, SegmentID: 5, Offset: 0, PhysicalLen: 100})
+	idx.Put(Item{Key: keyC, SegmentID: 7, Offset: 0, PhysicalLen: 100})
 
-	t.Run("KeyOnlyInOlderSegment", func(t *testing.T) {
+	t.Run("KeyInOlderSegment", func(t *testing.T) {
 		// keyA is in segment 3
-		// When floor=5, segment 3 is older (3 < 5), so should return true
-		require.True(t, p.hasOlderShadow(keyA, 5))
-
-		// When floor=3, no segment is older (no segment < 3), so should return false
-		require.False(t, p.hasOlderShadow(keyA, 3))
-
-		// When floor=10, segment 3 is older, so should return true
-		require.True(t, p.hasOlderShadow(keyA, 10))
+		// floor=5: segment 3 < 5 → true
+		require.True(t, idx.HasOlderShadow(keyA, 5))
+		// floor=10: segment 3 < 10 → true
+		require.True(t, idx.HasOlderShadow(keyA, 10))
 	})
 
-	t.Run("KeyOnlyInNewerSegment", func(t *testing.T) {
-		// keyC is in segment 7
-		// When floor=5, segments 3 is older (3 < 5) but doesn't contain keyC
-		require.False(t, p.hasOlderShadow(keyC, 5))
-
-		// When floor=7, no segment < 7 contains keyC
-		require.False(t, p.hasOlderShadow(keyC, 7))
+	t.Run("KeyInSameOrNewerSegment", func(t *testing.T) {
+		// keyA is in segment 3
+		// floor=3: segment 3 is NOT < 3 → false (key is in compaction range)
+		require.False(t, idx.HasOlderShadow(keyA, 3))
+		// floor=2: segment 3 is NOT < 2 → false
+		require.False(t, idx.HasOlderShadow(keyA, 2))
 	})
 
-	t.Run("KeyNotInAnySegment", func(t *testing.T) {
-		unknownKey := Key{Lo: 0xDEADBEEF, Hi: 0xCAFEBABE}
-		// Unknown key should not match any segment
-		require.False(t, p.hasOlderShadow(unknownKey, 10))
-		require.False(t, p.hasOlderShadow(unknownKey, 3))
+	t.Run("KeyNotInRAM", func(t *testing.T) {
+		// Unknown key not in RAM → false (no known version)
+		require.False(t, idx.HasOlderShadow(unknownKey, 10))
+		require.False(t, idx.HasOlderShadow(unknownKey, 0))
 	})
 
-	t.Run("KeyInMultipleSegments", func(t *testing.T) {
-		// Add keyA to segment 5 as well (key exists in both 3 and 5)
-		registerSeg(5, keyA, keyB) // Overwrite segment 5 filter
+	t.Run("KeyEvictedFromRAM", func(t *testing.T) {
+		// Simulate eviction: remove keyA from RAM
+		idx.Delete(keyA)
 
-		// When floor=5, segment 3 has keyA (3 < 5), so should return true
-		require.True(t, p.hasOlderShadow(keyA, 5))
+		// Key not in RAM → false (dissolve tombstone)
+		require.False(t, idx.HasOlderShadow(keyA, 10))
+		require.False(t, idx.HasOlderShadow(keyA, 5))
 
-		// When floor=3, no segment < 3, so should return false
-		require.False(t, p.hasOlderShadow(keyA, 3))
+		// Restore for other tests
+		idx.Put(Item{Key: keyA, SegmentID: 3, Offset: 0, PhysicalLen: 100})
 	})
 
-	t.Run("UnregisterSegment", func(t *testing.T) {
-		// Unregister segment 3
-		p.unregisterSegment(3)
+	t.Run("KeyOverwrittenToNewerSegment", func(t *testing.T) {
+		// keyA overwritten from segment 3 to segment 8
+		idx.Put(Item{Key: keyA, SegmentID: 8, Offset: 0, PhysicalLen: 100})
 
-		// Now keyA only exists in segment 5
-		// When floor=5, no segment < 5 has keyA anymore
-		require.False(t, p.hasOlderShadow(keyA, 5))
-
-		// Re-register segment 3 for other tests
-		registerSeg(3, keyA)
+		// floor=5: segment 8 is NOT < 5 → false (newer write supersedes)
+		require.False(t, idx.HasOlderShadow(keyA, 5))
+		// floor=10: segment 8 < 10 → true
+		require.True(t, idx.HasOlderShadow(keyA, 10))
 	})
 
-	t.Run("UnregisterMultipleSegments", func(t *testing.T) {
-		// Unregister segments 3 and 5
-		p.unregisterSegments([]uint32{3, 5})
+	t.Run("DeletedKeyStillInRAM", func(t *testing.T) {
+		// Mark keyB as deleted (still in RAM with deleted flag)
+		idx.MarkDeleted(keyB)
 
-		// Now only segment 7 remains
-		require.False(t, p.hasOlderShadow(keyA, 10))
-		require.False(t, p.hasOlderShadow(keyB, 10))
-		require.True(t, p.hasOlderShadow(keyC, 10)) // keyC in segment 7, 7 < 10
-
-		// Re-register for cleanup
-		registerSeg(3, keyA)
-		registerSeg(5, keyB)
+		// keyB still in RAM at segment 5
+		// floor=10: segment 5 < 10 → true (must preserve tombstone)
+		require.True(t, idx.HasOlderShadow(keyB, 10))
+		// floor=5: segment 5 is NOT < 5 → false
+		require.False(t, idx.HasOlderShadow(keyB, 5))
 	})
 }
 

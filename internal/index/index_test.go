@@ -145,6 +145,40 @@ func TestBasicCRUD(t *testing.T) {
 	require.False(t, found, "Key should not be found after Delete")
 }
 
+func TestPeek(t *testing.T) {
+	idx := NewBlobIndex(1024)
+	k := makeTestKey(1)
+	item := makeItem(k, 1, 50)
+	item.Offset = 100
+
+	idx.Put(item)
+
+	// Peek returns item without marking visited
+	got, found := idx.Peek(k)
+	require.True(t, found)
+	require.Equal(t, item.SegmentID, got.SegmentID)
+	require.Equal(t, item.Offset, got.Offset)
+
+	// Verify visited bit is NOT set after Peek
+	s := idx.Shard(k)
+	s.RLock()
+	i, ok := s.Items[k]
+	require.True(t, ok)
+	require.Equal(t, uint32(0), s.Extra.nodes[i].visited.Load(), "Peek should NOT mark visited")
+	s.RUnlock()
+
+	// Get DOES mark visited
+	idx.Get(k)
+	s.RLock()
+	i = s.Items[k]
+	require.Equal(t, uint32(1), s.Extra.nodes[i].visited.Load(), "Get should mark visited")
+	s.RUnlock()
+
+	// Peek on missing key returns false
+	_, found = idx.Peek(makeTestKey(999))
+	require.False(t, found)
+}
+
 func TestArenaReuse(t *testing.T) {
 	// Verifies the "Zero-Allocation" property in steady state.
 	count := 10_000

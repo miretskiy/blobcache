@@ -62,6 +62,13 @@ func (idx *DurableIndex) Get(k Key) (Item, bool) {
 	return idx.blobs.Get(k)
 }
 
+// Peek retrieves an item from the RAM index without marking it as visited.
+// Used for metadata decisions (e.g., tombstone dissolution) where perturbing
+// SIEVE eviction order is undesirable.
+func (idx *DurableIndex) Peek(k Key) (Item, bool) {
+	return idx.blobs.Peek(k)
+}
+
 // Put inserts or updates an item in the RAM index.
 func (idx *DurableIndex) Put(item Item) {
 	idx.blobs.Put(item)
@@ -132,7 +139,6 @@ func (idx *DurableIndex) AddSegment(segmentID uint32, items []Item) {
 	var liveBytes int64
 
 	// Create frozen Bloom filter snapshot from ALL items (including deleted).
-	// This enables hasOlderShadow queries for tombstone dissolution.
 	//
 	// Size dynamically: bloom.New(n, 0.03) → ~1 bit/key at 3% FPR.
 	// For 1MB blobs in 64MB segment: ~64 items → 72 bytes.
@@ -390,14 +396,48 @@ func (idx *DurableIndex) DropSegment(segID uint32) error {
 	return idx.segments.dropSegment(segID)
 }
 
-// HasOlderShadow checks if any segment with ID < floorID might contain the key.
-// Returns true if any older segment's Bloom filter tests positive.
+// HasOlderShadow checks if a key might have a live version in any segment
+// with ID < floorID.
 //
 // This is the core tombstone dissolution query:
 //   - If true: tombstone MUST be preserved (older version may exist)
 //   - If false: tombstone can be safely dissolved (no older version)
+//
+// Uses direct RAM index lookup — exact, O(1), no false positives for the
+// common case. Three outcomes:
+//
+//  1. Key not in RAM (evicted): dissolve. Trade-off: if the key was
+//     overwritten to a newer segment then evicted, the old segment still
+//     has live data but the key is absent from RAM. Benign in cache mode
+//     (stale data reappears after crash, gets re-evicted) and impossible
+//     in CAS mode (content-addressed keys are never overwritten).
+//
+//  2. Key in RAM with SegmentID < floorID: older shadow confirmed, keep.
+//
+//  3. Key in RAM with SegmentID >= floorID: the RAM entry is likely the
+//     tombstone itself (it overwrote any older live entry during AddSegment).
+//     If live, a newer write supersedes the tombstone — dissolve.
+//     If deleted, conservatively check whether ANY registered segments exist
+//     before floorID. This enables dissolution during tail compaction (the
+//     primary case) while safely preserving during non-tail compaction.
 func (idx *DurableIndex) HasOlderShadow(key Key, floorID uint32) bool {
-	return idx.segments.hasOlderShadow(key, floorID)
+	item, found := idx.blobs.Peek(key)
+	if !found {
+		return false
+	}
+	if item.SegmentID < floorID {
+		return true
+	}
+	// SegmentID >= floorID: item is in/after compaction range.
+	// If live, a newer write supersedes the tombstone regardless.
+	if !item.IsDeleted() {
+		return false
+	}
+	// Tombstone in compaction range — can't determine from RAM alone.
+	// Conservative: keep if older segments exist (non-tail compaction).
+	// Dissolve if this IS the tail (no segments before floorID).
+	oldest := idx.segments.getOldestSegmentID()
+	return oldest != 0 && oldest < floorID
 }
 
 // SegmentLockShard returns the RWMutex for a given segment ID.

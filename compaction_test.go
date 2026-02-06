@@ -190,8 +190,12 @@ func TestCompactor_StalenessFiltering(t *testing.T) {
 }
 
 func TestCompactor_TombstonePreservation(t *testing.T) {
-	// Tombstones (deleted items) must be preserved during compaction for crash safety.
-	// They prevent resurrection of keys that were deleted.
+	// Tombstones must be preserved during non-tail compaction when older segments
+	// exist that might contain the key. This prevents resurrection of deleted keys.
+	//
+	// Setup: segment 1 has live data for keyDeleted, segment 3 has a tombstone.
+	// Compacting only segment 3 must preserve the tombstone because segment 1
+	// (older shadow) still exists.
 
 	tmpDir := t.TempDir()
 	setupTestDirs(t, tmpDir)
@@ -204,38 +208,46 @@ func TestCompactor_TombstonePreservation(t *testing.T) {
 	defer archivist.Close()
 
 	segIDs := &segmentIDProvider{}
-	sourceSegID := segIDs.NextSegmentID() // Allocate source segment ID
+	segIDs.counter.Store(100) // Output segments start at 101
+
+	// Segment 1: older segment with live data for keyDeleted (the "older shadow")
+	const seg1ID uint32 = 1
+	keyDeleted := index.Key{Lo: 2, Hi: 2}
+	blob1 := makeTestBlob(t, keyDeleted, []byte("old-value"), 1)
+	segPath1 := getSegmentPath(tmpDir, 0, seg1ID)
+	writeTestSegment(t, segPath1, blob1)
+
+	items1 := []index.Item{
+		{Key: keyDeleted, SegmentID: seg1ID, Offset: record.FileHeaderSize, PhysicalLen: uint32(len(blob1))},
+	}
+	writeTestMeta(t, SegmentMetaPath(segPath1), seg1ID, items1)
+	idx.AddSegment(seg1ID, items1)
+
+	// Segment 3: newer segment with one live item + tombstone for keyDeleted
+	const seg3ID uint32 = 3
+	key1 := index.Key{Lo: 1, Hi: 1}
+	blob3 := makeTestBlob(t, key1, []byte("value1"), 3)
+	segPath3 := getSegmentPath(tmpDir, 0, seg3ID)
+	writeTestSegment(t, segPath3, blob3)
+
+	deletedItem := index.Item{Key: keyDeleted, SegmentID: seg3ID, Offset: 0, PhysicalLen: 0}
+	deletedItem.SetDeleted()
+
+	items3 := []index.Item{
+		{Key: key1, SegmentID: seg3ID, Offset: record.FileHeaderSize, PhysicalLen: uint32(len(blob3))},
+		deletedItem,
+	}
+	writeTestMeta(t, SegmentMetaPath(segPath3), seg3ID, items3)
+	idx.AddSegment(seg3ID, items3)
 
 	c := NewCompactor(idx, segIDs, tmpDir, 0, sys.SyncNone, 64<<20, archivist.DropSegmentCache)
 
-	key1 := index.Key{Lo: 1, Hi: 1}
-	keyDeleted := index.Key{Lo: 2, Hi: 2}
-
-	// Write source segment with one live item
-	blob1 := makeTestBlob(t, key1, []byte("value1"), 1)
-	segPath := getSegmentPath(tmpDir, 0, sourceSegID)
-	writeTestSegment(t, segPath, blob1)
-
-	// Create items: one live, one tombstone
-	deletedItem := index.Item{Key: keyDeleted, SegmentID: sourceSegID, Offset: 0, PhysicalLen: 0}
-	deletedItem.SetDeleted()
-
-	items := []index.Item{
-		{Key: key1, SegmentID: sourceSegID, Offset: record.FileHeaderSize, PhysicalLen: uint32(len(blob1))},
-		deletedItem,
-	}
-	// Write .meta file so compaction can read the manifest
-	writeTestMeta(t, SegmentMetaPath(segPath), sourceSegID, items)
-	idx.AddSegment(0, items)
-
-	// Remove the deleted key from RAM (tombstones don't stay in RAM index for lookups)
-	idx.Delete(keyDeleted)
-
-	result, err := c.Compact([]uint32{sourceSegID}, false)
+	// Compact only segment 3 — segment 1 is the older shadow
+	result, err := c.Compact([]uint32{seg3ID}, false)
 	require.NoError(t, err)
 
 	require.Equal(t, 1, result.ItemsCompacted)
-	require.Equal(t, 1, result.TombstonesKept)
+	require.Equal(t, 1, result.TombstonesKept, "tombstone must be preserved with older shadow")
 
 	// Verify the tombstone was persisted in the new segment's manifest
 	manifest, found := idx.GetSegmentManifest(result.NewSegmentID)
@@ -253,7 +265,7 @@ func TestCompactor_TombstonePreservation(t *testing.T) {
 
 func TestCompactor_TombstoneDissolution(t *testing.T) {
 	// Tombstone dissolution allows safe GC of tombstones during compaction when
-	// no older segment might contain the key (via HasOlderShadow Bloom filter check).
+	// no older segment contains the key (via HasOlderShadow RAM index check).
 	//
 	// Test scenarios:
 	// 1. Key only in segment 5, compacting [5] -> dissolve (no older shadow)
@@ -298,7 +310,7 @@ func TestCompactor_TombstoneDissolution(t *testing.T) {
 		idx.MarkDeleted(keyDeleted)
 
 		// Compact with dropTombstones=false (NOT tail segment)
-		// Since there's no older segment, tombstone should be DISSOLVED via HasOlderShadow
+		// Since key is not in RAM (or only in compaction range), tombstone should be DISSOLVED
 		result, err := c.Compact([]uint32{sourceSegID}, false)
 		require.NoError(t, err)
 
@@ -514,7 +526,7 @@ func TestCompactor_TombstoneDropping(t *testing.T) {
 	}
 	// Write .meta file so compaction can read the manifest
 	writeTestMeta(t, SegmentMetaPath(segPath), sourceSegID, items)
-	idx.AddSegment(0, items)
+	idx.AddSegment(sourceSegID, items)
 
 	// Simulate real deletion scenario: markDeleted sets the flag but KEEPS item in RAM.
 	// This is what happens when Delete() is called - the item stays in RAM with IsDeleted=true.
@@ -530,9 +542,13 @@ func TestCompactor_TombstoneDropping(t *testing.T) {
 	result, err := c.Compact([]uint32{sourceSegID}, true)
 	require.NoError(t, err)
 
+	// At the tail, there are no older segments, so HasOlderShadow returns false
+	// and tombstones are dissolved during collectItems (before the dropTombstones
+	// path runs). Both dissolution and dropping achieve the same result: tombstone
+	// removed from disk and RAM.
 	require.Equal(t, 1, result.ItemsCompacted)
 	require.Equal(t, 0, result.TombstonesKept, "tombstones should not be kept")
-	require.Equal(t, 1, result.TombstonesDropped, "tombstone should be dropped")
+	require.Equal(t, 1, result.TombstonesDissolved, "tail: dissolved because no older shadow")
 
 	// Verify the tombstone was NOT persisted in the new segment's manifest
 	manifest, found := idx.GetSegmentManifest(result.NewSegmentID)

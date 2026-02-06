@@ -125,7 +125,7 @@ func BenchmarkBlobCache(b *testing.B) {
 
 	// --- SYSTEM MONITOR (Background Heartbeat) ---
 	ctx, cancel := context.WithCancel(context.Background())
-	metricsChan := startSystemMonitor(ctx, &totalWriteBytes, &totalReadBytes, tmpDir)
+	metricsChan := startSystemMonitor(ctx, &totalWriteBytes, &totalReadBytes, &cache.approxSize, tmpDir)
 
 	// Reinterpret b.N: each iteration = one write
 	// e.g., -benchtime=1000000x means 1M writes (~1TB at 1MB/write)
@@ -343,7 +343,7 @@ func reportLatency(b *testing.B, name string, h *hdrhistogram.Histogram) {
 }
 
 func startSystemMonitor(
-	ctx context.Context, logicalWriteBytes, logicalReadBytes *atomic.Int64, cachePath string,
+	ctx context.Context, logicalWriteBytes, logicalReadBytes, liveSizeBytes *atomic.Int64, cachePath string,
 ) <-chan SystemMetrics {
 	out := make(chan SystemMetrics, 1)
 	go func() {
@@ -404,23 +404,16 @@ func startSystemMonitor(
 					}
 				}
 
-				// 3. Physical vs Logical (Sparse/Hole-Punching Ratio)
-				var physicalSize, logicalSize int64
+				// 3. Physical disk usage (actual blocks, reflects hole punching + compaction)
+				var physicalSize int64
 				_ = filepath.Walk(cachePath, func(_ string, info os.FileInfo, err error) error {
 					if err == nil && !info.IsDir() {
-						logicalSize += info.Size()
 						if stat, ok := info.Sys().(*syscall.Stat_t); ok {
-							// Blocks are 512 bytes on almost all Unix-likes (Darwin/Linux)
 							physicalSize += stat.Blocks * 512
 						}
 					}
 					return nil
 				})
-
-				sRatio := 0.0
-				if logicalSize > 0 {
-					sRatio = float64(physicalSize) / float64(logicalSize)
-				}
 
 				// 4. Performance Throughput
 				currLogWrite := logicalWriteBytes.Load()
@@ -434,13 +427,22 @@ func startSystemMonitor(
 				usage, _ := disk.Usage(cachePath)
 				freeGB := float64(usage.Free) / (1 << 30)
 
+				// 6. Cache accounting
+				writtenGB := float64(logicalWriteBytes.Load()) / (1 << 30)
+				onDiskGB := float64(physicalSize) / (1 << 30)
+				liveGB := float64(liveSizeBytes.Load()) / (1 << 30)
+				diskRatio := 0.0
+				if writtenGB > 0 {
+					diskRatio = onDiskGB / writtenGB
+				}
+
 				fmt.Printf("\n[HEARTBEAT %s]\n"+
 					"  MEM:   RSS: %.2fGB\n"+
 					"  DISK:  IO Depth: %.2f | Phys-Read: %.2f GB/s | Phys-Write: %.2f GB/s | Free: %.1fGB\n"+
-					"  SIEVE: Phys: %.2fGB | Log: %.2fGB | Ratio: %.2f\n"+
+					"  CACHE: Written: %.2fGB | OnDisk: %.2fGB | Live: %.2fGB | Ratio: %.2f\n"+
 					"  TPUT:  Log-Write: %.2f GB/s | Log-Read: %.2f GB/s\n",
 					time.Now().Format("15:04:05"), rss, currentQD, physReadTP, physWriteTP, freeGB,
-					float64(physicalSize)/(1<<30), float64(logicalSize)/(1<<30), sRatio,
+					writtenGB, onDiskGB, liveGB, diskRatio,
 					logWriteTP, logReadTP)
 
 				// Update states

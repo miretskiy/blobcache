@@ -76,9 +76,9 @@ type SegmentMetadata struct {
 	LiveBytes      int64 // Sum of PhysicalLen for live (non-deleted) items
 
 	// SegmentKeys is a frozen Bloom filter snapshot of all keys written to this segment.
-	// IMPORTANT: This is immutable after creation - it represents the physical content
-	// at segment creation time, regardless of later deletions. This immutability is
-	// critical for correct tombstone dissolution decisions in hasOlderShadow().
+	// Immutable after creation — represents physical content at segment creation time.
+	// Currently unused (tombstone dissolution uses RAM index lookup instead of Bloom
+	// filters). Retained for potential future use.
 	SegmentKeys *bloom.Filter
 }
 
@@ -141,7 +141,7 @@ type persistence struct {
 	//
 	// Design for O(1) operations:
 	// - byID: O(1) lookup by segment ID
-	// - sorted: Binary search for hasOlderShadow(), re-sorted only on add/remove
+	// - sorted: O(1) oldest segment lookup, re-sorted only on add/remove
 	// - pendingTombstone/Merge: O(1) compaction candidate retrieval
 	segments struct {
 		sync.RWMutex
@@ -149,7 +149,7 @@ type persistence struct {
 		// O(1) lookup by segment ID
 		byID map[uint32]*SegmentMetadata
 
-		// Sorted by ID ascending for binary search in hasOlderShadow().
+		// Sorted by ID ascending for O(1) oldest segment lookup.
 		// Re-sorted only when segments are added or removed (rare).
 		sorted []*SegmentMetadata
 
@@ -1112,30 +1112,6 @@ func (p *persistence) getOldestSegmentID() uint32 {
 		return 0
 	}
 	return p.segments.sorted[0].ID
-}
-
-// This is the core tombstone dissolution query:
-//   - If true: tombstone MUST be preserved (older version may exist)
-//   - If false: tombstone can be safely dissolved (no older version)
-//
-// Thread-safe for concurrent reads.
-func (p *persistence) hasOlderShadow(key Key, floorID uint32) bool {
-	p.segments.RLock()
-	defer p.segments.RUnlock()
-
-	// Binary search for first segment >= floorID
-	floorIdx := sort.Search(len(p.segments.sorted), func(i int) bool {
-		return p.segments.sorted[i].ID >= floorID
-	})
-
-	// Check all segments before floorIdx (ID < floorID)
-	for i := range floorIdx {
-		if p.segments.sorted[i].SegmentKeys.Test(key) {
-			return true // Bloom says "maybe" - must preserve tombstone
-		}
-	}
-
-	return false // No older shadow - safe to dissolve
 }
 
 // close closes all open .meta file handles and flushes buffers.

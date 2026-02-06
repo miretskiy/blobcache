@@ -203,6 +203,24 @@ func (idx *BlobIndex) Get(k Key) (Item, bool) {
 	return val, true
 }
 
+// Peek returns the item for the given key WITHOUT marking it as visited.
+// Use this when reading the index for metadata decisions (e.g., tombstone
+// dissolution) where perturbing SIEVE eviction order is undesirable.
+func (idx *BlobIndex) Peek(k Key) (Item, bool) {
+	s := idx.Shard(k)
+
+	s.RLock()
+	i, ok := s.Items[k]
+	if !ok {
+		s.RUnlock()
+		return Item{}, false
+	}
+	val := s.Extra.nodes[i].item
+	s.RUnlock()
+
+	return val, true
+}
+
 // deleteIfAt removes an item only if it is still at the expected (segID, offset).
 // Returns the removed item and true, or (zero, false) if the item was not found,
 // already deleted, or has moved (e.g. relocated by compaction or overwritten).

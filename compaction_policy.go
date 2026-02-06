@@ -46,15 +46,15 @@ const (
 
 	// maxGravity is the maximum number of segments to merge (cap).
 	// Prevents excessive lock hold times during compaction.
-	maxGravity = 32
+	maxGravity = 64
 
 	// maxOutputMultiplier caps output size at 2x target to prevent "mega-segments".
 	maxOutputMultiplier = 2.0
 
 	// minOutputMultiplier sets the minimum worthwhile output size.
-	// Merges producing less than 25% of target are dropped to avoid metadata churn.
-	// This prevents creating 13MB output files when target is 128MB.
-	minOutputMultiplier = 0.25
+	// Merges producing less than 75% of target are dropped to avoid metadata churn.
+	// This prevents creating small output files when target is 128MB.
+	minOutputMultiplier = 0.75
 )
 
 // selectSegmentsForTombstoneCompaction returns segment IDs that exceed the tombstone threshold.
@@ -213,13 +213,14 @@ func (c *Cache) selectSegmentsForMerge(targetOutputSize int64, minRangeSize int)
 //   - At 50% sparse (ratio=0.5): gravity = ceil(1/0.5) = 2, clamped to 4
 //   - At 75% sparse (ratio=0.25): gravity = ceil(1/0.25) = 4
 //   - At 87.5% sparse (ratio=0.125): gravity = ceil(1/0.125) = 8
-//   - At 97% sparse (ratio=0.03): gravity = ceil(1/0.03) = 34, clamped to 32
+//   - At 97% sparse (ratio=0.03): gravity = ceil(1/0.03) = 34
+//   - At 99% sparse (ratio=0.01): gravity = ceil(1/0.01) = 100, clamped to 64
 //
 // Parameters:
 //   - physicalSize: Actual disk usage (from stat or approxSize after hole punching)
 //   - logicalSize: Tracked logical size (sum of item.PhysicalLen)
 //
-// Returns a value between minGravity (4) and maxGravity (32).
+// Returns a value between minGravity (4) and maxGravity (64).
 func calculateDynamicGravity(physicalSize, logicalSize int64) int {
 	if logicalSize <= 0 || physicalSize <= 0 {
 		return minGravity

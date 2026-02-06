@@ -549,9 +549,7 @@ func (p *persistence) scanAll(fn ScanBatchFn) error {
 			segPath := filepath.Join(shardPath, entry.Name())
 			manifest, err := p.loadSegmentManifest(segID, segPath)
 			if err != nil {
-				slog.Warn("failed to load segment manifest, skipping",
-					"segment", segID, "path", segPath, "error", err)
-				continue
+				return fmt.Errorf("load segment %d manifest: %w", segID, err)
 			}
 
 			if len(manifest.Items) == 0 {

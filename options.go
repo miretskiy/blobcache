@@ -244,7 +244,7 @@ func defaultConfig(path string) config {
 		DegradedMode:        DegradedMemoryOnly,
 		TrustHash:           true,      // Cache mode: trust hash, skip key verification
 		BallastSize:         1 << 30,   // 1GB heap ballast to reduce GC frequency
-		CompactionBandwidth: 200 << 20, // 200 MB/s for merge compaction throttling
+		CompactionBandwidth: 400 << 20, // 400 MB/s allows catch-up during high stress
 		IO: IOConfig{
 			FDataSync:     false,
 			Fadvise:       sys.UseFadvise,

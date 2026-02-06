@@ -679,7 +679,8 @@ type Batcher interface {
 
 // maintenanceSegmentInterval determines how often segment production triggers maintenance.
 // Every N segments, an eviction + compaction check is triggered.
-const maintenanceSegmentInterval = 10
+// Lower value (5) keeps up with high-velocity Sieve by checking merges more often.
+const maintenanceSegmentInterval = 5
 
 func (c *Cache) PutBatch(segID uint32, items []index.Item, _ uint64) error {
 	// Phase 1: Ingest into Index (also registers segment snapshot for tombstone dissolution)

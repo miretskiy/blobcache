@@ -47,15 +47,16 @@ const (
 	// maxGravity is the maximum number of segments to merge (cap).
 	// Elastic window: at ratio 0.40 ("death zone"), gravity expands to bridge gaps
 	// between sparse segments, effectively "healing" the physical layout.
-	maxGravity = 256
+	// 128 balances wide search window vs lock hold times.
+	maxGravity = 128
 
 	// maxOutputMultiplier caps output size at 2x target to prevent "mega-segments".
 	maxOutputMultiplier = 2.0
 
 	// minOutputMultiplier sets the minimum worthwhile output size.
-	// Merges producing less than 75% of target are dropped to avoid metadata churn.
-	// This prevents creating small output files when target is 128MB.
-	minOutputMultiplier = 0.75
+	// At 0.40 (~25.6MB for 64MB target), we heal fragmentation before ratio hits
+	// the "death zone". Too high (0.75) lets fragmentation win.
+	minOutputMultiplier = 0.40
 )
 
 // selectSegmentsForTombstoneCompaction returns segment IDs that exceed the tombstone threshold.
@@ -216,39 +217,27 @@ func (c *Cache) selectSegmentsForMerge(targetOutputSize int64, minRangeSize int)
 //   - At 87.5% sparse (ratio=0.125): gravity = ceil(1/0.125) = 8
 //   - At 97% sparse (ratio=0.03): gravity = ceil(1/0.03) = 34
 //   - At 99% sparse (ratio=0.01): gravity = ceil(1/0.01) = 100
-//   - At 99.6% sparse (ratio=0.004): gravity = ceil(1/0.004) = 250, clamped to 256
+//   - At 99.2% sparse (ratio=0.008): gravity = ceil(1/0.008) = 125, near maxGravity=128
 //
 // Parameters:
 //   - physicalSize: Actual disk usage (from stat or approxSize after hole punching)
 //   - logicalSize: Tracked logical size (sum of item.PhysicalLen)
 //
-// Returns a value between minGravity (4) and maxGravity (256).
+// Returns a value between minGravity (4) and maxGravity (128).
 func calculateDynamicGravity(physicalSize, logicalSize int64) int {
 	if logicalSize <= 0 || physicalSize <= 0 {
 		return minGravity
 	}
 
 	// Ratio of physical to logical (1.0 = fully dense, 0.1 = 90% sparse)
-	ratio := float64(physicalSize) / float64(logicalSize)
+	// Clamp ratio at 0.008 to prevent runaway gravity (99.2% sparse → gravity=125)
+	ratio := max(float64(physicalSize)/float64(logicalSize), 0.008)
 
 	// Invert to get gravity: sparser systems need more segments to form dense output
-	// Protect against division by zero and very small ratios
-	// At ratio=0.004 (99.6% sparse), gravity = 250 (near maxGravity=256)
-	if ratio < 0.004 {
-		ratio = 0.004
-	}
-
 	gravity := int(1.0/ratio + 0.999) // Ceiling
 
-	// Clamp to bounds
-	if gravity < minGravity {
-		gravity = minGravity
-	}
-	if gravity > maxGravity {
-		gravity = maxGravity
-	}
-
-	return gravity
+	// Clamp to bounds [minGravity, maxGravity]
+	return max(minGravity, min(gravity, maxGravity))
 }
 
 // recalculateOldestSegmentID updates oldestLiveSegmentID from the in-memory registry.

@@ -172,15 +172,15 @@ func TestCalculateDynamicGravity(t *testing.T) {
 		},
 		{
 			name:         "extreme_sparse",
-			physicalSize: 4,
+			physicalSize: 8,
 			logicalSize:  1000,
-			expected:     250, // ratio=0.004, gravity=250 (at elastic limit)
+			expected:     125, // ratio=0.008, gravity=125 (near maxGravity=128)
 		},
 		{
 			name:         "beyond_elastic_limit",
 			physicalSize: 1,
 			logicalSize:  1000,
-			expected:     250, // ratio=0.001, clamped to 0.004, gravity=250
+			expected:     125, // ratio=0.001, clamped to 0.008, gravity=125
 		},
 	}
 

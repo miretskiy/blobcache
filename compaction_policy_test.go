@@ -13,7 +13,6 @@ func TestCalculateDynamicGravity(t *testing.T) {
 		name         string
 		physicalSize int64
 		logicalSize  int64
-		avgBlobSize  int64
 		expected     int
 	}{
 		{
@@ -82,40 +81,11 @@ func TestCalculateDynamicGravity(t *testing.T) {
 			logicalSize:  1000,
 			expected:     125, // ratio=0.001, clamped to 0.008, gravity=125
 		},
-		// Size-aware scaling tests (avgBlobSize > 0)
-		{
-			name:         "large_blobs_double_gravity",
-			physicalSize: 100,
-			logicalSize:  1000,
-			avgBlobSize:  256 * 1024, // 256KB → multiplier=2.0
-			expected:     20,         // base=10 * 2.0 = 20
-		},
-		{
-			name:         "medium_blobs_partial_scale",
-			physicalSize: 100,
-			logicalSize:  1000,
-			avgBlobSize:  128 * 1024, // 128KB → multiplier=1.5
-			expected:     15,         // base=10 * 1.5 = 15
-		},
-		{
-			name:         "small_blobs_no_scale",
-			physicalSize: 100,
-			logicalSize:  1000,
-			avgBlobSize:  4 * 1024, // 4KB → multiplier≈1.015
-			expected:     10,       // base=10, effectively no scaling
-		},
-		{
-			name:         "large_blobs_clamped",
-			physicalSize: 10,
-			logicalSize:  1000,
-			avgBlobSize:  1024 * 1024, // 1MB → multiplier=2.0, capped at 1.0
-			expected:     128,         // base=100 * 2.0 = 200, clamped to 128
-		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gravity := calculateDynamicGravity(tt.physicalSize, tt.logicalSize, tt.avgBlobSize)
+			gravity := calculateDynamicGravity(tt.physicalSize, tt.logicalSize)
 			require.Equal(t, tt.expected, gravity)
 		})
 	}
@@ -130,9 +100,9 @@ func TestDynamicMergeThreshold(t *testing.T) {
 		{"4KB_blobs", 4 * 1024, 0.90},
 		{"32KB_blobs", 32 * 1024, 0.90},
 		{"64KB_blobs", 64 * 1024, 0.90},
-		{"128KB_blobs", 128 * 1024, 0.9166666666666666}, // 0.90 + (64K/192K)*0.05
-		{"256KB_blobs", 256 * 1024, 0.95},
-		{"1MB_blobs", 1024 * 1024, 0.95},
+		{"128KB_blobs", 128 * 1024, 0.8166666666666667}, // 0.90 - (64K/192K)*0.25
+		{"256KB_blobs", 256 * 1024, 0.65},
+		{"1MB_blobs", 1024 * 1024, 0.65},
 		{"zero_size", 0, 0.90},
 	}
 	for _, tt := range tests {

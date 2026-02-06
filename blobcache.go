@@ -1051,7 +1051,7 @@ func (c *Cache) maybeMergeSegments() error {
 	}
 	physicalEnvelope := segCount * c.WriteBufferSize
 	avgBlobSize := c.index.GetGlobalAvgBlobSize()
-	gravity := calculateDynamicGravity(logicalLive, physicalEnvelope, avgBlobSize)
+	gravity := calculateDynamicGravity(logicalLive, physicalEnvelope)
 	threshold := dynamicMergeThreshold(avgBlobSize)
 	// Target 1.5x WriteBufferSize (~96MB for default 64MB buffer) for efficient sequential I/O
 	targetOutputSize := c.WriteBufferSize + c.WriteBufferSize/2

@@ -96,9 +96,9 @@ func BenchmarkBlobCache(b *testing.B) {
 	crand.Read(entropy)
 
 	var (
-		numReads, numFound, totalWriteBytes atomic.Int64
-		writeHead                           atomic.Uint64
-		workerID                            atomic.Int64
+		numReads, numFound, totalWriteBytes, totalReadBytes atomic.Int64
+		writeHead                                           atomic.Uint64
+		workerID                                            atomic.Int64
 
 		mu sync.Mutex
 		// HDR Range: 10ns to 10s. Nanoseconds are required for M4 Max resolution.
@@ -125,7 +125,7 @@ func BenchmarkBlobCache(b *testing.B) {
 
 	// --- SYSTEM MONITOR (Background Heartbeat) ---
 	ctx, cancel := context.WithCancel(context.Background())
-	metricsChan := startSystemMonitor(ctx, &totalWriteBytes, tmpDir)
+	metricsChan := startSystemMonitor(ctx, &totalWriteBytes, &totalReadBytes, tmpDir)
 
 	// Reinterpret b.N: each iteration = one write
 	// e.g., -benchtime=1000000x means 1M writes (~1TB at 1MB/write)
@@ -149,10 +149,11 @@ func BenchmarkBlobCache(b *testing.B) {
 		localGet := hdrhistogram.New(10, 10_000_000_000, 3)
 
 		// Hoist closure outside loop to avoid per-iteration allocation.
-		// Touch memory to prove we got it, but don't allocate.
+		// Touch memory to prove we got it, track logical read bytes.
 		viewFn := func(b []byte) {
 			if len(b) > 0 {
 				_ = b[0]
+				totalReadBytes.Add(int64(len(b)))
 			}
 		}
 
@@ -342,18 +343,19 @@ func reportLatency(b *testing.B, name string, h *hdrhistogram.Histogram) {
 }
 
 func startSystemMonitor(
-	ctx context.Context, logicalBytes *atomic.Int64, cachePath string,
+	ctx context.Context, logicalWriteBytes, logicalReadBytes *atomic.Int64, cachePath string,
 ) <-chan SystemMetrics {
 	out := make(chan SystemMetrics, 1)
 	go func() {
 		var (
 			maxRSS, totalQD float64
 			samples         int
-			interval        = 60 * time.Second // Reduced frequency to minimize GC pressure
+			interval        = 30 * time.Second
 			ticker          = time.NewTicker(interval)
 			proc, _         = process.NewProcess(int32(os.Getpid()))
 			v1, _           = disk.IOCounters()
-			prevLog         = logicalBytes.Load()
+			prevLogWrite    = logicalWriteBytes.Load()
+			prevLogRead     = logicalReadBytes.Load()
 		)
 		defer ticker.Stop()
 
@@ -421,10 +423,12 @@ func startSystemMonitor(
 				}
 
 				// 4. Performance Throughput
-				currLog := logicalBytes.Load()
+				currLogWrite := logicalWriteBytes.Load()
+				currLogRead := logicalReadBytes.Load()
 				physWriteTP := (physWriteBytes / (1 << 30)) / interval.Seconds()
 				physReadTP := (physReadBytes / (1 << 30)) / interval.Seconds()
-				logicalTP := (float64(currLog-prevLog) / (1 << 30)) / interval.Seconds()
+				logWriteTP := (float64(currLogWrite-prevLogWrite) / (1 << 30)) / interval.Seconds()
+				logReadTP := (float64(currLogRead-prevLogRead) / (1 << 30)) / interval.Seconds()
 
 				// 5. System Safety Check
 				usage, _ := disk.Usage(cachePath)
@@ -433,16 +437,18 @@ func startSystemMonitor(
 				fmt.Printf("\n[HEARTBEAT %s]\n"+
 					"  MEM:   RSS: %.2fGB\n"+
 					"  DISK:  IO Depth: %.2f | Phys-Read: %.2f GB/s | Phys-Write: %.2f GB/s | Free: %.1fGB\n"+
-					"  SIEVE: Phys: %.2fGB | Log: %.2fGB | Ratio: %.2f | Log-TP: %.2f GB/s\n",
+					"  SIEVE: Phys: %.2fGB | Log: %.2fGB | Ratio: %.2f\n"+
+					"  TPUT:  Log-Write: %.2f GB/s | Log-Read: %.2f GB/s\n",
 					time.Now().Format("15:04:05"), rss, currentQD, physReadTP, physWriteTP, freeGB,
-					float64(physicalSize)/(1<<30), float64(logicalSize)/(1<<30),
-					sRatio, logicalTP)
+					float64(physicalSize)/(1<<30), float64(logicalSize)/(1<<30), sRatio,
+					logWriteTP, logReadTP)
 
 				// Update states
 				totalQD += currentQD
 				samples++
 				v1 = v2
-				prevLog = currLog
+				prevLogWrite = currLogWrite
+				prevLogRead = currLogRead
 			}
 		}
 	}()

@@ -160,9 +160,12 @@ type persistence struct {
 	}
 }
 
-// MergeWasteRatioThreshold is the sparseness threshold for merge compaction.
-// Segments with waste ratio >= this value are candidates for merging.
-const MergeWasteRatioThreshold = 0.90
+// MergeWasteRatioThreshold is the floor for merge compaction candidate tracking.
+// Segments crossing this threshold are added to pendingMerge for consideration.
+// The actual merge decision uses a dynamic threshold from dynamicMergeThreshold()
+// which varies by blob size (0.65 for large blobs, 0.90 for small blobs).
+// This floor must be <= the minimum possible dynamic threshold.
+const MergeWasteRatioThreshold = 0.60
 
 func newPersistence(basePath string, shards int) (*persistence, error) {
 	p := &persistence{
@@ -1045,13 +1048,21 @@ func (p *persistence) getMergeCompactionCandidates(maxEligibleID uint32, wasteTh
 	var candidates []SparseSegment
 	for segID := range p.segments.pendingMerge {
 		if segID < maxEligibleID {
-			if entry, ok := p.segments.byID[segID]; ok && entry.WasteRatio() >= wasteThreshold {
+			entry, ok := p.segments.byID[segID]
+			if !ok {
+				// Segment was deleted (e.g., by another compaction). Clean up.
+				delete(p.segments.pendingMerge, segID)
+				continue
+			}
+			if entry.WasteRatio() >= wasteThreshold {
 				candidates = append(candidates, SparseSegment{
 					ID:        segID,
 					LiveBytes: entry.LiveBytes,
 				})
+				delete(p.segments.pendingMerge, segID)
 			}
-			delete(p.segments.pendingMerge, segID)
+			// If segment doesn't pass dynamic threshold yet, leave in pending
+			// for re-evaluation next cycle (waste may increase further).
 		}
 	}
 

@@ -145,7 +145,7 @@ func (c *Cache) selectSegmentsForMerge(targetOutputSize int64, minRangeSize int,
 }
 
 // calculateDynamicGravity computes the minimum segment count based on system
-// sparseness and average blob size.
+// sparseness (physical/logical ratio).
 //
 // The "gravity" increases as the system becomes sparser (elastic window):
 //   - At 50% sparse (ratio=0.5): gravity = ceil(1/0.5) = 2, clamped to 4
@@ -154,14 +154,8 @@ func (c *Cache) selectSegmentsForMerge(targetOutputSize int64, minRangeSize int,
 //   - At 97% sparse (ratio=0.03): gravity = ceil(1/0.03) = 34
 //   - At 99% sparse (ratio=0.01): gravity = ceil(1/0.01) = 100
 //
-// Size-aware scaling (avgBlobSize):
-//   - Large blobs (>=256KB) create fewer, larger holes per eviction — less
-//     fragmentation per unit of waste — so gravity doubles (more patient).
-//   - Small blobs create many small extents per MB of waste, so gravity stays low.
-//   - Linear interpolation between 1.0x (0 bytes) and 2.0x (256KB+).
-//
 // Returns a value between minGravity (4) and maxGravity (128).
-func calculateDynamicGravity(physicalSize, logicalSize, avgBlobSize int64) int {
+func calculateDynamicGravity(physicalSize, logicalSize int64) int {
 	if logicalSize <= 0 || physicalSize <= 0 {
 		return minGravity
 	}
@@ -173,31 +167,29 @@ func calculateDynamicGravity(physicalSize, logicalSize, avgBlobSize int64) int {
 	// Invert to get gravity: sparser systems need more segments to form dense output
 	gravity := int(1.0/ratio + 0.999) // Ceiling
 
-	// Size-aware scaling: large blobs need wider search since each eviction
-	// frees more bytes per hole punch, reducing fragmentation per unit of waste.
-	if avgBlobSize > 0 {
-		sizeMultiplier := 1.0 + min(float64(avgBlobSize)/float64(256*1024), 1.0)
-		gravity = int(float64(gravity) * sizeMultiplier)
-	}
-
 	// Clamp to bounds [minGravity, maxGravity]
 	return max(minGravity, min(gravity, maxGravity))
 }
 
 // dynamicMergeThreshold returns the waste ratio threshold for merge compaction
-// based on average blob size.  Large blobs create fewer, larger holes per
-// eviction so we can afford to wait longer before merging.
+// based on average blob size.
 //
-//   - 4KB blobs:    0.90 (many small extents per MB)
+// Large blobs have fewer items per segment, so each eviction removes a larger
+// fraction. Segments become sparse faster and should merge earlier to prevent
+// read fragmentation. Small blobs have many items per segment; each hole is
+// a tiny fraction, so segments tolerate more waste before merging helps.
+//
+//   - 4KB blobs:    0.90 (many items/segment, holes are tiny)
 //   - 64KB blobs:   0.90 (transition point)
-//   - 256KB+ blobs: 0.95 (few large extents, less fragmentation)
+//   - 256KB+ blobs: 0.65 (few items/segment, merge early)
 func dynamicMergeThreshold(avgBlobSize int64) float64 {
 	if avgBlobSize >= 256*1024 {
-		return 0.95
+		return 0.65
 	}
 	if avgBlobSize >= 64*1024 {
+		// Linear: 0.90 at 64KB → 0.65 at 256KB
 		ratio := float64(avgBlobSize-64*1024) / float64(192*1024) // 256K-64K = 192K
-		return 0.90 + ratio*0.05
+		return 0.90 - ratio*0.25
 	}
 	return 0.90
 }

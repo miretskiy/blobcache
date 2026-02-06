@@ -184,8 +184,8 @@ type KeyConsumer func(k Key)
 // RecordAdditions arranges for this filter to record all added keys until
 // stopRecording or consumeRecording function is invoked.
 func (f *Filter) RecordAdditions() (
-		stopRecording func(),
-		consumeRecording func(consumer KeyConsumer),
+	stopRecording func(),
+	consumeRecording func(consumer KeyConsumer),
 ) {
 	// Pre-allocate 256k slots (4MB for 128-bit keys). This is "large" for 8KB blobs.
 	r := &recording{

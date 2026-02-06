@@ -15,6 +15,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/time/rate"
+
 	"github.com/miretskiy/blobcache/base"
 	"github.com/miretskiy/blobcache/bloom"
 	"github.com/miretskiy/blobcache/internal/index"
@@ -22,7 +24,6 @@ import (
 	"github.com/miretskiy/blobcache/internal/sys"
 	"github.com/miretskiy/blobcache/internal/wal"
 	"github.com/zeebo/xxh3"
-	"golang.org/x/time/rate"
 )
 
 // Key is the 128-bit hash of a blob key.
@@ -879,6 +880,12 @@ func (c *Cache) runWALRecovery() (bool, error) {
 	return recovered, nil
 }
 
+// maxSpatialBystanders limits the blast radius of spatial co-eviction.
+// SIEVE picks a cold anchor; bystanders may be warm or hot — they are evicted
+// only because they are physically adjacent.  Keeping this small bounds the
+// cache pollution from "innocent bystander" eviction.
+const maxSpatialBystanders = 64
+
 // CoalesceVictims sorts victims by (SegmentID, Offset) and merges adjacent ranges
 // into a single HoleRange. This reduces filesystem journal commits by ~98% when
 // evicting thousands of blobs, turning "Swiss cheese" into "stripes".
@@ -1005,14 +1012,19 @@ func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
 		physicallyReclaimed int64
 	)
 
-	// 1. SELECTION PHASE
+	// 1. SELECTION PHASE — Spatial SIEVE
+	// Each Evict call finds the coldest item via SIEVE (anchor), then co-evicts
+	// physically adjacent items in the same segment up to the remaining budget.
+	// This turns scattered "Swiss cheese" holes into contiguous stripes.
 	for evictedBytes < toEvictBytes {
-		victim, err := c.index.Evict()
-		if err != nil {
+		batch := c.index.Evict(toEvictBytes-evictedBytes, maxSpatialBystanders)
+		if len(batch) == 0 {
 			break
 		}
-		victims = append(victims, victim)
-		evictedBytes += int64(victim.PhysicalLen)
+		for _, v := range batch {
+			victims = append(victims, v)
+			evictedBytes += int64(v.PhysicalLen)
+		}
 	}
 
 	if len(victims) == 0 {
@@ -1040,38 +1052,15 @@ func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
 		delete(c.segmentDeleteBuf, segID) // Clear for reuse
 	}
 
-	// 3. RECLAMATION PHASE - Deferred Hole Punching
-	// Instead of punching every small hole immediately, we only punch segments
-	// whose DirtyBytes exceed the threshold (10% of WriteBufferSize). This
-	// transforms thousands of small metadata updates into fewer large "extent trims",
-	// reducing filesystem journal contention.
-	//
-	// Still coalesce for efficiency - but only punch dirty segments.
+	// 3. RECLAMATION PHASE
+	// Coalesce adjacent eviction holes into contiguous ranges to reduce syscalls,
+	// then punch through the rate limiter (2000 ops/sec in archivist).
 	c.reclaimBuf = CoalesceVictims(victims, c.reclaimBuf[:0])
-
-	// Deferred punching threshold: 10% of segment size
-	dirtyThreshold := c.WriteBufferSize / 10
-	dirtySegments := c.index.GetDirtySegments(dirtyThreshold)
-
-	// Build set of segments that are dirty enough to punch
-	dirtySet := make(map[uint32]struct{}, len(dirtySegments))
-	for _, ds := range dirtySegments {
-		dirtySet[ds.ID] = struct{}{}
-	}
-
 	var syscallCount int
 	for _, r := range c.reclaimBuf {
-		// Only punch if this segment crossed the dirty threshold
-		if _, dirty := dirtySet[r.SegmentID]; dirty {
-			reclaimed, _ := c.archivist.HolePunchRange(context.Background(), r.SegmentID, r.Offset, r.Length)
-			physicallyReclaimed += reclaimed
-			syscallCount++
-		}
-	}
-
-	// Reset DirtyBytes for segments we punched
-	for segID := range dirtySet {
-		c.index.ResetDirtyBytes(segID)
+		reclaimed, _ := c.archivist.HolePunchRange(context.Background(), r.SegmentID, r.Offset, r.Length)
+		physicallyReclaimed += reclaimed
+		syscallCount++
 	}
 
 	// 4. METRICS & MAINTENANCE
@@ -1127,18 +1116,25 @@ func (c *Cache) maybeCompactSegments() error {
 //   - Size-based accumulator targeting WriteBufferSize output
 //   - Yielding between merges to protect foreground read throughput
 func (c *Cache) maybeMergeSegments() error {
-	// Calculate dynamic gravity based on system sparseness
-	// physicalSize approximated by approxSize (tracks logical after hole punching)
-	// For now, use a fixed gravity until we have proper physical size tracking
-	logicalSize := c.approxSize.Load()
-	physicalSize := logicalSize // TODO: Track actual physical size via stat.Blocks
-
-	gravity := calculateDynamicGravity(physicalSize, logicalSize)
+	// Calculate dynamic gravity based on system sparseness.
+	// Density = logicalLive / physicalEnvelope, where physicalEnvelope is the
+	// total disk space covered by all segments (segmentCount * WriteBufferSize).
+	// As eviction creates holes, logicalLive shrinks relative to the envelope,
+	// causing gravity to increase and widen the merge search window.
+	logicalLive := c.approxSize.Load()
+	segCount := int64(c.index.GetSegmentCount())
+	if segCount == 0 {
+		return nil
+	}
+	physicalEnvelope := segCount * c.WriteBufferSize
+	avgBlobSize := c.index.GetGlobalAvgBlobSize()
+	gravity := calculateDynamicGravity(logicalLive, physicalEnvelope, avgBlobSize)
+	threshold := dynamicMergeThreshold(avgBlobSize)
 	// Target 1.5x WriteBufferSize (~96MB for default 64MB buffer) for efficient sequential I/O
 	targetOutputSize := c.WriteBufferSize + c.WriteBufferSize/2
 
 	// Select candidate ranges using sliding window accumulator
-	candidates := c.selectSegmentsForMerge(targetOutputSize, gravity)
+	candidates := c.selectSegmentsForMerge(targetOutputSize, gravity, threshold)
 	if len(candidates) == 0 {
 		return nil
 	}
@@ -1208,11 +1204,14 @@ func (c *Cache) maybeMergeSegments() error {
 		if c.compactionLimiter != nil && result.WriteBytes > 0 {
 			// WaitN blocks until we've earned tokens for the bytes we just wrote.
 			// This is more precise than fixed sleep: large merges wait longer.
-			tokens := int(result.WriteBytes)
-			if tokens > c.compactionLimiter.Burst() {
-				// If write exceeds burst, use burst size (limiter's max allowance)
-				tokens = c.compactionLimiter.Burst()
-			}
+			//
+			// Caveat: WaitN requires tokens <= Burst. When a single merge writes
+			// more than Burst bytes (WriteBufferSize), we cap at Burst. This means
+			// very large merges are throttled less than ideal — they consume one
+			// burst-worth of tokens instead of proportional to their actual output.
+			// In practice this is acceptable: merges target ~1.5x WriteBufferSize
+			// and burst is set to WriteBufferSize, so the undershoot is ≤1.5x.
+			tokens := min(int(result.WriteBytes), c.compactionLimiter.Burst())
 			_ = c.compactionLimiter.WaitN(context.Background(), tokens)
 		}
 	}
@@ -1227,7 +1226,7 @@ func (c *Cache) maybeMergeSegments() error {
 // This collapses the tombstone incremental log into the segment manifest and
 // reclaims space via hole punching.
 func (c *Cache) maybeCompactTombstones() error {
-	segments := c.selectSegmentsForTombstoneCompaction(DefaultTombstoneCompactionThreshold)
+	segments := c.selectSegmentsForTombstoneCompaction()
 	if len(segments) == 0 {
 		return nil
 	}
@@ -1235,16 +1234,22 @@ func (c *Cache) maybeCompactTombstones() error {
 	log.Debug("tombstone compaction starting", "segment_count", len(segments))
 
 	for _, segID := range segments {
-		// Acquire segment lock (shared with compaction, exclusive from Delete)
+		// Acquire shared lock: allows concurrent compactions, blocks Delete.
+		// Delete takes Lock() (exclusive), compaction takes RLock() (shared).
 		shard := c.index.SegmentLockShard(segID)
-		shard.Lock()
+		shard.RLock()
 		err := c.compactSegmentTombstones(segID)
-		shard.Unlock()
+		shard.RUnlock()
 
 		if err != nil {
-			// Fail fast on first error to avoid accumulating repeated errors
+			// Candidate remains in pending set for retry on next cycle.
 			return err
 		}
+
+		// Only acknowledge after success — failed compactions retain the candidate
+		// so it can be retried. The segment can't re-cross the threshold since it
+		// already did, so without acknowledgment, it would be permanently lost.
+		c.index.AcknowledgeTombstoneCompaction(segID)
 	}
 
 	return nil

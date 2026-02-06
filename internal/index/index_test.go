@@ -226,6 +226,68 @@ func TestEviction_ClockLogic(t *testing.T) {
 	require.False(t, hasC, "Item C (Cold) should be evicted")
 }
 
+func TestDeleteIfAt_Success(t *testing.T) {
+	idx := NewBlobIndex(100)
+	k := makeTestKey(1)
+	idx.Put(makeItem(k, 10, 500))
+
+	// Delete with matching SegmentID and Offset — should succeed
+	item, ok := idx.deleteIfAt(k, 10, 0)
+	require.True(t, ok)
+	require.Equal(t, uint32(10), item.SegmentID)
+	require.Equal(t, uint32(500), item.PhysicalLen)
+
+	// Item should be gone
+	_, found := idx.Get(k)
+	require.False(t, found)
+}
+
+func TestDeleteIfAt_WrongSegment(t *testing.T) {
+	idx := NewBlobIndex(100)
+	k := makeTestKey(1)
+	idx.Put(makeItem(k, 10, 500))
+
+	// Delete with wrong SegmentID — should fail, item untouched
+	_, ok := idx.deleteIfAt(k, 99, 0)
+	require.False(t, ok)
+
+	_, found := idx.Get(k)
+	require.True(t, found)
+}
+
+func TestDeleteIfAt_WrongOffset(t *testing.T) {
+	idx := NewBlobIndex(100)
+	k := makeTestKey(1)
+	item := makeItem(k, 10, 500)
+	item.Offset = 4096
+	idx.Put(item)
+
+	// Delete with wrong Offset — should fail
+	_, ok := idx.deleteIfAt(k, 10, 0)
+	require.False(t, ok)
+
+	_, found := idx.Get(k)
+	require.True(t, found)
+}
+
+func TestDeleteIfAt_NotFound(t *testing.T) {
+	idx := NewBlobIndex(100)
+	_, ok := idx.deleteIfAt(makeTestKey(42), 1, 0)
+	require.False(t, ok)
+}
+
+func TestDeleteIfAt_AlreadyDeleted(t *testing.T) {
+	idx := NewBlobIndex(100)
+	k := makeTestKey(1)
+	item := makeItem(k, 10, 500)
+	item.SetDeleted()
+	idx.Put(item)
+
+	// Item is marked deleted — deleteIfAt should refuse
+	_, ok := idx.deleteIfAt(k, 10, 0)
+	require.False(t, ok)
+}
+
 func TestEviction_SizeBased(t *testing.T) {
 	idx := NewBlobIndex(1000)
 	count := 100

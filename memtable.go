@@ -65,8 +65,8 @@ type MemTable struct {
 }
 
 func NewMemTable(
-		cfg config, b Batcher, reporter ErrorReporter, pub Publisher, w *wal.WAL,
-		segIDs SegmentIDProvider,
+	cfg config, b Batcher, reporter ErrorReporter, pub Publisher, w *wal.WAL,
+	segIDs SegmentIDProvider,
 ) *MemTable {
 	poolCapacity := cfg.MaxCachedSlabs + cfg.MaxInflightSlabs + 2
 
@@ -163,13 +163,13 @@ func (mt *MemTable) Put(seqID uint64, hash Key, keyBytes, value []byte) error {
 }
 
 func (mt *MemTable) PutChecksummed(
-		seqID uint64, hash Key, keyBytes, value []byte, checksum uint32,
+	seqID uint64, hash Key, keyBytes, value []byte, checksum uint32,
 ) error {
 	return mt.putActive(seqID, hash, keyBytes, value, &checksum)
 }
 
 func (mt *MemTable) putActive(
-		seqID uint64, hash Key, keyBytes, value []byte, checksum *uint32,
+	seqID uint64, hash Key, keyBytes, value []byte, checksum *uint32,
 ) error {
 	// 1. Compress before lock (parallel compression) - only on first call
 	c := mt.maybeCompress(value)
@@ -178,7 +178,7 @@ func (mt *MemTable) putActive(
 }
 
 func (mt *MemTable) putActiveCompressed(
-		seqID uint64, hash Key, keyBytes, value []byte, checksum *uint32, compressed *BufferHandle,
+	seqID uint64, hash Key, keyBytes, value []byte, checksum *uint32, compressed *BufferHandle,
 ) error {
 	// 1. Build record BEFORE lock (pure computation, no lock needed)
 	valueBytes := value
@@ -627,7 +627,7 @@ func (mt *MemTable) ioFlags() sys.OpenFlag {
 
 // finalizeFlush updates the index and writes the footer file.
 func (mt *MemTable) finalizeFlush(
-		segmentID uint32, segmentPath string, entries []record.FooterEntry, maxSeqID uint64,
+	segmentID uint32, segmentPath string, entries []record.FooterEntry, maxSeqID uint64,
 ) error {
 	if mt.Knobs != nil && mt.Knobs.InjectIndexErr != nil {
 		if err := mt.Knobs.InjectIndexErr(); err != nil {
@@ -664,10 +664,10 @@ func (mt *MemTable) finalizeFlush(
 // break O_DIRECT alignment (the remaining data wouldn't start at a page boundary).
 // The 8 bytes of "waste" per XL write is acceptable given the simplicity.
 func writeSegmentWithXLPayloads(
-		segmentPath string,
-		flags sys.OpenFlag,
-		alignedData []byte,
-		xlWrites []SlabEntry,
+	segmentPath string,
+	flags sys.OpenFlag,
+	alignedData []byte,
+	xlWrites []SlabEntry,
 ) (retErr error) {
 	var xlSize int64
 	for _, w := range xlWrites {
@@ -726,9 +726,9 @@ func writeSegmentWithXLPayloads(
 //
 // Preconditions: entries and xlWrites must both be sorted by (Pos, SeqID).
 func adjustFilePositionsForXLWrites(
-		entries []record.FooterEntry,
-		xlWrites []SlabEntry,
-		xlSeqIDs map[uint64]int,
+	entries []record.FooterEntry,
+	xlWrites []SlabEntry,
+	xlSeqIDs map[uint64]int,
 ) {
 	var cumulativeXLSize int64
 	xlIdx := 0

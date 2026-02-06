@@ -1,39 +1,5 @@
 package blobcache
 
-import (
-	"github.com/miretskiy/blobcache/internal/index"
-)
-
-func init() {
-	// Verify thresholds stay in sync
-	if DefaultTombstoneCompactionThreshold != index.TombstoneCompactionThreshold {
-		panic("DefaultTombstoneCompactionThreshold != index.TombstoneCompactionThreshold")
-	}
-}
-
-// SegmentStats holds computed statistics for a single segment.
-// Computed on-demand during compaction selection.
-type SegmentStats struct {
-	SegmentID      uint32
-	TombstoneCount int
-	LiveItemCount  int
-	LiveBytes      int64 // Sum of PhysicalLen for live (non-deleted) items
-}
-
-// WasteRatio returns the proportion of tombstones (0.0 to 1.0).
-// Returns 0 if segment is empty.
-func (s SegmentStats) WasteRatio() float64 {
-	total := s.TombstoneCount + s.LiveItemCount
-	if total == 0 {
-		return 0
-	}
-	return float64(s.TombstoneCount) / float64(total)
-}
-
-// DefaultTombstoneCompactionThreshold is the minimum tombstone count to trigger compaction.
-// Segments with fewer tombstones are not worth the I/O overhead.
-const DefaultTombstoneCompactionThreshold = 100
-
 // coolingPeriodMargin adds safety margin to the cooling period.
 // This ensures segments are fully aged out of Librarian before compaction.
 const coolingPeriodMargin = 2
@@ -66,7 +32,7 @@ const (
 // This uses lazy candidate tracking for O(K) complexity where K is the number of
 // pending candidates, instead of O(N) scanning of all segments. Candidates are
 // tracked incrementally during UpdateSegmentOnDelete() when they cross the threshold.
-func (c *Cache) selectSegmentsForTombstoneCompaction(_ int) []uint32 {
+func (c *Cache) selectSegmentsForTombstoneCompaction() []uint32 {
 	currentSegID := c.segIDs.CurrentSegmentID()
 	coolingGap := uint32(c.MaxCachedSlabs + coolingPeriodMargin)
 
@@ -79,40 +45,9 @@ func (c *Cache) selectSegmentsForTombstoneCompaction(_ int) []uint32 {
 	return c.index.GetTombstoneCompactionCandidates(maxEligibleID)
 }
 
-// selectContiguousRanges groups segment IDs into contiguous ranges for merge compaction.
-// A contiguous range is a sequence where each segment ID is exactly 1 more than the previous.
-//
-// Example: [1, 2, 3, 7, 8, 10] -> [[1,2,3], [7,8], [10]]
-//
-// This respects the Strict Contiguity Rule required by Compactor.Compact().
-func selectContiguousRanges(segmentIDs []uint32) [][]uint32 {
-	if len(segmentIDs) == 0 {
-		return nil
-	}
-
-	var ranges [][]uint32
-	current := []uint32{segmentIDs[0]}
-
-	for i := 1; i < len(segmentIDs); i++ {
-		if segmentIDs[i] == segmentIDs[i-1]+1 {
-			// Contiguous - extend current range
-			current = append(current, segmentIDs[i])
-		} else {
-			// Gap - start new range
-			ranges = append(ranges, current)
-			current = []uint32{segmentIDs[i]}
-		}
-	}
-
-	// Don't forget the last range
-	ranges = append(ranges, current)
-
-	return ranges
-}
-
 // MergeCandidate represents a contiguous range of segments selected for merge compaction.
 type MergeCandidate struct {
-	SegmentIDs       []uint32 // Contiguous segment IDs to merge
+	SegmentIDs         []uint32 // Contiguous segment IDs to merge
 	EstimatedLiveBytes int64    // Sum of live bytes across all segments
 }
 
@@ -132,7 +67,7 @@ type MergeCandidate struct {
 //
 // Uses lazy candidate tracking for O(K) complexity where K is the number of
 // sparse segments, instead of O(N) scanning of all segments.
-func (c *Cache) selectSegmentsForMerge(targetOutputSize int64, minRangeSize int) []MergeCandidate {
+func (c *Cache) selectSegmentsForMerge(targetOutputSize int64, minRangeSize int, wasteThreshold float64) []MergeCandidate {
 	currentSegID := c.segIDs.CurrentSegmentID()
 	coolingGap := uint32(c.MaxCachedSlabs + coolingPeriodMargin)
 
@@ -142,7 +77,7 @@ func (c *Cache) selectSegmentsForMerge(targetOutputSize int64, minRangeSize int)
 	}
 
 	maxEligibleID := currentSegID - coolingGap
-	sparse := c.index.GetMergeCompactionCandidates(maxEligibleID)
+	sparse := c.index.GetMergeCompactionCandidates(maxEligibleID, wasteThreshold)
 
 	if len(sparse) == 0 {
 		return nil
@@ -209,7 +144,8 @@ func (c *Cache) selectSegmentsForMerge(targetOutputSize int64, minRangeSize int)
 	return result
 }
 
-// calculateDynamicGravity computes the minimum segment count based on system sparseness.
+// calculateDynamicGravity computes the minimum segment count based on system
+// sparseness and average blob size.
 //
 // The "gravity" increases as the system becomes sparser (elastic window):
 //   - At 50% sparse (ratio=0.5): gravity = ceil(1/0.5) = 2, clamped to 4
@@ -217,14 +153,15 @@ func (c *Cache) selectSegmentsForMerge(targetOutputSize int64, minRangeSize int)
 //   - At 87.5% sparse (ratio=0.125): gravity = ceil(1/0.125) = 8
 //   - At 97% sparse (ratio=0.03): gravity = ceil(1/0.03) = 34
 //   - At 99% sparse (ratio=0.01): gravity = ceil(1/0.01) = 100
-//   - At 99.2% sparse (ratio=0.008): gravity = ceil(1/0.008) = 125, near maxGravity=128
 //
-// Parameters:
-//   - physicalSize: Actual disk usage (from stat or approxSize after hole punching)
-//   - logicalSize: Tracked logical size (sum of item.PhysicalLen)
+// Size-aware scaling (avgBlobSize):
+//   - Large blobs (>=256KB) create fewer, larger holes per eviction — less
+//     fragmentation per unit of waste — so gravity doubles (more patient).
+//   - Small blobs create many small extents per MB of waste, so gravity stays low.
+//   - Linear interpolation between 1.0x (0 bytes) and 2.0x (256KB+).
 //
 // Returns a value between minGravity (4) and maxGravity (128).
-func calculateDynamicGravity(physicalSize, logicalSize int64) int {
+func calculateDynamicGravity(physicalSize, logicalSize, avgBlobSize int64) int {
 	if logicalSize <= 0 || physicalSize <= 0 {
 		return minGravity
 	}
@@ -236,8 +173,33 @@ func calculateDynamicGravity(physicalSize, logicalSize int64) int {
 	// Invert to get gravity: sparser systems need more segments to form dense output
 	gravity := int(1.0/ratio + 0.999) // Ceiling
 
+	// Size-aware scaling: large blobs need wider search since each eviction
+	// frees more bytes per hole punch, reducing fragmentation per unit of waste.
+	if avgBlobSize > 0 {
+		sizeMultiplier := 1.0 + min(float64(avgBlobSize)/float64(256*1024), 1.0)
+		gravity = int(float64(gravity) * sizeMultiplier)
+	}
+
 	// Clamp to bounds [minGravity, maxGravity]
 	return max(minGravity, min(gravity, maxGravity))
+}
+
+// dynamicMergeThreshold returns the waste ratio threshold for merge compaction
+// based on average blob size.  Large blobs create fewer, larger holes per
+// eviction so we can afford to wait longer before merging.
+//
+//   - 4KB blobs:    0.90 (many small extents per MB)
+//   - 64KB blobs:   0.90 (transition point)
+//   - 256KB+ blobs: 0.95 (few large extents, less fragmentation)
+func dynamicMergeThreshold(avgBlobSize int64) float64 {
+	if avgBlobSize >= 256*1024 {
+		return 0.95
+	}
+	if avgBlobSize >= 64*1024 {
+		ratio := float64(avgBlobSize-64*1024) / float64(192*1024) // 256K-64K = 192K
+		return 0.90 + ratio*0.05
+	}
+	return 0.90
 }
 
 // recalculateOldestSegmentID updates oldestLiveSegmentID from the in-memory registry.

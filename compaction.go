@@ -23,9 +23,6 @@ type CompactorKnobs struct {
 	BeforeRelocate func(k index.Key)
 }
 
-// DefaultCompactBufSize is used when no buffer size is specified.
-const DefaultCompactBufSize = 64 << 20 // 64MB
-
 // Compactor handles segment compaction using a copy-forward approach.
 // It merges contiguous segments, filters out stale/deleted items, and
 // produces a single compacted segment.
@@ -58,7 +55,7 @@ type segmentFileInfo struct {
 }
 
 // NewCompactor creates a Compactor with the given dependencies.
-// bufSize specifies the buffer size for compaction I/O (0 for default 64MB).
+// bufSize must be positive (typically WriteBufferSize).
 // releaseCachedFile is called before deleting segment files to release cached handles.
 func NewCompactor(
 	idx *index.DurableIndex,
@@ -70,7 +67,7 @@ func NewCompactor(
 	releaseCachedFile SegmentCacheReleaseFn,
 ) *Compactor {
 	if bufSize <= 0 {
-		bufSize = DefaultCompactBufSize
+		panic("NewCompactor: bufSize must be positive")
 	}
 	return &Compactor{
 		index:             idx,
@@ -149,8 +146,12 @@ func (c *Compactor) Compact(segmentIDs []uint32, dropTombstones bool) (_ Compact
 
 	startTime := time.Now()
 
-	// Acquire shared locks (RLock allows concurrent compactions, blocks Delete)
-	// Multiple segments may map to same shard - multiple RLocks is fine
+	// Acquire shared locks on segment shards.
+	// RLock allows concurrent compactions while blocking Delete operations.
+	// Multiple segments may map to the same shard (segID % 256). Multiple
+	// RLocks from the same goroutine are safe: Go's sync.RWMutex uses an
+	// additive reader count, so each RLock increments the counter without
+	// deadlock. Each RLock must have a matching RUnlock (handled in defer).
 	var shards []*sync.RWMutex
 	for _, segID := range segmentIDs {
 		shard := c.index.SegmentLockShard(segID)
@@ -342,9 +343,9 @@ func (c *Compactor) collectItems(segmentIDs []uint32) ([]relocInfo, []index.Item
 // Reads use aligned-read-then-shift via readBlobAligned (caches segment file handles).
 // Writes accumulate in an aligned buffer and flush in 4KB chunks.
 func (c *Compactor) writeCompactedSegment(
-		newSegID uint32,
-		toRelocate []relocInfo,
-		result *CompactResult,
+	newSegID uint32,
+	toRelocate []relocInfo,
+	result *CompactResult,
 ) ([]record.FooterEntry, error) {
 	// Lazy-allocate compaction buffer on first use
 	if c.compactBuf == nil {
@@ -366,8 +367,8 @@ func (c *Compactor) writeCompactedSegment(
 		return nil, fmt.Errorf("compaction: create segment: %w", err)
 	}
 
-	bufPos := 0       // Bytes in buffer (not yet written to disk)
-	diskWritten := 0  // Bytes written to disk
+	bufPos := 0      // Bytes in buffer (not yet written to disk)
+	diskWritten := 0 // Bytes written to disk
 	footerEntries := make([]record.FooterEntry, 0, len(toRelocate))
 
 	// Copy file header into buffer
@@ -583,7 +584,7 @@ func (c *Compactor) flushFullBlocks(f *os.File, buf []byte, bufPos int) (int, er
 
 // finalFlush writes remaining data with padding, then truncates to exact size.
 func (c *Compactor) finalFlush(
-		f *os.File, buf []byte, bufPos int, totalSize int64, res *CompactResult,
+	f *os.File, buf []byte, bufPos int, totalSize int64, res *CompactResult,
 ) error {
 	if bufPos == 0 {
 		return nil

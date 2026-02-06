@@ -14,7 +14,7 @@ import (
 
 // writeTestFooter writes a SegmentFooter to a .meta file for testing.
 func writeTestFooter(
-		t *testing.T, path string, segID uint32, entries []record.FooterEntry, maxSeqID uint64,
+	t *testing.T, path string, segID uint32, entries []record.FooterEntry, maxSeqID uint64,
 ) {
 	t.Helper()
 

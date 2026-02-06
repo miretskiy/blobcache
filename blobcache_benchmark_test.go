@@ -63,10 +63,8 @@ func BenchmarkBlobCache(b *testing.B) {
 	if _, err := os.Stat("/instance_storage"); err == nil {
 		tmpDir = "/instance_storage/bench-blobcache"
 	}
-	fmt.Printf("DEBUG: BenchmarkBlobCache starting, removing %s\n", tmpDir)
 	os.RemoveAll(tmpDir)
 	defer func() {
-		fmt.Printf("DEBUG: BenchmarkBlobCache defer cleanup running for %s\n", tmpDir)
 		os.RemoveAll(tmpDir)
 	}()
 
@@ -344,7 +342,7 @@ func reportLatency(b *testing.B, name string, h *hdrhistogram.Histogram) {
 }
 
 func startSystemMonitor(
-		ctx context.Context, logicalBytes *atomic.Int64, cachePath string,
+	ctx context.Context, logicalBytes *atomic.Int64, cachePath string,
 ) <-chan SystemMetrics {
 	out := make(chan SystemMetrics, 1)
 	go func() {
@@ -433,9 +431,9 @@ func startSystemMonitor(
 				freeGB := float64(usage.Free) / (1 << 30)
 
 				fmt.Printf("\n[HEARTBEAT %s]\n"+
-						"  MEM:   RSS: %.2fGB\n"+
-						"  DISK:  IO Depth: %.2f | Phys-Read: %.2f GB/s | Phys-Write: %.2f GB/s | Free: %.1fGB\n"+
-						"  SIEVE: Phys: %.2fGB | Log: %.2fGB | Ratio: %.2f | Log-TP: %.2f GB/s\n",
+					"  MEM:   RSS: %.2fGB\n"+
+					"  DISK:  IO Depth: %.2f | Phys-Read: %.2f GB/s | Phys-Write: %.2f GB/s | Free: %.1fGB\n"+
+					"  SIEVE: Phys: %.2fGB | Log: %.2fGB | Ratio: %.2f | Log-TP: %.2f GB/s\n",
 					time.Now().Format("15:04:05"), rss, currentQD, physReadTP, physWriteTP, freeGB,
 					float64(physicalSize)/(1<<30), float64(logicalSize)/(1<<30),
 					sRatio, logicalTP)
@@ -528,11 +526,11 @@ func BenchmarkEviction_SieveVictimSelection(b *testing.B) {
 
 	var totalBytes int64
 	for i := 0; i < b.N; i++ {
-		victim, err := idx.Evict()
-		if err != nil {
-			b.Fatalf("Eviction failed at %d/%d: %v", i, b.N, err)
+		victims := idx.Evict(1, 0) // Anchor only, no bystanders — pure SIEVE speed
+		if len(victims) == 0 {
+			b.Fatalf("Eviction failed at %d/%d: empty", i, b.N)
 		}
-		totalBytes += int64(victim.PhysicalLen)
+		totalBytes += int64(victims[0].PhysicalLen)
 	}
 
 	elapsed := time.Since(start)

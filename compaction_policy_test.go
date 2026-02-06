@@ -4,116 +4,16 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/miretskiy/blobcache/internal/index"
 	"github.com/stretchr/testify/require"
 )
-
-func TestSelectContiguousRanges(t *testing.T) {
-	tests := []struct {
-		name     string
-		input    []uint32
-		expected [][]uint32
-	}{
-		{
-			name:     "empty",
-			input:    nil,
-			expected: nil,
-		},
-		{
-			name:     "single",
-			input:    []uint32{5},
-			expected: [][]uint32{{5}},
-		},
-		{
-			name:     "contiguous_pair",
-			input:    []uint32{1, 2},
-			expected: [][]uint32{{1, 2}},
-		},
-		{
-			name:     "contiguous_triple",
-			input:    []uint32{10, 11, 12},
-			expected: [][]uint32{{10, 11, 12}},
-		},
-		{
-			name:     "gap_creates_two_ranges",
-			input:    []uint32{1, 2, 3, 7, 8},
-			expected: [][]uint32{{1, 2, 3}, {7, 8}},
-		},
-		{
-			name:     "all_isolated",
-			input:    []uint32{1, 5, 10, 20},
-			expected: [][]uint32{{1}, {5}, {10}, {20}},
-		},
-		{
-			name:     "mixed_ranges",
-			input:    []uint32{1, 2, 3, 7, 8, 10, 100, 101},
-			expected: [][]uint32{{1, 2, 3}, {7, 8}, {10}, {100, 101}},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := selectContiguousRanges(tt.input)
-			require.Equal(t, tt.expected, result)
-		})
-	}
-}
-
-func TestSegmentStats_WasteRatio(t *testing.T) {
-	tests := []struct {
-		name      string
-		stats     SegmentStats
-		expected  float64
-		tolerance float64
-	}{
-		{
-			name:      "empty_segment",
-			stats:     SegmentStats{TombstoneCount: 0, LiveItemCount: 0},
-			expected:  0.0,
-			tolerance: 0.0,
-		},
-		{
-			name:      "no_tombstones",
-			stats:     SegmentStats{TombstoneCount: 0, LiveItemCount: 100},
-			expected:  0.0,
-			tolerance: 0.0,
-		},
-		{
-			name:      "all_tombstones",
-			stats:     SegmentStats{TombstoneCount: 100, LiveItemCount: 0},
-			expected:  1.0,
-			tolerance: 0.0,
-		},
-		{
-			name:      "half_tombstones",
-			stats:     SegmentStats{TombstoneCount: 50, LiveItemCount: 50},
-			expected:  0.5,
-			tolerance: 0.001,
-		},
-		{
-			name:      "quarter_tombstones",
-			stats:     SegmentStats{TombstoneCount: 25, LiveItemCount: 75},
-			expected:  0.25,
-			tolerance: 0.001,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			ratio := tt.stats.WasteRatio()
-			if tt.tolerance == 0 {
-				require.Equal(t, tt.expected, ratio)
-			} else {
-				require.InDelta(t, tt.expected, ratio, tt.tolerance)
-			}
-		})
-	}
-}
 
 func TestCalculateDynamicGravity(t *testing.T) {
 	tests := []struct {
 		name         string
 		physicalSize int64
 		logicalSize  int64
+		avgBlobSize  int64
 		expected     int
 	}{
 		{
@@ -182,12 +82,63 @@ func TestCalculateDynamicGravity(t *testing.T) {
 			logicalSize:  1000,
 			expected:     125, // ratio=0.001, clamped to 0.008, gravity=125
 		},
+		// Size-aware scaling tests (avgBlobSize > 0)
+		{
+			name:         "large_blobs_double_gravity",
+			physicalSize: 100,
+			logicalSize:  1000,
+			avgBlobSize:  256 * 1024, // 256KB → multiplier=2.0
+			expected:     20,         // base=10 * 2.0 = 20
+		},
+		{
+			name:         "medium_blobs_partial_scale",
+			physicalSize: 100,
+			logicalSize:  1000,
+			avgBlobSize:  128 * 1024, // 128KB → multiplier=1.5
+			expected:     15,         // base=10 * 1.5 = 15
+		},
+		{
+			name:         "small_blobs_no_scale",
+			physicalSize: 100,
+			logicalSize:  1000,
+			avgBlobSize:  4 * 1024, // 4KB → multiplier≈1.015
+			expected:     10,       // base=10, effectively no scaling
+		},
+		{
+			name:         "large_blobs_clamped",
+			physicalSize: 10,
+			logicalSize:  1000,
+			avgBlobSize:  1024 * 1024, // 1MB → multiplier=2.0, capped at 1.0
+			expected:     128,         // base=100 * 2.0 = 200, clamped to 128
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gravity := calculateDynamicGravity(tt.physicalSize, tt.logicalSize)
+			gravity := calculateDynamicGravity(tt.physicalSize, tt.logicalSize, tt.avgBlobSize)
 			require.Equal(t, tt.expected, gravity)
+		})
+	}
+}
+
+func TestDynamicMergeThreshold(t *testing.T) {
+	tests := []struct {
+		name        string
+		avgBlobSize int64
+		expected    float64
+	}{
+		{"4KB_blobs", 4 * 1024, 0.90},
+		{"32KB_blobs", 32 * 1024, 0.90},
+		{"64KB_blobs", 64 * 1024, 0.90},
+		{"128KB_blobs", 128 * 1024, 0.9166666666666666}, // 0.90 + (64K/192K)*0.05
+		{"256KB_blobs", 256 * 1024, 0.95},
+		{"1MB_blobs", 1024 * 1024, 0.95},
+		{"zero_size", 0, 0.90},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			threshold := dynamicMergeThreshold(tt.avgBlobSize)
+			require.InDelta(t, tt.expected, threshold, 1e-10)
 		})
 	}
 }
@@ -204,27 +155,27 @@ func TestSelectSegmentsForTombstoneCompaction(t *testing.T) {
 	defer cache.Close()
 
 	// Initially no segments
-	segments := cache.selectSegmentsForTombstoneCompaction(DefaultTombstoneCompactionThreshold)
+	segments := cache.selectSegmentsForTombstoneCompaction()
 	require.Empty(t, segments, "should be empty with no segments")
 
 	// Write enough data to create tombstones that exceed the threshold.
 	// Each small write creates a separate item.
 	value := make([]byte, 1_000)
-	numItems := DefaultTombstoneCompactionThreshold + 20 // 120 items
+	numItems := index.TombstoneCompactionThreshold + 20 // 120 items
 	for i := range numItems {
-		key := []byte(fmt.Sprintf("key-%04d", i))
+		key := fmt.Appendf(nil, "key-%04d", i)
 		require.NoError(t, cache.Put(key, value))
 	}
 	cache.Drain()
 
 	// No tombstones yet, should select nothing
-	segments = cache.selectSegmentsForTombstoneCompaction(DefaultTombstoneCompactionThreshold)
+	segments = cache.selectSegmentsForTombstoneCompaction()
 	require.Empty(t, segments, "should be empty with no tombstones")
 
 	// Delete enough keys to cross the threshold (100+)
-	numDeletes := DefaultTombstoneCompactionThreshold + 5 // 105 deletes
+	numDeletes := index.TombstoneCompactionThreshold + 5 // 105 deletes
 	for i := range numDeletes {
-		key := []byte(fmt.Sprintf("key-%04d", i))
+		key := fmt.Appendf(nil, "key-%04d", i)
 		require.NoError(t, cache.Delete(key))
 	}
 
@@ -237,6 +188,6 @@ func TestSelectSegmentsForTombstoneCompaction(t *testing.T) {
 	}
 
 	// Now should select the segment that crossed the threshold
-	segments = cache.selectSegmentsForTombstoneCompaction(DefaultTombstoneCompactionThreshold)
+	segments = cache.selectSegmentsForTombstoneCompaction()
 	require.Len(t, segments, 1, "should select one segment with 105 tombstones")
 }

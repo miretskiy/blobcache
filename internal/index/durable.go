@@ -1,7 +1,6 @@
 package index
 
 import (
-	"errors"
 	"fmt"
 	"sync"
 
@@ -86,7 +85,7 @@ func (idx *DurableIndex) BlobStats() Stats {
 }
 
 func (idx *DurableIndex) Relocate(
-		k Key, oldSeg, newSeg SegmentID, oldOff, newOff Offset, mode RelocateMode,
+	k Key, oldSeg, newSeg SegmentID, oldOff, newOff Offset, mode RelocateMode,
 ) bool {
 	return idx.blobs.Relocate(k, oldSeg, newSeg, oldOff, newOff, mode)
 }
@@ -134,7 +133,13 @@ func (idx *DurableIndex) AddSegment(segmentID uint32, items []Item) {
 
 	// Create frozen Bloom filter snapshot from ALL items (including deleted).
 	// This enables hasOlderShadow queries for tombstone dissolution.
-	filter := bloom.New(32_000, 0.03) // 32k items, 3% FPR (~29KB)
+	//
+	// Size dynamically: bloom.New(n, 0.03) → ~1 bit/key at 3% FPR.
+	// For 1MB blobs in 64MB segment: ~64 items → 72 bytes.
+	// For 4KB blobs: ~16K items → ~14KB. (Was hardcoded 32K → ~29KB always.)
+	// Floor at 64 to avoid degenerate filters for very small segments.
+	n := max(uint(len(items)), 64)
+	filter := bloom.New(n, 0.03)
 	for _, item := range items {
 		filter.AddHash(item.Key)
 		if item.IsDeleted() {
@@ -161,14 +166,113 @@ func (idx *DurableIndex) AddSegment(segmentID uint32, items []Item) {
 	}
 }
 
-// Evict removes the coldest item using SIEVE and returns it.
-// This is a RAM-only operation; persistence sync is caller's responsibility.
-func (idx *DurableIndex) Evict() (Item, error) {
-	evicted := idx.EvictBatch(1)
-	if len(evicted) == 0 {
-		return Item{}, errors.New("eviction: empty")
+// Evict finds the coldest item via SIEVE (the "anchor") and then expands
+// spatially to co-evict physically adjacent items in the same segment.
+//
+// Returns at least 1 item (the anchor) unless the index is empty.
+// The total evicted bytes will not exceed targetBytes and at most
+// maxBystanders additional items are co-evicted beyond the anchor.
+//
+// Spatial expansion reads the segment's .meta manifest (small buffered I/O,
+// typically kernel page-cache hot) and walks outward from the anchor's offset,
+// removing each verified bystander atomically from the SIEVE list.
+// Bystanders may be warm or hot — that is the cost of physical contiguity —
+// so maxBystanders limits the blast radius.
+//
+// Persistence sync (tombstones) is the caller's responsibility.
+func (idx *DurableIndex) Evict(targetBytes int64, maxBystanders int) []Item {
+	// 1. Find anchor via SIEVE — single coldest item, removed from RAM.
+	anchors := idx.blobs.EvictBatch(1)
+	if len(anchors) == 0 {
+		return nil
 	}
-	return evicted[0], nil
+	anchor := anchors[0]
+	result := []Item{anchor}
+	remaining := targetBytes - int64(anchor.PhysicalLen)
+
+	if remaining <= 0 || maxBystanders <= 0 {
+		return result
+	}
+
+	// 2. Read segment manifest for spatial expansion.
+	manifest, err := idx.segments.readMetaFile(anchor.SegmentID)
+	if err != nil || len(manifest.Items) == 0 {
+		return result // Manifest unavailable — return anchor only
+	}
+
+	// 3. Walk manifest items outward from anchor, co-evicting bystanders.
+	result = idx.expandEviction(result, manifest.Items, anchor, remaining, maxBystanders)
+	return result
+}
+
+// expandEviction walks the manifest items outward (forward then backward)
+// from the anchor's offset, atomically removing verified bystanders from RAM.
+//
+// Items are checked via deleteIfAt which verifies (SegmentID, Offset) match
+// under the shard lock — no TOCTOU race with concurrent writes or compaction.
+func (idx *DurableIndex) expandEviction(
+	result []Item, manifestItems []Item, anchor Item,
+	remainingBytes int64, maxBystanders int,
+) []Item {
+	anchorOff := int64(anchor.Offset)
+	bystanders := 0
+
+	// Find anchor's position in the manifest (items are sorted by offset).
+	anchorIdx := -1
+	for i := range manifestItems {
+		if manifestItems[i].Offset == anchor.Offset && manifestItems[i].Key == anchor.Key {
+			anchorIdx = i
+			break
+		}
+	}
+	if anchorIdx < 0 {
+		return result
+	}
+
+	// Expand forward (higher offsets) and backward (lower offsets) in lockstep,
+	// choosing the closer neighbor each step to keep the hole contiguous.
+	lo, hi := anchorIdx-1, anchorIdx+1
+
+	for bystanders < maxBystanders && remainingBytes > 0 && (lo >= 0 || hi < len(manifestItems)) {
+		// Pick the closer candidate (prefer forward to extend contiguous run).
+		var pick int
+		switch {
+		case lo < 0:
+			pick = hi
+			hi++
+		case hi >= len(manifestItems):
+			pick = lo
+			lo--
+		default:
+			// Both valid — pick whichever is closer to anchor in offset space.
+			distLo := anchorOff - int64(manifestItems[lo].Offset)
+			distHi := int64(manifestItems[hi].Offset) - anchorOff
+			if distHi <= distLo {
+				pick = hi
+				hi++
+			} else {
+				pick = lo
+				lo--
+			}
+		}
+
+		mi := &manifestItems[pick]
+		if mi.IsDeleted() {
+			continue
+		}
+
+		// Atomic verify-and-remove: checks (SegmentID, Offset) match under shard lock.
+		evicted, ok := idx.blobs.deleteIfAt(mi.Key, anchor.SegmentID, mi.Offset)
+		if !ok {
+			continue // Already evicted, relocated, or overwritten
+		}
+
+		result = append(result, evicted)
+		remainingBytes -= int64(evicted.PhysicalLen)
+		bystanders++
+	}
+
+	return result
 }
 
 // DeleteSegment removes all entries for a segment from both RAM and disk.
@@ -280,19 +384,6 @@ func (idx *DurableIndex) DropSegment(segID uint32) error {
 	return idx.segments.dropSegment(segID)
 }
 
-// DropSegments removes multiple segments atomically.
-// More efficient than multiple DropSegment calls when dropping merged segments.
-// Stops on first error.
-func (idx *DurableIndex) DropSegments(segIDs []uint32) error {
-	idx.segments.unregisterSegments(segIDs)
-	for _, segID := range segIDs {
-		if err := idx.segments.dropSegment(segID); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 // HasOlderShadow checks if any segment with ID < floorID might contain the key.
 // Returns true if any older segment's Bloom filter tests positive.
 //
@@ -313,16 +404,22 @@ func (idx *DurableIndex) SegmentLockShard(segID uint32) *sync.RWMutex {
 	return &idx.segments.segmentLocks[segID%numSegmentLockShards]
 }
 
-// ForEachSegmentMeta iterates over all registered segments in ID order.
-// Used for computing segment statistics without scanning disk files.
-func (idx *DurableIndex) ForEachSegmentMeta(fn func(meta SegmentMetadata) bool) {
-	idx.segments.forEachSegment(fn)
-}
-
 // GetOldestSegmentID returns the ID of the oldest registered segment, or 0 if none.
 // O(1) lookup from the in-memory registry. Thread-safe for concurrent reads.
 func (idx *DurableIndex) GetOldestSegmentID() uint32 {
 	return idx.segments.getOldestSegmentID()
+}
+
+// GetSegmentCount returns the number of registered segments.
+// Thread-safe for concurrent reads.
+func (idx *DurableIndex) GetSegmentCount() int {
+	return idx.segments.getSegmentCount()
+}
+
+// GetGlobalAvgBlobSize returns the average live blob size across all segments.
+// Returns 0 if there are no live items.
+func (idx *DurableIndex) GetGlobalAvgBlobSize() int64 {
+	return idx.segments.getGlobalAvgBlobSize()
 }
 
 // UpdateSegmentOnDelete updates a segment's metadata after items are deleted.
@@ -336,28 +433,27 @@ func (idx *DurableIndex) UpdateSegmentOnDelete(segID uint32, deletedCount int32,
 //
 // This is O(K) where K is the number of pending candidates, avoiding O(N) scan
 // of all segments. Returns sorted segment IDs for deterministic processing.
+// Candidates are NOT consumed; call AcknowledgeTombstoneCompaction after success.
 func (idx *DurableIndex) GetTombstoneCompactionCandidates(maxEligibleID uint32) []uint32 {
 	return idx.segments.getTombstoneCompactionCandidates(maxEligibleID)
 }
 
-// GetMergeCompactionCandidates returns segments that have crossed the waste ratio
-// threshold (90%+) and have cooled past the given boundary.
+// AcknowledgeTombstoneCompaction removes a segment from the pending tombstone
+// compaction set after successful compaction.
+func (idx *DurableIndex) AcknowledgeTombstoneCompaction(segID uint32) {
+	idx.segments.acknowledgeTombstoneCompaction(segID)
+}
+
+// GetMergeCompactionCandidates returns segments that have crossed the given waste
+// ratio threshold and have cooled past the given boundary.
+//
+// The wasteThreshold is dynamic (see dynamicMergeThreshold in compaction_policy.go):
+// larger blobs tolerate more waste before triggering a merge.
 //
 // This is O(K) where K is the number of pending candidates, avoiding O(N) scan
 // of all segments. Returns candidates sorted by segment ID for deterministic processing.
-func (idx *DurableIndex) GetMergeCompactionCandidates(maxEligibleID uint32) []SparseSegment {
-	return idx.segments.getMergeCompactionCandidates(maxEligibleID)
-}
-
-// GetDirtySegments returns segments whose DirtyBytes exceed the threshold.
-// Used for deferred hole punching - batch many small deletes into fewer large punches.
-func (idx *DurableIndex) GetDirtySegments(threshold int64) []DirtySegment {
-	return idx.segments.getDirtySegments(threshold)
-}
-
-// ResetDirtyBytes clears the DirtyBytes counter for a segment after hole punching.
-func (idx *DurableIndex) ResetDirtyBytes(segID uint32) {
-	idx.segments.resetDirtyBytes(segID)
+func (idx *DurableIndex) GetMergeCompactionCandidates(maxEligibleID uint32, wasteThreshold float64) []SparseSegment {
+	return idx.segments.getMergeCompactionCandidates(maxEligibleID, wasteThreshold)
 }
 
 // CompactTombstones merges the tombstone incremental log into the segment manifest.

@@ -66,9 +66,9 @@ type config struct {
 	Resilience         ResilienceConfig
 	Compression        CompressionConfig
 	WAL                WALConfig
-	DegradedMode DegradedMode // How to handle degraded mode (default: memory-only)
-	TrustHash    bool         // Skip key verification on reads (cache mode optimization)
-	BallastSize  int          // Heap ballast size in bytes (default: 1GB, 0 = disabled)
+	DegradedMode       DegradedMode // How to handle degraded mode (default: memory-only)
+	TrustHash          bool         // Skip key verification on reads (cache mode optimization)
+	BallastSize        int          // Heap ballast size in bytes (default: 1GB, 0 = disabled)
 
 	// Compaction bandwidth limit in bytes/sec (default: 200 MB/s)
 	// Throttles merge compaction to avoid saturating the I/O bus during ingestion.
@@ -235,9 +235,9 @@ func defaultConfig(path string) config {
 		Path:                path,
 		MaxSize:             0,
 		Shards:              0,
-		WriteBufferSize:     64 << 20,  // 64MB
+		WriteBufferSize:     64 << 20, // 64MB
 		MaxInflightSlabs:    6,
-		MaxCachedSlabs:      8,         // Keep ~1GB of recently written data in RAM
+		MaxCachedSlabs:      8, // Keep ~1GB of recently written data in RAM
 		FlushConcurrency:    2,
 		BloomFPRate:         0.01,
 		BloomEstimatedKeys:  1_000_000,

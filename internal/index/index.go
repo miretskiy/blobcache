@@ -163,10 +163,7 @@ func NewBlobIndex(initialCapacity int) *BlobIndex {
 	}
 
 	// Initialize arena for each shard
-	shardCap := initialCapacity / ShardCount
-	if shardCap < 1 {
-		shardCap = 1
-	}
+	shardCap := max(initialCapacity/ShardCount, 1)
 	for i := range ShardCount {
 		s := bi.ShardAt(i)
 		s.Lock()
@@ -204,6 +201,34 @@ func (idx *BlobIndex) Get(k Key) (Item, bool) {
 	s.RUnlock()
 
 	return val, true
+}
+
+// deleteIfAt removes an item only if it is still at the expected (segID, offset).
+// Returns the removed item and true, or (zero, false) if the item was not found,
+// already deleted, or has moved (e.g. relocated by compaction or overwritten).
+//
+// This is the atomic building block for spatial SIEVE expansion: we know the
+// physical coordinates from the segment manifest, and this call verifies + removes
+// in one lock acquisition — no TOCTOU race with concurrent writes.
+func (idx *BlobIndex) deleteIfAt(k Key, segID uint32, offset uint32) (Item, bool) {
+	s := idx.Shard(k)
+
+	s.Lock()
+	defer s.Unlock()
+
+	i, ok := s.Items[k]
+	if !ok {
+		return Item{}, false
+	}
+
+	item := s.Extra.nodes[i].item
+	if item.IsDeleted() || item.SegmentID != segID || item.Offset != offset {
+		return Item{}, false
+	}
+
+	delete(s.Items, k)
+	freeNode(&s.Extra, i)
+	return item, true
 }
 
 // Put inserts or updates an item.

@@ -4,12 +4,12 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/miretskiy/blobcache/internal/index"
 	"github.com/miretskiy/blobcache/internal/record"
 	"github.com/miretskiy/blobcache/internal/sys"
-	"github.com/miretskiy/blobcache/internal/xmap"
 )
 
 // SegmentCacheReleaseFn is called to release cached segment file handles
@@ -151,7 +151,7 @@ func (c *Compactor) Compact(segmentIDs []uint32, dropTombstones bool) (_ Compact
 
 	// Acquire shared locks (RLock allows concurrent compactions, blocks Delete)
 	// Multiple segments may map to same shard - multiple RLocks is fine
-	var shards []*xmap.Shard[struct{}, xmap.Pad32]
+	var shards []*sync.RWMutex
 	for _, segID := range segmentIDs {
 		shard := c.index.SegmentLockShard(segID)
 		shard.RLock()

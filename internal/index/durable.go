@@ -3,10 +3,10 @@ package index
 import (
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/miretskiy/blobcache/base"
 	"github.com/miretskiy/blobcache/bloom"
-	"github.com/miretskiy/blobcache/internal/xmap"
 )
 
 // DurableIndex wraps BlobIndex with append-only .meta file persistence.
@@ -303,15 +303,14 @@ func (idx *DurableIndex) HasOlderShadow(key Key, floorID uint32) bool {
 	return idx.segments.hasOlderShadow(key, floorID)
 }
 
-// SegmentLockShard returns the xmap shard for a given segment ID.
-// Exposes the shard's RWMutex for coordinating Delete and Compaction.
+// SegmentLockShard returns the RWMutex for a given segment ID.
+// Used for coordinating Delete and Compaction operations.
 //
 // Locking protocol:
-// - Delete: shard.Lock() (exclusive, blocks compaction)
-// - Compaction: shard.RLock() (shared, multiple compactions allowed)
-func (idx *DurableIndex) SegmentLockShard(segID uint32) *xmap.Shard[struct{}, xmap.Pad32] {
-	key := Key{Lo: uint64(segID), Hi: 0}
-	return idx.segments.segmentLocks.Shard(key)
+// - Delete: Lock() (exclusive, blocks compaction)
+// - Compaction: RLock() (shared, multiple compactions allowed)
+func (idx *DurableIndex) SegmentLockShard(segID uint32) *sync.RWMutex {
+	return &idx.segments.segmentLocks[segID%numSegmentLockShards]
 }
 
 // ForEachSegmentMeta iterates over all registered segments in ID order.
@@ -324,6 +323,24 @@ func (idx *DurableIndex) ForEachSegmentMeta(fn func(meta SegmentMetadata) bool) 
 // Called during eviction or explicit delete to track tombstone accumulation.
 func (idx *DurableIndex) UpdateSegmentOnDelete(segID uint32, deletedCount int32, deletedBytes int64) {
 	idx.segments.updateSegmentOnDelete(segID, deletedCount, deletedBytes)
+}
+
+// GetTombstoneCompactionCandidates returns segment IDs that have crossed the
+// tombstone threshold (100+) and have cooled past the given boundary.
+//
+// This is O(K) where K is the number of pending candidates, avoiding O(N) scan
+// of all segments. Returns sorted segment IDs for deterministic processing.
+func (idx *DurableIndex) GetTombstoneCompactionCandidates(maxEligibleID uint32) []uint32 {
+	return idx.segments.getTombstoneCompactionCandidates(maxEligibleID)
+}
+
+// GetMergeCompactionCandidates returns segments that have crossed the waste ratio
+// threshold (90%+) and have cooled past the given boundary.
+//
+// This is O(K) where K is the number of pending candidates, avoiding O(N) scan
+// of all segments. Returns candidates sorted by segment ID for deterministic processing.
+func (idx *DurableIndex) GetMergeCompactionCandidates(maxEligibleID uint32) []SparseSegment {
+	return idx.segments.getMergeCompactionCandidates(maxEligibleID)
 }
 
 // CompactTombstones merges the tombstone incremental log into the segment manifest.

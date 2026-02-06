@@ -1,6 +1,7 @@
 package blobcache
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -191,24 +192,27 @@ func TestSelectSegmentsForTombstoneCompaction(t *testing.T) {
 	defer cache.Close()
 
 	// Initially no segments
-	segments := cache.selectSegmentsForTombstoneCompaction(10)
+	segments := cache.selectSegmentsForTombstoneCompaction(DefaultTombstoneCompactionThreshold)
 	require.Empty(t, segments, "should be empty with no segments")
 
-	// Write data to create a segment
-	value := make([]byte, 10_000)
-	for i := range 20 {
-		key := []byte("key-" + string(rune('A'+i)))
+	// Write enough data to create tombstones that exceed the threshold.
+	// Each small write creates a separate item.
+	value := make([]byte, 1_000)
+	numItems := DefaultTombstoneCompactionThreshold + 20 // 120 items
+	for i := range numItems {
+		key := []byte(fmt.Sprintf("key-%04d", i))
 		require.NoError(t, cache.Put(key, value))
 	}
 	cache.Drain()
 
-	// No tombstones yet, should select nothing with threshold=10
-	segments = cache.selectSegmentsForTombstoneCompaction(10)
+	// No tombstones yet, should select nothing
+	segments = cache.selectSegmentsForTombstoneCompaction(DefaultTombstoneCompactionThreshold)
 	require.Empty(t, segments, "should be empty with no tombstones")
 
-	// Delete 15 keys to create tombstones
-	for i := range 15 {
-		key := []byte("key-" + string(rune('A'+i)))
+	// Delete enough keys to cross the threshold (100+)
+	numDeletes := DefaultTombstoneCompactionThreshold + 5 // 105 deletes
+	for i := range numDeletes {
+		key := []byte(fmt.Sprintf("key-%04d", i))
 		require.NoError(t, cache.Delete(key))
 	}
 
@@ -220,11 +224,7 @@ func TestSelectSegmentsForTombstoneCompaction(t *testing.T) {
 		cache.Drain()
 	}
 
-	// Now should select the segment with threshold=10
-	segments = cache.selectSegmentsForTombstoneCompaction(10)
-	require.Len(t, segments, 1, "should select one segment with 15 tombstones")
-
-	// Higher threshold should not select
-	segments = cache.selectSegmentsForTombstoneCompaction(20)
-	require.Empty(t, segments, "should not select with threshold=20 when we have 15 tombstones")
+	// Now should select the segment that crossed the threshold
+	segments = cache.selectSegmentsForTombstoneCompaction(DefaultTombstoneCompactionThreshold)
+	require.Len(t, segments, 1, "should select one segment with 105 tombstones")
 }

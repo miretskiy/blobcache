@@ -16,7 +16,6 @@ import (
 	"github.com/miretskiy/blobcache/bloom"
 	"github.com/miretskiy/blobcache/internal/record"
 	"github.com/miretskiy/blobcache/internal/sys"
-	"github.com/miretskiy/blobcache/internal/xmap"
 )
 
 // Persistence format constants for the unified .meta file.
@@ -66,9 +65,9 @@ type TombstoneRecord struct {
 type TombstoneFn func(TombstoneRecord)
 
 // SegmentMetadata tracks per-segment state for compaction decisions.
-// This is a "value" type stored in a sorted slice, protected by snapshots.RWMutex.
+// Stored by pointer in the segment registry for O(1) lookup and efficient sorting.
 //
-// Fields are plain types (no atomics) - all access is under the snapshots lock.
+// Fields are plain types (no atomics) - all access is under the segments lock.
 type SegmentMetadata struct {
 	ID             uint32
 	TombstoneCount int32
@@ -81,6 +80,20 @@ type SegmentMetadata struct {
 	// critical for correct tombstone dissolution decisions in hasOlderShadow().
 	SegmentKeys *bloom.Filter
 }
+
+// WasteRatio returns the proportion of tombstones (0.0 to 1.0).
+// Returns 0 if segment is empty.
+func (m *SegmentMetadata) WasteRatio() float64 {
+	total := m.TombstoneCount + m.LiveItemCount
+	if total == 0 {
+		return 0
+	}
+	return float64(m.TombstoneCount) / float64(total)
+}
+
+// numSegmentLockShards is the number of shards for segment locking.
+// Must be a power of 2 for efficient modulo via bitmask.
+const numSegmentLockShards = 256
 
 // metaFile manages append-only tombstone operations for a segment's .meta file.
 type metaFile struct {
@@ -101,34 +114,50 @@ type persistence struct {
 	files sync.Map // map[uint32]*metaFile
 
 	// Sharded row locks for coordinating Delete and Compaction operations.
-	// The xmap provides per-segment locking without storing actual data.
+	// Simple fixed-size array of RWMutex (replaces xmap for lower overhead).
 	//
 	// Locking protocol:
-	// - Delete: Acquires shard.Lock() for one segment (write lock, exclusive)
-	// - Compaction: Acquires shard.RLock() for multiple segments (read lock, shared)
-	//
-	// Type params: V=struct{} (no data stored), E=Pad32 (padding for alignment)
-	segmentLocks *xmap.Map[struct{}, xmap.Pad32]
+	// - Delete: Acquires Lock() for one segment (exclusive, blocks compaction)
+	// - Compaction: Acquires RLock() for multiple segments (shared)
+	segmentLocks [numSegmentLockShards]sync.RWMutex
 
 	// Segment registry: metadata + Bloom filters for all registered segments.
-	// Protected by segments.RWMutex. Sorted by ID ascending for binary search.
+	// Protected by segments.RWMutex.
 	//
-	// Used for:
-	// - hasOlderShadow(): Binary search for tombstone dissolution decisions
-	// - forEachSegment(): Ordered iteration for compaction candidate selection
-	// - Metadata tracking: TombstoneCount, LiveItemCount, LiveBytes
+	// Design for O(1) operations:
+	// - byID: O(1) lookup by segment ID
+	// - sorted: Binary search for hasOlderShadow(), re-sorted only on add/remove
+	// - pendingTombstone/Merge: O(1) compaction candidate retrieval
 	segments struct {
 		sync.RWMutex
-		entries []SegmentMetadata // Sorted by ID ascending
+
+		// O(1) lookup by segment ID
+		byID map[uint32]*SegmentMetadata
+
+		// Sorted by ID ascending for binary search in hasOlderShadow().
+		// Re-sorted only when segments are added or removed (rare).
+		sorted []*SegmentMetadata
+
+		// Lazy compaction candidate tracking for O(1) retrieval.
+		// Populated during updateSegmentOnDelete() when thresholds are crossed.
+		pendingTombstone map[uint32]struct{} // tombstones >= TombstoneCompactionThreshold
+		pendingMerge     map[uint32]struct{} // waste ratio >= MergeWasteRatioThreshold
 	}
 }
 
+// MergeWasteRatioThreshold is the sparseness threshold for merge compaction.
+// Segments with waste ratio >= this value are candidates for merging.
+const MergeWasteRatioThreshold = 0.90
+
 func newPersistence(basePath string, shards int) (*persistence, error) {
-	return &persistence{
-		basePath:     basePath,
-		shards:       shards,
-		segmentLocks: xmap.New[struct{}, xmap.Pad32](xmap.WithShardShift(8)), // 256 shards
-	}, nil
+	p := &persistence{
+		basePath: basePath,
+		shards:   shards,
+	}
+	p.segments.byID = make(map[uint32]*SegmentMetadata)
+	p.segments.pendingTombstone = make(map[uint32]struct{})
+	p.segments.pendingMerge = make(map[uint32]struct{})
+	return p, nil
 }
 
 // metaPath returns the path to a segment's .meta file.
@@ -813,31 +842,29 @@ func (p *persistence) compactTombstones(segID uint32, onTombstone TombstoneFn) e
 // registerSegment adds a segment with its metadata and frozen Bloom filter.
 // Called after segment flush completes successfully.
 // The filter must be Freeze()'d before registration.
+// Idempotent: re-registering updates the existing entry.
 func (p *persistence) registerSegment(meta SegmentMetadata) {
 	p.segments.Lock()
 	defer p.segments.Unlock()
 
-	// Fast path: append at end (common case - segments created in order)
-	if len(p.segments.entries) == 0 || p.segments.entries[len(p.segments.entries)-1].ID < meta.ID {
-		p.segments.entries = append(p.segments.entries, meta)
+	// Check for existing entry (idempotent update)
+	if existing, ok := p.segments.byID[meta.ID]; ok {
+		// Update in place - pointer in sorted slice points to same object
+		*existing = meta
 		return
 	}
 
-	// Binary search for insertion point (rare case: out-of-order registration)
-	idx := sort.Search(len(p.segments.entries), func(i int) bool {
-		return p.segments.entries[i].ID >= meta.ID
+	// New entry - store by pointer for O(1) lookup and efficient sorting
+	entry := new(SegmentMetadata)
+	*entry = meta
+	p.segments.byID[meta.ID] = entry
+
+	// Append to sorted slice and re-sort (segments usually arrive in order,
+	// so this is typically O(1) for already-sorted data with optimized sort)
+	p.segments.sorted = append(p.segments.sorted, entry)
+	sort.Slice(p.segments.sorted, func(i, j int) bool {
+		return p.segments.sorted[i].ID < p.segments.sorted[j].ID
 	})
-
-	// Check for duplicate (idempotent registration)
-	if idx < len(p.segments.entries) && p.segments.entries[idx].ID == meta.ID {
-		p.segments.entries[idx] = meta // Update existing
-		return
-	}
-
-	// Insert at idx
-	p.segments.entries = append(p.segments.entries, SegmentMetadata{})
-	copy(p.segments.entries[idx+1:], p.segments.entries[idx:])
-	p.segments.entries[idx] = meta
 }
 
 // unregisterSegment removes a segment from the registry.
@@ -846,13 +873,20 @@ func (p *persistence) unregisterSegment(segID uint32) {
 	p.segments.Lock()
 	defer p.segments.Unlock()
 
-	idx := sort.Search(len(p.segments.entries), func(i int) bool {
-		return p.segments.entries[i].ID >= segID
-	})
+	// O(1) removal from map
+	delete(p.segments.byID, segID)
 
-	if idx < len(p.segments.entries) && p.segments.entries[idx].ID == segID {
-		p.segments.entries = append(p.segments.entries[:idx], p.segments.entries[idx+1:]...)
+	// Remove from sorted slice (binary search + shift)
+	idx := sort.Search(len(p.segments.sorted), func(i int) bool {
+		return p.segments.sorted[i].ID >= segID
+	})
+	if idx < len(p.segments.sorted) && p.segments.sorted[idx].ID == segID {
+		p.segments.sorted = append(p.segments.sorted[:idx], p.segments.sorted[idx+1:]...)
 	}
+
+	// Clean up pending compaction tracking
+	delete(p.segments.pendingTombstone, segID)
+	delete(p.segments.pendingMerge, segID)
 }
 
 // unregisterSegments removes multiple segments from the registry atomically.
@@ -869,33 +903,62 @@ func (p *persistence) unregisterSegments(segIDs []uint32) {
 	toRemove := make(map[uint32]struct{}, len(segIDs))
 	for _, id := range segIDs {
 		toRemove[id] = struct{}{}
+		// O(1) removal from map
+		delete(p.segments.byID, id)
+		// Clean up pending compaction tracking
+		delete(p.segments.pendingTombstone, id)
+		delete(p.segments.pendingMerge, id)
 	}
 
-	// Filter in place - preserves sorted order
+	// Filter sorted slice in place - preserves sorted order
 	n := 0
-	for _, entry := range p.segments.entries {
+	for _, entry := range p.segments.sorted {
 		if _, remove := toRemove[entry.ID]; !remove {
-			p.segments.entries[n] = entry
+			p.segments.sorted[n] = entry
 			n++
 		}
 	}
-	p.segments.entries = p.segments.entries[:n]
+	p.segments.sorted = p.segments.sorted[:n]
 }
+
+// TombstoneCompactionThreshold is the minimum tombstone count to mark a segment
+// as a compaction candidate. Segments crossing this threshold during
+// updateSegmentOnDelete() are added to the pending compaction set.
+const TombstoneCompactionThreshold = 100
 
 // updateSegmentOnDelete updates a segment's metadata after items are deleted.
 // Called during eviction or explicit delete to track tombstone accumulation.
+//
+// Lazily tracks compaction candidates:
+// - pendingTombstone: when tombstone count crosses TombstoneCompactionThreshold
+// - pendingMerge: when waste ratio crosses MergeWasteRatioThreshold
+//
+// This enables O(1) candidate retrieval instead of O(N) scanning.
 func (p *persistence) updateSegmentOnDelete(segID uint32, deletedCount int32, deletedBytes int64) {
 	p.segments.Lock()
 	defer p.segments.Unlock()
 
-	idx := sort.Search(len(p.segments.entries), func(i int) bool {
-		return p.segments.entries[i].ID >= segID
-	})
+	// O(1) lookup via map
+	entry, ok := p.segments.byID[segID]
+	if !ok {
+		return
+	}
 
-	if idx < len(p.segments.entries) && p.segments.entries[idx].ID == segID {
-		p.segments.entries[idx].TombstoneCount += deletedCount
-		p.segments.entries[idx].LiveItemCount -= deletedCount
-		p.segments.entries[idx].LiveBytes -= deletedBytes
+	wasAboveTombstoneThreshold := entry.TombstoneCount >= TombstoneCompactionThreshold
+	wasAboveMergeThreshold := entry.WasteRatio() >= MergeWasteRatioThreshold
+
+	entry.TombstoneCount += deletedCount
+	entry.LiveItemCount -= deletedCount
+	entry.LiveBytes -= deletedBytes
+
+	// Track when a segment crosses the tombstone threshold
+	if !wasAboveTombstoneThreshold && entry.TombstoneCount >= TombstoneCompactionThreshold {
+		p.segments.pendingTombstone[segID] = struct{}{}
+	}
+
+	// Track when a segment crosses the merge waste ratio threshold
+	if !wasAboveMergeThreshold && entry.WasteRatio() >= MergeWasteRatioThreshold {
+		p.segments.pendingMerge[segID] = struct{}{}
 	}
 }
 
@@ -906,11 +969,89 @@ func (p *persistence) forEachSegment(fn func(meta SegmentMetadata) bool) {
 	p.segments.RLock()
 	defer p.segments.RUnlock()
 
-	for _, entry := range p.segments.entries {
-		if !fn(entry) {
+	for _, entry := range p.segments.sorted {
+		if !fn(*entry) {
 			return
 		}
 	}
+}
+
+// getTombstoneCompactionCandidates returns segment IDs that have crossed the
+// tombstone threshold and have cooled past the given boundary.
+//
+// The maxEligibleID is the highest segment ID that is eligible for compaction
+// (segments must be below this to be considered "cooled").
+//
+// This is O(K) where K is the number of pending candidates, not O(N) where N is
+// total segments. Candidates are removed from the pending set after retrieval;
+// they'll be re-added if more tombstones accumulate.
+//
+// Returns segment IDs sorted in ascending order for deterministic processing.
+func (p *persistence) getTombstoneCompactionCandidates(maxEligibleID uint32) []uint32 {
+	p.segments.Lock()
+	defer p.segments.Unlock()
+
+	if len(p.segments.pendingTombstone) == 0 {
+		return nil
+	}
+
+	var candidates []uint32
+	for segID := range p.segments.pendingTombstone {
+		if segID < maxEligibleID {
+			candidates = append(candidates, segID)
+			delete(p.segments.pendingTombstone, segID)
+		}
+	}
+
+	// Sort for deterministic processing order
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i] < candidates[j]
+	})
+
+	return candidates
+}
+
+// SparseSegment represents a segment that has crossed the merge waste ratio threshold.
+type SparseSegment struct {
+	ID        uint32
+	LiveBytes int64
+}
+
+// getMergeCompactionCandidates returns segments that have crossed the waste ratio
+// threshold and have cooled past the given boundary.
+//
+// This is O(K) where K is the number of pending candidates, not O(N) where N is
+// total segments. Candidates are removed from the pending set after retrieval;
+// they'll be re-added if their waste ratio increases again.
+//
+// Returns candidates sorted by segment ID ascending for deterministic processing.
+func (p *persistence) getMergeCompactionCandidates(maxEligibleID uint32) []SparseSegment {
+	p.segments.Lock()
+	defer p.segments.Unlock()
+
+	if len(p.segments.pendingMerge) == 0 {
+		return nil
+	}
+
+	var candidates []SparseSegment
+	for segID := range p.segments.pendingMerge {
+		if segID < maxEligibleID {
+			if entry, ok := p.segments.byID[segID]; ok {
+				candidates = append(candidates, SparseSegment{
+					ID:        segID,
+					LiveBytes: entry.LiveBytes,
+				})
+			}
+			delete(p.segments.pendingMerge, segID)
+		}
+	}
+
+	// Sort by segment ID for deterministic processing
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].ID < candidates[j].ID
+	})
+
+	return candidates
 }
 
 // hasOlderShadow checks if any segment with ID < floorID might contain the key.
@@ -926,13 +1067,13 @@ func (p *persistence) hasOlderShadow(key Key, floorID uint32) bool {
 	defer p.segments.RUnlock()
 
 	// Binary search for first segment >= floorID
-	floorIdx := sort.Search(len(p.segments.entries), func(i int) bool {
-		return p.segments.entries[i].ID >= floorID
+	floorIdx := sort.Search(len(p.segments.sorted), func(i int) bool {
+		return p.segments.sorted[i].ID >= floorID
 	})
 
 	// Check all segments before floorIdx (ID < floorID)
 	for i := 0; i < floorIdx; i++ {
-		if p.segments.entries[i].SegmentKeys.Test(key) {
+		if p.segments.sorted[i].SegmentKeys.Test(key) {
 			return true // Bloom says "maybe" - must preserve tombstone
 		}
 	}

@@ -9,16 +9,8 @@ import (
 
 	"github.com/miretskiy/blobcache/bloom"
 	"github.com/miretskiy/blobcache/internal/record"
-	"github.com/miretskiy/blobcache/internal/xmap"
 	"github.com/stretchr/testify/require"
 )
-
-// TestSegmentLocks_Alignment verifies segmentLocks xmap is properly aligned.
-// The xmap stores struct{} as values (only used for locking coordination).
-func TestSegmentLocks_Alignment(t *testing.T) {
-	err := xmap.VerifyAlignment[struct{}, xmap.Pad32]()
-	require.NoError(t, err, "segmentLocks must be properly aligned for xmap usage")
-}
 
 // writeTestFooter writes a SegmentFooter to a .meta file for testing.
 func writeTestFooter(
@@ -321,10 +313,11 @@ func TestSegmentRegistry(t *testing.T) {
 		p.registerSegment(createMeta(3, Key{Lo: 3}))
 
 		p.segments.RLock()
-		require.Len(t, p.segments.entries, 3)
-		require.Equal(t, uint32(1), p.segments.entries[0].ID)
-		require.Equal(t, uint32(2), p.segments.entries[1].ID)
-		require.Equal(t, uint32(3), p.segments.entries[2].ID)
+		require.Len(t, p.segments.sorted, 3)
+		require.Len(t, p.segments.byID, 3)
+		require.Equal(t, uint32(1), p.segments.sorted[0].ID)
+		require.Equal(t, uint32(2), p.segments.sorted[1].ID)
+		require.Equal(t, uint32(3), p.segments.sorted[2].ID)
 		p.segments.RUnlock()
 
 		// Cleanup
@@ -338,11 +331,12 @@ func TestSegmentRegistry(t *testing.T) {
 		p.registerSegment(createMeta(20, Key{Lo: 20}))
 
 		p.segments.RLock()
-		require.Len(t, p.segments.entries, 3)
+		require.Len(t, p.segments.sorted, 3)
+		require.Len(t, p.segments.byID, 3)
 		// Should be sorted
-		require.Equal(t, uint32(10), p.segments.entries[0].ID)
-		require.Equal(t, uint32(20), p.segments.entries[1].ID)
-		require.Equal(t, uint32(30), p.segments.entries[2].ID)
+		require.Equal(t, uint32(10), p.segments.sorted[0].ID)
+		require.Equal(t, uint32(20), p.segments.sorted[1].ID)
+		require.Equal(t, uint32(30), p.segments.sorted[2].ID)
 		p.segments.RUnlock()
 
 		// Cleanup
@@ -357,10 +351,11 @@ func TestSegmentRegistry(t *testing.T) {
 		p.registerSegment(meta2) // Should update, not duplicate
 
 		p.segments.RLock()
-		require.Len(t, p.segments.entries, 1)
-		require.Equal(t, uint32(5), p.segments.entries[0].ID)
+		require.Len(t, p.segments.sorted, 1)
+		require.Len(t, p.segments.byID, 1)
+		require.Equal(t, uint32(5), p.segments.sorted[0].ID)
 		// Should be the second filter (updated)
-		require.True(t, p.segments.entries[0].SegmentKeys.Test(Key{Lo: 2}))
+		require.True(t, p.segments.sorted[0].SegmentKeys.Test(Key{Lo: 2}))
 		p.segments.RUnlock()
 
 		// Cleanup

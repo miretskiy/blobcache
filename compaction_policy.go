@@ -1,10 +1,15 @@
 package blobcache
 
 import (
-	"slices"
-
 	"github.com/miretskiy/blobcache/internal/index"
 )
+
+func init() {
+	// Verify thresholds stay in sync
+	if DefaultTombstoneCompactionThreshold != index.TombstoneCompactionThreshold {
+		panic("DefaultTombstoneCompactionThreshold != index.TombstoneCompactionThreshold")
+	}
+}
 
 // SegmentStats holds computed statistics for a single segment.
 // Computed on-demand during compaction selection.
@@ -45,65 +50,26 @@ const (
 
 	// maxOutputMultiplier caps output size at 2x target to prevent "mega-segments".
 	maxOutputMultiplier = 2.0
-
-	// defaultMaxWasteRatio is the sparseness threshold for merge eligibility.
-	// With aggressive tombstone dissolution, we can afford higher sparseness
-	// before paying the I/O cost to merge.
-	defaultMaxWasteRatio = 0.90
 )
 
-// isEligibleForCompaction returns true if a segment has "cooled" enough to be compacted.
-// The cooling period ensures segments still in Librarian's cache are not compacted,
-// preventing dangling references when segment files are deleted.
+// selectSegmentsForTombstoneCompaction returns segment IDs that exceed the tombstone threshold.
+// Returns segments sorted by SegmentID (ascending) for deterministic processing.
+// Segments still in the "hot zone" (Librarian cache) are excluded via cooling period check.
 //
-// The boundary is: segID + coolingGap < currentSegID
-// where coolingGap = MaxCachedSlabs + margin
-func (c *Cache) isEligibleForCompaction(segID uint32) bool {
+// This uses lazy candidate tracking for O(K) complexity where K is the number of
+// pending candidates, instead of O(N) scanning of all segments. Candidates are
+// tracked incrementally during UpdateSegmentOnDelete() when they cross the threshold.
+func (c *Cache) selectSegmentsForTombstoneCompaction(_ int) []uint32 {
 	currentSegID := c.segIDs.CurrentSegmentID()
 	coolingGap := uint32(c.MaxCachedSlabs + coolingPeriodMargin)
 
 	// Avoid underflow: if currentSegID is small, no segments are eligible
 	if currentSegID <= coolingGap {
-		return false
-	}
-	return segID < currentSegID-coolingGap
-}
-
-// computeSegmentStats returns statistics for all registered segments.
-// Uses in-memory segment metadata (no disk scanning).
-func (c *Cache) computeSegmentStats() map[uint32]*SegmentStats {
-	stats := make(map[uint32]*SegmentStats)
-
-	c.index.ForEachSegmentMeta(func(meta index.SegmentMetadata) bool {
-		stats[meta.ID] = &SegmentStats{
-			SegmentID:      meta.ID,
-			TombstoneCount: int(meta.TombstoneCount),
-			LiveItemCount:  int(meta.LiveItemCount),
-			LiveBytes:      meta.LiveBytes,
-		}
-		return true
-	})
-
-	return stats
-}
-
-// selectSegmentsForTombstoneCompaction returns segment IDs that exceed the tombstone threshold.
-// Returns segments sorted by SegmentID (ascending) for deterministic processing.
-// Segments still in the "hot zone" (Librarian cache) are excluded via cooling period check.
-func (c *Cache) selectSegmentsForTombstoneCompaction(minTombstones int) []uint32 {
-	stats := c.computeSegmentStats()
-
-	var selected []uint32
-	for _, ss := range stats {
-		if ss.TombstoneCount >= minTombstones && c.isEligibleForCompaction(ss.SegmentID) {
-			selected = append(selected, ss.SegmentID)
-		}
+		return nil
 	}
 
-	// Sort for deterministic processing order
-	slices.Sort(selected)
-
-	return selected
+	maxEligibleID := currentSegID - coolingGap
+	return c.index.GetTombstoneCompactionCandidates(maxEligibleID)
 }
 
 // selectContiguousRanges groups segment IDs into contiguous ranges for merge compaction.
@@ -156,35 +122,24 @@ type MergeCandidate struct {
 //   - minRangeSize: Minimum number of segments required (dynamic gravity)
 //
 // Returns slices of contiguous segment IDs that can be passed to Compactor.Compact().
+//
+// Uses lazy candidate tracking for O(K) complexity where K is the number of
+// sparse segments, instead of O(N) scanning of all segments.
 func (c *Cache) selectSegmentsForMerge(targetOutputSize int64, minRangeSize int) []MergeCandidate {
-	stats := c.computeSegmentStats()
+	currentSegID := c.segIDs.CurrentSegmentID()
+	coolingGap := uint32(c.MaxCachedSlabs + coolingPeriodMargin)
 
-	// Collect segments with high waste ratio that have cooled
-	type sparseSegment struct {
-		id        uint32
-		liveBytes int64
+	// Avoid underflow: if currentSegID is small, no segments are eligible
+	if currentSegID <= coolingGap {
+		return nil
 	}
-	var sparse []sparseSegment
-	for _, ss := range stats {
-		if ss.WasteRatio() >= defaultMaxWasteRatio && c.isEligibleForCompaction(ss.SegmentID) {
-			sparse = append(sparse, sparseSegment{id: ss.SegmentID, liveBytes: ss.LiveBytes})
-		}
-	}
+
+	maxEligibleID := currentSegID - coolingGap
+	sparse := c.index.GetMergeCompactionCandidates(maxEligibleID)
 
 	if len(sparse) == 0 {
 		return nil
 	}
-
-	// Sort by segment ID for contiguity analysis
-	slices.SortFunc(sparse, func(a, b sparseSegment) int {
-		if a.id < b.id {
-			return -1
-		}
-		if a.id > b.id {
-			return 1
-		}
-		return 0
-	})
 
 	// Sliding window accumulator: build ranges targeting outputSize
 	maxOutputSize := int64(float64(targetOutputSize) * maxOutputMultiplier)
@@ -210,27 +165,27 @@ func (c *Cache) selectSegmentsForMerge(targetOutputSize int64, minRangeSize int)
 
 	for i, seg := range sparse {
 		// Check contiguity with previous segment
-		if len(currentIDs) > 0 && seg.id != currentIDs[len(currentIDs)-1]+1 {
+		if len(currentIDs) > 0 && seg.ID != currentIDs[len(currentIDs)-1]+1 {
 			// Gap detected - finalize current range and start new one
 			finalizeRange()
 		}
 
 		// Check if adding this segment would exceed max output size
-		if currentBytes+seg.liveBytes > maxOutputSize && len(currentIDs) >= minRangeSize {
+		if currentBytes+seg.LiveBytes > maxOutputSize && len(currentIDs) >= minRangeSize {
 			// Would exceed ceiling and we have enough segments - finalize
 			finalizeRange()
 		}
 
 		// Add segment to current range
-		currentIDs = append(currentIDs, seg.id)
-		currentBytes += seg.liveBytes
+		currentIDs = append(currentIDs, seg.ID)
+		currentBytes += seg.LiveBytes
 
 		// Check if we've reached target size with enough segments
 		if currentBytes >= targetOutputSize && len(currentIDs) >= minRangeSize {
 			// Target reached - check if next segment would still be contiguous
 			// If so, consider including it if it doesn't exceed ceiling
-			if i+1 < len(sparse) && sparse[i+1].id == seg.id+1 {
-				nextBytes := currentBytes + sparse[i+1].liveBytes
+			if i+1 < len(sparse) && sparse[i+1].ID == seg.ID+1 {
+				nextBytes := currentBytes + sparse[i+1].LiveBytes
 				if nextBytes <= maxOutputSize {
 					continue // Include next segment in this range
 				}

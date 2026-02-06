@@ -34,6 +34,13 @@ const (
 	evictionHysteresis = 0.93
 )
 
+// segmentDeleteStats groups per-segment delete counts for batch metadata updates.
+// Used during eviction to aggregate deletes before calling UpdateSegmentOnDelete.
+type segmentDeleteStats struct {
+	count int32
+	bytes int64
+}
+
 // Cache is a high-performance blob storage with bloom filter optimization
 type Cache struct {
 	config
@@ -89,6 +96,10 @@ type Cache struct {
 	// reclaimBuf is reused across eviction cycles to avoid heap allocations.
 	// Holds coalesced hole ranges after merging adjacent victims.
 	reclaimBuf []HoleRange
+
+	// segmentDeleteBuf is reused across eviction cycles to group deletes by segment.
+	// Cleared and reused to avoid map allocation every eviction cycle.
+	segmentDeleteBuf map[uint32]segmentDeleteStats
 
 	// ballast is a heap allocation that reduces GC frequency by keeping
 	// the heap larger. Never accessed after initialization.
@@ -1025,16 +1036,20 @@ func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
 		return fmt.Errorf("eviction durability sync failed: %w", err)
 	}
 
-	// Update segment metadata for compaction selection (group by segment)
-	segmentDeletes := make(map[uint32]struct{ count int32; bytes int64 })
+	// Update segment metadata for compaction selection (group by segment).
+	// Reuse buffer across eviction cycles to avoid allocation storm.
+	if c.segmentDeleteBuf == nil {
+		c.segmentDeleteBuf = make(map[uint32]segmentDeleteStats)
+	}
 	for _, v := range victims {
-		sd := segmentDeletes[v.SegmentID]
+		sd := c.segmentDeleteBuf[v.SegmentID]
 		sd.count++
 		sd.bytes += int64(v.PhysicalLen)
-		segmentDeletes[v.SegmentID] = sd
+		c.segmentDeleteBuf[v.SegmentID] = sd
 	}
-	for segID, sd := range segmentDeletes {
+	for segID, sd := range c.segmentDeleteBuf {
 		c.index.UpdateSegmentOnDelete(segID, sd.count, sd.bytes)
+		delete(c.segmentDeleteBuf, segID) // Clear for reuse
 	}
 
 	// 3. RECLAMATION PHASE

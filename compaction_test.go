@@ -774,8 +774,8 @@ func TestCompactor_SmallBlobAlignment(t *testing.T) {
 	writeTestMeta(t, SegmentMetaPath(segPath), sourceSegID, items)
 	idx.AddSegment(0, items)
 
-	// Compact — this will fail if readRecordHeader can't handle boundary-straddling headers
-	c := NewCompactor(idx, segIDs, tmpDir, 0, sys.SyncNone, archivist.DropSegmentCache)
+	// Compact with O_DIRECT — exposes readRecordHeader bugs when headers straddle block boundaries
+	c := NewCompactor(idx, segIDs, tmpDir, 0, sys.FlDirectIO, archivist.DropSegmentCache)
 	defer c.Close()
 
 	result, err := c.Compact([]uint32{sourceSegID}, false)

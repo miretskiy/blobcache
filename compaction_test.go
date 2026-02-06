@@ -721,6 +721,90 @@ func TestCompactor_XLBlobHandling(t *testing.T) {
 	require.Equal(t, xlValue, recoveredValue, "XL blob data should be preserved")
 }
 
+// TestCompactor_SmallBlobAlignment verifies compaction handles records whose
+// headers straddle 4KB block boundaries. Each record is 59 bytes
+// (Header=42 + Key=16 + Value=1). After ~69 records, the next header
+// starts near offset 4079 and spans the 4096 boundary.
+func TestCompactor_SmallBlobAlignment(t *testing.T) {
+	tmpDir := t.TempDir()
+	setupTestDirs(t, tmpDir)
+	idx, err := index.OpenIndex(tmpDir, 0, 100)
+	require.NoError(t, err)
+	defer idx.Close()
+	archivist := NewArchivist(config{Path: tmpDir}, idx)
+	defer archivist.Close()
+
+	segIDs := &segmentIDProvider{}
+	segIDs.counter.Store(100)
+
+	const sourceSegID = 1
+	const numRecords = 100 // Enough to force multiple block-boundary crossings
+
+	// Build records — each ~59 bytes (Header=42 + Key=16 + Value=1)
+	type keyVal struct {
+		key   index.Key
+		value []byte
+	}
+	records := make([]keyVal, numRecords)
+	blobs := make([][]byte, numRecords)
+	for i := range numRecords {
+		records[i] = keyVal{
+			key:   index.Key{Lo: uint64(i + 1), Hi: uint64(i + 1)},
+			value: []byte{byte(i)},
+		}
+		blobs[i] = makeTestBlob(t, records[i].key, records[i].value, uint64(i+1))
+	}
+
+	// Write all records into one segment
+	segPath := getSegmentPath(tmpDir, 0, sourceSegID)
+	writeTestSegment(t, segPath, blobs...)
+
+	// Build index items with correct offsets
+	offset := record.FileHeaderSize
+	items := make([]index.Item, numRecords)
+	for i := range numRecords {
+		items[i] = index.Item{
+			Key:         records[i].key,
+			SegmentID:   sourceSegID,
+			Offset:      uint32(offset),
+			PhysicalLen: uint32(len(blobs[i])),
+		}
+		offset += len(blobs[i])
+	}
+	writeTestMeta(t, SegmentMetaPath(segPath), sourceSegID, items)
+	idx.AddSegment(0, items)
+
+	// Compact — this will fail if readRecordHeader can't handle boundary-straddling headers
+	c := NewCompactor(idx, segIDs, tmpDir, 0, sys.SyncNone, archivist.DropSegmentCache)
+	defer c.Close()
+
+	result, err := c.Compact([]uint32{sourceSegID}, false)
+	require.NoError(t, err, "compaction should handle small records across block boundaries")
+	require.Equal(t, numRecords, result.ItemsCompacted)
+
+	// Verify every record is readable from the compacted segment
+	for i := range numRecords {
+		item, found := idx.Get(records[i].key)
+		require.True(t, found, "key %d should exist after compaction", i)
+		require.Equal(t, result.NewSegmentID, item.SegmentID)
+
+		// Read and verify record data from new segment
+		newSegPath := getSegmentPath(tmpDir, 0, item.SegmentID)
+		f, err := os.Open(newSegPath)
+		require.NoError(t, err)
+		readBuf := make([]byte, item.PhysicalLen)
+		_, err = f.ReadAt(readBuf, int64(item.Offset))
+		require.NoError(t, err)
+		_ = f.Close()
+
+		hdr, err := record.DecodeHeader(readBuf[:record.HeaderSize])
+		require.NoError(t, err)
+		valueStart := record.HeaderSize + int(hdr.KeyLen)
+		require.Equal(t, records[i].value, readBuf[valueStart:valueStart+int(hdr.PhysicalSize)],
+			"value mismatch at record %d", i)
+	}
+}
+
 // --- Integration Tests ---
 
 func TestCompaction_Integration_BasicCompaction(t *testing.T) {

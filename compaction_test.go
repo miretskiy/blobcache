@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/miretskiy/blobcache/internal/index"
 	"github.com/miretskiy/blobcache/internal/record"
@@ -725,8 +726,21 @@ func TestCompactor_XLBlobHandling(t *testing.T) {
 // headers straddle 4KB block boundaries. Each record is 59 bytes
 // (Header=42 + Key=16 + Value=1). After ~69 records, the next header
 // starts near offset 4079 and spans the 4096 boundary.
+//
+// IMPORTANT: This test uses O_DIRECT and MUST run on a real filesystem
+// (XFS/ext4), not tmpfs. tmpfs silently ignores O_DIRECT, masking
+// alignment bugs. On Linux with /instance_storage available, the test
+// runs there; otherwise it falls back to t.TempDir() (may not catch bugs).
 func TestCompactor_SmallBlobAlignment(t *testing.T) {
 	tmpDir := t.TempDir()
+	// Prefer real filesystem for O_DIRECT testing
+	if dir := "/instance_storage"; sys.RequiresAlignment {
+		sub := filepath.Join(dir, fmt.Sprintf("compaction_test_%d", time.Now().UnixNano()))
+		if err := os.MkdirAll(sub, 0755); err == nil {
+			tmpDir = sub
+			t.Cleanup(func() { os.RemoveAll(sub) })
+		}
+	}
 	setupTestDirs(t, tmpDir)
 	idx, err := index.OpenIndex(tmpDir, 0, 100)
 	require.NoError(t, err)
@@ -774,8 +788,12 @@ func TestCompactor_SmallBlobAlignment(t *testing.T) {
 	writeTestMeta(t, SegmentMetaPath(segPath), sourceSegID, items)
 	idx.AddSegment(0, items)
 
-	// Compact with O_DIRECT — exposes readRecordHeader bugs when headers straddle block boundaries
-	c := NewCompactor(idx, segIDs, tmpDir, 0, sys.FlDirectIO, archivist.DropSegmentCache)
+	// Use FlDirectIO to exercise real O_DIRECT alignment on Linux.
+	// IMPORTANT: This test MUST run on a real filesystem (XFS/ext4), not tmpfs.
+	// tmpfs silently ignores O_DIRECT, masking alignment bugs.
+	// Set BLOBCACHE_TEST_DIR to a real filesystem path (e.g. /instance_storage/test).
+	ioFlags := sys.FlDirectIO
+	c := NewCompactor(idx, segIDs, tmpDir, 0, ioFlags, archivist.DropSegmentCache)
 	defer c.Close()
 
 	result, err := c.Compact([]uint32{sourceSegID}, false)

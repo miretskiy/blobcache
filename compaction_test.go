@@ -727,7 +727,7 @@ func TestCompactor_XLBlobHandling(t *testing.T) {
 // (Header=42 + Key=16 + Value=1). After ~69 records, the next header
 // starts near offset 4079 and spans the 4096 boundary.
 //
-// IMPORTANT: This test uses O_DIRECT and MUST run on a real filesystem
+/// IMPORTANT: This test uses O_DIRECT and MUST run on a real filesystem
 // (XFS/ext4), not tmpfs. tmpfs silently ignores O_DIRECT, masking
 // alignment bugs. On Linux with /instance_storage available, the test
 // runs there; otherwise it falls back to t.TempDir() (may not catch bugs).

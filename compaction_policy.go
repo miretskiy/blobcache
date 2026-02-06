@@ -50,6 +50,11 @@ const (
 
 	// maxOutputMultiplier caps output size at 2x target to prevent "mega-segments".
 	maxOutputMultiplier = 2.0
+
+	// minOutputMultiplier sets the minimum worthwhile output size.
+	// Merges producing less than 25% of target are dropped to avoid metadata churn.
+	// This prevents creating 13MB output files when target is 128MB.
+	minOutputMultiplier = 0.25
 )
 
 // selectSegmentsForTombstoneCompaction returns segment IDs that exceed the tombstone threshold.
@@ -143,17 +148,19 @@ func (c *Cache) selectSegmentsForMerge(targetOutputSize int64, minRangeSize int)
 
 	// Sliding window accumulator: build ranges targeting outputSize
 	maxOutputSize := int64(float64(targetOutputSize) * maxOutputMultiplier)
+	minOutputSize := int64(float64(targetOutputSize) * minOutputMultiplier)
 	var result []MergeCandidate
 
 	var currentIDs []uint32
 	var currentBytes int64
 
 	finalizeRange := func() {
-		// Only accept ranges meeting minimum gravity.
-		// Ranges below minRangeSize are dropped: this prevents micro-merges but means
-		// very sparse segments wait until enough contiguous sparse neighbors accumulate.
-		// This is intentional - the I/O cost of merging 2-3 sparse segments doesn't pay off.
-		if len(currentIDs) >= minRangeSize {
+		// Accept ranges meeting BOTH gravity and size thresholds.
+		// Ranges below minRangeSize are dropped: too few segments for I/O efficiency.
+		// Ranges below minOutputSize are dropped: not worth the metadata churn.
+		// This means sparse segments wait until enough contiguous neighbors with
+		// enough live data accumulate. Better to do one large merge than many tiny ones.
+		if len(currentIDs) >= minRangeSize && currentBytes >= minOutputSize {
 			result = append(result, MergeCandidate{
 				SegmentIDs:         currentIDs,
 				EstimatedLiveBytes: currentBytes,

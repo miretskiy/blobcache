@@ -228,26 +228,20 @@ func open(cfg config) (*Cache, bool, error) {
 		return nil, false, fmt.Errorf("initialization failed: %w", err)
 	}
 
-	// Create new bloom filter and figure out how much data on disk from segment meta.
-	// Also track oldest segment ID for tombstone GC.
+	// Create new bloom filter and compute total size from in-memory index.
+	// Using ForEachBlob instead of ForEachSegment avoids disk scanning.
 	var totalSize int64
-	var oldestSegID uint32
 	filter := bloom.New(uint(cfg.BloomEstimatedKeys), cfg.BloomFPRate)
-	if err := idx.ForEachSegment(func(m index.DurableBatch) bool {
-		// Track oldest segment
-		if oldestSegID == 0 || m.SegmentID < oldestSegID {
-			oldestSegID = m.SegmentID
-		}
-		for _, item := range m.Items {
-			if !item.IsDeleted() {
-				filter.Add(item.Key)                 // Full 128-bit key
-				totalSize += int64(item.PhysicalLen) // Track on-disk size
-			}
+	idx.ForEachBlob(func(item index.Item) bool {
+		if !item.IsDeleted() {
+			filter.Add(item.Key)                 // Full 128-bit key
+			totalSize += int64(item.PhysicalLen) // Track on-disk size
 		}
 		return true
-	}); err != nil {
-		return nil, false, err
-	}
+	})
+
+	// Get oldest segment from in-memory registry (O(1))
+	oldestSegID := idx.GetOldestSegmentID()
 
 	c := &Cache{
 		config:             cfg,
@@ -745,20 +739,13 @@ func (c *Cache) rebuildBloom() error {
 		stopRecording, consumeRecording = oldFilter.RecordAdditions()
 	}
 
-	err := c.index.ForEachSegment(func(m index.DurableBatch) bool {
-		for _, item := range m.Items {
-			if !item.IsDeleted() {
-				newFilter.AddHash(item.Key)
-			}
+	// Use in-memory index instead of disk scan (avoids "invalid file magic" races)
+	c.index.ForEachBlob(func(item index.Item) bool {
+		if !item.IsDeleted() {
+			newFilter.AddHash(item.Key)
 		}
 		return true
 	})
-	if err != nil {
-		if stopRecording != nil {
-			stopRecording()
-		}
-		return err
-	}
 
 	oldFilter := c.hot.bloom.Swap(newFilter)
 

@@ -36,7 +36,7 @@ func NewArchivist(cfg config, idx *index.DurableIndex) *Archivist {
 		// Storm" competes with foreground reads for journal locks and inode
 		// metadata updates. 2000 ops/sec empirically keeps foreground p99 read
 		// latency stable while still reclaiming space within ~1 eviction cycle.
-		// Burst of 100 absorbs bursty CoalesceVictims batches without queueing.
+		// Burst absorbs clustered punches from back-to-back eviction batches.
 		punchLimiter: rate.NewLimiter(rate.Limit(2000), 100),
 	}
 }
@@ -181,17 +181,10 @@ func (a *Archivist) HolePunchBlob(
 	return sys.PunchHole(sf, int64(offset), int64(physicalLen))
 }
 
-// HoleRange represents a contiguous range to punch within a segment.
-// Used by CoalesceVictims to merge adjacent evicted blobs into single syscalls.
-type HoleRange struct {
-	SegmentID uint32
-	Offset    int64
-	Length    int64
-}
-
-// HolePunchRange releases disk space for a pre-coalesced range.
-// This is the batched version of HolePunchBlob, used after CoalesceVictims
-// merges adjacent holes to reduce filesystem journal commits.
+// HolePunchRange releases disk space for a contiguous byte range within a segment.
+// Used during spatial SIEVE eviction to punch one range per batch (covering the
+// anchor + all bystanders). Gaps from previously-evicted items within the range
+// are already holes — punching them again is a kernel no-op.
 //
 // Rate-limited to 2000 syscalls/sec to protect foreground read throughput
 // from "Metadata Storms" during heavy eviction.

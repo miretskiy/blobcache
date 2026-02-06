@@ -70,6 +70,16 @@ type config struct {
 	TrustHash          bool         // Skip key verification on reads (cache mode optimization)
 	BallastSize        int          // Heap ballast size in bytes (default: 1GB, 0 = disabled)
 
+	// MaxBystanderBytes limits the blast radius of spatial co-eviction per SIEVE
+	// anchor. After SIEVE picks a cold anchor, we co-evict physically adjacent
+	// items up to this byte budget. Bystanders may be warm or hot — they are
+	// evicted only because they are physically adjacent — so this bounds the
+	// cache pollution from "innocent bystander" eviction.
+	//
+	// Default: WriteBufferSize / 8 (e.g. 8MB for 64MB segments).
+	// Set to 0 to disable spatial expansion (pure SIEVE, no bystanders).
+	MaxBystanderBytes int64
+
 	// Compaction bandwidth limit in bytes/sec (default: 200 MB/s)
 	// Throttles merge compaction to avoid saturating the I/O bus during ingestion.
 	CompactionBandwidth int64
@@ -220,6 +230,14 @@ func WithTrustHash(enabled bool) Option {
 // Use WithBallast(0) to disable, or WithBallast(10<<30) for 10GB, etc.
 func WithBallast(size int) Option {
 	return funcOpt(func(c *config) { c.BallastSize = max(0, size) })
+}
+
+// WithMaxBystanderBytes sets the byte budget for spatial co-eviction per anchor.
+// After SIEVE picks a cold victim, adjacent items up to this many bytes are
+// co-evicted to create contiguous holes instead of "Swiss cheese" fragmentation.
+// Default: WriteBufferSize / 8. Set to 0 to disable spatial expansion.
+func WithMaxBystanderBytes(bytes int64) Option {
+	return funcOpt(func(c *config) { c.MaxBystanderBytes = bytes })
 }
 
 // WithCompactionBandwidth sets the maximum bytes/sec for merge compaction I/O.

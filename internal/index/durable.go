@@ -170,17 +170,21 @@ func (idx *DurableIndex) AddSegment(segmentID uint32, items []Item) {
 // spatially to co-evict physically adjacent items in the same segment.
 //
 // Returns at least 1 item (the anchor) unless the index is empty.
-// The total evicted bytes will not exceed targetBytes and at most
-// maxBystanders additional items are co-evicted beyond the anchor.
+// All returned items belong to the same segment, sorted by ascending offset.
 //
 // Spatial expansion reads the segment's .meta manifest (small buffered I/O,
-// typically kernel page-cache hot) and walks outward from the anchor's offset,
-// removing each verified bystander atomically from the SIEVE list.
-// Bystanders may be warm or hot — that is the cost of physical contiguity —
-// so maxBystanders limits the blast radius.
+// typically kernel page-cache hot) and walks outward from the anchor's offset
+// in BOTH directions (lower and higher offsets), choosing the closer neighbor
+// at each step to keep the hole as contiguous as possible. Each candidate is
+// verified and removed atomically via deleteIfAt (no TOCTOU race).
+//
+// Bystanders may be warm or hot — they are evicted only because they are
+// physically adjacent to the cold anchor. maxBystanderBytes limits the blast
+// radius of this "innocent bystander" eviction. Set to 0 to disable spatial
+// expansion (pure SIEVE, anchor only).
 //
 // Persistence sync (tombstones) is the caller's responsibility.
-func (idx *DurableIndex) Evict(targetBytes int64, maxBystanders int) []Item {
+func (idx *DurableIndex) Evict(targetBytes int64, maxBystanderBytes int64) []Item {
 	// 1. Find anchor via SIEVE — single coldest item, removed from RAM.
 	anchors := idx.blobs.EvictBatch(1)
 	if len(anchors) == 0 {
@@ -188,9 +192,9 @@ func (idx *DurableIndex) Evict(targetBytes int64, maxBystanders int) []Item {
 	}
 	anchor := anchors[0]
 	result := []Item{anchor}
-	remaining := targetBytes - int64(anchor.PhysicalLen)
 
-	if remaining <= 0 || maxBystanders <= 0 {
+	budget := min(targetBytes-int64(anchor.PhysicalLen), maxBystanderBytes)
+	if budget <= 0 {
 		return result
 	}
 
@@ -201,21 +205,26 @@ func (idx *DurableIndex) Evict(targetBytes int64, maxBystanders int) []Item {
 	}
 
 	// 3. Walk manifest items outward from anchor, co-evicting bystanders.
-	result = idx.expandEviction(result, manifest.Items, anchor, remaining, maxBystanders)
+	result = idx.expandEviction(result, manifest.Items, anchor, budget)
 	return result
 }
 
-// expandEviction walks the manifest items outward (forward then backward)
-// from the anchor's offset, atomically removing verified bystanders from RAM.
+// expandEviction walks the manifest items outward in both directions from
+// the anchor's physical offset, atomically removing verified bystanders.
 //
-// Items are checked via deleteIfAt which verifies (SegmentID, Offset) match
-// under the shard lock — no TOCTOU race with concurrent writes or compaction.
+// The walk alternates between lower and higher neighbors, always picking
+// the one closer to the anchor in offset space. This keeps the resulting
+// hole as contiguous as possible. Items already evicted, relocated, or
+// overwritten are skipped via deleteIfAt (atomic verify-and-remove under
+// shard lock — no TOCTOU race).
+//
+// bystanderBudget is the remaining byte budget for bystanders only (does
+// not include the anchor).
 func (idx *DurableIndex) expandEviction(
 	result []Item, manifestItems []Item, anchor Item,
-	remainingBytes int64, maxBystanders int,
+	bystanderBudget int64,
 ) []Item {
 	anchorOff := int64(anchor.Offset)
-	bystanders := 0
 
 	// Find anchor's position in the manifest (items are sorted by offset).
 	anchorIdx := -1
@@ -229,12 +238,11 @@ func (idx *DurableIndex) expandEviction(
 		return result
 	}
 
-	// Expand forward (higher offsets) and backward (lower offsets) in lockstep,
-	// choosing the closer neighbor each step to keep the hole contiguous.
+	// Walk outward: lo scans lower offsets, hi scans higher offsets.
 	lo, hi := anchorIdx-1, anchorIdx+1
 
-	for bystanders < maxBystanders && remainingBytes > 0 && (lo >= 0 || hi < len(manifestItems)) {
-		// Pick the closer candidate (prefer forward to extend contiguous run).
+	for bystanderBudget > 0 && (lo >= 0 || hi < len(manifestItems)) {
+		// Pick the closer candidate (prefer forward on tie to extend contiguous run).
 		var pick int
 		switch {
 		case lo < 0:
@@ -244,7 +252,6 @@ func (idx *DurableIndex) expandEviction(
 			pick = lo
 			lo--
 		default:
-			// Both valid — pick whichever is closer to anchor in offset space.
 			distLo := anchorOff - int64(manifestItems[lo].Offset)
 			distHi := int64(manifestItems[hi].Offset) - anchorOff
 			if distHi <= distLo {
@@ -268,8 +275,7 @@ func (idx *DurableIndex) expandEviction(
 		}
 
 		result = append(result, evicted)
-		remainingBytes -= int64(evicted.PhysicalLen)
-		bystanders++
+		bystanderBudget -= int64(evicted.PhysicalLen)
 	}
 
 	return result

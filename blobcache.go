@@ -2,7 +2,6 @@ package blobcache
 
 import (
 	"bytes"
-	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -10,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
-	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -34,13 +32,6 @@ const (
 	// evictionHysteresis is the target fraction of MaxSize to evict to.
 	evictionHysteresis = 0.93
 )
-
-// segmentDeleteStats groups per-segment delete counts for batch metadata updates.
-// Used during eviction to aggregate deletes before calling UpdateSegmentOnDelete.
-type segmentDeleteStats struct {
-	count int32
-	bytes int64
-}
 
 // Cache is a high-performance blob storage with bloom filter optimization
 type Cache struct {
@@ -93,14 +84,6 @@ type Cache struct {
 
 	// Knobs provides testing hooks. Set directly in tests: c.Knobs = &TestingKnobs{...}
 	Knobs *TestingKnobs
-
-	// reclaimBuf is reused across eviction cycles to avoid heap allocations.
-	// Holds coalesced hole ranges after merging adjacent victims.
-	reclaimBuf []HoleRange
-
-	// segmentDeleteBuf is reused across eviction cycles to group deletes by segment.
-	// Cleared and reused to avoid map allocation every eviction cycle.
-	segmentDeleteBuf map[uint32]segmentDeleteStats
 
 	// ballast is a heap allocation that reduces GC frequency by keeping
 	// the heap larger. Never accessed after initialization.
@@ -187,6 +170,11 @@ func New(path string, opts ...Option) (*Cache, error) {
 	cfg := defaultConfig(path)
 	for _, opt := range opts {
 		opt.apply(&cfg)
+	}
+
+	// Apply derived defaults that depend on other config values.
+	if cfg.MaxBystanderBytes == 0 {
+		cfg.MaxBystanderBytes = cfg.WriteBufferSize / 8
 	}
 
 	// Iterative open with hard limit of 2 attempts:
@@ -880,75 +868,6 @@ func (c *Cache) runWALRecovery() (bool, error) {
 	return recovered, nil
 }
 
-// maxSpatialBystanders limits the blast radius of spatial co-eviction.
-// SIEVE picks a cold anchor; bystanders may be warm or hot — they are evicted
-// only because they are physically adjacent.  Keeping this small bounds the
-// cache pollution from "innocent bystander" eviction.
-const maxSpatialBystanders = 64
-
-// CoalesceVictims sorts victims by (SegmentID, Offset) and merges adjacent ranges
-// into a single HoleRange. This reduces filesystem journal commits by ~98% when
-// evicting thousands of blobs, turning "Swiss cheese" into "stripes".
-//
-// The dst slice is reused to avoid heap allocations. Pass c.reclaimBuf[:0] for
-// zero-allocation coalescing across eviction cycles.
-//
-// Algorithm:
-//  1. Sort victims in-place by SegmentID, then Offset
-//  2. Walk through sorted victims, merging contiguous ranges
-//  3. Two blobs are contiguous if: same SegmentID AND v[i].Offset + v[i].PhysicalLen == v[i+1].Offset
-func CoalesceVictims(victims []index.Item, dst []HoleRange) []HoleRange {
-	if len(victims) == 0 {
-		return dst[:0]
-	}
-
-	// Sort by (SegmentID, Offset) - stable sort not needed since offsets are unique
-	slices.SortFunc(victims, func(a, b index.Item) int {
-		if c := cmp.Compare(a.SegmentID, b.SegmentID); c != 0 {
-			return c
-		}
-		return cmp.Compare(a.Offset, b.Offset)
-	})
-
-	// Reset destination, keeping underlying capacity
-	dst = dst[:0]
-
-	// Start with first victim as current range
-	currentSeg := victims[0].SegmentID
-	currentOff := int64(victims[0].Offset)
-	currentLen := int64(victims[0].PhysicalLen)
-
-	for i := 1; i < len(victims); i++ {
-		v := &victims[i]
-		vEnd := currentOff + currentLen
-
-		// Check if this victim is contiguous with current range
-		if v.SegmentID == currentSeg && int64(v.Offset) == vEnd {
-			// Merge: extend current range
-			currentLen += int64(v.PhysicalLen)
-		} else {
-			// Emit current range and start new one
-			dst = append(dst, HoleRange{
-				SegmentID: currentSeg,
-				Offset:    currentOff,
-				Length:    currentLen,
-			})
-			currentSeg = v.SegmentID
-			currentOff = int64(v.Offset)
-			currentLen = int64(v.PhysicalLen)
-		}
-	}
-
-	// Emit final range
-	dst = append(dst, HoleRange{
-		SegmentID: currentSeg,
-		Offset:    currentOff,
-		Length:    currentLen,
-	})
-
-	return dst
-}
-
 // maintenanceWorker handles eviction and compaction in a unified event-driven loop.
 //
 // Lifecycle (no timers):
@@ -984,7 +903,15 @@ func (c *Cache) maintenanceWorker() {
 	}
 }
 
-// runEvictionSieve evicts blobs using Sieve algorithm until under size limit
+// runEvictionSieve evicts blobs using Sieve algorithm until under size limit.
+//
+// Each iteration: SIEVE picks a cold anchor, co-evicts physically adjacent
+// bystanders (spatial expansion), commits tombstones, and punches a single
+// contiguous hole covering [min(offset), max(offset+physLen)].
+//
+// No separate coalescing pass: each Evict() call produces items from one
+// segment, so we punch one range per call. Gaps from previously-evicted
+// items within the range are already holes — punching them again is a no-op.
 func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
 	evictionStart := time.Now()
 
@@ -1007,80 +934,76 @@ func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
 	toEvictBytes := currentSize - target
 
 	var (
-		victims             []index.Item
-		evictedBytes        int64
-		physicallyReclaimed int64
+		evictedBytes int64
+		evictedCount int
+		punchCount   int
 	)
 
-	// 1. SELECTION PHASE — Spatial SIEVE
-	// Each Evict call finds the coldest item via SIEVE (anchor), then co-evicts
-	// physically adjacent items in the same segment up to the remaining budget.
-	// This turns scattered "Swiss cheese" holes into contiguous stripes.
 	for evictedBytes < toEvictBytes {
-		batch := c.index.Evict(toEvictBytes-evictedBytes, maxSpatialBystanders)
+		// 1. SELECT — SIEVE anchor + spatial bystanders (single segment).
+		batch := c.index.Evict(toEvictBytes-evictedBytes, c.MaxBystanderBytes)
 		if len(batch) == 0 {
 			break
 		}
-		for _, v := range batch {
-			victims = append(victims, v)
-			evictedBytes += int64(v.PhysicalLen)
+
+		// 2. COMMIT — persist tombstones for this batch.
+		if err := c.index.DeleteBlobs(batch...); err != nil {
+			return fmt.Errorf("eviction durability sync failed: %w", err)
 		}
+
+		// Update segment metadata (all items are same segment).
+		segID := batch[0].SegmentID
+		var batchBytes int64
+		for _, v := range batch {
+			batchBytes += int64(v.PhysicalLen)
+		}
+		c.index.UpdateSegmentOnDelete(segID, int32(len(batch)), batchBytes)
+
+		// 3. RECLAIM — punch one contiguous range covering the batch.
+		// Items are from the same segment; compute [min, max] offset extent.
+		// Gaps from previously-evicted items are already holes (punch is idempotent).
+		// physicallyReclaimed = sum of evicted PhysicalLen (not the punch range,
+		// which may include pre-existing holes we don't want to double-count).
+		minOff := int64(batch[0].Offset)
+		maxEnd := int64(batch[0].Offset) + int64(batch[0].PhysicalLen)
+		for _, v := range batch[1:] {
+			off := int64(v.Offset)
+			end := off + int64(v.PhysicalLen)
+			if off < minOff {
+				minOff = off
+			}
+			if end > maxEnd {
+				maxEnd = end
+			}
+		}
+		c.archivist.HolePunchRange(context.Background(), segID, minOff, maxEnd-minOff)
+		punchCount++
+
+		evictedBytes += batchBytes
+		evictedCount += len(batch)
 	}
 
-	if len(victims) == 0 {
+	if evictedCount == 0 {
 		return nil
 	}
 
-	// 2. COMMIT PHASE
-	if err := c.index.DeleteBlobs(victims...); err != nil {
-		return fmt.Errorf("eviction durability sync failed: %w", err)
-	}
-
-	// Update segment metadata for compaction selection (group by segment).
-	// Reuse buffer across eviction cycles to avoid allocation storm.
-	if c.segmentDeleteBuf == nil {
-		c.segmentDeleteBuf = make(map[uint32]segmentDeleteStats)
-	}
-	for _, v := range victims {
-		sd := c.segmentDeleteBuf[v.SegmentID]
-		sd.count++
-		sd.bytes += int64(v.PhysicalLen)
-		c.segmentDeleteBuf[v.SegmentID] = sd
-	}
-	for segID, sd := range c.segmentDeleteBuf {
-		c.index.UpdateSegmentOnDelete(segID, sd.count, sd.bytes)
-		delete(c.segmentDeleteBuf, segID) // Clear for reuse
-	}
-
-	// 3. RECLAMATION PHASE
-	// Coalesce adjacent eviction holes into contiguous ranges to reduce syscalls,
-	// then punch through the rate limiter (2000 ops/sec in archivist).
-	c.reclaimBuf = CoalesceVictims(victims, c.reclaimBuf[:0])
-	var syscallCount int
-	for _, r := range c.reclaimBuf {
-		reclaimed, _ := c.archivist.HolePunchRange(context.Background(), r.SegmentID, r.Offset, r.Length)
-		physicallyReclaimed += reclaimed
-		syscallCount++
-	}
-
-	// 4. METRICS & MAINTENANCE
+	// METRICS & MAINTENANCE
 	c.approxSize.Add(-evictedBytes)
-	evictedCount := len(victims)
 
-	// Calculate batching efficiency: higher = more syscalls saved
+	// Batch efficiency: items evicted per punch syscall.
+	// With spatial expansion each punch covers ~N bystanders, so this should be
+	// much higher than 1.0 (the old per-item regime).
 	var batchEfficiency float64
-	if syscallCount > 0 {
-		batchEfficiency = float64(evictedCount) / float64(syscallCount)
+	if punchCount > 0 {
+		batchEfficiency = float64(evictedCount) / float64(punchCount)
 	}
 
 	log.Info("eviction completed",
 		"duration", time.Since(evictionStart),
 		"evicted_count", evictedCount,
 		"evicted_mb", evictedBytes/(1024*1024),
-		"reclaimed_mb", physicallyReclaimed/(1024*1024),
-		"reclaim_pct", 100*float64(physicallyReclaimed)/float64(evictedBytes),
 		"remaining_mb", c.approxSize.Load()/(1024*1024),
-		"punch_syscalls", syscallCount,
+		"punch_syscalls", punchCount,
 		"batch_efficiency", fmt.Sprintf("%.1fx", batchEfficiency))
 
 	c.bloomStats.deletions.Add(int64(evictedCount))

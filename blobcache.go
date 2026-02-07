@@ -276,9 +276,10 @@ func open(cfg config) (*Cache, bool, error) {
 
 	// Token bucket rate limiter for compaction I/O throttling.
 	// Smooths the rate of copy_file_range calls (reflink metadata updates) to
-	// prevent overwhelming the filesystem. Burst allows one segment without waiting.
+	// prevent overwhelming the filesystem. Burst = 4MB allows a few records
+	// through instantly but enforces 400 MB/s steady-state across a merge.
 	if cfg.CompactionBandwidth > 0 {
-		burst := max(int(cfg.WriteBufferSize*2), 1)
+		burst := 4 << 20 // 4MB — a few records of headroom
 		c.compactor.rateLimiter = rate.NewLimiter(rate.Limit(cfg.CompactionBandwidth), burst)
 	}
 

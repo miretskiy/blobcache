@@ -1,6 +1,7 @@
 package blobcache
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"github.com/miretskiy/blobcache/internal/index"
 	"github.com/miretskiy/blobcache/internal/record"
 	"github.com/miretskiy/blobcache/internal/sys"
+	"golang.org/x/time/rate"
 )
 
 // SegmentCacheReleaseFn is called to release cached segment file handles
@@ -33,6 +35,11 @@ type Compactor struct {
 	shards            int
 	ioFlags           sys.OpenFlag
 	releaseCachedFile SegmentCacheReleaseFn
+
+	// rateLimiter throttles copy_file_range calls to smooth metadata update rate.
+	// Each reflink is a metadata operation; without throttling, a burst of hundreds
+	// of copy_file_range calls can overwhelm the filesystem. Nil means unlimited.
+	rateLimiter *rate.Limiter
 
 	// ioBuf is a reusable buffer for header reads during compaction.
 	// Lazily allocated on first use.
@@ -96,6 +103,7 @@ type CompactResult struct {
 	SpliceOps   int   // Number of copy_file_range calls (reflinks on XFS when aligned)
 	SpliceBytes int64 // Bytes copied via copy_file_range
 	DurationMs  int64 // Total compaction duration in milliseconds
+	ThrottleMs  int64 // Time spent waiting for rate limiter tokens
 
 	// Targeted Gravity metrics
 	EstimatedInputMB float64 // Pre-compaction estimate of live data (from policy)
@@ -493,6 +501,14 @@ func (c *Compactor) copyRecord(
 	recordLen int64,
 	result *CompactResult,
 ) error {
+	// Throttle before issuing the syscall to smooth metadata update rate.
+	if c.rateLimiter != nil {
+		tokens := min(int(recordLen), c.rateLimiter.Burst())
+		waitStart := time.Now()
+		_ = c.rateLimiter.WaitN(context.Background(), tokens)
+		result.ThrottleMs += time.Since(waitStart).Milliseconds()
+	}
+
 	bufSrc := srcOff
 	if _, err := copyFileRangeFull(seg.file, dst, &bufSrc, dstOff, int(recordLen)); err != nil {
 		return err

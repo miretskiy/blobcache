@@ -53,10 +53,9 @@ type Cache struct {
 	}
 
 	// --- ARCHITECTURE COMPONENTS ---
-	memTable          *MemTable     // The Write Engine (Producer)
-	librarian         *Librarian    // The Read Cache (Consumer)
-	compactor         *Compactor    // Segment merge compaction
-	compactionLimiter *rate.Limiter // Token bucket for compaction I/O throttling
+	memTable  *MemTable  // The Write Engine (Producer)
+	librarian *Librarian // The Read Cache (Consumer)
+	compactor *Compactor // Segment merge compaction
 
 	// Global monotonic sequence counter for operation ordering.
 	// Initialized to time.Now().UnixNano() for continuity across restarts.
@@ -276,11 +275,11 @@ func open(cfg config) (*Cache, bool, error) {
 	c.compactor = NewCompactor(idx, c.segIDs, cfg.Path, cfg.Shards, ioFlags, c.archivist.DropSegmentCache)
 
 	// Token bucket rate limiter for compaction I/O throttling.
-	// Prevents compaction (especially reflink metadata updates) from overwhelming
-	// the filesystem. Burst allows one full segment without waiting.
+	// Smooths the rate of copy_file_range calls (reflink metadata updates) to
+	// prevent overwhelming the filesystem. Burst allows one segment without waiting.
 	if cfg.CompactionBandwidth > 0 {
 		burst := max(int(cfg.WriteBufferSize*2), 1)
-		c.compactionLimiter = rate.NewLimiter(rate.Limit(cfg.CompactionBandwidth), burst)
+		c.compactor.rateLimiter = rate.NewLimiter(rate.Limit(cfg.CompactionBandwidth), burst)
 	}
 
 	// Run WAL recovery after memtable is initialized
@@ -1104,17 +1103,12 @@ func (c *Cache) maybeMergeSegments() error {
 			"estimated_input_mb", fmt.Sprintf("%.1f", result.EstimatedInputMB),
 			"actual_output_mb", fmt.Sprintf("%.1f", result.ActualOutputMB),
 			"duration_ms", result.DurationMs,
+			"throttle_ms", result.ThrottleMs,
 			"splice_ops", result.SpliceOps,
 			"splice_mbps", fmt.Sprintf("%.1f", spliceMBps),
 			"hdr_read_ops", result.ReadOps,
 			"hdr_read_mbps", fmt.Sprintf("%.1f", readMBps))
 
-		// Token bucket rate limiting: throttle based on bytes moved.
-		// Protects foreground I/O from compaction saturating the filesystem.
-		if c.compactionLimiter != nil && totalOutputBytes > 0 {
-			tokens := min(int(totalOutputBytes), c.compactionLimiter.Burst())
-			_ = c.compactionLimiter.WaitN(context.Background(), tokens)
-		}
 	}
 
 	// Recalculate oldest segment after dropping segments (O(1) from in-memory registry)

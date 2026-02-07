@@ -161,6 +161,10 @@ type ActiveSlab struct {
 	// (since XL writes don't consume space in the main slab buffer).
 	// Accessed only under MemTable.mu.Lock, so no atomics needed.
 	xlSize int64
+
+	// padBytes tracks cumulative block-alignment padding in this slab.
+	// Accessed only under MemTable.mu.Lock, so no atomics needed.
+	padBytes int64
 }
 
 // Alloc reserves n bytes in the slab at a block-aligned offset.
@@ -174,7 +178,9 @@ type ActiveSlab struct {
 // If there isn't enough capacity, it returns nil, 0.
 // The caller should use EncodeTo methods to write directly into buf.
 func (as *ActiveSlab) Alloc(n int) (buf []byte, offset int64) {
-	as.wPos = sys.PageAlign(as.wPos)
+	aligned := sys.PageAlign(as.wPos)
+	as.padBytes += aligned - as.wPos
+	as.wPos = aligned
 	offset = as.wPos
 	end := offset + int64(n)
 	if end > int64(as.buf.Cap()) {

@@ -20,6 +20,7 @@ import (
 	"github.com/miretskiy/blobcache/internal/sys"
 	"github.com/miretskiy/blobcache/internal/wal"
 	"github.com/zeebo/xxh3"
+	"golang.org/x/time/rate"
 )
 
 // Key is the 128-bit hash of a blob key.
@@ -52,9 +53,10 @@ type Cache struct {
 	}
 
 	// --- ARCHITECTURE COMPONENTS ---
-	memTable  *MemTable  // The Write Engine (Producer)
-	librarian *Librarian // The Read Cache (Consumer)
-	compactor *Compactor // Segment merge compaction
+	memTable          *MemTable     // The Write Engine (Producer)
+	librarian         *Librarian    // The Read Cache (Consumer)
+	compactor         *Compactor    // Segment merge compaction
+	compactionLimiter *rate.Limiter // Token bucket for compaction I/O throttling
 
 	// Global monotonic sequence counter for operation ordering.
 	// Initialized to time.Now().UnixNano() for continuity across restarts.
@@ -272,6 +274,14 @@ func open(cfg config) (*Cache, bool, error) {
 		ioFlags |= sys.SyncData
 	}
 	c.compactor = NewCompactor(idx, c.segIDs, cfg.Path, cfg.Shards, ioFlags, c.archivist.DropSegmentCache)
+
+	// Token bucket rate limiter for compaction I/O throttling.
+	// Prevents compaction (especially reflink metadata updates) from overwhelming
+	// the filesystem. Burst allows one full segment without waiting.
+	if cfg.CompactionBandwidth > 0 {
+		burst := max(int(cfg.WriteBufferSize*2), 1)
+		c.compactionLimiter = rate.NewLimiter(rate.Limit(cfg.CompactionBandwidth), burst)
+	}
 
 	// Run WAL recovery after memtable is initialized
 	var recovered bool
@@ -1098,6 +1108,13 @@ func (c *Cache) maybeMergeSegments() error {
 			"splice_mbps", fmt.Sprintf("%.1f", spliceMBps),
 			"hdr_read_ops", result.ReadOps,
 			"hdr_read_mbps", fmt.Sprintf("%.1f", readMBps))
+
+		// Token bucket rate limiting: throttle based on bytes moved.
+		// Protects foreground I/O from compaction saturating the filesystem.
+		if c.compactionLimiter != nil && totalOutputBytes > 0 {
+			tokens := min(int(totalOutputBytes), c.compactionLimiter.Burst())
+			_ = c.compactionLimiter.WaitN(context.Background(), tokens)
+		}
 	}
 
 	// Recalculate oldest segment after dropping segments (O(1) from in-memory registry)

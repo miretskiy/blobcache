@@ -70,6 +70,11 @@ type config struct {
 	TrustHash          bool         // Skip key verification on reads (cache mode optimization)
 	BallastSize        int          // Heap ballast size in bytes (default: 1GB, 0 = disabled)
 
+	// CompactionBandwidth limits merge compaction throughput in bytes/sec.
+	// Throttles compaction to avoid saturating the I/O bus during ingestion.
+	// Default: 400 MB/s. Set to 0 to disable throttling.
+	CompactionBandwidth int64
+
 	// MaxBystanderBytes limits the blast radius of spatial co-eviction per SIEVE
 	// anchor. After SIEVE picks a cold anchor, we co-evict physically adjacent
 	// items up to this byte budget. Bystanders may be warm or hot — they are
@@ -236,20 +241,28 @@ func WithMaxBystanderBytes(bytes int64) Option {
 	return funcOpt(func(c *config) { c.MaxBystanderBytes = bytes })
 }
 
+// WithCompactionBandwidth sets the maximum bytes/sec for merge compaction I/O.
+// Throttles compaction to avoid saturating the filesystem with metadata updates.
+// Default: 400 MB/s. Set to 0 to disable throttling (not recommended for production).
+func WithCompactionBandwidth(bytesPerSec int64) Option {
+	return funcOpt(func(c *config) { c.CompactionBandwidth = bytesPerSec })
+}
+
 func defaultConfig(path string) config {
 	return config{
-		Path:               path,
-		MaxSize:            0,
-		Shards:             0,
-		WriteBufferSize:    64 << 20, // 64MB
-		MaxInflightSlabs:   6,
-		MaxCachedSlabs:     8, // Keep ~1GB of recently written data in RAM
-		FlushConcurrency:   2,
-		BloomFPRate:        0.01,
-		BloomEstimatedKeys: 1_000_000,
-		DegradedMode:       DegradedMemoryOnly,
-		TrustHash:          true,    // Cache mode: trust hash, skip key verification
-		BallastSize:        1 << 30, // 1GB heap ballast to reduce GC frequency
+		Path:                path,
+		MaxSize:             0,
+		Shards:              0,
+		WriteBufferSize:     64 << 20, // 64MB
+		MaxInflightSlabs:    6,
+		MaxCachedSlabs:      8, // Keep ~1GB of recently written data in RAM
+		FlushConcurrency:    2,
+		BloomFPRate:         0.01,
+		BloomEstimatedKeys:  1_000_000,
+		DegradedMode:        DegradedMemoryOnly,
+		TrustHash:           true,      // Cache mode: trust hash, skip key verification
+		BallastSize:         1 << 30,   // 1GB heap ballast to reduce GC frequency
+		CompactionBandwidth: 400 << 20, // 400 MB/s for merge compaction throttling
 		IO: IOConfig{
 			FDataSync:     false,
 			Fadvise:       sys.UseFadvise,

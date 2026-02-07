@@ -657,7 +657,7 @@ func TestCache_Eviction_Headroom(t *testing.T) {
 	// Small cache with eviction enabled
 	cache, err := New(tmpDir,
 		WithMaxSize(20*1024),        // 20KB limit
-		WithWriteBufferSize(2*1024)) // Small buffer to ensure flush
+		WithWriteBufferSize(2*1024)) // Small buffer to ensure flush (clamped to 8KB min)
 	require.NoError(t, err)
 	defer cache.Close()
 	cache.Start() // Start eviction worker

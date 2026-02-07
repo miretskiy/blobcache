@@ -34,14 +34,11 @@ type Compactor struct {
 	ioFlags           sys.OpenFlag
 	releaseCachedFile SegmentCacheReleaseFn
 
-	// ioBuf is a reusable buffer for small reads/writes (headers, head/tail blocks).
-	// Lazily allocated on first use. Regular heap memory (not mmap'd) since
-	// it's used with buffered fds, not O_DIRECT.
+	// ioBuf is a reusable buffer for header reads during compaction.
+	// Lazily allocated on first use.
 	ioBuf []byte
 
-	// segmentFiles caches open file handles and sizes for source segments.
-	// Each entry has two fds: O_DIRECT (for aligned copy_file_range) and
-	// buffered (for header reads and unaligned data).
+	// segmentFiles caches open file handles for source segments.
 	// Populated during compaction, closed after each Compact() call.
 	segmentFiles map[uint32]segmentFileInfo
 
@@ -49,13 +46,12 @@ type Compactor struct {
 	Knobs *CompactorKnobs
 }
 
-// segmentFileInfo holds cached file handles for a source segment.
-// Two fds allow using O_DIRECT for aligned copy_file_range (reflinks on XFS)
-// while using buffered I/O for unaligned reads (headers, head/tail of records).
+// segmentFileInfo holds a cached file handle for a source segment.
+// A single buffered fd is used for both copy_file_range and header reads.
+// Reflinks on XFS depend on block-aligned offsets, not O_DIRECT.
 type segmentFileInfo struct {
-	direct   *os.File // O_DIRECT — for body copy_file_range at aligned offsets
-	buffered *os.File // Buffered — for header reads, head/tail block copies
-	size     int64
+	file *os.File
+	size int64
 }
 
 // NewCompactor creates a Compactor with the given dependencies.
@@ -93,13 +89,13 @@ type CompactResult struct {
 	StaleSkipped        int      // Number of stale entries skipped (superseded by newer writes)
 
 	// I/O stats for bandwidth analysis
-	ReadOps    int   // Number of read operations (header reads + head/tail blocks)
-	ReadBytes  int64 // Total bytes read from old segments
-	WriteOps   int   // Number of write operations (head/tail block writes)
-	WriteBytes int64 // Total bytes written via pwrite (head/tail blocks)
-	SpliceOps  int   // Number of copy_file_range calls (zero-copy on aligned sources)
+	ReadOps     int   // Number of read operations (header reads)
+	ReadBytes   int64 // Total bytes read from old segments
+	WriteOps    int   // Number of write operations
+	WriteBytes  int64 // Total bytes written via pwrite
+	SpliceOps   int   // Number of copy_file_range calls (reflinks on XFS when aligned)
 	SpliceBytes int64 // Bytes copied via copy_file_range
-	DurationMs int64 // Total compaction duration in milliseconds
+	DurationMs  int64 // Total compaction duration in milliseconds
 
 	// Targeted Gravity metrics
 	EstimatedInputMB float64 // Pre-compaction estimate of live data (from policy)
@@ -331,8 +327,8 @@ func (c *Compactor) collectItems(segmentIDs []uint32) ([]relocInfo, []index.Item
 	return toRelocate, tombstones, maxSeqID, staleCount, dissolvedCount, nil
 }
 
-// getSegmentFile returns cached file handles for a source segment.
-// Opens two fds: O_DIRECT for aligned copy_file_range, buffered for headers/unaligned reads.
+// getSegmentFile returns a cached file handle for a source segment.
+// Opens a single buffered fd — reflinks depend on block-aligned offsets, not O_DIRECT.
 func (c *Compactor) getSegmentFile(segmentID uint32) (segmentFileInfo, error) {
 	if info, ok := c.segmentFiles[segmentID]; ok {
 		return info, nil
@@ -340,27 +336,18 @@ func (c *Compactor) getSegmentFile(segmentID uint32) (segmentFileInfo, error) {
 
 	path := getSegmentPath(c.basePath, c.shards, segmentID)
 
-	// O_DIRECT fd for aligned copy_file_range (reflinks on XFS)
-	directFd, err := sys.OpenFileForRead(path, c.ioFlags)
+	f, err := sys.OpenFileForRead(path, 0)
 	if err != nil {
-		return segmentFileInfo{}, fmt.Errorf("compaction: open segment %d (direct): %w", segmentID, err)
+		return segmentFileInfo{}, fmt.Errorf("compaction: open segment %d: %w", segmentID, err)
 	}
 
-	// Buffered fd for header reads and unaligned head/tail data
-	bufferedFd, err := sys.OpenFileForRead(path, 0)
+	stat, err := f.Stat()
 	if err != nil {
-		_ = directFd.Close()
-		return segmentFileInfo{}, fmt.Errorf("compaction: open segment %d (buffered): %w", segmentID, err)
-	}
-
-	stat, err := directFd.Stat()
-	if err != nil {
-		_ = directFd.Close()
-		_ = bufferedFd.Close()
+		_ = f.Close()
 		return segmentFileInfo{}, fmt.Errorf("compaction: stat segment %d: %w", segmentID, err)
 	}
 
-	info := segmentFileInfo{direct: directFd, buffered: bufferedFd, size: stat.Size()}
+	info := segmentFileInfo{file: f, size: stat.Size()}
 	c.segmentFiles[segmentID] = info
 	return info, nil
 }
@@ -369,11 +356,8 @@ func (c *Compactor) getSegmentFile(segmentID uint32) (segmentFileInfo, error) {
 // Called after each compaction to avoid accumulating open files.
 func (c *Compactor) closeSegmentFiles() (retErr error) {
 	for segID, info := range c.segmentFiles {
-		if err := info.direct.Close(); err != nil {
-			retErr = errors.Join(retErr, fmt.Errorf("close segment %d (direct): %w", segID, err))
-		}
-		if err := info.buffered.Close(); err != nil {
-			retErr = errors.Join(retErr, fmt.Errorf("close segment %d (buffered): %w", segID, err))
+		if err := info.file.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("close segment %d: %w", segID, err))
 		}
 		delete(c.segmentFiles, segID)
 	}
@@ -382,21 +366,13 @@ func (c *Compactor) closeSegmentFiles() (retErr error) {
 
 // writeCompactedSegment writes records to a new segment with block-aligned offsets.
 //
-// Alignment normalization: each record starts at a 4KB boundary in the destination.
-// This ensures that subsequent compactions can use copy_file_range with O_DIRECT
-// for reflink-based zero-copy on XFS.
+// Records from padded MemTable/WAL are born with block-aligned offsets. The
+// compactor preserves this alignment in the destination. On XFS with reflink=1,
+// copy_file_range produces shared extents when both offsets are block-aligned,
+// making compaction nearly zero-I/O for the data portion.
 //
-// For each record, the source offset determines the copy strategy:
-//
-//   - Aligned source (srcOff % 4096 == 0): O_DIRECT copy_file_range for the body
-//     (whole blocks → reflinks on XFS), buffered read/write for the tail (< 4KB).
-//
-//   - Unaligned source: buffered copy_file_range for the entire record (data copy,
-//     no reflinks possible). After normalization, the output is aligned for future
-//     compactions.
-//
-// The destination is opened without O_DIRECT. A single fdatasync at the end
-// ensures durability.
+// Legacy segments (pre-padding) have unaligned records: the first compaction does
+// a physical copy to normalize offsets, enabling reflinks in subsequent compactions.
 func (c *Compactor) writeCompactedSegment(
 	newSegID uint32,
 	toRelocate []relocInfo,
@@ -499,19 +475,16 @@ func (c *Compactor) writeCompactedSegment(
 	return footerEntries, nil
 }
 
-// copyRecord copies a single record from source to destination using a
-// Head/Body/Tail sandwich strategy to maximize reflink usage:
+// copyRecord copies a single record from source to destination via copy_file_range.
 //
-//	Head: bytes from srcOff to the next block boundary (buffered read/write)
-//	Body: whole blocks in the middle (O_DIRECT copy_file_range → reflinks on XFS)
-//	Tail: trailing partial block (buffered read/write)
+// Records from padded MemTable/WAL have block-aligned source offsets, and the
+// compactor places them at block-aligned destination offsets. On XFS with reflink=1,
+// this produces shared extents (reflinks) for all whole blocks — typically 99%+ of
+// a large blob. The kernel handles the trailing partial block as a physical copy.
 //
-// When source is block-aligned (from a prior compaction), Head is empty and the
-// entire record minus the tail gets reflinks. When source is unaligned (MemTable
-// flush), the head shift aligns the body for reflinks (~99%+ of data for large blobs).
-//
-// On non-Linux platforms (sys.RequiresAlignment == false), the entire record is
-// copied via buffered copy_file_range (emulated as read/write).
+// Legacy segments (pre-padding) have unaligned source offsets: copy_file_range falls
+// back to a physical copy. After one compaction pass, output is normalized for future
+// reflinks.
 func (c *Compactor) copyRecord(
 	seg segmentFileInfo,
 	dst *os.File,
@@ -520,77 +493,16 @@ func (c *Compactor) copyRecord(
 	recordLen int64,
 	result *CompactResult,
 ) error {
-	if !sys.RequiresAlignment {
-		// Non-Linux: no O_DIRECT, no reflinks. Buffered copy for entire record.
-		bufSrc := srcOff
-		if _, err := copyFileRangeFull(seg.buffered, dst, &bufSrc, dstOff, int(recordLen)); err != nil {
-			return err
-		}
-		result.SpliceOps++
-		result.SpliceBytes += recordLen
-		return nil
+	bufSrc := srcOff
+	if _, err := copyFileRangeFull(seg.file, dst, &bufSrc, dstOff, int(recordLen)); err != nil {
+		return err
 	}
-
-	// Head: partial block from srcOff to next block boundary.
-	// Zero when source is already aligned (from prior compaction).
-	headLen := int64(0)
-	if pad := srcOff & sys.BlockMask; pad != 0 {
-		headLen = min(sys.BlockSize-pad, recordLen)
-	}
-
-	// Body: whole blocks after head, eligible for O_DIRECT reflinks.
-	remaining := recordLen - headLen
-	bodyLen := (remaining / sys.BlockSize) * sys.BlockSize
-	tailLen := remaining - bodyLen
-
-	// Phase 1: Head — buffered read/write to shift past source misalignment
-	if headLen > 0 {
-		buf := c.ioBuf[:headLen]
-		if _, err := seg.buffered.ReadAt(buf, srcOff); err != nil {
-			return fmt.Errorf("read head: %w", err)
-		}
-		if _, err := dst.WriteAt(buf, *dstOff); err != nil {
-			return fmt.Errorf("write head: %w", err)
-		}
-		result.ReadOps++
-		result.ReadBytes += headLen
-		result.WriteOps++
-		result.WriteBytes += headLen
-		*dstOff += headLen
-	}
-
-	// Phase 2: Body — O_DIRECT copy_file_range (reflinks on XFS)
-	if bodyLen > 0 {
-		bodySrc := srcOff + headLen
-		if _, err := copyFileRangeFull(seg.direct, dst, &bodySrc, dstOff, int(bodyLen)); err != nil {
-			return err
-		}
-		result.SpliceOps++
-		result.SpliceBytes += bodyLen
-	}
-
-	// Phase 3: Tail — buffered read/write for trailing partial block
-	if tailLen > 0 {
-		buf := c.ioBuf[:tailLen]
-		tailSrc := srcOff + headLen + bodyLen
-		if _, err := seg.buffered.ReadAt(buf, tailSrc); err != nil {
-			return fmt.Errorf("read tail: %w", err)
-		}
-		if _, err := dst.WriteAt(buf, *dstOff); err != nil {
-			return fmt.Errorf("write tail: %w", err)
-		}
-		result.ReadOps++
-		result.ReadBytes += tailLen
-		result.WriteOps++
-		result.WriteBytes += tailLen
-		*dstOff += tailLen
-	}
-
+	result.SpliceOps++
+	result.SpliceBytes += recordLen
 	return nil
 }
 
 // readRecordHeader reads just the record header from a source segment.
-// Uses the buffered fd for a simple ReadAt — no alignment constraints.
 func (c *Compactor) readRecordHeader(e index.Item) (record.Header, error) {
 	seg, err := c.getSegmentFile(e.SegmentID)
 	if err != nil {
@@ -598,7 +510,7 @@ func (c *Compactor) readRecordHeader(e index.Item) (record.Header, error) {
 	}
 
 	buf := c.ioBuf[:record.HeaderSize]
-	if _, err := seg.buffered.ReadAt(buf, int64(e.Offset)); err != nil {
+	if _, err := seg.file.ReadAt(buf, int64(e.Offset)); err != nil {
 		return record.Header{}, fmt.Errorf("compaction: read header segment %d offset %d: %w",
 			e.SegmentID, e.Offset, err)
 	}

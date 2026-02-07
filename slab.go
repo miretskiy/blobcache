@@ -163,14 +163,18 @@ type ActiveSlab struct {
 	xlSize int64
 }
 
-// Alloc reserves n bytes in the slab.
+// Alloc reserves n bytes in the slab at a block-aligned offset.
 // Returns:
 //   - buf: A slice window into the reserved memory (safe to write to).
 //   - offset: The absolute offset of the start of the buffer (for the Index).
 //
+// Every record starts at a 4KB boundary so that segments are born with aligned
+// offsets, enabling XFS reflinks via copy_file_range during compaction.
+//
 // If there isn't enough capacity, it returns nil, 0.
 // The caller should use EncodeTo methods to write directly into buf.
 func (as *ActiveSlab) Alloc(n int) (buf []byte, offset int64) {
+	as.wPos = sys.PageAlign(as.wPos)
 	offset = as.wPos
 	end := offset + int64(n)
 	if end > int64(as.buf.Cap()) {

@@ -363,7 +363,7 @@ func (w *WAL) flushRecords(batch []*request) error {
 		needHeader := w.fileOffset == 0
 		overhead := 0
 		if needHeader {
-			overhead = FileHeaderSize
+			overhead = int(sys.PageAlign(int64(FileHeaderSize)))
 		}
 
 		chunkStart := idx
@@ -371,11 +371,11 @@ func (w *WAL) flushRecords(batch []*request) error {
 
 		for idx < len(batch) {
 			recSize := batch[idx].rec.EncodedSize()
-			projectedWrite := int(sys.PageAlign(int64(chunkSize + recSize)))
+			paddedRecSize := int(sys.PageAlign(int64(recSize)))
 
-			if projectedWrite <= bufCap {
-				// Record fits in current chunk
-				chunkSize += recSize
+			if chunkSize+paddedRecSize <= bufCap {
+				// Record fits in current chunk (padded to block boundary)
+				chunkSize += paddedRecSize
 				idx++
 			} else if chunkStart == idx {
 				// Single record exceeds buffer - use slow path
@@ -418,22 +418,28 @@ func (w *WAL) flushRecords(batch []*request) error {
 
 // writeChunk writes a chunk of records that fits in the staging buffer.
 // Populates WriteResult for each request in the chunk.
+//
+// Records are padded to block boundaries so that WAL-renamed segments are born
+// with block-aligned record offsets, enabling XFS reflinks during compaction.
 func (w *WAL) writeChunk(chunk []*request, includeHeader bool) error {
-	// Calculate payload size
+	// Calculate payload size with per-record block padding for reflink alignment.
+	// Each record occupies PageAlign(recSize) bytes, and the file header (when
+	// present) is padded to a full block so the first record starts at offset 4096.
 	payloadSize := 0
 	for _, req := range chunk {
-		payloadSize += req.rec.EncodedSize()
+		payloadSize = int(sys.PageAlign(int64(payloadSize + req.rec.EncodedSize())))
 	}
 
 	totalPayload := payloadSize
 	if includeHeader {
-		totalPayload += FileHeaderSize
+		totalPayload += int(sys.PageAlign(int64(FileHeaderSize)))
 	}
 	writeSize := int(sys.PageAlign(int64(totalPayload)))
 
 	buf := w.encodeBuf[:writeSize]
+	clear(buf) // Zero entire buffer: inter-record padding, header padding, tail
 
-	// Write header if needed
+	// Write header if needed, padded to block boundary so first record is aligned.
 	bufOffset := 0
 	if includeHeader {
 		hdr := FileHeader{
@@ -442,34 +448,28 @@ func (w *WAL) writeChunk(chunk []*request, includeHeader bool) error {
 			CreatedAt: time.Now().UnixNano(),
 		}
 		hdr.EncodeTo(buf)
-		bufOffset = FileHeaderSize
+		bufOffset = int(sys.PageAlign(int64(FileHeaderSize)))
 	}
 
 	// Track file offset for WriteResult (before writing)
 	baseFileOffset := w.fileOffset
 	if includeHeader {
-		baseFileOffset += FileHeaderSize
+		baseFileOffset += sys.PageAlign(int64(FileHeaderSize))
 	}
 
-	// Serialize records and populate WriteResult
+	// Serialize records with per-record block padding
 	for _, req := range chunk {
 		recSize := req.rec.EncodedSize()
 		req.rec.EncodeTo(buf[bufOffset:])
 
-		// Populate WriteResult with absolute file offset
 		req.Result = WriteResult{
 			Offset:       baseFileOffset,
 			BytesWritten: int64(recSize),
 			BytesAligned: int64(writeSize), // Shared across batch (total aligned write)
 		}
 
-		bufOffset += recSize
-		baseFileOffset += int64(recSize)
-	}
-
-	// Zero-pad tail
-	for i := bufOffset; i < writeSize; i++ {
-		buf[i] = 0
+		bufOffset = int(sys.PageAlign(int64(bufOffset + recSize)))
+		baseFileOffset = sys.PageAlign(baseFileOffset + int64(recSize))
 	}
 
 	// Write and sync
@@ -484,27 +484,24 @@ func (w *WAL) writeLargeRecord(req *request) error {
 		return err
 	}
 
-	// Determine if we need to include the file header
 	includeHeader := w.fileOffset == 0
 
 	recSize := req.rec.EncodedSize()
 	totalPayload := recSize
+	recordOffset := w.fileOffset
 	if includeHeader {
-		totalPayload += FileHeaderSize
+		paddedHeader := int(sys.PageAlign(int64(FileHeaderSize)))
+		totalPayload = paddedHeader + recSize
+		recordOffset += int64(paddedHeader)
 	}
 	writeSize := int(sys.PageAlign(int64(totalPayload)))
 
 	// Allocate temporary aligned buffer
 	buf := sys.AllocAligned(writeSize)
 	defer sys.FreeAligned(buf)
+	clear(buf) // Zero entire buffer (header padding + tail)
 
-	// Track file offset for WriteResult (before writing)
-	recordOffset := w.fileOffset
-	if includeHeader {
-		recordOffset += FileHeaderSize
-	}
-
-	// Write header if needed
+	// Write header if needed, padded to block boundary
 	bufOffset := 0
 	if includeHeader {
 		hdr := FileHeader{
@@ -513,17 +510,11 @@ func (w *WAL) writeLargeRecord(req *request) error {
 			CreatedAt: time.Now().UnixNano(),
 		}
 		hdr.EncodeTo(buf)
-		bufOffset = FileHeaderSize
+		bufOffset = int(sys.PageAlign(int64(FileHeaderSize)))
 	}
 
 	// Serialize record
 	req.rec.EncodeTo(buf[bufOffset:])
-	bufOffset += recSize
-
-	// Zero-pad tail
-	for i := bufOffset; i < writeSize; i++ {
-		buf[i] = 0
-	}
 
 	// Populate WriteResult
 	req.Result = WriteResult{

@@ -52,8 +52,8 @@ type Cache struct {
 	}
 
 	// --- ARCHITECTURE COMPONENTS ---
-	memTable          *MemTable     // The Write Engine (Producer)
-	librarian         *Librarian    // The Read Cache (Consumer)
+	memTable  *MemTable  // The Write Engine (Producer)
+	librarian *Librarian // The Read Cache (Consumer)
 	compactor *Compactor // Segment merge compaction
 
 	// Global monotonic sequence counter for operation ordering.

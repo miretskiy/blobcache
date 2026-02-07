@@ -102,7 +102,7 @@ func TestWAL_WriteAndRecover(t *testing.T) {
 	}
 
 	// First record starts after file header; sequential writes each become their own batch
-	expectedOffset := int64(FileHeaderSize)
+	expectedOffset := sys.PageAlign(int64(FileHeaderSize))
 	for i, rec := range records {
 		result := writeAndVerify(t, w, rec, expectedOffset)
 		if i == 0 {
@@ -146,13 +146,13 @@ func TestWAL_RecoverSkipsCommittedFiles(t *testing.T) {
 	require.NoError(t, err)
 
 	rec := record.NewRecord(100, []byte("key1"), []byte("value1"), 6)
-	writeAndVerify(t, w, rec, int64(FileHeaderSize))
+	writeAndVerify(t, w, rec, sys.PageAlign(int64(FileHeaderSize)))
 	_, err = w.EnqueueRotation()
 	require.NoError(t, err)
 
 	// Write records with SeqID 200 to second file (new file, so offset resets to FileHeaderSize)
 	rec = record.NewRecord(200, []byte("key2"), []byte("value2"), 6)
-	writeAndVerify(t, w, rec, int64(FileHeaderSize))
+	writeAndVerify(t, w, rec, sys.PageAlign(int64(FileHeaderSize)))
 	require.NoError(t, w.Close())
 
 	// Reopen and recover - mark first file as committed
@@ -184,7 +184,7 @@ func TestWAL_Rotate(t *testing.T) {
 
 	// Write record with SeqID 100 (becomes first WAL file name)
 	rec1 := record.NewRecord(100, []byte("key1"), []byte("value1"), 6)
-	writeAndVerify(t, w, rec1, int64(FileHeaderSize))
+	writeAndVerify(t, w, rec1, sys.PageAlign(int64(FileHeaderSize)))
 	require.Equal(t, uint64(100), w.CurrentFirstID())
 
 	// Rotate (closes current file)
@@ -194,7 +194,7 @@ func TestWAL_Rotate(t *testing.T) {
 
 	// Write to new slab with SeqID 200 (new file, offset resets)
 	rec2 := record.NewRecord(200, []byte("key2"), []byte("value2"), 6)
-	writeAndVerify(t, w, rec2, int64(FileHeaderSize))
+	writeAndVerify(t, w, rec2, sys.PageAlign(int64(FileHeaderSize)))
 	require.Equal(t, uint64(200), w.CurrentFirstID())
 
 	// Rotate again
@@ -203,7 +203,7 @@ func TestWAL_Rotate(t *testing.T) {
 
 	// Write to new slab with SeqID 300 (new file, offset resets)
 	rec3 := record.NewRecord(300, []byte("key3"), []byte("value3"), 6)
-	writeAndVerify(t, w, rec3, int64(FileHeaderSize))
+	writeAndVerify(t, w, rec3, sys.PageAlign(int64(FileHeaderSize)))
 
 	// Check multiple files were created
 	files, err := w.listWALFiles()
@@ -262,7 +262,7 @@ func TestWAL_DeleteFile(t *testing.T) {
 
 	// Write with SeqID 100 (file named wal-0000000000000100.log)
 	rec := record.NewRecord(100, []byte("key"), []byte("value"), 5)
-	writeAndVerify(t, w, rec, int64(FileHeaderSize))
+	writeAndVerify(t, w, rec, sys.PageAlign(int64(FileHeaderSize)))
 
 	// Rotate
 	_, err = w.EnqueueRotation()
@@ -270,7 +270,7 @@ func TestWAL_DeleteFile(t *testing.T) {
 
 	// Write with SeqID 200 (file named wal-0000000000000200.log)
 	rec2 := record.NewRecord(200, []byte("key2"), []byte("value2"), 6)
-	writeAndVerify(t, w, rec2, int64(FileHeaderSize))
+	writeAndVerify(t, w, rec2, sys.PageAlign(int64(FileHeaderSize)))
 
 	require.NoError(t, w.Close())
 
@@ -316,7 +316,7 @@ func TestWAL_DeleteRecord(t *testing.T) {
 	}
 	rec.SetCRC(record.ComputeCRC(rec.Key, nil))
 
-	writeAndVerify(t, w, rec, int64(FileHeaderSize))
+	writeAndVerify(t, w, rec, sys.PageAlign(int64(FileHeaderSize)))
 	require.NoError(t, w.Close())
 
 	// Recover and verify tombstone
@@ -346,7 +346,7 @@ func TestWAL_RecoverCorruptedRecord(t *testing.T) {
 	rec3 := record.NewRecord(3, []byte("key3"), []byte("value3"), 6)
 
 	// Sequential writes: each becomes its own batch
-	r1 := writeAndVerify(t, w, rec1, int64(FileHeaderSize))
+	r1 := writeAndVerify(t, w, rec1, sys.PageAlign(int64(FileHeaderSize)))
 	r2 := writeAndVerify(t, w, rec2, r1.BytesAligned)
 	writeAndVerify(t, w, rec3, r1.BytesAligned+r2.BytesAligned)
 	require.NoError(t, w.Close())
@@ -358,11 +358,9 @@ func TestWAL_RecoverCorruptedRecord(t *testing.T) {
 	data, err := os.ReadFile(files[0])
 	require.NoError(t, err)
 
-	// Corrupt somewhere in the middle of the file (after first record)
-	// The file structure is: header + rec1 + rec2 + rec3
-	// We corrupt a byte in rec2's area
-	corruptOffset := FileHeaderSize + rec1.EncodedSize() + 10 // Middle of rec2
-	data[corruptOffset] ^= 0xFF                               // Flip bits
+	// Corrupt somewhere in rec2's data area (10 bytes into rec2)
+	corruptOffset := int(r2.Offset) + 10
+	data[corruptOffset] ^= 0xFF // Flip bits
 
 	require.NoError(t, os.WriteFile(files[0], data, 0644))
 
@@ -393,7 +391,7 @@ func TestWAL_RecoverTruncatedFile(t *testing.T) {
 	rec2 := record.NewRecord(2, []byte("key2"), []byte("value2"), 6)
 
 	// Sequential writes: each becomes its own batch
-	r1 := writeAndVerify(t, w, rec1, int64(FileHeaderSize))
+	r1 := writeAndVerify(t, w, rec1, sys.PageAlign(int64(FileHeaderSize)))
 	writeAndVerify(t, w, rec2, r1.BytesAligned)
 	require.NoError(t, w.Close())
 
@@ -404,8 +402,8 @@ func TestWAL_RecoverTruncatedFile(t *testing.T) {
 	fi, err := os.Stat(files[0])
 	require.NoError(t, err)
 
-	// Truncate to just after the first record (cutting off record 2)
-	truncateAt := int64(FileHeaderSize + rec1.EncodedSize() + 5) // Partial record 2
+	// Truncate to 5 bytes into the second write batch (partial record 2)
+	truncateAt := r1.BytesAligned + 5
 	require.Less(t, truncateAt, fi.Size())
 	require.NoError(t, os.Truncate(files[0], truncateAt))
 
@@ -433,7 +431,7 @@ func TestWAL_RecoverEmptyFile(t *testing.T) {
 	require.NoError(t, err)
 
 	rec := record.NewRecord(1, []byte("key"), []byte("value"), 5)
-	writeAndVerify(t, w, rec, int64(FileHeaderSize))
+	writeAndVerify(t, w, rec, sys.PageAlign(int64(FileHeaderSize)))
 	require.NoError(t, w.Close())
 
 	// Truncate to just header (no records)
@@ -462,12 +460,12 @@ func TestWAL_RecoverMultipleFiles(t *testing.T) {
 	require.NoError(t, err)
 
 	rec1 := record.NewRecord(100, []byte("key1"), []byte("value1"), 6)
-	writeAndVerify(t, w, rec1, int64(FileHeaderSize))
+	writeAndVerify(t, w, rec1, sys.PageAlign(int64(FileHeaderSize)))
 	_, err = w.EnqueueRotation()
 	require.NoError(t, err)
 
 	rec2 := record.NewRecord(200, []byte("key2"), []byte("value2"), 6)
-	writeAndVerify(t, w, rec2, int64(FileHeaderSize)) // New file, offset resets
+	writeAndVerify(t, w, rec2, sys.PageAlign(int64(FileHeaderSize))) // New file, offset resets
 	require.NoError(t, w.Close())
 
 	// Verify 2 files exist
@@ -539,7 +537,7 @@ func TestScanMaxSeqID(t *testing.T) {
 	require.NoError(t, err)
 
 	// Write records with various SeqIDs - sequential writes, each is its own batch
-	expectedOffset := int64(FileHeaderSize)
+	expectedOffset := sys.PageAlign(int64(FileHeaderSize))
 	seqIDs := []uint64{10, 50, 30, 100, 75}
 	for i, seq := range seqIDs {
 		rec := record.NewRecord(seq, []byte("key"), []byte("value"), 5)
@@ -628,7 +626,7 @@ func TestWAL_ListWALFiles(t *testing.T) {
 	seqIDs := []uint64{100, 200, 300, 400}
 	for i, seqID := range seqIDs {
 		rec := record.NewRecord(seqID, []byte("key"), []byte("value"), 5)
-		writeAndVerify(t, w, rec, int64(FileHeaderSize)) // Each file starts fresh
+		writeAndVerify(t, w, rec, sys.PageAlign(int64(FileHeaderSize))) // Each file starts fresh
 		if i < len(seqIDs)-1 {
 			_, err = w.EnqueueRotation()
 			require.NoError(t, err)
@@ -673,7 +671,7 @@ func TestWAL_BatchSplitting(t *testing.T) {
 	}
 
 	// Write all records (batch splitting doesn't allow precise offset tracking)
-	offset := int64(FileHeaderSize)
+	offset := sys.PageAlign(int64(FileHeaderSize))
 	for _, rec := range records {
 		result, err := w.Write(rec)
 		require.NoError(t, err)
@@ -721,7 +719,7 @@ func TestWAL_OversizedRecord(t *testing.T) {
 	largeRec := record.NewRecord(1, []byte("bigkey"), largeValue, 6)
 
 	// Write should succeed via slow path
-	writeAndVerify(t, w, largeRec, int64(FileHeaderSize))
+	writeAndVerify(t, w, largeRec, sys.PageAlign(int64(FileHeaderSize)))
 	require.NoError(t, w.Close())
 
 	// Recover and verify
@@ -860,7 +858,7 @@ func TestWAL_Guard_PreventsTimeTravel(t *testing.T) {
 
 	// 1. Write SeqID 100
 	rec100 := record.NewRecord(100, []byte("k"), []byte("v"), 0)
-	writeAndVerify(t, w, rec100, int64(FileHeaderSize))
+	writeAndVerify(t, w, rec100, sys.PageAlign(int64(FileHeaderSize)))
 
 	// 2. Rotate. This sets w.lastRotatedSeq = 100
 	_, err = w.EnqueueRotation()
@@ -868,7 +866,7 @@ func TestWAL_Guard_PreventsTimeTravel(t *testing.T) {
 
 	// 3. Write SeqID 200 (Valid: > 100) - new file, offset resets
 	rec200 := record.NewRecord(200, []byte("k"), []byte("v"), 0)
-	writeAndVerify(t, w, rec200, int64(FileHeaderSize))
+	writeAndVerify(t, w, rec200, sys.PageAlign(int64(FileHeaderSize)))
 
 	// 4. ATTACK: Attempt to write SeqID 99 (Time Travel)
 	// This should be rejected because 99 <= lastRotatedSeq (100)
@@ -902,7 +900,7 @@ func TestWAL_Write_LargeAlignedValue(t *testing.T) {
 	}
 
 	rec := record.NewRecord(1, []byte("big-key"), value, 6)
-	result := writeAndVerify(t, w, rec, int64(FileHeaderSize))
+	result := writeAndVerify(t, w, rec, sys.PageAlign(int64(FileHeaderSize)))
 
 	// Write another normal record - next offset is at BytesAligned (not BytesWritten)
 	rec2 := record.NewRecord(2, []byte("small-key"), []byte("small-value"), 6)
@@ -954,7 +952,7 @@ func TestWAL_Write_1MB_Record(t *testing.T) {
 	}
 
 	rec := record.NewRecord(1, []byte("megabyte-key"), value, 6)
-	writeAndVerify(t, w, rec, int64(FileHeaderSize))
+	writeAndVerify(t, w, rec, sys.PageAlign(int64(FileHeaderSize)))
 
 	require.NoError(t, w.Close())
 
@@ -982,6 +980,41 @@ func TestWAL_Write_1MB_Record(t *testing.T) {
 	}
 }
 
+// TestWAL_RecordBlockAlignment verifies that every record's Offset is block-aligned
+// (a multiple of 4096), which is the prerequisite for XFS reflinks during compaction.
+func TestWAL_RecordBlockAlignment(t *testing.T) {
+	dir := t.TempDir()
+	cfg := DefaultConfig(dir)
+	cfg.Flags = sys.FlDirectIO
+
+	w, err := Open(cfg)
+	require.NoError(t, err)
+
+	// Write records of various sizes — all offsets must be block-aligned
+	sizes := []int{1, 42, 100, 4096, 4097, 8000, 100000}
+	for i, size := range sizes {
+		value := make([]byte, size)
+		rec := record.NewRecord(uint64(i+1), []byte("key"), value, 3)
+		result, err := w.Write(rec)
+		require.NoError(t, err)
+		require.Zero(t, result.Offset%sys.BlockSize,
+			"record %d (size=%d) has unaligned offset %d", i, size, result.Offset)
+	}
+
+	require.NoError(t, w.Close())
+
+	// Verify recovery finds all records
+	w2, err := Open(cfg)
+	require.NoError(t, err)
+	defer w2.Close()
+
+	replayer := &testReplayer{}
+	recovered, err := w2.Recover(replayer, nil)
+	require.NoError(t, err)
+	require.True(t, recovered)
+	require.Len(t, replayer.records, len(sizes))
+}
+
 // TestWAL_Write_MixedSizes verifies that Write handles records of mixed sizes
 // correctly, with some exceeding the staging buffer (slow path) and some not.
 func TestWAL_Write_MixedSizes(t *testing.T) {
@@ -997,7 +1030,7 @@ func TestWAL_Write_MixedSizes(t *testing.T) {
 
 	// Normal write 1
 	rec1 := record.NewRecord(1, []byte("k1"), []byte("normal1"), 6)
-	r1 := writeAndVerify(t, w, rec1, int64(FileHeaderSize))
+	r1 := writeAndVerify(t, w, rec1, sys.PageAlign(int64(FileHeaderSize)))
 	nextOffset := r1.BytesAligned // First batch includes header
 
 	// Direct write 1

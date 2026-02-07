@@ -68,6 +68,10 @@ func NewMemTable(
 	cfg config, b Batcher, reporter ErrorReporter, pub Publisher, w *wal.WAL,
 	segIDs SegmentIDProvider,
 ) *MemTable {
+	// Clamp WriteBufferSize: block-aligned records start at offset BlockSize (4096),
+	// so the slab (WriteBufferSize + BlockSize) must have room for at least one record.
+	cfg.WriteBufferSize = max(cfg.WriteBufferSize, 2*sys.BlockSize)
+
 	poolCapacity := cfg.MaxCachedSlabs + cfg.MaxInflightSlabs + 2
 
 	mt := &MemTable{
@@ -77,7 +81,7 @@ func NewMemTable(
 		publisher:     pub,
 		wal:           w, // nil if WAL disabled
 		segIDs:        segIDs,
-		slabPool:      NewMmapPool("slab", cfg.WriteBufferSize, poolCapacity),
+		slabPool:      NewMmapPool("slab", cfg.WriteBufferSize+sys.BlockSize, poolCapacity),
 		flushCh:       make(chan FlushTicket, cfg.MaxInflightSlabs),
 		stopCh:        make(chan struct{}),
 	}
@@ -103,7 +107,7 @@ func (mt *MemTable) newActiveSlab(size int) *ActiveSlab {
 		if mt.IsDegraded() {
 			// If degraded, just safer to use unpooled.  Readers/Writers might
 			// not have released their resources due to an error.
-			return NewMmapBuffer(mt.WriteBufferSize)
+			return NewMmapBuffer(mt.WriteBufferSize + sys.BlockSize)
 		}
 		return mt.slabPool.Acquire()
 	}()

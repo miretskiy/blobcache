@@ -238,18 +238,18 @@ func WithMaxBystanderBytes(bytes int64) Option {
 
 func defaultConfig(path string) config {
 	return config{
-		Path:                path,
-		MaxSize:             0,
-		Shards:              0,
-		WriteBufferSize:     64 << 20, // 64MB
-		MaxInflightSlabs:    6,
-		MaxCachedSlabs:      8, // Keep ~1GB of recently written data in RAM
-		FlushConcurrency:    2,
-		BloomFPRate:         0.01,
-		BloomEstimatedKeys:  1_000_000,
-		DegradedMode:        DegradedMemoryOnly,
-		TrustHash:           true,      // Cache mode: trust hash, skip key verification
-		BallastSize: 1 << 30, // 1GB heap ballast to reduce GC frequency
+		Path:               path,
+		MaxSize:            0,
+		Shards:             0,
+		WriteBufferSize:    64 << 20, // 64MB
+		MaxInflightSlabs:   6,
+		MaxCachedSlabs:     8, // Keep ~1GB of recently written data in RAM
+		FlushConcurrency:   2,
+		BloomFPRate:        0.01,
+		BloomEstimatedKeys: 1_000_000,
+		DegradedMode:       DegradedMemoryOnly,
+		TrustHash:          true,    // Cache mode: trust hash, skip key verification
+		BallastSize:        1 << 30, // 1GB heap ballast to reduce GC frequency
 		IO: IOConfig{
 			FDataSync:     false,
 			Fadvise:       sys.UseFadvise,

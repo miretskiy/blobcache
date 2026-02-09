@@ -412,17 +412,12 @@ func (c *Compactor) writeCompactedSegment(
 	toRelocate []relocInfo,
 	result *CompactResult,
 ) ([]record.FooterEntry, error) {
-	// Calculate total size with alignment padding.
-	// Each record starts at a block boundary; the file header is padded to BlockSize.
-	totalSize := sys.PageAlign(int64(record.FileHeaderSize))
-	for i := range toRelocate {
-		totalSize += sys.PageAlign(int64(toRelocate[i].item.PhysicalLen))
-	}
-	allocSize := sys.PageAlign(totalSize)
-
-	// Create destination WITHOUT O_DIRECT — copy_file_range operates in-kernel.
+	// Create destination WITHOUT O_DIRECT or fallocate.
+	// copy_file_range operates in-kernel; on XFS with reflink=1, it creates shared
+	// extents (metadata-only). Pre-allocating via fallocate would defeat reflinks by
+	// giving the destination its own physical blocks before copy_file_range runs.
 	segPath := getSegmentPath(c.basePath, c.shards, newSegID)
-	f, err := sys.CreateAndAllocateFile(segPath, 0, allocSize)
+	f, err := sys.CreateFile(segPath, 0)
 	if err != nil {
 		return nil, fmt.Errorf("compaction: create segment: %w", err)
 	}
@@ -474,16 +469,14 @@ func (c *Compactor) writeCompactedSegment(
 		result.ItemsCompacted++
 	}
 
-	// Truncate to exact logical size (removes fallocate padding beyond last record)
-	if err := f.Truncate(dstOff); err != nil {
-		return nil, errors.Join(
-			fmt.Errorf("compaction: truncate: %w", err),
-			f.Close(),
-		)
+	// Sync only when durability is required (CAS mode with FlDSync/FlSync).
+	// In cache mode, old segments survive until explicitly deleted — if we crash
+	// before sync completes, recovery replays from the intact source segments.
+	var syncErr error
+	if c.ioFlags&(sys.FlDSync|sys.FlSync) != 0 {
+		syncErr = sys.Fdatasync(f)
 	}
-
-	// Single fdatasync + close
-	if err := errors.Join(sys.Fdatasync(f), f.Close()); err != nil {
+	if err := errors.Join(syncErr, f.Close()); err != nil {
 		return nil, fmt.Errorf("compaction: sync segment: %w", err)
 	}
 

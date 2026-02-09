@@ -1,10 +1,8 @@
 package blobcache
 
 import (
-	"fmt"
 	"testing"
 
-	"github.com/miretskiy/blobcache/internal/index"
 	"github.com/stretchr/testify/require"
 )
 
@@ -113,51 +111,4 @@ func TestDynamicMergeThreshold(t *testing.T) {
 	}
 }
 
-func TestSelectSegmentsForTombstoneCompaction(t *testing.T) {
-	tmpDir := t.TempDir()
 
-	cache, err := New(tmpDir,
-		WithWAL(),
-		WithMaxCachedSlabs(0),
-	)
-	require.NoError(t, err)
-	cache.Start()
-	defer cache.Close()
-
-	// Initially no segments
-	segments := cache.selectSegmentsForTombstoneCompaction()
-	require.Empty(t, segments, "should be empty with no segments")
-
-	// Write enough data to create tombstones that exceed the threshold.
-	// Each small write creates a separate item.
-	value := make([]byte, 1_000)
-	numItems := index.TombstoneCompactionThreshold + 20 // 120 items
-	for i := range numItems {
-		key := fmt.Appendf(nil, "key-%04d", i)
-		require.NoError(t, cache.Put(key, value))
-	}
-	cache.Drain()
-
-	// No tombstones yet, should select nothing
-	segments = cache.selectSegmentsForTombstoneCompaction()
-	require.Empty(t, segments, "should be empty with no tombstones")
-
-	// Delete enough keys to cross the threshold (100+)
-	numDeletes := index.TombstoneCompactionThreshold + 5 // 105 deletes
-	for i := range numDeletes {
-		key := fmt.Appendf(nil, "key-%04d", i)
-		require.NoError(t, cache.Delete(key))
-	}
-
-	// Create additional segments to push the first segment past the cooling period.
-	// With MaxCachedSlabs=0, coolingGap=2, so we need at least 2 more segment IDs.
-	for range 3 {
-		largeValue := make([]byte, 200_000) // Force new segments
-		require.NoError(t, cache.Put([]byte("filler-key"), largeValue))
-		cache.Drain()
-	}
-
-	// Now should select the segment that crossed the threshold
-	segments = cache.selectSegmentsForTombstoneCompaction()
-	require.Len(t, segments, 1, "should select one segment with 105 tombstones")
-}

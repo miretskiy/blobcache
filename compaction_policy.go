@@ -25,26 +25,6 @@ const (
 	minOutputMultiplier = 0.40
 )
 
-// selectSegmentsForTombstoneCompaction returns segment IDs that exceed the tombstone threshold.
-// Returns segments sorted by SegmentID (ascending) for deterministic processing.
-// Segments still in the "hot zone" (Librarian cache) are excluded via cooling period check.
-//
-// This uses lazy candidate tracking for O(K) complexity where K is the number of
-// pending candidates, instead of O(N) scanning of all segments. Candidates are
-// tracked incrementally during UpdateSegmentOnDelete() when they cross the threshold.
-func (c *Cache) selectSegmentsForTombstoneCompaction() []uint32 {
-	currentSegID := c.segIDs.CurrentSegmentID()
-	coolingGap := uint32(c.MaxCachedSlabs + coolingPeriodMargin)
-
-	// Avoid underflow: if currentSegID is small, no segments are eligible
-	if currentSegID <= coolingGap {
-		return nil
-	}
-
-	maxEligibleID := currentSegID - coolingGap
-	return c.index.GetTombstoneCompactionCandidates(maxEligibleID)
-}
-
 // MergeCandidate represents a contiguous range of segments selected for merge compaction.
 type MergeCandidate struct {
 	SegmentIDs         []uint32 // Contiguous segment IDs to merge

@@ -254,46 +254,4 @@ func TestTombstone_Batch(t *testing.T) {
 	require.Equal(t, numItems/2, deleted, "Should have deleted half the items")
 }
 
-// TestTombstone_CompactTombstones validates tombstone compaction.
-func TestTombstone_CompactTombstones(t *testing.T) {
-	tmpDir := t.TempDir()
-	segDir := filepath.Join(tmpDir, "segments", "0000")
-	require.NoError(t, os.MkdirAll(segDir, 0o755))
 
-	p, err := newPersistence(tmpDir, 1)
-	require.NoError(t, err)
-	defer p.close()
-
-	segID := uint32(1)
-
-	// Write base items
-	items := []Item{
-		{Key: Key{Lo: 1}, SegmentID: segID, Offset: 0, PhysicalLen: 100},
-		{Key: Key{Lo: 2}, SegmentID: segID, Offset: 100, PhysicalLen: 100},
-		{Key: Key{Lo: 3}, SegmentID: segID, Offset: 200, PhysicalLen: 100},
-	}
-	writeTestFooterTS(t, p.metaPath(segID), segID, items)
-
-	// Write tombstones
-	require.NoError(t, p.tombstone(segID, Key{Lo: 1}, nil))
-	require.NoError(t, p.tombstone(segID, Key{Lo: 3}, nil))
-	require.NoError(t, p.flushMetaFile(segID))
-
-	// Compact tombstones
-	callbackCount := 0
-	err = p.compactTombstones(segID, func(tr TombstoneRecord) {
-		callbackCount++
-	})
-	require.NoError(t, err)
-	require.Equal(t, 2, callbackCount, "Should invoke callback for each tombstone")
-
-	// Read back - tombstones should be baked into items, no more tombstone batches
-	manifest, err := p.readMetaFile(segID)
-	require.NoError(t, err)
-	require.Len(t, manifest.Items, 3)
-
-	// Items 1 and 3 should be marked deleted
-	require.True(t, manifest.Items[0].IsDeleted())
-	require.False(t, manifest.Items[1].IsDeleted())
-	require.True(t, manifest.Items[2].IsDeleted())
-}

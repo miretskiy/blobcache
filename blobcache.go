@@ -12,6 +12,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/time/rate"
+
 	"github.com/miretskiy/blobcache/base"
 	"github.com/miretskiy/blobcache/bloom"
 	"github.com/miretskiy/blobcache/internal/index"
@@ -19,7 +21,6 @@ import (
 	"github.com/miretskiy/blobcache/internal/sys"
 	"github.com/miretskiy/blobcache/internal/wal"
 	"github.com/zeebo/xxh3"
-	"golang.org/x/time/rate"
 )
 
 // Key is the 128-bit hash of a blob key.
@@ -869,7 +870,7 @@ func (c *Cache) maintenanceWorker() {
 
 			// Phase 2: Compaction (always check after eviction or segment production)
 			if !c.IsDegraded() {
-				if err := c.maybeCompactSegments(); err != nil {
+				if err := c.maybeMergeSegments(); err != nil {
 					c.ReportError(fmt.Errorf("compaction: %w", err))
 				}
 			}
@@ -913,10 +914,6 @@ func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
 	var (
 		evictedBytes int64
 		evictedCount int
-		// Track segments with evicted items for page cache cleanup.
-		// fadvise(DONTNEED) evicts dead pages from kernel cache without
-		// hole punching (no extent B-tree fragmentation).
-		affectedSegments map[uint32]struct{}
 	)
 
 	for evictedBytes < toEvictBytes {
@@ -939,27 +936,12 @@ func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
 		}
 		c.index.UpdateSegmentOnDelete(segID, int32(len(batch)), batchBytes)
 
-		if affectedSegments == nil {
-			affectedSegments = make(map[uint32]struct{})
-		}
-		affectedSegments[segID] = struct{}{}
-
 		evictedBytes += batchBytes
 		evictedCount += len(batch)
 	}
 
 	if evictedCount == 0 {
 		return nil
-	}
-
-	// 3. CACHE CLEANUP — evict dead pages from kernel page cache.
-	// Opens a private FD per segment (not shared with read path) and advises
-	// the kernel to drop all pages. This prevents dead-on-disk data from
-	// polluting the page cache without extent B-tree fragmentation from hole punching.
-	if sys.UseFadvise {
-		for segID := range affectedSegments {
-			c.adviseDropSegmentPages(segID)
-		}
 	}
 
 	// METRICS & MAINTENANCE
@@ -980,41 +962,6 @@ func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
 	return nil
 }
 
-// adviseDropSegmentPages opens a private FD for the segment and advises
-// the kernel to drop all cached pages via fadvise(FADV_DONTNEED).
-// This is a lightweight alternative to hole punching — it frees page cache
-// memory without modifying the extent B-tree.
-// Errors are logged and swallowed (advisory, not critical).
-func (c *Cache) adviseDropSegmentPages(segmentID uint32) {
-	path := getSegmentPath(c.Path, c.Shards, segmentID)
-	f, err := sys.OpenFileForRead(path, 0)
-	if err != nil {
-		return // Segment may have been deleted by compaction
-	}
-	stat, err := f.Stat()
-	if err != nil {
-		_ = f.Close()
-		return
-	}
-	_ = sys.Fadvise(f.Fd(), 0, stat.Size(), sys.FadvDontNeed)
-	_ = f.Close()
-}
-
-func (c *Cache) maybeCompactSegments() error {
-	var errs []error
-
-	// Phase 1: Tombstone compaction (metadata cleanup)
-	if err := c.maybeCompactTombstones(); err != nil {
-		errs = append(errs, fmt.Errorf("tombstone compaction: %w", err))
-	}
-
-	// Phase 2: Merge compaction (combine sparse segments)
-	if err := c.maybeMergeSegments(); err != nil {
-		errs = append(errs, fmt.Errorf("merge compaction: %w", err))
-	}
-
-	return errors.Join(errs...)
-}
 
 // maybeMergeSegments identifies sparse segments and merges contiguous ranges.
 // This reclaims space by combining multiple sparse segments into fewer dense segments.
@@ -1107,50 +1054,4 @@ func (c *Cache) maybeMergeSegments() error {
 	return nil
 }
 
-// maybeCompactTombstones identifies segments with many tombstones and compacts them.
-// Collapses the tombstone incremental log into the segment manifest (metadata-only).
-// Physical space is reclaimed later by merge compaction.
-func (c *Cache) maybeCompactTombstones() error {
-	segments := c.selectSegmentsForTombstoneCompaction()
-	if len(segments) == 0 {
-		return nil
-	}
-
-	log.Debug("tombstone compaction starting", "segment_count", len(segments))
-
-	for _, segID := range segments {
-		// Acquire shared lock: allows concurrent compactions, blocks Delete.
-		// Delete takes Lock() (exclusive), compaction takes RLock() (shared).
-		shard := c.index.SegmentLockShard(segID)
-		shard.RLock()
-		err := c.compactSegmentTombstones(segID)
-		shard.RUnlock()
-
-		if err != nil {
-			// Candidate remains in pending set for retry on next cycle.
-			return err
-		}
-
-		// Only acknowledge after success — failed compactions retain the candidate
-		// so it can be retried. The segment can't re-cross the threshold since it
-		// already did, so without acknowledgment, it would be permanently lost.
-		c.index.AcknowledgeTombstoneCompaction(segID)
-	}
-
-	return nil
-}
-
-// compactSegmentTombstones performs tombstone compaction on a single segment.
-// Collapses the tombstone incremental log into the segment manifest and
-// updates SegmentMetadata counts. No hole punching — physical space is
-// reclaimed by merge compaction (rewriting sparse segments).
-//
-// The caller must hold the segment lock before calling this method.
-func (c *Cache) compactSegmentTombstones(segID uint32) error {
-	err := c.index.CompactTombstones(segID, nil)
-	if err != nil {
-		return fmt.Errorf("compact tombstones segment %d: %w", segID, err)
-	}
-	return nil
-}
 

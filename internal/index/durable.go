@@ -469,25 +469,9 @@ func (idx *DurableIndex) GetGlobalAvgBlobSize() int64 {
 }
 
 // UpdateSegmentOnDelete updates a segment's metadata after items are deleted.
-// Called during eviction or explicit delete to track tombstone accumulation.
+// Called during eviction or explicit delete to track merge compaction candidates.
 func (idx *DurableIndex) UpdateSegmentOnDelete(segID uint32, deletedCount int32, deletedBytes int64) {
 	idx.segments.updateSegmentOnDelete(segID, deletedCount, deletedBytes)
-}
-
-// GetTombstoneCompactionCandidates returns segment IDs that have crossed the
-// tombstone threshold (100+) and have cooled past the given boundary.
-//
-// This is O(K) where K is the number of pending candidates, avoiding O(N) scan
-// of all segments. Returns sorted segment IDs for deterministic processing.
-// Candidates are NOT consumed; call AcknowledgeTombstoneCompaction after success.
-func (idx *DurableIndex) GetTombstoneCompactionCandidates(maxEligibleID uint32) []uint32 {
-	return idx.segments.getTombstoneCompactionCandidates(maxEligibleID)
-}
-
-// AcknowledgeTombstoneCompaction removes a segment from the pending tombstone
-// compaction set after successful compaction.
-func (idx *DurableIndex) AcknowledgeTombstoneCompaction(segID uint32) {
-	idx.segments.acknowledgeTombstoneCompaction(segID)
 }
 
 // GetMergeCompactionCandidates returns segments that have crossed the given waste
@@ -500,37 +484,6 @@ func (idx *DurableIndex) AcknowledgeTombstoneCompaction(segID uint32) {
 // of all segments. Returns candidates sorted by segment ID for deterministic processing.
 func (idx *DurableIndex) GetMergeCompactionCandidates(maxEligibleID uint32, wasteThreshold float64) []SparseSegment {
 	return idx.segments.getMergeCompactionCandidates(maxEligibleID, wasteThreshold)
-}
-
-// CompactTombstones merges the tombstone incremental log into the segment manifest.
-// The onTombstone callback is invoked for each tombstone, allowing the caller to
-// perform I/O operations (e.g., hole punching) before the metadata is updated.
-//
-// This is a metadata cleanup operation:
-// - Collapses tombstone batches into the segment Items (marked as deleted)
-// - Rewrites the .meta file without tombstone batches
-// - Allows caller to reclaim space via callback
-//
-// The caller must hold the segment lock before calling this method.
-func (idx *DurableIndex) CompactTombstones(segID uint32, onTombstone TombstoneFn) error {
-	return idx.segments.compactTombstones(segID, onTombstone)
-}
-
-// GetSegmentDeadItems reads the merged manifest for a segment and returns all
-// deleted items that still occupy physical space (PhysicalLen > 0).
-// Used by emergency hole punching to find reclaimable regions.
-func (idx *DurableIndex) GetSegmentDeadItems(segID uint32) ([]Item, error) {
-	manifest, err := idx.segments.readMetaFile(segID)
-	if err != nil {
-		return nil, err
-	}
-	var dead []Item
-	for i := range manifest.Items {
-		if manifest.Items[i].IsDeleted() && manifest.Items[i].PhysicalLen > 0 {
-			dead = append(dead, manifest.Items[i])
-		}
-	}
-	return dead, nil
 }
 
 // VerifyNoSegmentsInRange checks that no segments exist in the open interval (startID, endID).

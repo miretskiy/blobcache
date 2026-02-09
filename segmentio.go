@@ -204,14 +204,8 @@ func (w *segmentWriter) Finalize(
 	maxSeqID uint64,
 	indexWriter Batcher,
 ) error {
-	// Build index items from footer entries
-	items, err := footerEntriesToIndexItems(w.segmentID, entries)
-	if err != nil {
-		return err
-	}
-
-	// Update index (RAM + Bitcask)
-	if err := indexWriter.PutBatch(w.segmentID, items, maxSeqID); err != nil {
+	// Update index (RAM + Bitcask) with raw entries for in-memory manifest caching.
+	if err := indexWriter.PutBatch(w.segmentID, entries, maxSeqID); err != nil {
 		return fmt.Errorf("index update: %w", err)
 	}
 

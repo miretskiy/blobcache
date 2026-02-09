@@ -10,6 +10,7 @@ import (
 
 	"github.com/miretskiy/blobcache/base"
 	"github.com/miretskiy/blobcache/internal/index"
+	"github.com/miretskiy/blobcache/internal/record"
 	"github.com/miretskiy/blobcache/internal/xmap"
 	"github.com/stretchr/testify/require"
 )
@@ -55,15 +56,26 @@ type MockBatcher struct {
 	Count   int
 }
 
-func (m *MockBatcher) PutBatch(segID uint32, items []index.Item, _ uint64) error {
+func (m *MockBatcher) PutBatch(segID uint32, entries []record.FooterEntry, _ uint64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.Batches == nil {
 		m.Batches = make(map[uint32][]index.Item)
 	}
-	// Copy slice to simulate persistent storage.
-	m.Batches[segID] = append(m.Batches[segID], items...)
-	m.Count += len(items)
+	// Convert entries to items for test assertions.
+	for i := range entries {
+		e := &entries[i]
+		physicalLen := int64(record.HeaderSize) + int64(e.KeyLen) + e.PhysicalSize
+		item := index.Item{
+			Key:         e.Key,
+			SegmentID:   segID,
+			Offset:      uint32(e.Pos),
+			PhysicalLen: uint32(physicalLen),
+		}
+		item.SetCompression(e.Compression())
+		m.Batches[segID] = append(m.Batches[segID], item)
+	}
+	m.Count += len(entries)
 	return nil
 }
 

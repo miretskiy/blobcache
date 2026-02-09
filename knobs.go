@@ -15,5 +15,4 @@ type TestingKnobs struct {
 	// SequenceVendor overrides the default sequence ID generation.
 	// If set, NextSeq() calls are delegated to this interface.
 	SequenceVendor SequenceVendor
-
 }

@@ -6,6 +6,7 @@ import (
 
 	"github.com/miretskiy/blobcache/base"
 	"github.com/miretskiy/blobcache/bloom"
+	"github.com/miretskiy/blobcache/internal/record"
 )
 
 // DurableIndex wraps BlobIndex with append-only .meta file persistence.
@@ -29,9 +30,14 @@ func OpenIndex(basePath string, shards int, initialCapacity int) (*DurableIndex,
 		segments: p,
 	}
 
-	// Load all persisted items into memory and register segment snapshots
+	// Load all persisted items into memory and register segment snapshots.
+	// Use entries from disk scan for in-memory manifest caching.
 	err = p.scanAll(func(m DurableBatch) bool {
-		idx.AddSegment(m.SegmentID, m.Items)
+		if m.Entries != nil {
+			idx.AddSegmentFromEntries(m.SegmentID, m.Entries)
+		} else {
+			idx.AddSegment(m.SegmentID, m.Items)
+		}
 		return true
 	})
 	if err != nil {
@@ -125,17 +131,62 @@ func (idx *DurableIndex) GetSegmentManifest(segmentID uint32) (DurableBatch, boo
 	return fullManifest, true
 }
 
-// GetSegmentManifestRaw reads a segment's .meta file and returns raw footer entries
-// with tombstones merged. Preserves full FooterEntry fields (LogicalSize, PhysicalSize,
-// SeqID, Flags, KeyLen) needed by compaction to write output footers without
-// re-reading record headers from disk.
+// GetSegmentManifestRaw returns raw footer entries for a segment.
+// Checks in-memory cache first (populated by AddSegmentFromEntries), falls back
+// to reading .meta from disk for backward compatibility (test-registered segments).
 func (idx *DurableIndex) GetSegmentManifestRaw(segmentID uint32) (SegmentManifest, error) {
+	if m, ok := idx.segments.getInMemoryManifest(segmentID); ok {
+		return m, nil
+	}
 	return idx.segments.readSegmentManifest(segmentID)
+}
+
+// AddSegmentFromEntries registers a new segment from raw footer entries.
+// Stores entries in SegmentMetadata for in-memory manifest access (eliminates
+// .meta disk reads during compaction and spatial eviction).
+// Derives Items internally for the RAM index and Bloom filter.
+func (idx *DurableIndex) AddSegmentFromEntries(segmentID uint32, entries []record.FooterEntry) {
+	items := make([]Item, len(entries))
+	for i := range entries {
+		items[i] = footerEntryToItem(segmentID, &entries[i])
+	}
+
+	var liveCount, tombstoneCount int32
+	var liveBytes int64
+
+	n := max(uint(len(entries)), 64)
+	filter := bloom.New(n, 0.03)
+	for i, item := range items {
+		filter.AddHash(entries[i].Key)
+		if item.IsDeleted() {
+			tombstoneCount++
+		} else {
+			liveCount++
+			liveBytes += int64(item.PhysicalLen)
+		}
+	}
+	filter.Freeze()
+
+	idx.segments.registerSegment(SegmentMetadata{
+		ID:             segmentID,
+		LiveItemCount:  liveCount,
+		TombstoneCount: tombstoneCount,
+		LiveBytes:      liveBytes,
+		SegmentKeys:    filter,
+		Entries:        entries,
+	})
+
+	for _, item := range items {
+		idx.Put(item)
+	}
 }
 
 // AddSegment registers a new segment with its items.
 // Creates a frozen Bloom filter snapshot (for tombstone dissolution queries),
 // computes initial metadata, and ingests live items into the RAM index.
+//
+// Note: This path does NOT cache entries for in-memory manifest access.
+// Use AddSegmentFromEntries for production paths where footer entries are available.
 //
 // Persistence is handled separately via .meta files:
 //   - During flush: WriteFooter writes the .meta file before this is called
@@ -213,13 +264,26 @@ func (idx *DurableIndex) Evict(targetBytes int64, maxBystanderBytes int64) []Ite
 	}
 
 	// 2. Read segment manifest for spatial expansion.
-	manifest, err := idx.segments.readMetaFile(anchor.SegmentID)
-	if err != nil || len(manifest.Items) == 0 {
+	// Check in-memory cache first (no disk I/O in steady state).
+	var manifestItems []Item
+	if m, ok := idx.segments.getInMemoryManifest(anchor.SegmentID); ok {
+		manifestItems = make([]Item, len(m.Entries))
+		for i := range m.Entries {
+			manifestItems[i] = footerEntryToItem(m.SegmentID, &m.Entries[i])
+		}
+	} else {
+		manifest, err := idx.segments.readMetaFile(anchor.SegmentID)
+		if err != nil || len(manifest.Items) == 0 {
+			return result
+		}
+		manifestItems = manifest.Items
+	}
+	if len(manifestItems) == 0 {
 		return result // Manifest unavailable — return anchor only
 	}
 
 	// 3. Walk manifest items outward from anchor, co-evicting bystanders.
-	result = idx.expandEviction(result, manifest.Items, anchor, budget)
+	result = idx.expandEviction(result, manifestItems, anchor, budget)
 	return result
 }
 

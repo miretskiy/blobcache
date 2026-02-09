@@ -646,12 +646,6 @@ func (mt *MemTable) finalizeFlush(
 		}
 	}
 
-	// Build index items from footer entries
-	items, err := footerEntriesToIndexItems(segmentID, entries)
-	if err != nil {
-		return err
-	}
-
 	// Write footer BEFORE updating index.
 	// This ensures .meta file exists before items become evictable.
 	// Eviction needs the .meta file to write tombstones.
@@ -659,8 +653,9 @@ func (mt *MemTable) finalizeFlush(
 		return fmt.Errorf("write footer: %w", err)
 	}
 
-	// Update index (items now visible to lookups and eviction)
-	if err := mt.PutBatch(segmentID, items, maxSeqID); err != nil {
+	// Update index (items now visible to lookups and eviction).
+	// Passes raw entries for in-memory manifest caching.
+	if err := mt.PutBatch(segmentID, entries, maxSeqID); err != nil {
 		return fmt.Errorf("index update: %w", err)
 	}
 

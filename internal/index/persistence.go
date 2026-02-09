@@ -49,6 +49,7 @@ type DurableBatch struct {
 	CTime     int64
 	MaxSeqID  uint64 // Highest SeqID in this segment (WAL recovery checkpoint)
 	Items     []Item
+	Entries   []record.FooterEntry // Raw footer entries (optional, for in-memory caching)
 }
 
 // ScanBatchFn is the callback for scanning segment manifests.
@@ -69,6 +70,13 @@ type SegmentMetadata struct {
 	// Currently unused (tombstone dissolution uses RAM index lookup instead of Bloom
 	// filters). Retained for potential future use.
 	SegmentKeys *bloom.Filter
+
+	// Entries holds the raw footer entries for this segment, including full metadata
+	// (LogicalSize, PhysicalSize, SeqID, KeyLen) needed by compaction to write output
+	// footers without re-reading .meta files from disk. Nil for test-registered segments.
+	// Tombstones applied after registration are NOT reflected here; callers must check
+	// the RAM index for current deleted status.
+	Entries []record.FooterEntry
 }
 
 // WasteRatio returns the proportion of tombstones (0.0 to 1.0).
@@ -500,10 +508,15 @@ func (p *persistence) readMetaFile(segID uint32) (DurableBatch, error) {
 		}
 	}
 
-	// Apply tombstones to items
+	// Apply tombstones to items and entries
 	for i := range items {
 		if _, deleted := tombstones[items[i].Key]; deleted {
 			items[i].SetDeleted()
+		}
+	}
+	for i := range footer.Entries {
+		if _, deleted := tombstones[footer.Entries[i].Key]; deleted {
+			footer.Entries[i].SetDeleted()
 		}
 	}
 
@@ -512,6 +525,7 @@ func (p *persistence) readMetaFile(segID uint32) (DurableBatch, error) {
 		CTime:     footer.CTime,
 		MaxSeqID:  footer.MaxSeqID,
 		Items:     items,
+		Entries:   footer.Entries,
 	}, nil
 }
 
@@ -761,6 +775,7 @@ func (p *persistence) loadSegmentManifest(segID uint32, segPath string) (Durable
 		SegmentID: segID,
 		CTime:     footer.CTime,
 		MaxSeqID:  footer.MaxSeqID,
+		Entries:   footer.Entries,
 		Items:     items,
 	}, nil
 }
@@ -949,6 +964,7 @@ func (p *persistence) updateSegmentOnDelete(segID uint32, deletedCount int32, de
 		p.segments.pendingMerge[segID] = struct{}{}
 	}
 }
+
 // SparseSegment represents a segment that has crossed the merge waste ratio threshold.
 type SparseSegment struct {
 	ID        uint32
@@ -1008,6 +1024,23 @@ func (p *persistence) getMergeCompactionCandidates(maxEligibleID uint32, wasteTh
 	})
 
 	return candidates
+}
+
+// getInMemoryManifest returns the cached manifest for a segment, if available.
+// Returns false if the segment has no cached entries (e.g., test-registered segments).
+func (p *persistence) getInMemoryManifest(segID uint32) (SegmentManifest, bool) {
+	p.segments.RLock()
+	defer p.segments.RUnlock()
+
+	entry, ok := p.segments.byID[segID]
+	if !ok || entry.Entries == nil {
+		return SegmentManifest{}, false
+	}
+
+	return SegmentManifest{
+		SegmentID: segID,
+		Entries:   entry.Entries,
+	}, true
 }
 
 // getSegmentCount returns the number of registered segments.

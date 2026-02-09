@@ -19,7 +19,7 @@ import (
 // It uses the Index Item contract: Offset points to Magic, PhysicalLen = 42 + KeyLen + PhysSize.
 type Archivist struct {
 	config
-	index        *index.DurableIndex
+	index *index.DurableIndex
 	cache sync.Map // segmentID (uint32) -> *os.File
 }
 

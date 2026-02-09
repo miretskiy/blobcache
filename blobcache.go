@@ -649,7 +649,7 @@ func (c *Cache) putWithRetry(h Key, keyBytes, value []byte, checksum *uint32) {
 }
 
 type Batcher interface {
-	PutBatch(segID uint32, items []index.Item, maxSeqID uint64) error
+	PutBatch(segID uint32, entries []record.FooterEntry, maxSeqID uint64) error
 }
 
 // maintenanceSegmentInterval determines how often segment production triggers maintenance.
@@ -657,14 +657,16 @@ type Batcher interface {
 // Lower value (5) keeps up with high-velocity Sieve by checking merges more often.
 const maintenanceSegmentInterval = 5
 
-func (c *Cache) PutBatch(segID uint32, items []index.Item, _ uint64) error {
-	// Phase 1: Ingest into Index (also registers segment snapshot for tombstone dissolution)
-	c.index.AddSegment(segID, items)
+func (c *Cache) PutBatch(segID uint32, entries []record.FooterEntry, _ uint64) error {
+	// Phase 1: Ingest into Index with entries for in-memory manifest caching
+	c.index.AddSegmentFromEntries(segID, entries)
 
 	// Phase 2: Update size tracking (using PhysicalLen = on-disk size)
 	var addedBytes int64
-	for _, item := range items {
-		addedBytes += int64(item.PhysicalLen)
+	for i := range entries {
+		if !entries[i].IsDeleted() {
+			addedBytes += int64(record.HeaderSize) + int64(entries[i].KeyLen) + entries[i].PhysicalSize
+		}
 	}
 	newSize := c.approxSize.Add(addedBytes)
 
@@ -962,7 +964,6 @@ func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
 	return nil
 }
 
-
 // maybeMergeSegments identifies sparse segments and merges contiguous ranges.
 // This reclaims space by combining multiple sparse segments into fewer dense segments.
 //
@@ -1050,5 +1051,3 @@ func (c *Cache) maybeMergeSegments() error {
 
 	return nil
 }
-
-

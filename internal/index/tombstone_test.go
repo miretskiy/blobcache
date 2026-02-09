@@ -253,5 +253,3 @@ func TestTombstone_Batch(t *testing.T) {
 	}
 	require.Equal(t, numItems/2, deleted, "Should have deleted half the items")
 }
-
-

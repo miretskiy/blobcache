@@ -321,6 +321,21 @@ func (c *Compactor) collectItems(segmentIDs []uint32) ([]relocInfo, []index.Item
 				continue
 			}
 
+			// Check if item was tombstoned after segment registration.
+			// In-memory entries from registration don't reflect later tombstones;
+			// the RAM index is the authoritative source for deleted status.
+			if ramItem.IsDeleted() {
+				if !c.index.HasOlderShadow(item.Key, floorID) {
+					c.index.Delete(item.Key)
+					dissolvedCount++
+					continue
+				}
+				tombstoneItem := item
+				tombstoneItem.SetDeleted()
+				tombstones = append(tombstones, tombstoneItem)
+				continue
+			}
+
 			toRelocate = append(toRelocate, relocInfo{
 				item:   item,
 				footer: *entry,

@@ -2,7 +2,6 @@ package blobcache
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -568,7 +567,8 @@ func (c *Cache) deleteInCASMode(key []byte, h Key, item index.Item) error {
 }
 
 // deleteInCacheMode handles deletion in Cache mode (no WAL).
-// Immediately reclaims space via hole punching.
+// Marks the item as dead in the index; physical space is reclaimed later
+// by merge compaction (rewriting sparse segments into dense output).
 //
 // Uses segment lock to coordinate with compaction (prevents concurrent segment drop).
 func (c *Cache) deleteInCacheMode(key []byte, h Key, item index.Item) error {
@@ -578,17 +578,6 @@ func (c *Cache) deleteInCacheMode(key []byte, h Key, item index.Item) error {
 	shard := c.index.SegmentLockShard(segID)
 	shard.Lock()
 	defer shard.Unlock()
-
-	// Immediate space reclamation via hole punch
-	reclaimed, err := c.archivist.HolePunchBlob(segID, item.Offset, item.PhysicalLen)
-	if err != nil {
-		log.Warn("hole punch failed, space not reclaimed",
-			"segment", segID, "offset", item.Offset,
-			"size", item.PhysicalLen, "error", err)
-	} else if reclaimed > 0 {
-		log.Debug("reclaimed space via hole punch",
-			"segment", segID, "bytes", reclaimed)
-	}
 
 	// Write tombstone to incremental log (with user key)
 	if err := c.index.Tombstone(segID, h, key); err != nil {
@@ -799,14 +788,10 @@ func (r *cacheReplayer) ReplayRecord(rec record.Record) error {
 	h := xxh3.Hash128(rec.Key)
 
 	if rec.IsDeleted() {
-		// Replay delete: look up item and mark as tombstone
+		// Replay delete: look up item and mark as tombstone.
+		// No hole punching — merge compaction reclaims space.
 		item, found := r.cache.index.Get(h)
 		if found && !item.IsDeleted() {
-			// Hole punch to reclaim space (log errors but don't fail recovery)
-			if _, err := r.cache.archivist.HolePunchBlob(item.SegmentID, item.Offset, item.PhysicalLen); err != nil {
-				log.Warn("hole punch during delete replay failed", "key", h, "error", err)
-			}
-			// Mark as tombstone
 			if err := r.cache.index.DeleteBlobs(item); err != nil {
 				return fmt.Errorf("replay delete: %w", err)
 			}
@@ -866,14 +851,17 @@ func (c *Cache) runWALRecovery() (bool, error) {
 
 // maintenanceWorker handles eviction and compaction in a unified event-driven loop.
 //
-// Lifecycle (no timers):
+// Two event sources:
 //   - maintenanceTrigger: Fired by PutBatch when over size limit OR every N segments
+//   - emergencyTicker: 30-second timer for disk pressure detection
 //
-// Each cycle: (1) evict if over size, (2) compact sparse segments.
-// This ensures "Swiss cheese" holes from eviction are promptly defragmented,
-// and segment production naturally triggers merge compaction.
+// Normal cycle: (1) evict if over size, (2) compact sparse segments.
+// Emergency cycle: check disk usage and aggressively compact if low on space.
 func (c *Cache) maintenanceWorker() {
 	defer c.wg.Done()
+
+	emergencyTicker := time.NewTicker(30 * time.Second)
+	defer emergencyTicker.Stop()
 
 	for {
 		select {
@@ -893,6 +881,13 @@ func (c *Cache) maintenanceWorker() {
 				}
 			}
 
+		case <-emergencyTicker.C:
+			if !c.IsDegraded() {
+				if err := c.maybeEmergencyPunch(); err != nil {
+					log.Warn("emergency punch failed", "error", err)
+				}
+			}
+
 		case <-c.stopCh:
 			return
 		}
@@ -902,12 +897,12 @@ func (c *Cache) maintenanceWorker() {
 // runEvictionSieve evicts blobs using Sieve algorithm until under size limit.
 //
 // Each iteration: SIEVE picks a cold anchor, co-evicts physically adjacent
-// bystanders (spatial expansion), commits tombstones, and punches a single
-// contiguous hole covering [min(offset), max(offset+physLen)].
+// bystanders (spatial expansion), commits tombstones, and updates segment
+// metadata. Physical space is NOT reclaimed here — merge compaction handles
+// that by rewriting sparse segments into dense output segments.
 //
-// No separate coalescing pass: each Evict() call produces items from one
-// segment, so we punch one range per call. Gaps from previously-evicted
-// items within the range are already holes — punching them again is a no-op.
+// This avoids extent B-tree fragmentation from hole punching, which degrades
+// read throughput by ~24% at 75% sparseness.
 func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
 	evictionStart := time.Now()
 
@@ -932,7 +927,6 @@ func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
 	var (
 		evictedBytes int64
 		evictedCount int
-		punchCount   int
 	)
 
 	for evictedBytes < toEvictBytes {
@@ -955,26 +949,6 @@ func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
 		}
 		c.index.UpdateSegmentOnDelete(segID, int32(len(batch)), batchBytes)
 
-		// 3. RECLAIM — punch one contiguous range covering the batch.
-		// Items are from the same segment; compute [min, max] offset extent.
-		// Gaps from previously-evicted items are already holes (punch is idempotent).
-		// physicallyReclaimed = sum of evicted PhysicalLen (not the punch range,
-		// which may include pre-existing holes we don't want to double-count).
-		minOff := int64(batch[0].Offset)
-		maxEnd := int64(batch[0].Offset) + int64(batch[0].PhysicalLen)
-		for _, v := range batch[1:] {
-			off := int64(v.Offset)
-			end := off + int64(v.PhysicalLen)
-			if off < minOff {
-				minOff = off
-			}
-			if end > maxEnd {
-				maxEnd = end
-			}
-		}
-		c.archivist.HolePunchRange(context.Background(), segID, minOff, maxEnd-minOff)
-		punchCount++
-
 		evictedBytes += batchBytes
 		evictedCount += len(batch)
 	}
@@ -986,21 +960,11 @@ func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
 	// METRICS & MAINTENANCE
 	c.approxSize.Add(-evictedBytes)
 
-	// Batch efficiency: items evicted per punch syscall.
-	// With spatial expansion each punch covers ~N bystanders, so this should be
-	// much higher than 1.0 (the old per-item regime).
-	var batchEfficiency float64
-	if punchCount > 0 {
-		batchEfficiency = float64(evictedCount) / float64(punchCount)
-	}
-
 	log.Info("eviction completed",
 		"duration", time.Since(evictionStart),
 		"evicted_count", evictedCount,
 		"evicted_mb", evictedBytes/(1024*1024),
-		"remaining_mb", c.approxSize.Load()/(1024*1024),
-		"punch_syscalls", punchCount,
-		"batch_efficiency", fmt.Sprintf("%.1fx", batchEfficiency))
+		"remaining_mb", c.approxSize.Load()/(1024*1024))
 
 	c.bloomStats.deletions.Add(int64(evictedCount))
 
@@ -1014,7 +978,7 @@ func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
 func (c *Cache) maybeCompactSegments() error {
 	var errs []error
 
-	// Phase 1: Tombstone compaction (metadata cleanup + hole punching)
+	// Phase 1: Tombstone compaction (metadata cleanup)
 	if err := c.maybeCompactTombstones(); err != nil {
 		errs = append(errs, fmt.Errorf("tombstone compaction: %w", err))
 	}
@@ -1119,8 +1083,8 @@ func (c *Cache) maybeMergeSegments() error {
 }
 
 // maybeCompactTombstones identifies segments with many tombstones and compacts them.
-// This collapses the tombstone incremental log into the segment manifest and
-// reclaims space via hole punching.
+// Collapses the tombstone incremental log into the segment manifest (metadata-only).
+// Physical space is reclaimed later by merge compaction.
 func (c *Cache) maybeCompactTombstones() error {
 	segments := c.selectSegmentsForTombstoneCompaction()
 	if len(segments) == 0 {
@@ -1152,38 +1116,128 @@ func (c *Cache) maybeCompactTombstones() error {
 }
 
 // compactSegmentTombstones performs tombstone compaction on a single segment.
-// This is the high-level operation that:
-// 1. Hole punches tombstoned blobs (space reclamation)
-// 2. Collapses tombstone log into segment manifest (metadata cleanup)
-// 3. Updates SegmentMetadata counts
+// Collapses the tombstone incremental log into the segment manifest and
+// updates SegmentMetadata counts. No hole punching — physical space is
+// reclaimed by merge compaction (rewriting sparse segments).
 //
 // The caller must hold the segment lock before calling this method.
 func (c *Cache) compactSegmentTombstones(segID uint32) error {
-	var punchedCount int
-	var punchedBytes int64
-
-	err := c.index.CompactTombstones(segID, func(tr index.TombstoneRecord) {
-		// Hole punch (idempotent - no-op if already punched in cache mode/eviction)
-		reclaimed, err := c.archivist.HolePunchBlob(segID, tr.Item.Offset, tr.Item.PhysicalLen)
-		if err != nil {
-			log.Warn("hole punch failed during tombstone compaction",
-				"segment", segID, "key", tr.KeyHash, "error", err)
-		} else if reclaimed > 0 {
-			punchedCount++
-			punchedBytes += reclaimed
-		}
-	})
-
+	err := c.index.CompactTombstones(segID, nil)
 	if err != nil {
 		return fmt.Errorf("compact tombstones segment %d: %w", segID, err)
 	}
+	return nil
+}
 
-	if punchedCount > 0 {
-		log.Info("tombstone compaction completed",
-			"segment", segID,
-			"punched_count", punchedCount,
-			"reclaimed_mb", punchedBytes/(1024*1024))
+// maybeEmergencyPunch checks disk pressure and hole-punches dead items in sparse
+// segments when available disk falls below EmergencyDiskThreshold.
+//
+// This is a break-the-glass safety valve for disk pressure. Normal operation never
+// punches holes (merge compaction reclaims space by rewriting segments). But when
+// disk is critically low and compaction can't keep up, emergency punching reclaims
+// space immediately at the cost of some read throughput degradation.
+//
+// Each segment is punched up to EmergencyPunchCap (default 25%) of WriteBufferSize.
+// At 25% sparseness, read throughput degradation is ~6.5% (from sparse file benchmarks).
+func (c *Cache) maybeEmergencyPunch() error {
+	if c.EmergencyDiskThreshold <= 0 || c.EmergencyPunchCap <= 0 {
+		return nil
+	}
+
+	available, total, err := c.getDiskUsage()
+	if err != nil {
+		return fmt.Errorf("statfs: %w", err)
+	}
+
+	if total == 0 {
+		return nil
+	}
+
+	freeRatio := float64(available) / float64(total)
+	if freeRatio >= c.EmergencyDiskThreshold {
+		return nil // Plenty of disk space
+	}
+
+	log.Warn("emergency hole punch triggered",
+		"available_gb", fmt.Sprintf("%.1f", float64(available)/(1024*1024*1024)),
+		"total_gb", fmt.Sprintf("%.1f", float64(total)/(1024*1024*1024)),
+		"free_pct", fmt.Sprintf("%.1f%%", freeRatio*100),
+		"threshold_pct", fmt.Sprintf("%.1f%%", c.EmergencyDiskThreshold*100))
+
+	// Use the same cooling period as normal compaction to avoid punching hot segments.
+	currentSegID := c.segIDs.CurrentSegmentID()
+	coolingGap := uint32(c.MaxCachedSlabs + coolingPeriodMargin)
+	if currentSegID <= coolingGap {
+		return nil
+	}
+	maxEligibleID := currentSegID - coolingGap
+
+	// Get sparse segments from the merge candidate pool.
+	// Use a low threshold (0.20) to catch anything with meaningful waste.
+	sparse := c.index.GetMergeCompactionCandidates(maxEligibleID, 0.20)
+	if len(sparse) == 0 {
+		log.Warn("emergency punch: no sparse segments found")
+		return nil
+	}
+
+	maxPunchPerSegment := int64(float64(c.WriteBufferSize) * c.EmergencyPunchCap)
+	var totalPunched int64
+	var segmentsPunched int
+
+	for _, seg := range sparse {
+		deadItems, err := c.index.GetSegmentDeadItems(seg.ID)
+		if err != nil {
+			log.Warn("emergency punch: failed to read dead items",
+				"segment", seg.ID, "error", err)
+			continue
+		}
+
+		if len(deadItems) == 0 {
+			continue
+		}
+
+		// Acquire shared lock (same coordination as tombstone compaction).
+		shard := c.index.SegmentLockShard(seg.ID)
+		shard.RLock()
+
+		var segPunched int64
+		for _, item := range deadItems {
+			if segPunched >= maxPunchPerSegment {
+				break // Hit per-segment cap
+			}
+			reclaimed, err := c.archivist.HolePunchBlob(seg.ID, item.Offset, item.PhysicalLen)
+			if err != nil {
+				log.Warn("emergency punch failed",
+					"segment", seg.ID, "offset", item.Offset, "error", err)
+				continue
+			}
+			segPunched += reclaimed
+		}
+
+		shard.RUnlock()
+
+		if segPunched > 0 {
+			totalPunched += segPunched
+			segmentsPunched++
+		}
+	}
+
+	if totalPunched > 0 {
+		log.Warn("emergency punch completed",
+			"segments_punched", segmentsPunched,
+			"reclaimed_mb", fmt.Sprintf("%.1f", float64(totalPunched)/(1024*1024)),
+			"cap_pct", fmt.Sprintf("%.0f%%", c.EmergencyPunchCap*100))
 	}
 
 	return nil
+}
+
+// getDiskUsage returns available and total bytes for the cache filesystem.
+// Uses InjectDiskUsage testing knob if set, otherwise queries the real filesystem.
+func (c *Cache) getDiskUsage() (available, total uint64, err error) {
+	if c.Knobs != nil && c.Knobs.InjectDiskUsage != nil {
+		a, t := c.Knobs.InjectDiskUsage()
+		return a, t, nil
+	}
+	return sys.Statfs(c.Path)
 }

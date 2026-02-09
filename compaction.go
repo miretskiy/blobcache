@@ -337,6 +337,7 @@ func (c *Compactor) collectItems(segmentIDs []uint32) ([]relocInfo, []index.Item
 
 // getSegmentFile returns a cached file handle for a source segment.
 // Opens a single buffered fd — reflinks depend on block-aligned offsets, not O_DIRECT.
+// Hints FADV_SEQUENTIAL for readahead during copy_file_range on ext4 (RocksDB pattern).
 func (c *Compactor) getSegmentFile(segmentID uint32) (segmentFileInfo, error) {
 	if info, ok := c.segmentFiles[segmentID]; ok {
 		return info, nil
@@ -355,15 +356,27 @@ func (c *Compactor) getSegmentFile(segmentID uint32) (segmentFileInfo, error) {
 		return segmentFileInfo{}, fmt.Errorf("compaction: stat segment %d: %w", segmentID, err)
 	}
 
+	// Hint sequential access for copy_file_range readahead (effective on ext4).
+	// On XFS with reflinks, copy_file_range is metadata-only so this is a no-op.
+	if sys.UseFadvise {
+		_ = sys.Fadvise(f.Fd(), 0, stat.Size(), sys.FadvSequential)
+	}
+
 	info := segmentFileInfo{file: f, size: stat.Size()}
 	c.segmentFiles[segmentID] = info
 	return info, nil
 }
 
 // closeSegmentFiles closes all cached segment file handles.
+// Evicts source segment pages from page cache via FADV_DONTNEED before closing
+// to prevent compaction from polluting the kernel page cache (RocksDB pattern).
 // Called after each compaction to avoid accumulating open files.
 func (c *Compactor) closeSegmentFiles() (retErr error) {
 	for segID, info := range c.segmentFiles {
+		// Evict source pages from page cache — compaction data is cold.
+		if sys.UseFadvise {
+			_ = sys.Fadvise(info.file.Fd(), 0, info.size, sys.FadvDontNeed)
+		}
 		if err := info.file.Close(); err != nil {
 			retErr = errors.Join(retErr, fmt.Errorf("close segment %d: %w", segID, err))
 		}

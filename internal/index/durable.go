@@ -516,6 +516,23 @@ func (idx *DurableIndex) CompactTombstones(segID uint32, onTombstone TombstoneFn
 	return idx.segments.compactTombstones(segID, onTombstone)
 }
 
+// GetSegmentDeadItems reads the merged manifest for a segment and returns all
+// deleted items that still occupy physical space (PhysicalLen > 0).
+// Used by emergency hole punching to find reclaimable regions.
+func (idx *DurableIndex) GetSegmentDeadItems(segID uint32) ([]Item, error) {
+	manifest, err := idx.segments.readMetaFile(segID)
+	if err != nil {
+		return nil, err
+	}
+	var dead []Item
+	for i := range manifest.Items {
+		if manifest.Items[i].IsDeleted() && manifest.Items[i].PhysicalLen > 0 {
+			dead = append(dead, manifest.Items[i])
+		}
+	}
+	return dead, nil
+}
+
 // VerifyNoSegmentsInRange checks that no segments exist in the open interval (startID, endID).
 // Used during compaction to validate the Strict Contiguity Rule.
 //

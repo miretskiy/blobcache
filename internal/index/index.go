@@ -77,10 +77,10 @@ func (item *Item) IsDeleted() bool {
 }
 
 // SetDeleted marks the blob as deleted (tombstone).
-// Clears PhysicalLen and all flags except deleted, since tombstones have no data.
+// Preserves PhysicalLen (needed for emergency hole punching and waste tracking).
+// Clears all flags except deleted since tombstones don't serve data.
 func (item *Item) SetDeleted() {
 	item.Flags = itemFlagDeleted // Clear compression, errno; keep only deleted flag
-	item.PhysicalLen = 0
 }
 
 // Errno returns the error code for this blob.

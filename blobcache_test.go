@@ -204,8 +204,9 @@ func TestCache_Delete_WAL_NoHolePunch(t *testing.T) {
 		"WAL mode should NOT hole-punch (space reclaimed during compaction)")
 }
 
-func TestCache_Delete_Cache_ImmediateReclaim(t *testing.T) {
-	// Validates that in Cache mode (no WAL), Delete() immediately hole-punches.
+func TestCache_Delete_Cache_LogicalTombstone(t *testing.T) {
+	// Validates that in Cache mode (no WAL), Delete() creates a logical tombstone
+	// without hole-punching. Physical space is reclaimed later by merge compaction.
 	tmpDir := t.TempDir()
 
 	cache, err := New(tmpDir,
@@ -221,13 +222,13 @@ func TestCache_Delete_Cache_ImmediateReclaim(t *testing.T) {
 	require.NoError(t, cache.Put(key, value))
 	cache.Drain()
 
-	// Get segment stats before delete
+	// Get segment info before delete
 	h := xxh3.Hash128(key)
 	item, found := cache.index.Get(h)
 	require.True(t, found)
 	segID := item.SegmentID
 
-	// Get physical size before delete
+	// Get physical size before delete (should NOT change)
 	segPath := getSegmentPath(cache.Path, cache.Shards, segID)
 	beforeStat, err := os.Stat(segPath)
 	require.NoError(t, err)
@@ -241,18 +242,14 @@ func TestCache_Delete_Cache_ImmediateReclaim(t *testing.T) {
 	require.True(t, found, "item should still exist as tombstone")
 	require.True(t, item.IsDeleted(), "item should be marked deleted")
 
-	// Verify hole punch happened (physical size decreased)
+	// Verify physical size unchanged (no hole punching)
 	afterStat, err := os.Stat(segPath)
 	require.NoError(t, err)
 	afterBlocks := afterStat.Sys().(*syscall.Stat_t).Blocks
+	require.Equal(t, beforeBlocks, afterBlocks,
+		"Delete should not hole-punch; physical space reclaimed by merge compaction")
 
-	reclaimedBytes := int64(beforeBlocks-afterBlocks) * 512
-	t.Logf("Reclaimed %d bytes (before: %d blocks, after: %d blocks)",
-		reclaimedBytes, beforeBlocks, afterBlocks)
-
-	// Should have reclaimed most of the blob (within 4KB alignment slack)
-	require.Greater(t, reclaimedBytes, int64(90_000),
-		"Cache mode should hole-punch and reclaim space immediately")
+	_ = segID // Used above
 }
 
 func TestCache_Put_LargeBlob(t *testing.T) {

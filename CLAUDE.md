@@ -99,6 +99,11 @@ go test -run TestName -count=100
 go test -run TestCache_Compression_Zstd -count=10
 ```
 
+*ALL* test results must be validated on a remote
+linumx machine: workspace-yevgeniy-miretskiy-m7gd-8xlarge
+
+Use ssh commands to execute tests and benchmark on linux.
+
 ### Code Quality Checks (REQUIRED before commits)
 
 ```bash

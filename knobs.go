@@ -16,8 +16,4 @@ type TestingKnobs struct {
 	// If set, NextSeq() calls are delegated to this interface.
 	SequenceVendor SequenceVendor
 
-	// InjectDiskUsage overrides sys.Statfs for testing emergency punch.
-	// Returns (available, total) bytes. When set, the real filesystem
-	// is not queried.
-	InjectDiskUsage func() (uint64, uint64)
 }

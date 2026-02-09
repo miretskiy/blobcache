@@ -2,7 +2,6 @@ package blobcache
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -14,7 +13,6 @@ import (
 	"github.com/miretskiy/blobcache/internal/index"
 	"github.com/miretskiy/blobcache/internal/record"
 	"github.com/miretskiy/blobcache/internal/sys"
-	"golang.org/x/time/rate"
 )
 
 // Archivist manages read-only access to persisted segments.
@@ -22,22 +20,13 @@ import (
 type Archivist struct {
 	config
 	index        *index.DurableIndex
-	cache        sync.Map      // segmentID (uint32) -> *os.File
-	punchLimiter *rate.Limiter // Rate limiter for hole punch syscalls
+	cache sync.Map // segmentID (uint32) -> *os.File
 }
 
 func NewArchivist(cfg config, idx *index.DurableIndex) *Archivist {
 	return &Archivist{
 		config: cfg,
 		index:  idx,
-		// Rate limit hole punching to 2000 ops/sec with burst of 100.
-		// Without this, heavy eviction generates 20-30k fallocate(PUNCH_HOLE)
-		// syscalls/sec, each updating filesystem extent metadata. This "Metadata
-		// Storm" competes with foreground reads for journal locks and inode
-		// metadata updates. 2000 ops/sec empirically keeps foreground p99 read
-		// latency stable while still reclaiming space within ~1 eviction cycle.
-		// Burst absorbs clustered punches from back-to-back eviction batches.
-		punchLimiter: rate.NewLimiter(rate.Limit(2000), 100),
 	}
 }
 
@@ -168,36 +157,6 @@ func (a *Archivist) getSegmentFile(segmentID uint32) (*os.File, error) {
 	}
 
 	return f, nil
-}
-
-// HolePunchBlob releases disk space for an evicted blob.
-func (a *Archivist) HolePunchBlob(
-	segmentID uint32, offset uint32, physicalLen uint32,
-) (int64, error) {
-	sf, err := a.getSegmentFile(segmentID)
-	if err != nil {
-		return 0, err
-	}
-	return sys.PunchHole(sf, int64(offset), int64(physicalLen))
-}
-
-// HolePunchRange releases disk space for a contiguous byte range within a segment.
-// Used during spatial SIEVE eviction to punch one range per batch (covering the
-// anchor + all bystanders). Gaps from previously-evicted items within the range
-// are already holes — punching them again is a kernel no-op.
-//
-// Rate-limited to 2000 syscalls/sec to protect foreground read throughput
-// from "Metadata Storms" during heavy eviction.
-func (a *Archivist) HolePunchRange(ctx context.Context, segmentID uint32, offset, length int64) (int64, error) {
-	// Rate limit to protect foreground reads
-	if err := a.punchLimiter.Wait(ctx); err != nil {
-		return 0, err
-	}
-	sf, err := a.getSegmentFile(segmentID)
-	if err != nil {
-		return 0, err
-	}
-	return sys.PunchHole(sf, offset, length)
 }
 
 // DropSegmentCache closes and removes a segment's cached file handle.

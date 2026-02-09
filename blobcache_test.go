@@ -686,43 +686,6 @@ func TestCache_Eviction_Headroom(t *testing.T) {
 	require.Greater(t, deletions, int64(0), "Deletions should be tracked after eviction")
 }
 
-func TestCache_HolePunching_Physical(t *testing.T) {
-	tmpDir := t.TempDir()
-	cache, err := New(tmpDir)
-	require.NoError(t, err)
-	defer cache.Close()
-
-	// Write a large blob (> 4KB block size)
-	val := make([]byte, 8192)
-	key := []byte("big-blob")
-	require.NoError(t, cache.Put(key, val))
-	cache.Drain()
-
-	// Get entry info
-	h := xxh3.Hash128(key)
-	entry, ok := cache.index.Get(index.Key(h))
-	require.True(t, ok)
-
-	segmentPath := getSegmentPath(tmpDir, cache.Shards, entry.SegmentID)
-	fiBefore, err := os.Stat(segmentPath)
-	require.NoError(t, err)
-
-	// 1. Mark as deleted in Index (Durable + RAM)
-	err = cache.index.DeleteBlobs(entry)
-	require.NoError(t, err)
-
-	// 2. Physically reclaim space via Storage
-	reclaimed, err := cache.archivist.HolePunchBlob(entry.SegmentID, entry.Offset, entry.PhysicalLen)
-	require.NoError(t, err)
-	t.Logf("Hole punch reclaimed %d bytes (requested %d)", reclaimed, entry.PhysicalLen)
-
-	fiAfter, err := os.Stat(segmentPath)
-	require.NoError(t, err)
-
-	// Logical size should remain constant (FALLOC_FL_KEEP_SIZE)
-	require.Equal(t, fiBefore.Size(), fiAfter.Size(), "Logical size must stay constant")
-}
-
 func TestCache_Restart_Persistence(t *testing.T) {
 	tmpDir := t.TempDir()
 

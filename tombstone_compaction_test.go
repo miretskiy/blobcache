@@ -70,8 +70,7 @@ func TestTombstoneCompaction_Basic(t *testing.T) {
 	shard.Lock()
 	err = cache.index.CompactTombstones(segID, func(tr index.TombstoneRecord) {
 		punchedKeys[tr.KeyHash] = true
-		// In real code, we'd hole punch here
-		// _, _ = cache.archivist.HolePunchBlob(segID, tr.Item.Offset, tr.Item.PhysicalLen)
+		// No-op: hole punching removed; merge compaction reclaims space
 	})
 	shard.Unlock()
 	require.NoError(t, err)

@@ -851,17 +851,10 @@ func (c *Cache) runWALRecovery() (bool, error) {
 
 // maintenanceWorker handles eviction and compaction in a unified event-driven loop.
 //
-// Two event sources:
-//   - maintenanceTrigger: Fired by PutBatch when over size limit OR every N segments
-//   - emergencyTicker: 30-second timer for disk pressure detection
-//
-// Normal cycle: (1) evict if over size, (2) compact sparse segments.
-// Emergency cycle: check disk usage and aggressively compact if low on space.
+// Event source: maintenanceTrigger fired by PutBatch when over size limit OR every N segments.
+// Cycle: (1) evict if over size, (2) compact sparse segments.
 func (c *Cache) maintenanceWorker() {
 	defer c.wg.Done()
-
-	emergencyTicker := time.NewTicker(30 * time.Second)
-	defer emergencyTicker.Stop()
 
 	for {
 		select {
@@ -878,13 +871,6 @@ func (c *Cache) maintenanceWorker() {
 			if !c.IsDegraded() {
 				if err := c.maybeCompactSegments(); err != nil {
 					c.ReportError(fmt.Errorf("compaction: %w", err))
-				}
-			}
-
-		case <-emergencyTicker.C:
-			if !c.IsDegraded() {
-				if err := c.maybeEmergencyPunch(); err != nil {
-					log.Warn("emergency punch failed", "error", err)
 				}
 			}
 
@@ -927,6 +913,10 @@ func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
 	var (
 		evictedBytes int64
 		evictedCount int
+		// Track segments with evicted items for page cache cleanup.
+		// fadvise(DONTNEED) evicts dead pages from kernel cache without
+		// hole punching (no extent B-tree fragmentation).
+		affectedSegments map[uint32]struct{}
 	)
 
 	for evictedBytes < toEvictBytes {
@@ -949,12 +939,27 @@ func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
 		}
 		c.index.UpdateSegmentOnDelete(segID, int32(len(batch)), batchBytes)
 
+		if affectedSegments == nil {
+			affectedSegments = make(map[uint32]struct{})
+		}
+		affectedSegments[segID] = struct{}{}
+
 		evictedBytes += batchBytes
 		evictedCount += len(batch)
 	}
 
 	if evictedCount == 0 {
 		return nil
+	}
+
+	// 3. CACHE CLEANUP — evict dead pages from kernel page cache.
+	// Opens a private FD per segment (not shared with read path) and advises
+	// the kernel to drop all pages. This prevents dead-on-disk data from
+	// polluting the page cache without extent B-tree fragmentation from hole punching.
+	if sys.UseFadvise {
+		for segID := range affectedSegments {
+			c.adviseDropSegmentPages(segID)
+		}
 	}
 
 	// METRICS & MAINTENANCE
@@ -973,6 +978,26 @@ func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
 	}
 
 	return nil
+}
+
+// adviseDropSegmentPages opens a private FD for the segment and advises
+// the kernel to drop all cached pages via fadvise(FADV_DONTNEED).
+// This is a lightweight alternative to hole punching — it frees page cache
+// memory without modifying the extent B-tree.
+// Errors are logged and swallowed (advisory, not critical).
+func (c *Cache) adviseDropSegmentPages(segmentID uint32) {
+	path := getSegmentPath(c.Path, c.Shards, segmentID)
+	f, err := sys.OpenFileForRead(path, 0)
+	if err != nil {
+		return // Segment may have been deleted by compaction
+	}
+	stat, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return
+	}
+	_ = sys.Fadvise(f.Fd(), 0, stat.Size(), sys.FadvDontNeed)
+	_ = f.Close()
 }
 
 func (c *Cache) maybeCompactSegments() error {
@@ -1129,115 +1154,3 @@ func (c *Cache) compactSegmentTombstones(segID uint32) error {
 	return nil
 }
 
-// maybeEmergencyPunch checks disk pressure and hole-punches dead items in sparse
-// segments when available disk falls below EmergencyDiskThreshold.
-//
-// This is a break-the-glass safety valve for disk pressure. Normal operation never
-// punches holes (merge compaction reclaims space by rewriting segments). But when
-// disk is critically low and compaction can't keep up, emergency punching reclaims
-// space immediately at the cost of some read throughput degradation.
-//
-// Each segment is punched up to EmergencyPunchCap (default 25%) of WriteBufferSize.
-// At 25% sparseness, read throughput degradation is ~6.5% (from sparse file benchmarks).
-func (c *Cache) maybeEmergencyPunch() error {
-	if c.EmergencyDiskThreshold <= 0 || c.EmergencyPunchCap <= 0 {
-		return nil
-	}
-
-	available, total, err := c.getDiskUsage()
-	if err != nil {
-		return fmt.Errorf("statfs: %w", err)
-	}
-
-	if total == 0 {
-		return nil
-	}
-
-	freeRatio := float64(available) / float64(total)
-	if freeRatio >= c.EmergencyDiskThreshold {
-		return nil // Plenty of disk space
-	}
-
-	log.Warn("emergency hole punch triggered",
-		"available_gb", fmt.Sprintf("%.1f", float64(available)/(1024*1024*1024)),
-		"total_gb", fmt.Sprintf("%.1f", float64(total)/(1024*1024*1024)),
-		"free_pct", fmt.Sprintf("%.1f%%", freeRatio*100),
-		"threshold_pct", fmt.Sprintf("%.1f%%", c.EmergencyDiskThreshold*100))
-
-	// Use the same cooling period as normal compaction to avoid punching hot segments.
-	currentSegID := c.segIDs.CurrentSegmentID()
-	coolingGap := uint32(c.MaxCachedSlabs + coolingPeriodMargin)
-	if currentSegID <= coolingGap {
-		return nil
-	}
-	maxEligibleID := currentSegID - coolingGap
-
-	// Get sparse segments from the merge candidate pool.
-	// Use a low threshold (0.20) to catch anything with meaningful waste.
-	sparse := c.index.GetMergeCompactionCandidates(maxEligibleID, 0.20)
-	if len(sparse) == 0 {
-		log.Warn("emergency punch: no sparse segments found")
-		return nil
-	}
-
-	maxPunchPerSegment := int64(float64(c.WriteBufferSize) * c.EmergencyPunchCap)
-	var totalPunched int64
-	var segmentsPunched int
-
-	for _, seg := range sparse {
-		deadItems, err := c.index.GetSegmentDeadItems(seg.ID)
-		if err != nil {
-			log.Warn("emergency punch: failed to read dead items",
-				"segment", seg.ID, "error", err)
-			continue
-		}
-
-		if len(deadItems) == 0 {
-			continue
-		}
-
-		// Acquire shared lock (same coordination as tombstone compaction).
-		shard := c.index.SegmentLockShard(seg.ID)
-		shard.RLock()
-
-		var segPunched int64
-		for _, item := range deadItems {
-			if segPunched >= maxPunchPerSegment {
-				break // Hit per-segment cap
-			}
-			reclaimed, err := c.archivist.HolePunchBlob(seg.ID, item.Offset, item.PhysicalLen)
-			if err != nil {
-				log.Warn("emergency punch failed",
-					"segment", seg.ID, "offset", item.Offset, "error", err)
-				continue
-			}
-			segPunched += reclaimed
-		}
-
-		shard.RUnlock()
-
-		if segPunched > 0 {
-			totalPunched += segPunched
-			segmentsPunched++
-		}
-	}
-
-	if totalPunched > 0 {
-		log.Warn("emergency punch completed",
-			"segments_punched", segmentsPunched,
-			"reclaimed_mb", fmt.Sprintf("%.1f", float64(totalPunched)/(1024*1024)),
-			"cap_pct", fmt.Sprintf("%.0f%%", c.EmergencyPunchCap*100))
-	}
-
-	return nil
-}
-
-// getDiskUsage returns available and total bytes for the cache filesystem.
-// Uses InjectDiskUsage testing knob if set, otherwise queries the real filesystem.
-func (c *Cache) getDiskUsage() (available, total uint64, err error) {
-	if c.Knobs != nil && c.Knobs.InjectDiskUsage != nil {
-		a, t := c.Knobs.InjectDiskUsage()
-		return a, t, nil
-	}
-	return sys.Statfs(c.Path)
-}

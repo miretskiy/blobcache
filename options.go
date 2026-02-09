@@ -85,18 +85,6 @@ type config struct {
 	// Set to 0 to disable spatial expansion (pure SIEVE, no bystanders).
 	MaxBystanderBytes int64
 
-	// EmergencyPunchCap is the max fraction of a segment that emergency
-	// hole punching will punch (0.25 = 25%). Limits read degradation to ~6.5%.
-	// Emergency punching is a break-the-glass safety valve triggered by disk
-	// pressure when merge compaction cannot reclaim space fast enough.
-	// Default: 0.25. Set to 0 to disable emergency punching entirely.
-	EmergencyPunchCap float64
-
-	// EmergencyDiskThreshold triggers emergency hole punching when
-	// available disk falls below this fraction of total capacity (0.05 = 5%).
-	// Default: 0.05. Set to 0 to disable.
-	EmergencyDiskThreshold float64
-
 	knobs *TestingKnobs
 }
 
@@ -260,20 +248,6 @@ func WithCompactionBandwidth(bytesPerSec int64) Option {
 	return funcOpt(func(c *config) { c.CompactionBandwidth = bytesPerSec })
 }
 
-// WithEmergencyPunchCap sets the max fraction of a segment that emergency hole
-// punching will punch. This is a break-the-glass safety valve for disk pressure.
-// Default: 0.25 (25%). Set to 0 to disable emergency punching entirely.
-func WithEmergencyPunchCap(fraction float64) Option {
-	return funcOpt(func(c *config) { c.EmergencyPunchCap = fraction })
-}
-
-// WithEmergencyDiskThreshold sets the available disk fraction that triggers
-// emergency hole punching. When available < threshold * total, emergency mode activates.
-// Default: 0.05 (5%). Set to 0 to disable.
-func WithEmergencyDiskThreshold(fraction float64) Option {
-	return funcOpt(func(c *config) { c.EmergencyDiskThreshold = fraction })
-}
-
 func defaultConfig(path string) config {
 	return config{
 		Path:                path,
@@ -288,9 +262,7 @@ func defaultConfig(path string) config {
 		DegradedMode:        DegradedMemoryOnly,
 		TrustHash:           true,      // Cache mode: trust hash, skip key verification
 		BallastSize:         1 << 30,   // 1GB heap ballast to reduce GC frequency
-		CompactionBandwidth:    400 << 20, // 400 MB/s for merge compaction throttling
-		EmergencyPunchCap:      0.25,     // 25% max sparseness per segment during emergency
-		EmergencyDiskThreshold: 0.05,     // Trigger emergency punch at 5% free disk
+		CompactionBandwidth: 400 << 20, // 400 MB/s for merge compaction throttling
 		IO: IOConfig{
 			FDataSync:     false,
 			Fadvise:       sys.UseFadvise,

@@ -385,18 +385,15 @@ func startSystemMonitor(
 						continue
 					}
 					if stat1, ok := v1[name]; ok {
-						// Calculate Delta
-						weightedDelta := float64(stat2.WeightedIO - stat1.WeightedIO)
-						timeDelta := float64(stat2.IoTime - stat1.IoTime)
 						intervalMs := float64(interval.Milliseconds())
 
-						// macOS Fix: If WeightedIO is not supported by the driver,
-						// fallback to IoTime/Interval to show utilization (max 1.0 per disk).
-						// If WeightedIO is present, it shows true concurrency (can be > 1.0).
-						if weightedDelta > 0 {
-							currentQD += weightedDelta / intervalMs
-						} else {
-							currentQD += timeDelta / intervalMs
+						// Guard against uint64 underflow: counters are monotonic,
+						// but stale v1 entries or device re-enumeration can cause
+						// stat2 < stat1, wrapping the unsigned subtraction.
+						if stat2.WeightedIO >= stat1.WeightedIO && stat2.WeightedIO-stat1.WeightedIO > 0 {
+							currentQD += float64(stat2.WeightedIO-stat1.WeightedIO) / intervalMs
+						} else if stat2.IoTime >= stat1.IoTime {
+							currentQD += float64(stat2.IoTime-stat1.IoTime) / intervalMs
 						}
 
 						physWriteBytes += float64(stat2.WriteBytes - stat1.WriteBytes)

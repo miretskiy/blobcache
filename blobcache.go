@@ -1022,10 +1022,9 @@ func (c *Cache) maybeMergeSegments() error {
 		result.ActualOutputMB = float64(totalOutputBytes) / (1024 * 1024)
 
 		// Calculate derived I/O metrics
-		var spliceMBps, readMBps float64
+		var spliceMBps float64
 		if result.DurationMs > 0 {
 			durSec := float64(result.DurationMs) / 1000.0
-			readMBps = float64(result.ReadBytes) / durSec / (1024 * 1024)
 			spliceMBps = float64(result.SpliceBytes) / durSec / (1024 * 1024)
 		}
 
@@ -1042,9 +1041,7 @@ func (c *Cache) maybeMergeSegments() error {
 			"duration_ms", result.DurationMs,
 			"throttle_ms", result.ThrottleMs,
 			"splice_ops", result.SpliceOps,
-			"splice_mbps", fmt.Sprintf("%.1f", spliceMBps),
-			"hdr_read_ops", result.ReadOps,
-			"hdr_read_mbps", fmt.Sprintf("%.1f", readMBps))
+			"splice_mbps", fmt.Sprintf("%.1f", spliceMBps))
 
 	}
 

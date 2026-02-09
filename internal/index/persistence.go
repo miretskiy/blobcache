@@ -515,6 +515,99 @@ func (p *persistence) readMetaFile(segID uint32) (DurableBatch, error) {
 	}, nil
 }
 
+// SegmentManifest holds raw footer entries with tombstones merged.
+// Used by compaction to avoid re-reading record headers from disk.
+type SegmentManifest struct {
+	SegmentID uint32
+	MaxSeqID  uint64
+	Entries   []record.FooterEntry
+}
+
+// Item converts the i-th footer entry to an Item.
+func (m *SegmentManifest) Item(i int) Item {
+	return footerEntryToItem(m.SegmentID, &m.Entries[i])
+}
+
+// readSegmentManifest reads a segment's .meta file and returns raw footer entries
+// with tombstones applied (deleted entries have SetDeleted flag).
+// Unlike readMetaFile, this preserves full FooterEntry data (LogicalSize,
+// PhysicalSize, SeqID, Flags, KeyLen) needed for compaction output footers.
+func (p *persistence) readSegmentManifest(segID uint32) (SegmentManifest, error) {
+	// Flush any pending buffered writes for this segment before reading
+	if v, ok := p.files.Load(segID); ok {
+		mf := v.(*metaFile)
+		mf.mu.Lock()
+		if err := mf.w.Flush(); err != nil {
+			mf.mu.Unlock()
+			return SegmentManifest{}, fmt.Errorf("flush pending meta for segment %d: %w", segID, err)
+		}
+		mf.mu.Unlock()
+	}
+
+	path := p.metaPath(segID)
+	f, err := os.Open(path)
+	if err != nil {
+		return SegmentManifest{}, err
+	}
+	defer func() { _ = f.Close() }()
+
+	stat, err := f.Stat()
+	if err != nil {
+		return SegmentManifest{}, err
+	}
+	fileSize := stat.Size()
+
+	footerBlockSize, err := findFooterBlockSize(path)
+	if err != nil {
+		return SegmentManifest{}, err
+	}
+
+	footer, _, err := record.ReadFooterBlock(f, footerBlockSize, int64(segID))
+	if err != nil {
+		return SegmentManifest{}, fmt.Errorf("read footer from %s: %w", path, err)
+	}
+
+	// Read and apply tombstones
+	if fileSize > footerBlockSize {
+		tombstoneData := make([]byte, fileSize-footerBlockSize)
+		if _, err := f.ReadAt(tombstoneData, footerBlockSize); err != nil {
+			return SegmentManifest{}, fmt.Errorf("read tombstones from %s: %w", path, err)
+		}
+
+		tombstones := make(map[Key]struct{})
+		pos := 0
+		for pos < len(tombstoneData) {
+			if pos+TombstoneHeaderSize > len(tombstoneData) {
+				break
+			}
+			if tombstoneData[pos] != TombstoneMagic {
+				break
+			}
+			count := int(binary.LittleEndian.Uint32(tombstoneData[pos+1:]))
+			pos += TombstoneHeaderSize
+			for j := 0; j < count && pos+TombstoneKeySize <= len(tombstoneData); j++ {
+				var k Key
+				k.Lo = binary.LittleEndian.Uint64(tombstoneData[pos:])
+				k.Hi = binary.LittleEndian.Uint64(tombstoneData[pos+8:])
+				tombstones[k] = struct{}{}
+				pos += TombstoneKeySize
+			}
+		}
+
+		for i := range footer.Entries {
+			if _, deleted := tombstones[footer.Entries[i].Key]; deleted {
+				footer.Entries[i].SetDeleted()
+			}
+		}
+	}
+
+	return SegmentManifest{
+		SegmentID: uint32(footer.SegmentID),
+		MaxSeqID:  footer.MaxSeqID,
+		Entries:   footer.Entries,
+	}, nil
+}
+
 // scanAll iterates over all segment files and invokes fn for each manifest.
 // It is resilient to missing/corrupt .meta files by scanning .seg files directly.
 //

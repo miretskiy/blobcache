@@ -41,10 +41,6 @@ type Compactor struct {
 	// of copy_file_range calls can overwhelm the filesystem. Nil means unlimited.
 	rateLimiter *rate.Limiter
 
-	// ioBuf is a reusable buffer for header reads during compaction.
-	// Lazily allocated on first use.
-	ioBuf []byte
-
 	// segmentFiles caches open file handles for source segments.
 	// Populated during compaction, closed after each Compact() call.
 	segmentFiles map[uint32]segmentFileInfo
@@ -54,7 +50,6 @@ type Compactor struct {
 }
 
 // segmentFileInfo holds a cached file handle for a source segment.
-// A single buffered fd is used for both copy_file_range and header reads.
 // Reflinks on XFS depend on block-aligned offsets, not O_DIRECT.
 type segmentFileInfo struct {
 	file *os.File
@@ -96,8 +91,6 @@ type CompactResult struct {
 	StaleSkipped        int      // Number of stale entries skipped (superseded by newer writes)
 
 	// I/O stats for bandwidth analysis
-	ReadOps     int   // Number of read operations (header reads)
-	ReadBytes   int64 // Total bytes read from old segments
 	WriteOps    int   // Number of write operations
 	WriteBytes  int64 // Total bytes written via pwrite
 	SpliceOps   int   // Number of copy_file_range calls (reflinks on XFS when aligned)
@@ -113,6 +106,7 @@ type CompactResult struct {
 // relocInfo tracks an item being relocated during compaction.
 type relocInfo struct {
 	item   index.Item
+	footer record.FooterEntry // Original footer entry (avoids re-reading record header)
 	oldSeg uint32
 	oldOff uint32
 }
@@ -292,8 +286,8 @@ func (c *Compactor) collectItems(segmentIDs []uint32) ([]relocInfo, []index.Item
 		}
 		prevSegID = segID
 
-		manifest, ok := c.index.GetSegmentManifest(segID)
-		if !ok {
+		manifest, err := c.index.GetSegmentManifestRaw(segID)
+		if err != nil {
 			continue // Segment might have been deleted
 		}
 
@@ -301,7 +295,10 @@ func (c *Compactor) collectItems(segmentIDs []uint32) ([]relocInfo, []index.Item
 			maxSeqID = manifest.MaxSeqID
 		}
 
-		for _, item := range manifest.Items {
+		for j := range manifest.Entries {
+			entry := &manifest.Entries[j]
+			item := manifest.Item(j)
+
 			if item.IsDeleted() {
 				// Check if tombstone can be safely dissolved (no older shadow exists)
 				if !c.index.HasOlderShadow(item.Key, floorID) {
@@ -326,6 +323,7 @@ func (c *Compactor) collectItems(segmentIDs []uint32) ([]relocInfo, []index.Item
 
 			toRelocate = append(toRelocate, relocInfo{
 				item:   item,
+				footer: *entry,
 				oldSeg: item.SegmentID,
 				oldOff: item.Offset,
 			})
@@ -399,11 +397,6 @@ func (c *Compactor) writeCompactedSegment(
 	toRelocate []relocInfo,
 	result *CompactResult,
 ) ([]record.FooterEntry, error) {
-	// Lazy-allocate I/O buffer for headers + head/tail block copies.
-	if c.ioBuf == nil {
-		c.ioBuf = make([]byte, sys.BlockSize)
-	}
-
 	// Calculate total size with alignment padding.
 	// Each record starts at a block boundary; the file header is padded to BlockSize.
 	totalSize := sys.PageAlign(int64(record.FileHeaderSize))
@@ -435,14 +428,6 @@ func (c *Compactor) writeCompactedSegment(
 		ri := &toRelocate[i]
 		recordLen := int64(ri.item.PhysicalLen)
 
-		// Read record header from buffered fd for footer metadata.
-		hdr, err := c.readRecordHeader(ri.item)
-		if err != nil {
-			return nil, errors.Join(err, f.Close())
-		}
-		result.ReadOps++
-		result.ReadBytes += int64(record.HeaderSize)
-
 		// Destination is always block-aligned (invariant maintained by this loop)
 		recordStart := dstOff
 
@@ -466,16 +451,10 @@ func (c *Compactor) writeCompactedSegment(
 		ri.item.SegmentID = newSegID
 		ri.item.Offset = uint32(recordStart)
 
-		// Build footer entry from parsed header
-		footerEntries = append(footerEntries, record.FooterEntry{
-			Key:          ri.item.Key,
-			Pos:          recordStart,
-			LogicalSize:  hdr.LogicalSize,
-			PhysicalSize: hdr.PhysicalSize,
-			SeqID:        hdr.SeqID,
-			Flags:        hdr.Flags,
-			KeyLen:       hdr.KeyLen,
-		})
+		// Build footer entry from original manifest data, updating position
+		fe := ri.footer
+		fe.Pos = recordStart
+		footerEntries = append(footerEntries, fe)
 
 		result.ItemsCompacted++
 	}
@@ -529,22 +508,6 @@ func (c *Compactor) copyRecord(
 	result.SpliceOps++
 	result.SpliceBytes += recordLen
 	return nil
-}
-
-// readRecordHeader reads just the record header from a source segment.
-func (c *Compactor) readRecordHeader(e index.Item) (record.Header, error) {
-	seg, err := c.getSegmentFile(e.SegmentID)
-	if err != nil {
-		return record.Header{}, err
-	}
-
-	buf := c.ioBuf[:record.HeaderSize]
-	if _, err := seg.file.ReadAt(buf, int64(e.Offset)); err != nil {
-		return record.Header{}, fmt.Errorf("compaction: read header segment %d offset %d: %w",
-			e.SegmentID, e.Offset, err)
-	}
-
-	return record.DecodeHeader(buf)
 }
 
 // copyFileRangeFull copies exactly `length` bytes using copy_file_range,

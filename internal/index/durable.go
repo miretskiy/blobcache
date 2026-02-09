@@ -125,6 +125,14 @@ func (idx *DurableIndex) GetSegmentManifest(segmentID uint32) (DurableBatch, boo
 	return fullManifest, true
 }
 
+// GetSegmentManifestRaw reads a segment's .meta file and returns raw footer entries
+// with tombstones merged. Preserves full FooterEntry fields (LogicalSize, PhysicalSize,
+// SeqID, Flags, KeyLen) needed by compaction to write output footers without
+// re-reading record headers from disk.
+func (idx *DurableIndex) GetSegmentManifestRaw(segmentID uint32) (SegmentManifest, error) {
+	return idx.segments.readSegmentManifest(segmentID)
+}
+
 // AddSegment registers a new segment with its items.
 // Creates a frozen Bloom filter snapshot (for tombstone dissolution queries),
 // computes initial metadata, and ingests live items into the RAM index.

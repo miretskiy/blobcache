@@ -695,15 +695,16 @@ Segment drain is the zero-write-amplification replacement for merge compaction. 
 
 Drain operates on a **different pressure signal** than SIEVE eviction:
 - **SIEVE** manages live data size: triggers when `approxSize > MaxSize`
-- **Drain** manages disk footprint: triggers when `estimatedDiskBytes > MaxSize * 1.5`
+- **Drain** manages disk waste: triggers when `(diskBytes - liveBytes) > MaxSize / 2`
 
-The 1.5x headroom accounts for structural overhead (partially-filled segments, footers, metadata files) that `approxSize` doesn't track. This prevents drain from competing with SIEVE at the same threshold.
+This separation prevents drain from competing with SIEVE. SIEVE runs first, selectively removing cold items. Over time, dead items accumulate as waste in segments. Drain kicks in only when that accumulated waste becomes significant (>50% of capacity), deleting the sparsest segments to reclaim disk space.
 
 ```text
 PRESSURE-DRIVEN DRAIN:
 
    estimatedDisk = numSegments * WriteBufferSize
-   excess = estimatedDisk - MaxSize * 3/2
+   waste = estimatedDisk - liveBytes
+   excess = waste - MaxSize/2
         |
         v (excess > 0?)
    [Get drain candidates]          <-- All cooled segments, sorted by LiveBytes ascending

@@ -10,35 +10,15 @@ import (
 	"github.com/zeebo/xxh3"
 )
 
-// drainFillers creates filler segments with unique keys to satisfy both
-// the cooling period and disk pressure requirements for drain tests.
-func drainFillers(t *testing.T, cache *Cache, n int) {
-	t.Helper()
-	for i := range n {
-		key := fmt.Appendf(nil, "filler-%04d", i)
-		require.NoError(t, cache.Put(key, make([]byte, 200_000)))
-		cache.Drain()
-	}
-}
-
-// drainFillersNeeded returns the number of filler segments needed to satisfy
-// both cooling period and disk pressure (estimatedDisk > MaxSize * 3/2).
-func drainFillersNeeded(cache *Cache) int {
-	cooling := cache.MaxCachedSlabs + index.CoolingPeriodMargin + 1
-	// Need (1 + fillers) * WBS > MaxSize * 3/2
-	pressure := int(cache.MaxSize*3/2/cache.WriteBufferSize) + 1
-	return max(cooling, pressure)
-}
-
 // TestSegmentDrain_Basic validates the full pressure-driven drain flow:
-// when on-disk footprint exceeds MaxSize*1.5, drain the sparsest segments.
+// when on-disk waste exceeds MaxSize/2, drain the sparsest segments.
 func TestSegmentDrain_Basic(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	cache, err := New(tmpDir,
 		WithMaxCachedSlabs(0),      // Force disk path
 		WithWriteBufferSize(1<<20), // 1MB segments for faster testing
-		WithMaxSize(2<<20),         // 2MB — drain threshold = 3MB
+		WithMaxSize(2<<20),         // 2MB — waste allowance = 1MB
 	)
 	require.NoError(t, err)
 	cache.Start()
@@ -65,10 +45,17 @@ func TestSegmentDrain_Basic(t *testing.T) {
 		require.NoError(t, cache.Delete(keys[i]))
 	}
 
-	// Create filler segments for cooling + disk pressure.
-	drainFillers(t, cache, drainFillersNeeded(cache))
+	// Create enough filler segments for BOTH cooling period AND waste pressure.
+	// Use unique keys so each filler segment retains live data — otherwise the
+	// filler segments become empty (sparsest) and get drained before the target.
+	coolingFillers := cache.MaxCachedSlabs + index.CoolingPeriodMargin + 1
+	for i := range max(coolingFillers, 4) {
+		key := fmt.Appendf(nil, "filler-%04d", i)
+		require.NoError(t, cache.Put(key, make([]byte, 200_000)))
+		cache.Drain()
+	}
 
-	// Run drain directly — disk pressure should trigger drain of sparsest segment.
+	// Run drain directly — waste pressure should trigger drain of sparsest segment.
 	err = cache.maybeDrainSegments()
 	require.NoError(t, err)
 
@@ -86,15 +73,15 @@ func TestSegmentDrain_Basic(t *testing.T) {
 	require.False(t, found, "drained item should be removed from RAM index")
 }
 
-// TestSegmentDrain_NoPressure verifies drain is a no-op when on-disk footprint
-// is well within the drain threshold (MaxSize * 1.5).
+// TestSegmentDrain_NoPressure verifies drain is a no-op when on-disk waste
+// is within the allowance (MaxSize/2).
 func TestSegmentDrain_NoPressure(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	cache, err := New(tmpDir,
 		WithMaxCachedSlabs(0),
 		WithWriteBufferSize(1<<20),
-		WithMaxSize(100<<20), // 100MB — drain threshold = 150MB, way above a few 1MB segments
+		WithMaxSize(100<<20), // 100MB — waste allowance = 50MB, way above a few 1MB segments
 	)
 	require.NoError(t, err)
 	cache.Start()
@@ -116,22 +103,26 @@ func TestSegmentDrain_NoPressure(t *testing.T) {
 	require.True(t, found)
 	segID := item.SegmentID
 
-	// Delete 50% of items — segment has waste, but insufficient disk pressure.
+	// Delete 50% of items — segment has waste, but insufficient pressure.
 	for i := range numItems / 2 {
 		require.NoError(t, cache.Delete(keys[i]))
 	}
 
 	// Create segments to push past cooling.
-	drainFillers(t, cache, cache.MaxCachedSlabs+index.CoolingPeriodMargin+1)
+	for i := range cache.MaxCachedSlabs + index.CoolingPeriodMargin + 1 {
+		key := fmt.Appendf(nil, "filler-%04d", i)
+		require.NoError(t, cache.Put(key, make([]byte, 200_000)))
+		cache.Drain()
+	}
 
-	// Run drain — should be a no-op (disk well within threshold).
+	// Run drain — should be a no-op (waste well within allowance).
 	err = cache.maybeDrainSegments()
 	require.NoError(t, err)
 
 	// Verify: segment file still exists.
 	segPath := getSegmentPath(cache.Path, cache.Shards, segID)
 	_, err = os.Stat(segPath)
-	require.NoError(t, err, "segment file should still exist (no disk pressure)")
+	require.NoError(t, err, "segment file should still exist (no waste pressure)")
 
 	// Verify: live items still accessible.
 	for i := numItems / 2; i < numItems; i++ {
@@ -141,14 +132,14 @@ func TestSegmentDrain_NoPressure(t *testing.T) {
 }
 
 // TestSegmentDrain_CoolingPeriod verifies that recent segments are not drained
-// even under disk pressure.
+// even under waste pressure.
 func TestSegmentDrain_CoolingPeriod(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	cache, err := New(tmpDir,
 		WithMaxCachedSlabs(0),
 		WithWriteBufferSize(1<<20),
-		WithMaxSize(1<<20), // 1MB — drain threshold = 1.5MB, immediate pressure
+		WithMaxSize(1<<20), // 1MB — waste allowance = 512KB, immediate pressure
 	)
 	require.NoError(t, err)
 	cache.Start()
@@ -185,8 +176,14 @@ func TestSegmentDrain_CoolingPeriod(t *testing.T) {
 	_, err = os.Stat(segPath)
 	require.NoError(t, err, "segment file should still exist (within cooling period)")
 
-	// Now create enough segments to push past cooling period + disk pressure.
-	drainFillers(t, cache, drainFillersNeeded(cache))
+	// Now create enough segments to push past cooling period.
+	// Use unique keys so filler segments stay populated.
+	coolingFillers := cache.MaxCachedSlabs + index.CoolingPeriodMargin + 1
+	for i := range max(coolingFillers, 4) {
+		key := fmt.Appendf(nil, "filler-%04d", i)
+		require.NoError(t, cache.Put(key, make([]byte, 200_000)))
+		cache.Drain()
+	}
 
 	// Run drain again — now should drain the sparse segment.
 	err = cache.maybeDrainSegments()
@@ -233,8 +230,13 @@ func TestSegmentDrain_WALModeSkipped(t *testing.T) {
 		require.NoError(t, cache.Delete(keys[i]))
 	}
 
-	// Create enough segments to push past cooling + disk pressure.
-	drainFillers(t, cache, drainFillersNeeded(cache))
+	// Create enough segments to push past cooling AND waste pressure.
+	coolingFillers := cache.MaxCachedSlabs + index.CoolingPeriodMargin + 1
+	for i := range max(coolingFillers, 4) {
+		key := fmt.Appendf(nil, "filler-%04d", i)
+		require.NoError(t, cache.Put(key, make([]byte, 200_000)))
+		cache.Drain()
+	}
 
 	// In WAL mode, maintenanceWorker skips drain (Phase 3 is guarded by c.wal == nil).
 	// We verify the segment file is still present.

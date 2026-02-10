@@ -231,132 +231,11 @@ func (idx *DurableIndex) AddSegment(segmentID uint32, items []Item) {
 	}
 }
 
-// Evict finds the coldest item via SIEVE (the "anchor") and then expands
-// spatially to co-evict physically adjacent items in the same segment.
-//
-// Returns at least 1 item (the anchor) unless the index is empty.
-// All returned items belong to the same segment, sorted by ascending offset.
-//
-// Spatial expansion reads the segment's .meta manifest (small buffered I/O,
-// typically kernel page-cache hot) and walks outward from the anchor's offset
-// in BOTH directions (lower and higher offsets), choosing the closer neighbor
-// at each step to keep the hole as contiguous as possible. Each candidate is
-// verified and removed atomically via deleteIfAt (no TOCTOU race).
-//
-// Bystanders may be warm or hot — they are evicted only because they are
-// physically adjacent to the cold anchor. maxBystanderBytes limits the blast
-// radius of this "innocent bystander" eviction. Set to 0 to disable spatial
-// expansion (pure SIEVE, anchor only).
-//
-// Persistence sync (tombstones) is the caller's responsibility.
-func (idx *DurableIndex) Evict(targetBytes int64, maxBystanderBytes int64) []Item {
-	// 1. Find anchor via SIEVE — single coldest item, removed from RAM.
-	anchors := idx.blobs.EvictBatch(1)
-	if len(anchors) == 0 {
-		return nil
-	}
-	anchor := anchors[0]
-	result := []Item{anchor}
-
-	budget := min(targetBytes-int64(anchor.PhysicalLen), maxBystanderBytes)
-	if budget <= 0 {
-		return result
-	}
-
-	// 2. Read segment manifest for spatial expansion.
-	// Check in-memory cache first (no disk I/O in steady state).
-	var manifestItems []Item
-	if m, ok := idx.segments.getInMemoryManifest(anchor.SegmentID); ok {
-		manifestItems = make([]Item, len(m.Entries))
-		for i := range m.Entries {
-			manifestItems[i] = footerEntryToItem(m.SegmentID, &m.Entries[i])
-		}
-	} else {
-		manifest, err := idx.segments.readMetaFile(anchor.SegmentID)
-		if err != nil || len(manifest.Items) == 0 {
-			return result
-		}
-		manifestItems = manifest.Items
-	}
-	if len(manifestItems) == 0 {
-		return result // Manifest unavailable — return anchor only
-	}
-
-	// 3. Walk manifest items outward from anchor, co-evicting bystanders.
-	result = idx.expandEviction(result, manifestItems, anchor, budget)
-	return result
-}
-
-// expandEviction walks the manifest items outward in both directions from
-// the anchor's physical offset, atomically removing verified bystanders.
-//
-// The walk alternates between lower and higher neighbors, always picking
-// the one closer to the anchor in offset space. This keeps the resulting
-// hole as contiguous as possible. Items already evicted, relocated, or
-// overwritten are skipped via deleteIfAt (atomic verify-and-remove under
-// shard lock — no TOCTOU race).
-//
-// bystanderBudget is the remaining byte budget for bystanders only (does
-// not include the anchor).
-func (idx *DurableIndex) expandEviction(
-	result []Item, manifestItems []Item, anchor Item,
-	bystanderBudget int64,
-) []Item {
-	anchorOff := int64(anchor.Offset)
-
-	// Find anchor's position in the manifest (items are sorted by offset).
-	anchorIdx := -1
-	for i := range manifestItems {
-		if manifestItems[i].Offset == anchor.Offset && manifestItems[i].Key == anchor.Key {
-			anchorIdx = i
-			break
-		}
-	}
-	if anchorIdx < 0 {
-		return result
-	}
-
-	// Walk outward: lo scans lower offsets, hi scans higher offsets.
-	lo, hi := anchorIdx-1, anchorIdx+1
-
-	for bystanderBudget > 0 && (lo >= 0 || hi < len(manifestItems)) {
-		// Pick the closer candidate (prefer forward on tie to extend contiguous run).
-		var pick int
-		switch {
-		case lo < 0:
-			pick = hi
-			hi++
-		case hi >= len(manifestItems):
-			pick = lo
-			lo--
-		default:
-			distLo := anchorOff - int64(manifestItems[lo].Offset)
-			distHi := int64(manifestItems[hi].Offset) - anchorOff
-			if distHi <= distLo {
-				pick = hi
-				hi++
-			} else {
-				pick = lo
-				lo--
-			}
-		}
-
-		mi := &manifestItems[pick]
-		if mi.IsDeleted() {
-			continue
-		}
-
-		// Atomic verify-and-remove: checks (SegmentID, Offset) match under shard lock.
-		evicted, ok := idx.blobs.deleteIfAt(mi.Key, anchor.SegmentID, mi.Offset)
-		if !ok {
-			continue // Already evicted, relocated, or overwritten
-		}
-
-		result = append(result, evicted)
-		bystanderBudget -= int64(evicted.PhysicalLen)
-	}
-
-	return result
+// Evict selects cold items via SIEVE and removes them from the RAM index.
+// Returns evicted items (may span multiple segments). The caller is responsible
+// for persisting tombstones and updating segment metadata.
+func (idx *DurableIndex) Evict(targetBytes int64) []Item {
+	return idx.blobs.EvictBatch(targetBytes)
 }
 
 // DrainSegment atomically removes all live items belonging to a segment from
@@ -611,16 +490,11 @@ func (idx *DurableIndex) CompactTombstones(segID uint32) error {
 	return idx.segments.compactTombstones(segID)
 }
 
-// GetMergeCompactionCandidates returns segments that have crossed the given waste
-// ratio threshold and have cooled past the given boundary.
-//
-// The wasteThreshold is dynamic (see dynamicMergeThreshold in compaction_policy.go):
-// larger blobs tolerate more waste before triggering a merge.
-//
-// This is O(K) where K is the number of pending candidates, avoiding O(N) scan
-// of all segments. Returns candidates sorted by segment ID for deterministic processing.
-func (idx *DurableIndex) GetMergeCompactionCandidates(maxEligibleID uint32, wasteThreshold float64) []SparseSegment {
-	return idx.segments.getMergeCompactionCandidates(maxEligibleID, wasteThreshold)
+// GetDrainCandidates returns all cooled segments (ID < maxEligibleID) sorted
+// by LiveBytes ascending (least populated first). Used by pressure-driven drain
+// to pick the cheapest segments to sacrifice.
+func (idx *DurableIndex) GetDrainCandidates(maxEligibleID uint32) []SparseSegment {
+	return idx.segments.getDrainCandidates(maxEligibleID)
 }
 
 // VerifyNoSegmentsInRange checks that no segments exist in the open interval (startID, endID).

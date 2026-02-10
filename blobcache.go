@@ -166,11 +166,6 @@ func New(path string, opts ...Option) (*Cache, error) {
 		opt.apply(&cfg)
 	}
 
-	// Apply derived defaults that depend on other config values.
-	if cfg.MaxBystanderBytes == 0 {
-		cfg.MaxBystanderBytes = cfg.WriteBufferSize / 8
-	}
-
 	// Iterative open with hard limit of 2 attempts:
 	// - Attempt 1: If WAL exists, recover it, flush to segments, close, restart
 	// - Attempt 2: Should be clean (no WAL). If WAL still exists, fail.
@@ -885,10 +880,9 @@ func (c *Cache) maintenanceWorker() {
 
 // runEvictionSieve evicts blobs using Sieve algorithm until under size limit.
 //
-// Each iteration: SIEVE picks a cold anchor, co-evicts physically adjacent
-// bystanders (spatial expansion), commits tombstones, and updates segment
-// metadata. Physical space is NOT reclaimed here — segments with enough
-// dead items will be retired and deleted entirely (segment drain).
+// Each iteration: SIEVE selects cold items, commits tombstones, and updates
+// segment metadata. Physical space is NOT reclaimed here — pressure-driven
+// drain retires and deletes sparse segment files.
 func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
 	evictionStart := time.Now()
 
@@ -916,24 +910,31 @@ func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
 	)
 
 	for evictedBytes < toEvictBytes {
-		// 1. SELECT — SIEVE anchor + spatial bystanders (single segment).
-		batch := c.index.Evict(toEvictBytes-evictedBytes, c.MaxBystanderBytes)
+		batch := c.index.Evict(toEvictBytes - evictedBytes)
 		if len(batch) == 0 {
 			break
 		}
 
-		// 2. COMMIT — persist tombstones for this batch.
 		if err := c.index.DeleteBlobs(batch...); err != nil {
 			return fmt.Errorf("eviction durability sync failed: %w", err)
 		}
 
-		// Update segment metadata (all items are same segment).
-		segID := batch[0].SegmentID
+		// Group by segment and update metadata.
+		segStats := make(map[uint32]struct {
+			count int32
+			bytes int64
+		})
 		var batchBytes int64
 		for _, v := range batch {
+			s := segStats[v.SegmentID]
+			s.count++
+			s.bytes += int64(v.PhysicalLen)
+			segStats[v.SegmentID] = s
 			batchBytes += int64(v.PhysicalLen)
 		}
-		c.index.UpdateSegmentOnDelete(segID, int32(len(batch)), batchBytes)
+		for segID, s := range segStats {
+			c.index.UpdateSegmentOnDelete(segID, s.count, s.bytes)
+		}
 
 		evictedBytes += batchBytes
 		evictedCount += len(batch)
@@ -1004,22 +1005,28 @@ func (c *Cache) selectSegmentsForTombstoneCompaction() []uint32 {
 	return c.index.GetTombstoneCompactionCandidates(maxEligibleID)
 }
 
-// maxDrainsPerCycle caps the number of segments drained in one maintenance pass.
-// Limits the burst of cache misses from draining too many segments at once.
-const maxDrainsPerCycle = 4
-
-// maybeDrainSegments identifies sparse segments (mostly dead items) and removes
-// them entirely: force-evict remaining live items from RAM, close FDs, delete files.
+// maybeDrainSegments is pressure-driven disk reclamation for cache mode.
+// When the estimated on-disk footprint exceeds MaxSize, it drains the least
+// populated segments (force-evict remaining live items, delete segment files)
+// until the excess is resolved.
 //
-// This is cache mode's zero-write-amplification space reclamation: no data is
-// rewritten, the entire segment file is simply deleted. Live items become cache
-// misses — acceptable because they were in 90%+ dead segments anyway.
+// Zero write amplification: no data is rewritten, segment files are simply deleted.
+// Live items become cache misses — acceptable because they are in the sparsest
+// segments (least live data sacrificed per segment deleted).
 func (c *Cache) maybeDrainSegments() error {
-	if c.DrainWasteThreshold <= 0 {
-		return nil // Drain disabled
+	if c.MaxSize <= 0 {
+		return nil // No size limit, no drain needed
 	}
 
-	// Select candidates: cooled segments above waste threshold.
+	// Estimate on-disk footprint: numSegments * WriteBufferSize.
+	segCount := c.index.GetSegmentCount()
+	estimatedDiskBytes := int64(segCount) * c.WriteBufferSize
+	excessBytes := estimatedDiskBytes - c.MaxSize
+	if excessBytes <= 0 {
+		return nil // Disk within budget
+	}
+
+	// Cooling: only drain segments older than Librarian window.
 	currentSegID := c.segIDs.CurrentSegmentID()
 	coolingGap := uint32(c.MaxCachedSlabs + index.CoolingPeriodMargin)
 	if currentSegID <= coolingGap {
@@ -1027,16 +1034,17 @@ func (c *Cache) maybeDrainSegments() error {
 	}
 	maxEligibleID := currentSegID - coolingGap
 
-	candidates := c.index.GetMergeCompactionCandidates(maxEligibleID, c.DrainWasteThreshold)
+	candidates := c.index.GetDrainCandidates(maxEligibleID)
 	if len(candidates) == 0 {
 		return nil
 	}
 
 	var totalDrainedBytes int64
 	var totalDrainedCount int
+	var segmentsDrained int
 
-	for i, seg := range candidates {
-		if i >= maxDrainsPerCycle {
+	for _, seg := range candidates {
+		if excessBytes <= 0 {
 			break
 		}
 
@@ -1057,14 +1065,16 @@ func (c *Cache) maybeDrainSegments() error {
 
 		totalDrainedBytes += drainedBytes
 		totalDrainedCount += drainedCount
+		segmentsDrained++
+		excessBytes -= c.WriteBufferSize
 	}
 
-	if totalDrainedCount > 0 {
+	if segmentsDrained > 0 {
 		c.approxSize.Add(-totalDrainedBytes)
 		c.bloomStats.deletions.Add(int64(totalDrainedCount))
 
 		log.Info("segment drain completed",
-			"segments", min(len(candidates), maxDrainsPerCycle),
+			"segments", segmentsDrained,
 			"drained_items", totalDrainedCount,
 			"drained_mb", totalDrainedBytes/(1024*1024))
 	}

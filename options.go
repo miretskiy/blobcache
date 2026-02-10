@@ -70,22 +70,6 @@ type config struct {
 	TrustHash          bool         // Skip key verification on reads (cache mode optimization)
 	BallastSize        int          // Heap ballast size in bytes (default: 1GB, 0 = disabled)
 
-	// MaxBystanderBytes limits the blast radius of spatial co-eviction per SIEVE
-	// anchor. After SIEVE picks a cold anchor, we co-evict physically adjacent
-	// items up to this byte budget. Bystanders may be warm or hot — they are
-	// evicted only because they are physically adjacent — so this bounds the
-	// cache pollution from "innocent bystander" eviction.
-	//
-	// Default: WriteBufferSize / 8 (e.g. 8MB for 64MB segments).
-	// Set to 0 to disable spatial expansion (pure SIEVE, no bystanders).
-	MaxBystanderBytes int64
-
-	// DrainWasteThreshold is the minimum waste ratio for a segment to be eligible
-	// for drain (cache mode only). At 0.90, a segment must be 90% dead before
-	// drain considers it — sacrificing at most 10% of its items as cache misses.
-	// Set to 0 to disable segment drain. Default: 0.90.
-	DrainWasteThreshold float64
-
 	knobs *TestingKnobs
 }
 
@@ -234,37 +218,20 @@ func WithBallast(size int) Option {
 	return funcOpt(func(c *config) { c.BallastSize = max(0, size) })
 }
 
-// WithMaxBystanderBytes sets the byte budget for spatial co-eviction per anchor.
-// After SIEVE picks a cold victim, adjacent items up to this many bytes are
-// co-evicted to create contiguous holes instead of "Swiss cheese" fragmentation.
-// Default: WriteBufferSize / 8. Set to 0 to disable spatial expansion.
-func WithMaxBystanderBytes(bytes int64) Option {
-	return funcOpt(func(c *config) { c.MaxBystanderBytes = bytes })
-}
-
-// WithDrainWasteThreshold sets the waste ratio threshold for segment drain.
-// Cache mode only: segments with waste ratio >= this threshold are eligible for
-// drain (force-evict remaining live items and delete the segment file).
-// Default: 0.90. Set to 0 to disable segment drain.
-func WithDrainWasteThreshold(threshold float64) Option {
-	return funcOpt(func(c *config) { c.DrainWasteThreshold = threshold })
-}
-
 func defaultConfig(path string) config {
 	return config{
-		Path:                path,
-		MaxSize:             0,
-		Shards:              0,
-		WriteBufferSize:     64 << 20, // 64MB
-		MaxInflightSlabs:    6,
-		MaxCachedSlabs:      8, // Keep ~1GB of recently written data in RAM
-		FlushConcurrency:    2,
-		BloomFPRate:         0.01,
-		BloomEstimatedKeys:  1_000_000,
-		DegradedMode:        DegradedMemoryOnly,
-		TrustHash:           true,    // Cache mode: trust hash, skip key verification
-		BallastSize:         1 << 30, // 1GB heap ballast to reduce GC frequency
-		DrainWasteThreshold: 0.90,    // Drain segments that are 90%+ dead (cache mode only)
+		Path:               path,
+		MaxSize:            0,
+		Shards:             0,
+		WriteBufferSize:    64 << 20, // 64MB
+		MaxInflightSlabs:   6,
+		MaxCachedSlabs:     8, // Keep ~1GB of recently written data in RAM
+		FlushConcurrency:   2,
+		BloomFPRate:        0.01,
+		BloomEstimatedKeys: 1_000_000,
+		DegradedMode:       DegradedMemoryOnly,
+		TrustHash:          true,    // Cache mode: trust hash, skip key verification
+		BallastSize:        1 << 30, // 1GB heap ballast to reduce GC frequency
 		IO: IOConfig{
 			FDataSync:     false,
 			Fadvise:       sys.UseFadvise,

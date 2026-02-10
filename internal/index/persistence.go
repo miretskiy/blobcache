@@ -116,7 +116,7 @@ type metaFile struct {
 //	    increment the counter without deadlock.
 //
 //	Tier 2: segments.RWMutex — registry metadata protection.
-//	  - Guards byID, sorted, and pendingMerge.
+//	  - Guards byID, sorted, and pendingTombstone.
 //	  - Hold time: microseconds (in-memory map/slice operations only).
 //
 //	Rule: these tiers are independent. Code must NEVER hold a segments lock
@@ -140,7 +140,6 @@ type persistence struct {
 	// Design for O(1) operations:
 	// - byID: O(1) lookup by segment ID
 	// - sorted: O(1) oldest segment lookup, re-sorted only on add/remove
-	// - pendingMerge: O(1) merge compaction candidate retrieval
 	segments struct {
 		sync.RWMutex
 
@@ -151,10 +150,9 @@ type persistence struct {
 		// Re-sorted only when segments are added or removed (rare).
 		sorted []*SegmentMetadata
 
-		// Lazy compaction candidate tracking for O(1) retrieval.
-		// Populated during updateSegmentOnDelete() when thresholds are crossed.
+		// Lazy tombstone compaction candidate tracking.
+		// Populated during updateSegmentOnDelete() when threshold is crossed.
 		pendingTombstone map[uint32]struct{} // tombstones >= TombstoneCompactionThreshold
-		pendingMerge     map[uint32]struct{} // waste ratio >= MergeWasteRatioThreshold
 
 		// Incremental counters for O(1) global avg blob size.
 		// Updated by registerSegment, unregisterSegment(s), updateSegmentOnDelete.
@@ -168,13 +166,6 @@ type persistence struct {
 // updateSegmentOnDelete() are added to the pending compaction set.
 const TombstoneCompactionThreshold = 100
 
-// MergeWasteRatioThreshold is the floor for merge compaction candidate tracking.
-// Segments crossing this threshold are added to pendingMerge for consideration.
-// The actual merge decision uses a dynamic threshold from dynamicMergeThreshold()
-// which varies by blob size (0.65 for large blobs, 0.90 for small blobs).
-// This floor must be <= the minimum possible dynamic threshold.
-const MergeWasteRatioThreshold = 0.60
-
 // CoolingPeriodMargin adds safety margin to the cooling period.
 // This ensures segments are fully aged out of Librarian before compaction.
 const CoolingPeriodMargin = 2
@@ -186,7 +177,6 @@ func newPersistence(basePath string, shards int) (*persistence, error) {
 	}
 	p.segments.byID = make(map[uint32]*SegmentMetadata)
 	p.segments.pendingTombstone = make(map[uint32]struct{})
-	p.segments.pendingMerge = make(map[uint32]struct{})
 	return p, nil
 }
 
@@ -1011,7 +1001,6 @@ func (p *persistence) unregisterSegment(segID uint32) {
 	}
 
 	delete(p.segments.pendingTombstone, segID)
-	delete(p.segments.pendingMerge, segID)
 }
 
 // unregisterSegments removes multiple segments from the registry atomically.
@@ -1034,7 +1023,6 @@ func (p *persistence) unregisterSegments(segIDs []uint32) {
 			delete(p.segments.byID, id)
 		}
 		delete(p.segments.pendingTombstone, id)
-		delete(p.segments.pendingMerge, id)
 	}
 
 	// Filter sorted slice in place - preserves sorted order
@@ -1049,7 +1037,7 @@ func (p *persistence) unregisterSegments(segIDs []uint32) {
 }
 
 // updateSegmentOnDelete updates a segment's metadata after items are deleted.
-// Called during eviction or explicit delete to track merge compaction candidates.
+// Called during eviction or explicit delete to track tombstone compaction candidates.
 func (p *persistence) updateSegmentOnDelete(segID uint32, deletedCount int32, deletedBytes int64) {
 	p.segments.Lock()
 	defer p.segments.Unlock()
@@ -1060,7 +1048,6 @@ func (p *persistence) updateSegmentOnDelete(segID uint32, deletedCount int32, de
 	}
 
 	wasAboveTombstoneThreshold := entry.TombstoneCount >= TombstoneCompactionThreshold
-	wasAboveMergeThreshold := entry.WasteRatio() >= MergeWasteRatioThreshold
 
 	entry.TombstoneCount += deletedCount
 	entry.LiveItemCount -= deletedCount
@@ -1070,10 +1057,6 @@ func (p *persistence) updateSegmentOnDelete(segID uint32, deletedCount int32, de
 
 	if !wasAboveTombstoneThreshold && entry.TombstoneCount >= TombstoneCompactionThreshold {
 		p.segments.pendingTombstone[segID] = struct{}{}
-	}
-
-	if !wasAboveMergeThreshold && entry.WasteRatio() >= MergeWasteRatioThreshold {
-		p.segments.pendingMerge[segID] = struct{}{}
 	}
 }
 
@@ -1113,62 +1096,32 @@ func (p *persistence) acknowledgeTombstoneCompaction(segID uint32) {
 	delete(p.segments.pendingTombstone, segID)
 }
 
-// SparseSegment represents a segment that has crossed the merge waste ratio threshold.
+// SparseSegment represents a drain candidate with its remaining live data.
 type SparseSegment struct {
 	ID        uint32
 	LiveBytes int64
 }
 
-// getMergeCompactionCandidates returns segments that have crossed the waste ratio
-// threshold and have cooled past the given boundary.
-//
-// This is O(K) where K is the number of pending candidates, not O(N) where N is
-// total segments. Candidates are removed from the pending set after retrieval;
-// they'll be re-added if their waste ratio increases again.
-//
-// Returns candidates sorted by segment ID ascending for deterministic processing.
-func (p *persistence) getMergeCompactionCandidates(maxEligibleID uint32, wasteThreshold float64) []SparseSegment {
-	// Phase 1: Read under RLock — allows concurrent updateSegmentOnDelete.
+// getDrainCandidates returns all cooled segments (ID < maxEligibleID) sorted
+// by LiveBytes ascending (least populated first). Used by pressure-driven drain
+// to pick the cheapest segments to sacrifice.
+func (p *persistence) getDrainCandidates(maxEligibleID uint32) []SparseSegment {
 	p.segments.RLock()
-	if len(p.segments.pendingMerge) == 0 {
-		p.segments.RUnlock()
-		return nil
-	}
+	defer p.segments.RUnlock()
 
 	var candidates []SparseSegment
-	var consumed []uint32
-	for segID := range p.segments.pendingMerge {
+	for segID, meta := range p.segments.byID {
 		if segID >= maxEligibleID {
 			continue
 		}
-		entry, ok := p.segments.byID[segID]
-		if !ok {
-			consumed = append(consumed, segID) // stale entry
-			continue
-		}
-		if entry.WasteRatio() >= wasteThreshold {
-			candidates = append(candidates, SparseSegment{
-				ID:        segID,
-				LiveBytes: entry.LiveBytes,
-			})
-			consumed = append(consumed, segID)
-		}
-		// If segment doesn't pass dynamic threshold yet, leave in pending
-		// for re-evaluation next cycle (waste may increase further).
-	}
-	p.segments.RUnlock()
-
-	// Phase 2: Brief exclusive lock to remove consumed entries.
-	if len(consumed) > 0 {
-		p.segments.Lock()
-		for _, id := range consumed {
-			delete(p.segments.pendingMerge, id)
-		}
-		p.segments.Unlock()
+		candidates = append(candidates, SparseSegment{
+			ID:        segID,
+			LiveBytes: meta.LiveBytes,
+		})
 	}
 
 	sort.Slice(candidates, func(i, j int) bool {
-		return candidates[i].ID < candidates[j].ID
+		return candidates[i].LiveBytes < candidates[j].LiveBytes
 	})
 
 	return candidates

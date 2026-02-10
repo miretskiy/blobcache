@@ -431,12 +431,12 @@ func startSystemMonitor(
 				freeGB := float64(usage.Free) / (1 << 30)
 
 				// 6. Cache accounting
-				writtenGB := float64(logicalWriteBytes.Load()) / (1 << 30)
 				onDiskGB := float64(physicalSize) / (1 << 30)
 				liveGB := float64(liveSizeBytes.Load()) / (1 << 30)
-				diskRatio := 0.0
-				if writtenGB > 0 {
-					diskRatio = onDiskGB / writtenGB
+				wasteGB := onDiskGB - liveGB
+				wastePct := 0.0
+				if onDiskGB > 0 {
+					wastePct = wasteGB / onDiskGB * 100
 				}
 
 				// 7. Hit/Miss accounting
@@ -456,11 +456,11 @@ func startSystemMonitor(
 				fmt.Printf("\n[HEARTBEAT %s]\n"+
 					"  MEM:   RSS: %.2fGB\n"+
 					"  DISK:  IO Depth: %.2f | Phys-Read: %.2f GB/s | Phys-Write: %.2f GB/s | Free: %.1fGB\n"+
-					"  CACHE: Written: %.2fGB | OnDisk: %.2fGB | Live: %.2fGB | Ratio: %.2f\n"+
+					"  CACHE: OnDisk: %.2fGB | Live: %.2fGB | Waste: %.2fGB (%.1f%%)\n"+
 					"  TPUT:  Log-Write: %.2f GB/s | Log-Read: %.2f GB/s\n"+
 					"  READS: %.0f/s total | %.0f/s hits | %.0f/s misses | HitRate: %.1f%%\n",
 					time.Now().Format("15:04:05"), rss, currentQD, physReadTP, physWriteTP, freeGB,
-					writtenGB, onDiskGB, liveGB, diskRatio,
+					onDiskGB, liveGB, wasteGB, wastePct,
 					logWriteTP, logReadTP,
 					readsPerSec, hitsPerSec, missesPerSec, hitRate)
 
@@ -555,7 +555,7 @@ func BenchmarkEviction_SieveVictimSelection(b *testing.B) {
 
 	var totalBytes int64
 	for i := 0; i < b.N; i++ {
-		victims := idx.Evict(1, 0) // Anchor only, no bystanders — pure SIEVE speed
+		victims := idx.Evict(1) // Pure SIEVE speed
 		if len(victims) == 0 {
 			b.Fatalf("Eviction failed at %d/%d: empty", i, b.N)
 		}

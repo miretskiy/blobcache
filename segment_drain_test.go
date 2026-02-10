@@ -10,15 +10,15 @@ import (
 	"github.com/zeebo/xxh3"
 )
 
-// TestSegmentDrain_Basic validates the full segment drain flow in cache mode:
-// write items, delete 90%+, drain sparse segments, verify cleanup.
+// TestSegmentDrain_Basic validates the full pressure-driven drain flow:
+// when on-disk footprint exceeds MaxSize, drain the sparsest segments.
 func TestSegmentDrain_Basic(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	cache, err := New(tmpDir,
-		WithMaxCachedSlabs(0),         // Force disk path
-		WithDrainWasteThreshold(0.90), // Drain segments that are 90%+ dead
-		WithWriteBufferSize(1<<20),    // 1MB segments for faster testing
+		WithMaxCachedSlabs(0),      // Force disk path
+		WithWriteBufferSize(1<<20), // 1MB segments for faster testing
+		WithMaxSize(5<<20),         // 5MB — creates pressure after ~5 segments
 	)
 	require.NoError(t, err)
 	cache.Start()
@@ -40,18 +40,23 @@ func TestSegmentDrain_Basic(t *testing.T) {
 	require.True(t, found)
 	segID := item.SegmentID
 
-	// Delete 19 of 20 items (95% waste → above 90% threshold).
+	// Delete 19 of 20 items — makes this segment the sparsest (~40KB live).
 	for i := 1; i < numItems; i++ {
 		require.NoError(t, cache.Delete(keys[i]))
 	}
 
-	// Create several more segments to push the target segment past cooling period.
-	for range cache.MaxCachedSlabs + index.CoolingPeriodMargin + 1 {
+	// Create enough segments to satisfy BOTH cooling period AND disk pressure.
+	// Cooling: currentSegID - coolingGap > segID (need enough segments to age past cooling).
+	// Pressure: numSegments * WriteBufferSize > MaxSize (need enough for disk to exceed budget).
+	coolingFillers := cache.MaxCachedSlabs + index.CoolingPeriodMargin + 1
+	pressureFillers := int(cache.MaxSize/cache.WriteBufferSize) // already have 1 segment
+	fillers := max(coolingFillers, pressureFillers)
+	for range fillers {
 		require.NoError(t, cache.Put([]byte("filler"), make([]byte, 200_000)))
 		cache.Drain()
 	}
 
-	// Run drain directly.
+	// Run drain directly — disk pressure should trigger drain of sparsest segment.
 	err = cache.maybeDrainSegments()
 	require.NoError(t, err)
 
@@ -69,15 +74,15 @@ func TestSegmentDrain_Basic(t *testing.T) {
 	require.False(t, found, "drained item should be removed from RAM index")
 }
 
-// TestSegmentDrain_BelowThreshold verifies drain is a no-op for segments below
-// the waste threshold.
-func TestSegmentDrain_BelowThreshold(t *testing.T) {
+// TestSegmentDrain_NoPressure verifies drain is a no-op when on-disk footprint
+// is within MaxSize (no disk pressure).
+func TestSegmentDrain_NoPressure(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	cache, err := New(tmpDir,
 		WithMaxCachedSlabs(0),
-		WithDrainWasteThreshold(0.90),
 		WithWriteBufferSize(1<<20),
+		WithMaxSize(100<<20), // 100MB — no pressure with a few 1MB segments
 	)
 	require.NoError(t, err)
 	cache.Start()
@@ -88,7 +93,7 @@ func TestSegmentDrain_BelowThreshold(t *testing.T) {
 	value := make([]byte, 40_000)
 	keys := make([][]byte, numItems)
 	for i := range numItems {
-		keys[i] = fmt.Appendf(nil, "below-key-%04d", i)
+		keys[i] = fmt.Appendf(nil, "nopressure-key-%04d", i)
 		require.NoError(t, cache.Put(keys[i], value))
 	}
 	cache.Drain()
@@ -99,7 +104,7 @@ func TestSegmentDrain_BelowThreshold(t *testing.T) {
 	require.True(t, found)
 	segID := item.SegmentID
 
-	// Delete only 50% of items (below 90% threshold).
+	// Delete 50% of items — segment has waste, but no disk pressure.
 	for i := range numItems / 2 {
 		require.NoError(t, cache.Delete(keys[i]))
 	}
@@ -110,14 +115,14 @@ func TestSegmentDrain_BelowThreshold(t *testing.T) {
 		cache.Drain()
 	}
 
-	// Run drain — should be a no-op (50% waste < 90% threshold).
+	// Run drain — should be a no-op (no disk pressure).
 	err = cache.maybeDrainSegments()
 	require.NoError(t, err)
 
 	// Verify: segment file still exists.
 	segPath := getSegmentPath(cache.Path, cache.Shards, segID)
 	_, err = os.Stat(segPath)
-	require.NoError(t, err, "segment file should still exist (below threshold)")
+	require.NoError(t, err, "segment file should still exist (no disk pressure)")
 
 	// Verify: live items still accessible.
 	for i := numItems / 2; i < numItems; i++ {
@@ -127,14 +132,14 @@ func TestSegmentDrain_BelowThreshold(t *testing.T) {
 }
 
 // TestSegmentDrain_CoolingPeriod verifies that recent segments are not drained
-// even if they exceed the waste threshold.
+// even under disk pressure.
 func TestSegmentDrain_CoolingPeriod(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	cache, err := New(tmpDir,
 		WithMaxCachedSlabs(0),
-		WithDrainWasteThreshold(0.90),
 		WithWriteBufferSize(1<<20),
+		WithMaxSize(1<<20), // 1MB — immediate pressure after first segment
 	)
 	require.NoError(t, err)
 	cache.Start()
@@ -171,8 +176,11 @@ func TestSegmentDrain_CoolingPeriod(t *testing.T) {
 	_, err = os.Stat(segPath)
 	require.NoError(t, err, "segment file should still exist (within cooling period)")
 
-	// Now create enough segments to push past cooling period.
-	for range cache.MaxCachedSlabs + index.CoolingPeriodMargin + 1 {
+	// Now create enough segments to push past cooling period AND disk pressure.
+	coolingFillers := cache.MaxCachedSlabs + index.CoolingPeriodMargin + 1
+	pressureFillers := int(cache.MaxSize/cache.WriteBufferSize) // already have 1 segment
+	fillers := max(coolingFillers, pressureFillers)
+	for range fillers {
 		require.NoError(t, cache.Put([]byte("filler"), make([]byte, 200_000)))
 		cache.Drain()
 	}
@@ -194,8 +202,8 @@ func TestSegmentDrain_WALModeSkipped(t *testing.T) {
 	cache, err := New(tmpDir,
 		WithWAL(),
 		WithMaxCachedSlabs(0),
-		WithDrainWasteThreshold(0.90),
 		WithWriteBufferSize(1<<20),
+		WithMaxSize(5<<20),
 	)
 	require.NoError(t, err)
 	cache.Start()
@@ -222,8 +230,11 @@ func TestSegmentDrain_WALModeSkipped(t *testing.T) {
 		require.NoError(t, cache.Delete(keys[i]))
 	}
 
-	// Create segments to push past cooling.
-	for range cache.MaxCachedSlabs + index.CoolingPeriodMargin + 1 {
+	// Create enough segments to push past cooling AND disk pressure.
+	coolingFillers := cache.MaxCachedSlabs + index.CoolingPeriodMargin + 1
+	pressureFillers := int(cache.MaxSize/cache.WriteBufferSize)
+	fillers := max(coolingFillers, pressureFillers)
+	for range fillers {
 		require.NoError(t, cache.Put([]byte("filler"), make([]byte, 200_000)))
 		cache.Drain()
 	}
@@ -237,54 +248,4 @@ func TestSegmentDrain_WALModeSkipped(t *testing.T) {
 	// Live item should still be accessible.
 	_, ok := cache.Get(keys[0])
 	require.True(t, ok, "live item should still be readable in WAL mode")
-}
-
-// TestSegmentDrain_Disabled verifies drain is skipped when threshold is 0.
-func TestSegmentDrain_Disabled(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	cache, err := New(tmpDir,
-		WithMaxCachedSlabs(0),
-		WithDrainWasteThreshold(0), // Disabled
-		WithWriteBufferSize(1<<20),
-	)
-	require.NoError(t, err)
-	cache.Start()
-	defer cache.Close()
-
-	// Write items.
-	const numItems = 20
-	value := make([]byte, 40_000)
-	keys := make([][]byte, numItems)
-	for i := range numItems {
-		keys[i] = fmt.Appendf(nil, "disabled-key-%04d", i)
-		require.NoError(t, cache.Put(keys[i], value))
-	}
-	cache.Drain()
-
-	// Get segment ID.
-	h := xxh3.Hash128(keys[0])
-	item, found := cache.index.Get(h)
-	require.True(t, found)
-	segID := item.SegmentID
-
-	// Delete 95% of items.
-	for i := 1; i < numItems; i++ {
-		require.NoError(t, cache.Delete(keys[i]))
-	}
-
-	// Create segments to push past cooling.
-	for range cache.MaxCachedSlabs + index.CoolingPeriodMargin + 1 {
-		require.NoError(t, cache.Put([]byte("filler"), make([]byte, 200_000)))
-		cache.Drain()
-	}
-
-	// Run drain — should be a no-op (disabled).
-	err = cache.maybeDrainSegments()
-	require.NoError(t, err)
-
-	// Verify: segment file still exists.
-	segPath := getSegmentPath(cache.Path, cache.Shards, segID)
-	_, err = os.Stat(segPath)
-	require.NoError(t, err, "segment file should still exist (drain disabled)")
 }

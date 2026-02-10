@@ -678,6 +678,11 @@ func (c *Cache) handleStorageError(h Key, e index.Item, err error) {
 }
 
 func (c *Cache) rebuildBloom() error {
+	start := time.Now()
+	prevGhosts := c.bloomStats.ghosts.Load()
+	prevHits := c.bloomStats.hits.Load()
+	prevDeletions := c.bloomStats.deletions.Load()
+
 	newFilter := bloom.New(uint(c.BloomEstimatedKeys), c.BloomFPRate)
 
 	var stopRecording func()
@@ -688,9 +693,11 @@ func (c *Cache) rebuildBloom() error {
 	}
 
 	// Use in-memory index instead of disk scan (avoids "invalid file magic" races)
+	var liveKeys int
 	c.index.ForEachBlob(func(item index.Item) bool {
 		if !item.IsDeleted() {
 			newFilter.AddHash(item.Key)
+			liveKeys++
 		}
 		return true
 	})
@@ -702,9 +709,24 @@ func (c *Cache) rebuildBloom() error {
 		consumeRecording(newFilter.AddHash)
 	}
 
+	// Reset all bloom stats for a clean observation window post-rebuild.
 	c.bloomStats.deletions.Store(0)
+	c.bloomStats.ghosts.Store(0)
+	c.bloomStats.hits.Store(0)
 	now := time.Now()
 	c.bloomStats.lastRebuild.Store(&now)
+
+	observedFPR := 0.0
+	if prevHits > 0 {
+		observedFPR = float64(prevGhosts) / float64(prevHits) * 100
+	}
+	log.Info("bloom filter rebuilt",
+		"duration", time.Since(start),
+		"live_keys", liveKeys,
+		"prev_ghosts", prevGhosts,
+		"prev_hits", prevHits,
+		"prev_deletions", prevDeletions,
+		"observed_fpr_pct", fmt.Sprintf("%.2f", observedFPR))
 
 	return nil
 }

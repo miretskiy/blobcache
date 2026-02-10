@@ -1006,14 +1006,12 @@ func (c *Cache) selectSegmentsForTombstoneCompaction() []uint32 {
 }
 
 // maybeDrainSegments is pressure-driven disk reclamation for cache mode.
-// Drain operates on a DIFFERENT pressure signal than SIEVE eviction:
-//   - SIEVE manages live data size: triggers when approxSize > MaxSize
-//   - Drain manages disk waste: triggers when (diskBytes - liveBytes) > MaxSize/2
+// SIEVE manages which items are live (approxSize > MaxSize triggers eviction).
+// Drain manages disk footprint: when estimated on-disk size exceeds 150% of
+// MaxSize, the sparsest segments are deleted until disk fits within budget.
 //
-// This separation prevents drain from competing with SIEVE. SIEVE runs first,
-// selectively removing cold items. Over time, dead items accumulate as waste in
-// segments. Drain kicks in only when that waste becomes significant (>50% of capacity),
-// deleting the sparsest segments to reclaim disk space.
+// The 1.5x headroom accounts for structural overhead (partially-filled segments,
+// footers, metadata files) that approxSize doesn't track.
 //
 // Zero write amplification: no data is rewritten, segment files are simply deleted.
 // Live items become cache misses — acceptable because they are in the sparsest
@@ -1026,15 +1024,10 @@ func (c *Cache) maybeDrainSegments() error {
 	// Estimate on-disk footprint: numSegments * WriteBufferSize.
 	segCount := c.index.GetSegmentCount()
 	estimatedDiskBytes := int64(segCount) * c.WriteBufferSize
-	liveBytes := c.approxSize.Load()
-
-	// Drain when accumulated waste exceeds 50% of MaxSize.
-	// Example: MaxSize=400GB, live=400GB → drain when disk > 600GB.
-	wasteAllowance := c.MaxSize / 2
-	wasteBytes := estimatedDiskBytes - liveBytes
-	excessBytes := wasteBytes - wasteAllowance
+	drainThreshold := c.MaxSize * 3 / 2
+	excessBytes := estimatedDiskBytes - drainThreshold
 	if excessBytes <= 0 {
-		return nil // Waste within budget
+		return nil // Disk within budget
 	}
 
 	// Cooling: only drain segments older than Librarian window.

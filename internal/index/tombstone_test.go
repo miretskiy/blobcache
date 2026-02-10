@@ -253,3 +253,83 @@ func TestTombstone_Batch(t *testing.T) {
 	}
 	require.Equal(t, numItems/2, deleted, "Should have deleted half the items")
 }
+
+// TestTombstone_CompactTombstones validates tombstone compaction.
+func TestTombstone_CompactTombstones(t *testing.T) {
+	tmpDir := t.TempDir()
+	segDir := filepath.Join(tmpDir, "segments", "0000")
+	require.NoError(t, os.MkdirAll(segDir, 0o755))
+
+	p, err := newPersistence(tmpDir, 1)
+	require.NoError(t, err)
+	defer p.close()
+
+	segID := uint32(1)
+
+	// Write base items
+	items := []Item{
+		{Key: Key{Lo: 1}, SegmentID: segID, Offset: 0, PhysicalLen: 100},
+		{Key: Key{Lo: 2}, SegmentID: segID, Offset: 100, PhysicalLen: 100},
+		{Key: Key{Lo: 3}, SegmentID: segID, Offset: 200, PhysicalLen: 100},
+	}
+	writeTestFooterTS(t, p.metaPath(segID), segID, items)
+
+	// Write tombstones
+	require.NoError(t, p.tombstone(segID, Key{Lo: 1}, nil))
+	require.NoError(t, p.tombstone(segID, Key{Lo: 3}, nil))
+	require.NoError(t, p.flushMetaFile(segID))
+
+	// Compact tombstones
+	err = p.compactTombstones(segID)
+	require.NoError(t, err)
+
+	// Read back - tombstones should be baked into items, no more tombstone batches
+	manifest, err := p.readMetaFile(segID)
+	require.NoError(t, err)
+	require.Len(t, manifest.Items, 3)
+
+	// Items 1 and 3 should be marked deleted
+	require.True(t, manifest.Items[0].IsDeleted())
+	require.False(t, manifest.Items[1].IsDeleted())
+	require.True(t, manifest.Items[2].IsDeleted())
+
+	// Verify the file no longer has tombstone appendages
+	// (file size should equal footer block size)
+	stat, err := os.Stat(p.metaPath(segID))
+	require.NoError(t, err)
+	footerBlockSize, err := findFooterBlockSize(p.metaPath(segID))
+	require.NoError(t, err)
+	require.Equal(t, footerBlockSize, stat.Size(),
+		"after compaction, file should have no tombstone appendages")
+}
+
+// TestTombstone_CompactNoOp validates compaction is a no-op when no tombstones.
+func TestTombstone_CompactNoOp(t *testing.T) {
+	tmpDir := t.TempDir()
+	segDir := filepath.Join(tmpDir, "segments", "0000")
+	require.NoError(t, os.MkdirAll(segDir, 0o755))
+
+	p, err := newPersistence(tmpDir, 1)
+	require.NoError(t, err)
+	defer p.close()
+
+	segID := uint32(1)
+
+	items := []Item{
+		{Key: Key{Lo: 1}, SegmentID: segID, Offset: 0, PhysicalLen: 100},
+	}
+	writeTestFooterTS(t, p.metaPath(segID), segID, items)
+
+	// Get file modification time before compaction
+	statBefore, err := os.Stat(p.metaPath(segID))
+	require.NoError(t, err)
+
+	// Compact with no tombstones — should be a no-op
+	err = p.compactTombstones(segID)
+	require.NoError(t, err)
+
+	// File should not have been rewritten (same size, same content)
+	statAfter, err := os.Stat(p.metaPath(segID))
+	require.NoError(t, err)
+	require.Equal(t, statBefore.Size(), statAfter.Size())
+}

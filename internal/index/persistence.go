@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -150,9 +151,10 @@ type persistence struct {
 		// Re-sorted only when segments are added or removed (rare).
 		sorted []*SegmentMetadata
 
-		// Lazy merge compaction candidate tracking for O(1) retrieval.
-		// Populated during updateSegmentOnDelete() when threshold is crossed.
-		pendingMerge map[uint32]struct{} // waste ratio >= MergeWasteRatioThreshold
+		// Lazy compaction candidate tracking for O(1) retrieval.
+		// Populated during updateSegmentOnDelete() when thresholds are crossed.
+		pendingTombstone map[uint32]struct{} // tombstones >= TombstoneCompactionThreshold
+		pendingMerge     map[uint32]struct{} // waste ratio >= MergeWasteRatioThreshold
 
 		// Incremental counters for O(1) global avg blob size.
 		// Updated by registerSegment, unregisterSegment(s), updateSegmentOnDelete.
@@ -161,6 +163,11 @@ type persistence struct {
 	}
 }
 
+// TombstoneCompactionThreshold is the minimum tombstone count to mark a segment
+// as a tombstone compaction candidate. Segments crossing this threshold during
+// updateSegmentOnDelete() are added to the pending compaction set.
+const TombstoneCompactionThreshold = 100
+
 // MergeWasteRatioThreshold is the floor for merge compaction candidate tracking.
 // Segments crossing this threshold are added to pendingMerge for consideration.
 // The actual merge decision uses a dynamic threshold from dynamicMergeThreshold()
@@ -168,12 +175,17 @@ type persistence struct {
 // This floor must be <= the minimum possible dynamic threshold.
 const MergeWasteRatioThreshold = 0.60
 
+// CoolingPeriodMargin adds safety margin to the cooling period.
+// This ensures segments are fully aged out of Librarian before compaction.
+const CoolingPeriodMargin = 2
+
 func newPersistence(basePath string, shards int) (*persistence, error) {
 	p := &persistence{
 		basePath: basePath,
 		shards:   shards,
 	}
 	p.segments.byID = make(map[uint32]*SegmentMetadata)
+	p.segments.pendingTombstone = make(map[uint32]struct{})
 	p.segments.pendingMerge = make(map[uint32]struct{})
 	return p, nil
 }
@@ -827,6 +839,99 @@ func (p *persistence) scanRange(startSegID, endSegID uint32, fn ScanBatchFn) err
 	return nil
 }
 
+// compactTombstones rewrites the .meta file with tombstones collapsed into footer entries.
+// If there are no tombstone batches (only baked-in deleted items), this is a no-op.
+func (p *persistence) compactTombstones(segID uint32) error {
+	// Flush any pending buffered writes for this segment
+	if v, ok := p.files.Load(segID); ok {
+		mf := v.(*metaFile)
+		mf.mu.Lock()
+		if err := mf.w.Flush(); err != nil {
+			mf.mu.Unlock()
+			return fmt.Errorf("flush pending meta for segment %d: %w", segID, err)
+		}
+		mf.mu.Unlock()
+	}
+
+	path := p.metaPath(segID)
+	stat, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+
+	// Find footer block size
+	footerBlockSize, err := findFooterBlockSize(path)
+	if err != nil {
+		return err
+	}
+
+	// If file size equals footer block size, no tombstone batches exist
+	if stat.Size() == footerBlockSize {
+		return nil // Nothing to compact
+	}
+
+	// Read full manifest with merged tombstones
+	manifest, err := p.readMetaFile(segID)
+	if err != nil {
+		return err
+	}
+
+	// Close file handle if open (we're about to replace the file)
+	if v, ok := p.files.LoadAndDelete(segID); ok {
+		mf := v.(*metaFile)
+		mf.mu.Lock()
+		_ = mf.w.Flush()
+		_ = mf.f.Close()
+		mf.mu.Unlock()
+	}
+
+	// Read original footer to rewrite with updated entries
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	footer, _, err := record.ReadFooterBlock(f, footerBlockSize, int64(segID))
+	if err := f.Close(); err != nil {
+		slog.Warn("close meta file during compaction", "segID", segID, "error", err)
+	}
+	if err != nil {
+		return err
+	}
+
+	// Build tombstone set from merged manifest
+	tombstoneKeys := make(map[Key]struct{})
+	for i := range manifest.Items {
+		if manifest.Items[i].IsDeleted() {
+			tombstoneKeys[manifest.Items[i].Key] = struct{}{}
+		}
+	}
+
+	// Update footer entries with deleted flags
+	for i := range footer.Entries {
+		if _, deleted := tombstoneKeys[footer.Entries[i].Key]; deleted {
+			footer.Entries[i].SetDeleted()
+		}
+	}
+
+	// Rewrite footer block without tombstone appendages
+	buf := record.AppendFooterBlock(nil, footer)
+
+	tmpPath := path + ".compact.tmp"
+	if err := os.WriteFile(tmpPath, buf, 0o644); err != nil {
+		return fmt.Errorf("write compacted meta: %w", err)
+	}
+
+	if err := os.Rename(tmpPath, path); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("rename compacted meta: %w", err)
+	}
+
+	return nil
+}
+
 // dropSegment deletes a segment's .meta file.
 // Used after compaction when segment data has been moved.
 func (p *persistence) dropSegment(segID uint32) error {
@@ -905,6 +1010,7 @@ func (p *persistence) unregisterSegment(segID uint32) {
 		p.segments.sorted = append(p.segments.sorted[:idx], p.segments.sorted[idx+1:]...)
 	}
 
+	delete(p.segments.pendingTombstone, segID)
 	delete(p.segments.pendingMerge, segID)
 }
 
@@ -927,6 +1033,7 @@ func (p *persistence) unregisterSegments(segIDs []uint32) {
 			p.segments.totalLiveItems -= int64(entry.LiveItemCount)
 			delete(p.segments.byID, id)
 		}
+		delete(p.segments.pendingTombstone, id)
 		delete(p.segments.pendingMerge, id)
 	}
 
@@ -952,6 +1059,7 @@ func (p *persistence) updateSegmentOnDelete(segID uint32, deletedCount int32, de
 		return
 	}
 
+	wasAboveTombstoneThreshold := entry.TombstoneCount >= TombstoneCompactionThreshold
 	wasAboveMergeThreshold := entry.WasteRatio() >= MergeWasteRatioThreshold
 
 	entry.TombstoneCount += deletedCount
@@ -960,9 +1068,49 @@ func (p *persistence) updateSegmentOnDelete(segID uint32, deletedCount int32, de
 	p.segments.totalLiveItems -= int64(deletedCount)
 	p.segments.totalLiveBytes -= deletedBytes
 
+	if !wasAboveTombstoneThreshold && entry.TombstoneCount >= TombstoneCompactionThreshold {
+		p.segments.pendingTombstone[segID] = struct{}{}
+	}
+
 	if !wasAboveMergeThreshold && entry.WasteRatio() >= MergeWasteRatioThreshold {
 		p.segments.pendingMerge[segID] = struct{}{}
 	}
+}
+
+// getTombstoneCompactionCandidates returns segment IDs that have crossed the
+// tombstone threshold and have cooled past the given boundary.
+//
+// This is O(K) where K is the number of pending candidates, not O(N) where N is
+// total segments. Candidates are NOT consumed on retrieval; call
+// acknowledgeTombstoneCompaction() after successful compaction to remove them.
+//
+// Returns segment IDs sorted in ascending order for deterministic processing.
+func (p *persistence) getTombstoneCompactionCandidates(maxEligibleID uint32) []uint32 {
+	p.segments.RLock()
+	defer p.segments.RUnlock()
+
+	if len(p.segments.pendingTombstone) == 0 {
+		return nil
+	}
+
+	var candidates []uint32
+	for segID := range p.segments.pendingTombstone {
+		if segID < maxEligibleID {
+			candidates = append(candidates, segID)
+		}
+	}
+
+	slices.Sort(candidates)
+
+	return candidates
+}
+
+// acknowledgeTombstoneCompaction removes a segment from the pending tombstone
+// compaction set after successful compaction.
+func (p *persistence) acknowledgeTombstoneCompaction(segID uint32) {
+	p.segments.Lock()
+	defer p.segments.Unlock()
+	delete(p.segments.pendingTombstone, segID)
 }
 
 // SparseSegment represents a segment that has crossed the merge waste ratio threshold.

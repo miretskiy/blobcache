@@ -12,8 +12,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"golang.org/x/time/rate"
-
 	"github.com/miretskiy/blobcache/base"
 	"github.com/miretskiy/blobcache/bloom"
 	"github.com/miretskiy/blobcache/internal/index"
@@ -55,8 +53,6 @@ type Cache struct {
 	// --- ARCHITECTURE COMPONENTS ---
 	memTable  *MemTable  // The Write Engine (Producer)
 	librarian *Librarian // The Read Cache (Consumer)
-	compactor *Compactor // Segment merge compaction
-
 	// Global monotonic sequence counter for operation ordering.
 	// Initialized to time.Now().UnixNano() for continuity across restarts.
 	// This ensures sequences are always increasing even after crashes,
@@ -76,7 +72,7 @@ type Cache struct {
 	bgError atomic.Pointer[error] // First background error (nil = healthy)
 
 	// Background workers
-	maintenanceTrigger chan struct{} // Capacity 1: trigger eviction + compaction cycle
+	maintenanceTrigger chan struct{} // Capacity 1: trigger eviction cycle
 	stopCh             chan struct{}
 	wg                 sync.WaitGroup
 
@@ -103,7 +99,7 @@ type SequenceVendor interface {
 }
 
 // SegmentIDProvider allocates unique segment IDs.
-// Both MemTable (normal writes) and Compaction use this to avoid conflicts.
+// Used by MemTable to allocate unique segment IDs for flushed slabs.
 type SegmentIDProvider interface {
 	NextSegmentID() uint32
 	CurrentSegmentID() uint32
@@ -264,25 +260,6 @@ func open(cfg config) (*Cache, bool, error) {
 	c.memTable = NewMemTable(c.config, c, c, c.librarian, c.wal, c.segIDs)
 	c.memTable.Knobs = c.Knobs
 
-	// Initialize compactor for segment merge operations
-	ioFlags := sys.SyncNone
-	if cfg.IO.DirectIOWrite {
-		ioFlags |= sys.FlDirectIO
-	}
-	if cfg.IO.FDataSync {
-		ioFlags |= sys.SyncData
-	}
-	c.compactor = NewCompactor(idx, c.segIDs, cfg.Path, cfg.Shards, ioFlags, c.archivist.DropSegmentCache)
-
-	// Token bucket rate limiter for compaction I/O throttling.
-	// Smooths the rate of copy_file_range calls (reflink metadata updates) to
-	// prevent overwhelming the filesystem. Burst = 4MB allows a few records
-	// through instantly but enforces 400 MB/s steady-state across a merge.
-	if cfg.CompactionBandwidth > 0 {
-		burst := 4 << 20 // 4MB — a few records of headroom
-		c.compactor.rateLimiter = rate.NewLimiter(rate.Limit(cfg.CompactionBandwidth), burst)
-	}
-
 	// Run WAL recovery after memtable is initialized
 	var recovered bool
 	if c.wal != nil {
@@ -303,7 +280,7 @@ func open(cfg config) (*Cache, bool, error) {
 	return c, recovered, nil
 }
 
-// Start begins background operations (maintenance worker for eviction + compaction).
+// Start begins background operations (maintenance worker for eviction).
 func (c *Cache) Start() {
 	c.wg.Add(1)
 	go c.maintenanceWorker()
@@ -329,11 +306,6 @@ func (c *Cache) Close() error {
 	c.memTable.ClosePools()
 
 	c.wg.Wait()
-
-	// Release compactor buffer
-	if c.compactor != nil {
-		c.compactor.Close()
-	}
 
 	// Collect all close errors (WAL may be nil if disabled)
 	var walErr error
@@ -653,8 +625,7 @@ type Batcher interface {
 }
 
 // maintenanceSegmentInterval determines how often segment production triggers maintenance.
-// Every N segments, an eviction + compaction check is triggered.
-// Lower value (5) keeps up with high-velocity Sieve by checking merges more often.
+// Every N segments, an eviction check is triggered.
 const maintenanceSegmentInterval = 5
 
 func (c *Cache) PutBatch(segID uint32, entries []record.FooterEntry, _ uint64) error {
@@ -670,8 +641,7 @@ func (c *Cache) PutBatch(segID uint32, entries []record.FooterEntry, _ uint64) e
 	}
 	newSize := c.approxSize.Add(addedBytes)
 
-	// Phase 3: Trigger maintenance (eviction + compaction) when needed
-	// Triggers when: over size limit OR every N segments for compaction
+	// Phase 3: Trigger maintenance (eviction) when needed
 	overSizeLimit := c.MaxSize > 0 && newSize > c.MaxSize
 	segmentInterval := segID%maintenanceSegmentInterval == 0
 
@@ -682,7 +652,7 @@ func (c *Cache) PutBatch(segID uint32, entries []record.FooterEntry, _ uint64) e
 	return nil
 }
 
-// triggerMaintenance signals the background worker to run eviction + compaction.
+// triggerMaintenance signals the background worker to run eviction.
 // Non-blocking: if maintenance is already pending, this is a no-op.
 func (c *Cache) triggerMaintenance() {
 	select {
@@ -792,7 +762,7 @@ func (r *cacheReplayer) ReplayRecord(rec record.Record) error {
 
 	if rec.IsDeleted() {
 		// Replay delete: look up item and mark as tombstone.
-		// No hole punching — merge compaction reclaims space.
+		// No hole punching — evicted items are logically dead.
 		item, found := r.cache.index.Get(h)
 		if found && !item.IsDeleted() {
 			if err := r.cache.index.DeleteBlobs(item); err != nil {
@@ -852,10 +822,9 @@ func (c *Cache) runWALRecovery() (bool, error) {
 	return recovered, nil
 }
 
-// maintenanceWorker handles eviction and compaction in a unified event-driven loop.
+// maintenanceWorker handles eviction and tombstone compaction in an event-driven loop.
 //
-// Event source: maintenanceTrigger fired by PutBatch when over size limit OR every N segments.
-// Cycle: (1) evict if over size, (2) compact sparse segments.
+// Event source: maintenanceTrigger fired by PutBatch when over size limit.
 func (c *Cache) maintenanceWorker() {
 	defer c.wg.Done()
 
@@ -870,10 +839,19 @@ func (c *Cache) maintenanceWorker() {
 				}
 			}
 
-			// Phase 2: Compaction (always check after eviction or segment production)
-			if !c.IsDegraded() {
-				if err := c.maybeMergeSegments(); err != nil {
-					c.ReportError(fmt.Errorf("compaction: %w", err))
+			// Phase 2: Tombstone compaction (WAL/durable mode only)
+			if c.wal != nil && !c.IsDegraded() {
+				if err := c.maybeCompactTombstones(); err != nil {
+					c.ReportError(fmt.Errorf("tombstone compaction: %w", err))
+					return
+				}
+			}
+
+			// Phase 3: Segment drain (cache mode only)
+			if c.wal == nil && !c.IsDegraded() {
+				if err := c.maybeDrainSegments(); err != nil {
+					c.ReportError(fmt.Errorf("segment drain: %w", err))
+					return
 				}
 			}
 
@@ -887,11 +865,8 @@ func (c *Cache) maintenanceWorker() {
 //
 // Each iteration: SIEVE picks a cold anchor, co-evicts physically adjacent
 // bystanders (spatial expansion), commits tombstones, and updates segment
-// metadata. Physical space is NOT reclaimed here — merge compaction handles
-// that by rewriting sparse segments into dense output segments.
-//
-// This avoids extent B-tree fragmentation from hole punching, which degrades
-// read throughput by ~24% at 75% sparseness.
+// metadata. Physical space is NOT reclaimed here — segments with enough
+// dead items will be retired and deleted entirely (segment drain).
 func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
 	evictionStart := time.Now()
 
@@ -964,90 +939,113 @@ func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
 	return nil
 }
 
-// maybeMergeSegments identifies sparse segments and merges contiguous ranges.
-// This reclaims space by combining multiple sparse segments into fewer dense segments.
-//
-// Uses the "Targeted Gravity" model:
-//   - Dynamic minimum range size based on system sparseness (physical/logical ratio)
-//   - Size-based accumulator targeting WriteBufferSize output
-//   - Yielding between merges to protect foreground read throughput
-func (c *Cache) maybeMergeSegments() error {
-	// Calculate dynamic gravity based on system sparseness.
-	// Density = logicalLive / physicalEnvelope, where physicalEnvelope is the
-	// total disk space covered by all segments (segmentCount * WriteBufferSize).
-	// As eviction creates holes, logicalLive shrinks relative to the envelope,
-	// causing gravity to increase and widen the merge search window.
-	logicalLive := c.approxSize.Load()
-	segCount := int64(c.index.GetSegmentCount())
-	if segCount == 0 {
+// maybeCompactTombstones identifies segments with many tombstones and compacts them.
+// Collapses the tombstone incremental log into the segment manifest (metadata-only).
+// Only used in WAL/durable mode where tombstones accumulate indefinitely.
+func (c *Cache) maybeCompactTombstones() error {
+	segments := c.selectSegmentsForTombstoneCompaction()
+	if len(segments) == 0 {
 		return nil
 	}
-	physicalEnvelope := segCount * c.WriteBufferSize
-	avgBlobSize := c.index.GetGlobalAvgBlobSize()
-	gravity := calculateDynamicGravity(logicalLive, physicalEnvelope)
-	threshold := dynamicMergeThreshold(avgBlobSize)
-	// Target 1.5x WriteBufferSize (~96MB for default 64MB buffer) for efficient sequential I/O
-	targetOutputSize := c.WriteBufferSize + c.WriteBufferSize/2
 
-	// Select candidate ranges using sliding window accumulator
-	candidates := c.selectSegmentsForMerge(targetOutputSize, gravity, threshold)
+	log.Debug("tombstone compaction starting", "segment_count", len(segments))
+
+	for _, segID := range segments {
+		// Acquire shared lock: allows concurrent compactions, blocks Delete.
+		shard := c.index.SegmentLockShard(segID)
+		shard.RLock()
+		err := c.index.CompactTombstones(segID)
+		shard.RUnlock()
+
+		if err != nil {
+			return fmt.Errorf("compact tombstones segment %d: %w", segID, err)
+		}
+
+		c.index.AcknowledgeTombstoneCompaction(segID)
+	}
+
+	return nil
+}
+
+// selectSegmentsForTombstoneCompaction returns cooled segments eligible for
+// tombstone compaction. Cooling ensures segments are fully flushed and out of
+// Librarian cache before compaction rewrites their .meta files.
+func (c *Cache) selectSegmentsForTombstoneCompaction() []uint32 {
+	currentSegID := c.segIDs.CurrentSegmentID()
+	coolingGap := uint32(c.MaxCachedSlabs + index.CoolingPeriodMargin)
+
+	if currentSegID <= coolingGap {
+		return nil
+	}
+
+	maxEligibleID := currentSegID - coolingGap
+	return c.index.GetTombstoneCompactionCandidates(maxEligibleID)
+}
+
+// maxDrainsPerCycle caps the number of segments drained in one maintenance pass.
+// Limits the burst of cache misses from draining too many segments at once.
+const maxDrainsPerCycle = 4
+
+// maybeDrainSegments identifies sparse segments (mostly dead items) and removes
+// them entirely: force-evict remaining live items from RAM, close FDs, delete files.
+//
+// This is cache mode's zero-write-amplification space reclamation: no data is
+// rewritten, the entire segment file is simply deleted. Live items become cache
+// misses — acceptable because they were in 90%+ dead segments anyway.
+func (c *Cache) maybeDrainSegments() error {
+	if c.DrainWasteThreshold <= 0 {
+		return nil // Drain disabled
+	}
+
+	// Select candidates: cooled segments above waste threshold.
+	currentSegID := c.segIDs.CurrentSegmentID()
+	coolingGap := uint32(c.MaxCachedSlabs + index.CoolingPeriodMargin)
+	if currentSegID <= coolingGap {
+		return nil
+	}
+	maxEligibleID := currentSegID - coolingGap
+
+	candidates := c.index.GetMergeCompactionCandidates(maxEligibleID, c.DrainWasteThreshold)
 	if len(candidates) == 0 {
 		return nil
 	}
 
-	log.Debug("merge compaction starting",
-		"candidate_count", len(candidates),
-		"gravity", gravity,
-		"target_mb", targetOutputSize/(1024*1024))
+	var totalDrainedBytes int64
+	var totalDrainedCount int
 
-	oldestSegID := c.OldestLiveSegmentID()
-
-	for _, candidate := range candidates {
-		segmentIDs := candidate.SegmentIDs
-
-		// Determine if this is a tail compaction (includes oldest segment)
-		// Safe to drop tombstones if we're compacting the oldest segment
-		dropTombstones := len(segmentIDs) > 0 && segmentIDs[0] == oldestSegID
-
-		result, err := c.compactor.Compact(segmentIDs, dropTombstones)
-		if err != nil {
-			// Fail fast: if one compaction fails, stop trying more.
-			// Avoids accumulating repeated errors for the same underlying issue.
-			return fmt.Errorf("compact segments %v: %w", segmentIDs, err)
+	for i, seg := range candidates {
+		if i >= maxDrainsPerCycle {
+			break
 		}
 
-		// Populate Targeted Gravity metrics.
-		// Total output = direct writes + data moved via copy_file_range.
-		totalOutputBytes := result.WriteBytes + result.SpliceBytes
-		result.EstimatedInputMB = float64(candidate.EstimatedLiveBytes) / (1024 * 1024)
-		result.ActualOutputMB = float64(totalOutputBytes) / (1024 * 1024)
+		// Exclusive segment lock: blocks Delete() during drain.
+		shard := c.index.SegmentLockShard(seg.ID)
+		shard.Lock()
 
-		// Calculate derived I/O metrics
-		var spliceMBps float64
-		if result.DurationMs > 0 {
-			durSec := float64(result.DurationMs) / 1000.0
-			spliceMBps = float64(result.SpliceBytes) / durSec / (1024 * 1024)
+		drainedBytes, drainedCount := c.index.DrainSegment(seg.ID)
+		c.archivist.DropSegmentCache(seg.ID)
+
+		shard.Unlock()
+
+		// Delete .seg file (outside lock — file is already unreferenced).
+		// .meta was already deleted by DrainSegment; double-delete is harmless.
+		if err := DeleteSegmentFiles(c.Path, c.Shards, seg.ID); err != nil {
+			log.Warn("drain: delete segment file", "segID", seg.ID, "error", err)
 		}
 
-		log.Info("segment merge completed",
-			"old_segments", result.OldSegmentIDs,
-			"new_segment", result.NewSegmentID,
-			"items_compacted", result.ItemsCompacted,
-			"stale_skipped", result.StaleSkipped,
-			"tombstones_kept", result.TombstonesKept,
-			"tombstones_dropped", result.TombstonesDropped,
-			"tombstones_dissolved", result.TombstonesDissolved,
-			"estimated_input_mb", fmt.Sprintf("%.1f", result.EstimatedInputMB),
-			"actual_output_mb", fmt.Sprintf("%.1f", result.ActualOutputMB),
-			"duration_ms", result.DurationMs,
-			"throttle_ms", result.ThrottleMs,
-			"splice_ops", result.SpliceOps,
-			"splice_mbps", fmt.Sprintf("%.1f", spliceMBps))
-
+		totalDrainedBytes += drainedBytes
+		totalDrainedCount += drainedCount
 	}
 
-	// Recalculate oldest segment after dropping segments (O(1) from in-memory registry)
-	c.recalculateOldestSegmentID()
+	if totalDrainedCount > 0 {
+		c.approxSize.Add(-totalDrainedBytes)
+		c.bloomStats.deletions.Add(int64(totalDrainedCount))
+
+		log.Info("segment drain completed",
+			"segments", min(len(candidates), maxDrainsPerCycle),
+			"drained_items", totalDrainedCount,
+			"drained_mb", totalDrainedBytes/(1024*1024))
+	}
 
 	return nil
 }

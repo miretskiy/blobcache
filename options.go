@@ -70,11 +70,6 @@ type config struct {
 	TrustHash          bool         // Skip key verification on reads (cache mode optimization)
 	BallastSize        int          // Heap ballast size in bytes (default: 1GB, 0 = disabled)
 
-	// CompactionBandwidth limits merge compaction throughput in bytes/sec.
-	// Throttles compaction to avoid saturating the I/O bus during ingestion.
-	// Default: 400 MB/s. Set to 0 to disable throttling.
-	CompactionBandwidth int64
-
 	// MaxBystanderBytes limits the blast radius of spatial co-eviction per SIEVE
 	// anchor. After SIEVE picks a cold anchor, we co-evict physically adjacent
 	// items up to this byte budget. Bystanders may be warm or hot — they are
@@ -84,6 +79,12 @@ type config struct {
 	// Default: WriteBufferSize / 8 (e.g. 8MB for 64MB segments).
 	// Set to 0 to disable spatial expansion (pure SIEVE, no bystanders).
 	MaxBystanderBytes int64
+
+	// DrainWasteThreshold is the minimum waste ratio for a segment to be eligible
+	// for drain (cache mode only). At 0.90, a segment must be 90% dead before
+	// drain considers it — sacrificing at most 10% of its items as cache misses.
+	// Set to 0 to disable segment drain. Default: 0.90.
+	DrainWasteThreshold float64
 
 	knobs *TestingKnobs
 }
@@ -241,11 +242,12 @@ func WithMaxBystanderBytes(bytes int64) Option {
 	return funcOpt(func(c *config) { c.MaxBystanderBytes = bytes })
 }
 
-// WithCompactionBandwidth sets the maximum bytes/sec for merge compaction I/O.
-// Throttles compaction to avoid saturating the filesystem with metadata updates.
-// Default: 400 MB/s. Set to 0 to disable throttling (not recommended for production).
-func WithCompactionBandwidth(bytesPerSec int64) Option {
-	return funcOpt(func(c *config) { c.CompactionBandwidth = bytesPerSec })
+// WithDrainWasteThreshold sets the waste ratio threshold for segment drain.
+// Cache mode only: segments with waste ratio >= this threshold are eligible for
+// drain (force-evict remaining live items and delete the segment file).
+// Default: 0.90. Set to 0 to disable segment drain.
+func WithDrainWasteThreshold(threshold float64) Option {
+	return funcOpt(func(c *config) { c.DrainWasteThreshold = threshold })
 }
 
 func defaultConfig(path string) config {
@@ -260,9 +262,9 @@ func defaultConfig(path string) config {
 		BloomFPRate:         0.01,
 		BloomEstimatedKeys:  1_000_000,
 		DegradedMode:        DegradedMemoryOnly,
-		TrustHash:           true,      // Cache mode: trust hash, skip key verification
-		BallastSize:         1 << 30,   // 1GB heap ballast to reduce GC frequency
-		CompactionBandwidth: 400 << 20, // 400 MB/s for merge compaction throttling
+		TrustHash:           true,    // Cache mode: trust hash, skip key verification
+		BallastSize:         1 << 30, // 1GB heap ballast to reduce GC frequency
+		DrainWasteThreshold: 0.90,    // Drain segments that are 90%+ dead (cache mode only)
 		IO: IOConfig{
 			FDataSync:     false,
 			Fadvise:       sys.UseFadvise,

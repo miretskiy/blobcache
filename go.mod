@@ -10,7 +10,6 @@ require (
 	github.com/shirou/gopsutil/v3 v3.24.5
 	github.com/stretchr/testify v1.11.1
 	github.com/zeebo/xxh3 v1.0.2
-	golang.org/x/time v0.14.0
 )
 
 require (

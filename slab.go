@@ -161,26 +161,19 @@ type ActiveSlab struct {
 	// (since XL writes don't consume space in the main slab buffer).
 	// Accessed only under MemTable.mu.Lock, so no atomics needed.
 	xlSize int64
-
-	// padBytes tracks cumulative block-alignment padding in this slab.
-	// Accessed only under MemTable.mu.Lock, so no atomics needed.
-	padBytes int64
 }
 
-// Alloc reserves n bytes in the slab at a block-aligned offset.
+// Alloc reserves n bytes in the slab.
 // Returns:
 //   - buf: A slice window into the reserved memory (safe to write to).
 //   - offset: The absolute offset of the start of the buffer (for the Index).
 //
-// Every record starts at a 4KB boundary so that segments are born with aligned
-// offsets, enabling XFS reflinks via copy_file_range during compaction.
+// Records are packed densely (no padding). The entire slab buffer is written
+// as a single Direct I/O call, so individual record offsets need not be aligned.
 //
 // If there isn't enough capacity, it returns nil, 0.
 // The caller should use EncodeTo methods to write directly into buf.
 func (as *ActiveSlab) Alloc(n int) (buf []byte, offset int64) {
-	aligned := sys.PageAlign(as.wPos)
-	as.padBytes += aligned - as.wPos
-	as.wPos = aligned
 	offset = as.wPos
 	end := offset + int64(n)
 	if end > int64(as.buf.Cap()) {

@@ -359,6 +359,47 @@ func (idx *DurableIndex) expandEviction(
 	return result
 }
 
+// DrainSegment atomically removes all live items belonging to a segment from
+// the RAM index, then unregisters and deletes the .meta file.
+//
+// Used in cache mode to reclaim disk space from sparse segments: once all live
+// items are removed from the index, the entire .seg file can be deleted.
+// Live items become cache misses — acceptable in cache mode since they were
+// already in mostly-dead segments destined for cleanup.
+//
+// Does NOT write tombstones — the entire segment file is deleted afterward,
+// so there's nothing to tombstone against.
+//
+// Returns the total bytes and count of items drained from the RAM index.
+// The caller must hold the exclusive segment lock before calling this method.
+func (idx *DurableIndex) DrainSegment(segID uint32) (drainedBytes int64, drainedCount int) {
+	// 1. Get manifest from in-memory cache (zero disk I/O in steady state).
+	manifest, ok := idx.segments.getInMemoryManifest(segID)
+	if !ok {
+		return 0, 0
+	}
+
+	// 2. For each entry, atomically verify-and-remove from RAM.
+	for i := range manifest.Entries {
+		item := footerEntryToItem(manifest.SegmentID, &manifest.Entries[i])
+		if item.IsDeleted() {
+			continue
+		}
+		// deleteIfAt: atomic check (segID, offset) + remove under shard lock.
+		// If the item was overwritten to a newer segment, returns false (safe skip).
+		if evicted, ok := idx.blobs.deleteIfAt(item.Key, segID, item.Offset); ok {
+			drainedBytes += int64(evicted.PhysicalLen)
+			drainedCount++
+		}
+	}
+
+	// 3. Unregister from segment registry + delete .meta file.
+	idx.segments.unregisterSegment(segID)
+	_ = idx.segments.dropSegment(segID)
+
+	return drainedBytes, drainedCount
+}
+
 // DeleteSegment removes all entries for a segment from both RAM and disk.
 func (idx *DurableIndex) DeleteSegment(segmentID uint32) error {
 	// Load manifest to get items for RAM deletion
@@ -544,6 +585,30 @@ func (idx *DurableIndex) GetGlobalAvgBlobSize() int64 {
 // Called during eviction or explicit delete to track merge compaction candidates.
 func (idx *DurableIndex) UpdateSegmentOnDelete(segID uint32, deletedCount int32, deletedBytes int64) {
 	idx.segments.updateSegmentOnDelete(segID, deletedCount, deletedBytes)
+}
+
+// GetTombstoneCompactionCandidates returns segment IDs that have crossed the
+// tombstone threshold (100+) and have cooled past the given boundary.
+//
+// This is O(K) where K is the number of pending candidates, avoiding O(N) scan
+// of all segments. Returns sorted segment IDs for deterministic processing.
+// Candidates are NOT consumed; call AcknowledgeTombstoneCompaction after success.
+func (idx *DurableIndex) GetTombstoneCompactionCandidates(maxEligibleID uint32) []uint32 {
+	return idx.segments.getTombstoneCompactionCandidates(maxEligibleID)
+}
+
+// AcknowledgeTombstoneCompaction removes a segment from the pending tombstone
+// compaction set after successful compaction.
+func (idx *DurableIndex) AcknowledgeTombstoneCompaction(segID uint32) {
+	idx.segments.acknowledgeTombstoneCompaction(segID)
+}
+
+// CompactTombstones merges the tombstone incremental log into the segment manifest.
+// Rewrites the .meta file with tombstone batches collapsed into footer entries.
+//
+// The caller must hold the segment lock before calling this method.
+func (idx *DurableIndex) CompactTombstones(segID uint32) error {
+	return idx.segments.compactTombstones(segID)
 }
 
 // GetMergeCompactionCandidates returns segments that have crossed the given waste

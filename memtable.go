@@ -6,7 +6,6 @@ import (
 	"os"
 	"slices"
 	"sync"
-	"sync/atomic"
 
 	"github.com/miretskiy/blobcache/bloom"
 	"github.com/miretskiy/blobcache/compression"
@@ -58,9 +57,6 @@ type MemTable struct {
 	// both read stale state and the slower (older) write overwrites the faster (newer).
 	// Usage: indexLocks[hash & indexShardMask].Lock()
 	indexLocks [numIndexShards]sync.Mutex
-
-	// PadBytes tracks cumulative block-alignment padding across all rotated slabs.
-	PadBytes atomic.Int64
 
 	flushCh chan FlushTicket
 	flushWg sync.WaitGroup // Tracks in-flight flush operations
@@ -347,9 +343,6 @@ func (mt *MemTable) prepareRotationLocked() func() {
 	if old.currentMaxSeq > mt.mu.maxSealedSeq {
 		mt.mu.maxSealedSeq = old.currentMaxSeq
 	}
-
-	// Accumulate padding stats from the rotated slab.
-	mt.PadBytes.Add(old.padBytes)
 
 	// 3. Retire Old Slab
 	old.retired.Store(true)

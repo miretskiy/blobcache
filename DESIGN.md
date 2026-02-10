@@ -693,13 +693,18 @@ An earlier design co-evicted physically adjacent items ("bystanders") alongside 
 
 Segment drain is the zero-write-amplification replacement for merge compaction. When the total on-disk footprint exceeds `MaxSize`, the sparsest segments (least live data) are deleted until disk usage fits within budget.
 
-The disk footprint is estimated as `numSegments * WriteBufferSize`. When this exceeds `MaxSize`, the excess is computed and segments are drained in order of ascending `LiveBytes` until the excess is eliminated.
+Drain operates on a **different pressure signal** than SIEVE eviction:
+- **SIEVE** manages live data size: triggers when `approxSize > MaxSize`
+- **Drain** manages disk waste: triggers when `(diskBytes - liveBytes) > MaxSize / 2`
+
+This separation prevents drain from competing with SIEVE. SIEVE runs first, selectively removing cold items. Over time, dead items accumulate as waste in segments. Drain kicks in only when that accumulated waste becomes significant (>50% of capacity), deleting the sparsest segments to reclaim disk space.
 
 ```text
 PRESSURE-DRIVEN DRAIN:
 
    estimatedDisk = numSegments * WriteBufferSize
-   excess = estimatedDisk - MaxSize
+   waste = estimatedDisk - liveBytes
+   excess = waste - MaxSize/2
         |
         v (excess > 0?)
    [Get drain candidates]          <-- All cooled segments, sorted by LiveBytes ascending

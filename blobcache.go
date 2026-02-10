@@ -1006,9 +1006,14 @@ func (c *Cache) selectSegmentsForTombstoneCompaction() []uint32 {
 }
 
 // maybeDrainSegments is pressure-driven disk reclamation for cache mode.
-// When the estimated on-disk footprint exceeds MaxSize, it drains the least
-// populated segments (force-evict remaining live items, delete segment files)
-// until the excess is resolved.
+// Drain operates on a DIFFERENT pressure signal than SIEVE eviction:
+//   - SIEVE manages live data size: triggers when approxSize > MaxSize
+//   - Drain manages disk waste: triggers when (diskBytes - liveBytes) > MaxSize/2
+//
+// This separation prevents drain from competing with SIEVE. SIEVE runs first,
+// selectively removing cold items. Over time, dead items accumulate as waste in
+// segments. Drain kicks in only when that waste becomes significant (>50% of capacity),
+// deleting the sparsest segments to reclaim disk space.
 //
 // Zero write amplification: no data is rewritten, segment files are simply deleted.
 // Live items become cache misses — acceptable because they are in the sparsest
@@ -1021,9 +1026,15 @@ func (c *Cache) maybeDrainSegments() error {
 	// Estimate on-disk footprint: numSegments * WriteBufferSize.
 	segCount := c.index.GetSegmentCount()
 	estimatedDiskBytes := int64(segCount) * c.WriteBufferSize
-	excessBytes := estimatedDiskBytes - c.MaxSize
+	liveBytes := c.approxSize.Load()
+
+	// Drain when accumulated waste exceeds 50% of MaxSize.
+	// Example: MaxSize=400GB, live=400GB → drain when disk > 600GB.
+	wasteAllowance := c.MaxSize / 2
+	wasteBytes := estimatedDiskBytes - liveBytes
+	excessBytes := wasteBytes - wasteAllowance
 	if excessBytes <= 0 {
-		return nil // Disk within budget
+		return nil // Waste within budget
 	}
 
 	// Cooling: only drain segments older than Librarian window.
@@ -1077,6 +1088,10 @@ func (c *Cache) maybeDrainSegments() error {
 			"segments", segmentsDrained,
 			"drained_items", totalDrainedCount,
 			"drained_mb", totalDrainedBytes/(1024*1024))
+
+		if err := c.maybeTriggerBloomRebuild(); err != nil {
+			log.Error("bloom rebuild failed after drain", "error", err)
+		}
 	}
 
 	return nil

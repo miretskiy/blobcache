@@ -1001,10 +1001,10 @@ func (c *Cache) selectSegmentsForTombstoneCompaction() []uint32 {
 //   - SIEVE manages live data size: triggers when approxSize > MaxSize
 //   - Drain manages disk waste: triggers when (diskBytes - liveBytes) > MaxSize/2
 //
-// This separation prevents drain from competing with SIEVE. SIEVE runs first,
-// selectively removing cold items. Over time, dead items accumulate as waste in
-// segments. Drain kicks in only when that waste becomes significant (>50% of capacity),
-// deleting the sparsest segments to reclaim disk space.
+// Hysteresis: triggers at high watermark (waste > MaxSize/2) but drains down to
+// low watermark (waste < MaxSize/4). This prevents cascading re-triggers — each
+// drained segment's live data is subtracted from approxSize, which would push
+// waste back above a single threshold. Draining to a lower target absorbs this.
 //
 // Zero write amplification: no data is rewritten, segment files are simply deleted.
 // Live items become cache misses — acceptable because they are in the sparsest
@@ -1018,15 +1018,17 @@ func (c *Cache) maybeDrainSegments() error {
 	segCount := c.index.GetSegmentCount()
 	estimatedDiskBytes := int64(segCount) * c.WriteBufferSize
 	liveBytes := c.approxSize.Load()
-
-	// Drain when accumulated waste exceeds 50% of MaxSize.
-	// Example: MaxSize=400GB, live=400GB → drain when disk > 600GB.
-	wasteAllowance := c.MaxSize / 2
 	wasteBytes := estimatedDiskBytes - liveBytes
-	excessBytes := wasteBytes - wasteAllowance
-	if excessBytes <= 0 {
+
+	// High watermark: trigger drain when waste > 50% of MaxSize.
+	highWatermark := c.MaxSize / 2
+	if wasteBytes <= highWatermark {
 		return nil // Waste within budget
 	}
+
+	// Low watermark: drain down to 25% of MaxSize to prevent re-trigger cascade.
+	lowWatermark := c.MaxSize / 4
+	drainTarget := wasteBytes - lowWatermark
 
 	// Cooling: only drain segments older than Librarian window.
 	currentSegID := c.segIDs.CurrentSegmentID()
@@ -1046,7 +1048,7 @@ func (c *Cache) maybeDrainSegments() error {
 	var segmentsDrained int
 
 	for _, seg := range candidates {
-		if excessBytes <= 0 {
+		if drainTarget <= 0 {
 			break
 		}
 
@@ -1068,7 +1070,7 @@ func (c *Cache) maybeDrainSegments() error {
 		totalDrainedBytes += drainedBytes
 		totalDrainedCount += drainedCount
 		segmentsDrained++
-		excessBytes -= c.WriteBufferSize
+		drainTarget -= c.WriteBufferSize
 	}
 
 	if segmentsDrained > 0 {

@@ -44,10 +44,9 @@ type Cache struct {
 	}
 
 	bloomStats struct {
-		hits        atomic.Uint64             // Bloom filter said "yes"
-		ghosts      atomic.Uint64             // Bloom said yes, but index said no.
-		deletions   atomic.Int64              // Track cumulative deletions since last rebuild
-		lastRebuild atomic.Pointer[time.Time] // When the last rebuild happened.
+		hits      atomic.Uint64 // Bloom filter said "yes"
+		ghosts    atomic.Uint64 // Bloom said yes, but index said no.
+		deletions atomic.Int64  // Track cumulative deletions since last rebuild
 	}
 
 	// --- ARCHITECTURE COMPONENTS ---
@@ -708,8 +707,6 @@ func (c *Cache) rebuildBloom() error {
 	c.bloomStats.deletions.Store(0)
 	c.bloomStats.ghosts.Store(0)
 	c.bloomStats.hits.Store(0)
-	now := time.Now()
-	c.bloomStats.lastRebuild.Store(&now)
 
 	observedFPR := 0.0
 	if prevHits > 0 {
@@ -727,12 +724,6 @@ func (c *Cache) rebuildBloom() error {
 }
 
 func (c *Cache) maybeTriggerBloomRebuild() error {
-	// 1. Cooldown Guard (e.g., 5 minutes)
-	last := c.bloomStats.lastRebuild.Load()
-	if last != nil && time.Since(*last) < 5*time.Minute {
-		return nil
-	}
-
 	shouldRebuild := false
 
 	// 2. Proactive: Cumulative Staleness check

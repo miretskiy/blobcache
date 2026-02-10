@@ -58,7 +58,7 @@ Unlike simple FIFO caches that must delete entire files to reclaim space, BlobCa
 With the high-level flow established, the following sections detail the low-level mechanics that enable BlobCache to saturate NVMe bandwidth. The architecture is built on a hierarchy of "increasingly expensive" checks. Each layer is designed to protect the one below it from unnecessary work:
 
 1.  **The Unified Bloom Filter** protects the CPU and Memory Bus from searching for keys that aren't there. Rejections occur in $\approx 1ns$.
-2.  **The Durable Index (Skipmap)** protects the Physical Segments by providing exact coordinates for retrieval, ensuring we only hit the disk when a result is guaranteed.
+2.  **The Durable Index (Sharded Arena)** protects the Physical Segments by providing exact coordinates for retrieval, ensuring we only hit the disk when a result is guaranteed.
 3.  **The MemTable** protects the Disk from random write pressure by aggregating data into aligned RAM slabs. It also functions as a "Controlled Page Cache" for fast retrieval of recently written data.
 
 ```text
@@ -71,7 +71,7 @@ v
 | (Hit)
 v
 +-----------------------+
-|    Index (Skipmap)    |  <-- [FAST] O(log N) RAM lookup for coordinates
+|  Index (Sharded Arena)|  <-- [FAST] O(1) RAM lookup for coordinates
 +-----------------------+
 | (Found)
 v
@@ -89,7 +89,7 @@ v
 
 ## 4. The Index: RAM, Persistence, and Sieve Coordination
 
-The Index is the "control plane" of BlobCache. It coordinates between sub-nanosecond RAM lookups and the Bitcask-powered durable metadata log. It is designed to be highly concurrent, crash-consistent, and memory-efficient.
+The Index is the "control plane" of BlobCache. It coordinates between sub-nanosecond RAM lookups and per-segment `.meta` file persistence. It is designed to be highly concurrent, crash-consistent, and memory-efficient.
 
 ### 4.1 High-Speed Lookup (Sharded Arena Index)
 
@@ -127,12 +127,13 @@ type shard struct {
 
 
 
-### 4.2 Durable Metadata (Bitcask Persistence)
-While blobs are stored in large Segment files, their metadata is stored in a **Bitcask-style log**. This allows for atomic updates and fast recovery.
+### 4.2 Durable Metadata (Per-Segment `.meta` Files)
+While blobs are stored in large Segment files, their metadata is persisted in **per-segment `.meta` files** stored alongside each `.seg` file. This provides crash-consistent metadata without a centralized metadata store.
 
-* **Composite Keys:** Persistence uses a 16-byte BigEndian key: `[SegmentID (8 bytes)][Sequence (8 bytes)]`. Contiguous storage allows efficient range scans.
-* **Chunked Metadata:** Batch records are chunked into 64KB entries to stay within Bitcask's `MaxValueSize` limits.
-* **Atomic Transactions:** Ingestion batches and eviction sets are committed via transactions, preventing index pointers from referencing non-durable data.
+* **Segment Footer Snapshots:** Each `.meta` file contains a segment footer block (array of `FooterEntry` records) capturing the initial state of all items in the segment at flush time.
+* **Incremental Tombstone Logs:** Deletions and evictions append tombstone batches to the `.meta` file without rewriting the footer. Over time: `[footer block] [tombstone batch 1] [batch 2] ...`.
+* **Tombstone Compaction:** When tombstone appendages accumulate past a threshold, the maintenance worker collapses them back into the footer entries (metadata-only rewrite, no blob data touched). See Section 10.5.
+* **In-Memory Manifest Cache:** At startup, footer entries are loaded into RAM (`SegmentMetadata.Entries`) for zero disk I/O during spatial SIEVE expansion and segment drain.
 
 ### 4.3 The Sieve Eviction Policy
 BlobCache implements the **SIEVE/Clock Algorithm** (a modern "Cache-Conscious" alternative to LRU) to manage the RAM footprint.
@@ -183,7 +184,7 @@ STEP 3: POST-EVICTION
       TAIL                              HEAD
       [n1|_] <-> [n2|_] <-> [n4|V] <-> [n5|V]
                                        ^
-       n3 node recycled (sync.Pool)    |
+       n3 node recycled (arena free list)|
                             HAND (Points to next live node)
 ```
 
@@ -270,22 +271,25 @@ type Item struct {
 4. Allocate buffer of size `KeyLen + PhysicalSize`
 5. Read Key + Value
 
-### 4.6 Start up and Crash Recovery
-`NewIndex` performs a **Persistence Scan**:
-1. It iterates through Bitcask using `scanAll`.
-2. Decodes `SegmentRecord` chunks.
-3. Populates the Skipmap and Sieve list in "Birth Order," ensuring the Sieve "Hand" is positioned correctly for immediate eviction logic upon startup.
+### 4.6 Startup and Crash Recovery
+`OpenIndex` performs a **Persistence Scan**:
+1. It discovers all `.meta` files across shard directories via `scanAll`.
+2. For each segment, reads the `.meta` file (footer + any tombstone appendages), merging tombstones into footer entries.
+3. Populates the sharded arena index and SIEVE list in "Birth Order," ensuring the SIEVE "Hand" is positioned correctly for immediate eviction logic upon startup.
+4. Caches raw `FooterEntry` slices in `SegmentMetadata.Entries` for zero disk I/O during spatial SIEVE expansion.
 
 ```go
-err := p.scanAll(func(seg metadata.SegmentRecord) bool {
-for _, rec := range seg.Records {
-if !rec.IsDeleted() {
-idx.blobs.Store(rec.Hash, idx.evictor.Add(Entry{rec, seg.SegmentID}))
-}
-}
-return true
+err = p.scanAll(func(m DurableBatch) bool {
+    if m.Entries != nil {
+        idx.AddSegmentFromEntries(m.SegmentID, m.Entries)
+    } else {
+        idx.AddSegment(m.SegmentID, m.Items)
+    }
+    return true
 })
 ```
+
+If a `.meta` file is missing or corrupt, `scanAll` falls back to scanning the `.seg` file record-by-record and optionally rebuilds the `.meta` file for future fast startup.
 
 ### 4.7 Write Ordering and Sequence IDs
 
@@ -307,14 +311,14 @@ The **Concurrency Guard** uses 256 sharded locks (indexed by key hash) to serial
 
 The overhead is minimal: one atomic increment (~10ns) plus a sharded lock acquisition (~20ns uncontended), totaling less than 100ns per write. The read path remains unchanged—sequence IDs are stored but never checked during retrieval, because the write-path guards guarantee that any visible entry is definitively the latest.
 
-This infrastructure also prepares BlobCache for future Write-Ahead Log (WAL) support. Sequence IDs embedded in WAL entries allow crash recovery to correctly skip replaying operations that were already persisted to segments, ensuring exactly-once semantics without complex coordination.
+Sequence IDs are also critical for WAL crash recovery (see Section 12). Sequence IDs embedded in WAL entries allow crash recovery to correctly skip replaying operations that were already persisted to segments, ensuring exactly-once semantics without complex coordination.
 
 ---
 
 ## 5. Memory Architecture: The User-Space Page Cache
 
 ### 5.1 MmapPool: Orchestrated Backpressure
-The `MmapPool` manifests physical resource limits (e.g., 8 slabs of 128MB each). It uses Go channels to hold `*MmapBuffer`. If the channel is empty (disk I/O cannot keep up with network ingestion), the `Put()` call **blocks**. This self-regulating backpressure prevents OOM crashes.
+The `MmapPool` manifests physical resource limits (e.g., 8 slabs of 64MB each). It uses Go channels to hold `*MmapBuffer`. If the channel is empty (disk I/O cannot keep up with network ingestion), the `Put()` call **blocks**. This self-regulating backpressure prevents OOM crashes.
 
 ```text
 INGESTION THREADS                         FLUSH WORKERS
@@ -331,7 +335,7 @@ v                                         |
 #### 5.1.1 The Librarian: A Lock-Free Read-After-Write Cache
 The **Librarian** is a dedicated component that provides a multi-gigabyte L1 cache for recently written data. It maintains an immutable, atomic snapshot of `SharedSlab` pointers, enabling **wait-free** reads while the write path continues at full speed. This architecture specifically targets the high-frequency "Read-After-Write" access pattern common in blob workloads.
 
-**Configuration:** `WithMaxCachedSlabs(n)` controls the Librarian's capacity (default: 8 slabs ≈ 1GB).
+**Configuration:** `WithMaxCachedSlabs(n)` controls the Librarian's capacity (default: 8 slabs ≈ 512MB).
 
 **The Slab Lifecycle:**
 
@@ -378,7 +382,7 @@ A `SharedSlab` transitions through a five-stage lifecycle managed by reference c
 * **Writers (Publish):** Use Compare-And-Swap to atomically install a new slice. If CAS fails, retry. Only the successful publisher can unpin the victim.
 * **No Mutexes:** The entire hot path (publish + acquire) is wait-free, avoiding lock contention under high concurrency.
 
-This design provides a multi-gigabyte L1 cache managed as 128MB units, avoiding the overhead of managing millions of individual entries. Serving a hit from a `Cached` slab involves a simple pointer offset within the `mmap` arena, resulting in zero memory copies and minimal CPU cycles.
+This design provides a multi-hundred-megabyte L1 cache managed as `WriteBufferSize` units (default: 64MB), avoiding the overhead of managing millions of individual entries. Serving a hit from a `Cached` slab involves a simple pointer offset within the `mmap` arena, resulting in zero memory copies and minimal CPU cycles.
 
 ### 5.2 Short-Circuiting "Pathological" Blobs: Virtual Interleaving
 
@@ -421,7 +425,7 @@ BlobCache uses **Go 1.24's `runtime.AddCleanup`**. The buffer only returns to th
 In a high-traffic environment, writing 10,000 blobs as individual files requires 30,000 syscalls (`open`/`write`/`close`). This involves heavy inode allocation, kernel-level locking, and file-system journaling for every small object. By packing blobs into **Segments** (~64MB, matching `WriteBufferSize`), BlobCache converts thousands of random file-system metadata operations into a single sequential write stream. This reduces the "syscall tax" to near-zero and allows the NVMe controller to operate in its most efficient sequential mode. The MemTable-sized segments enable efficient WAL-rename (zero-copy promotion), fast crash recovery (smaller files to scan), and effective space reclamation (easier to identify sparse segments for drain).
 
 ### 6.2 Segment Footers: Defense in Depth
-The **Segment Footer** is a page-aligned (4KB) block at the absolute EOF. If the primary Bitcask index is corrupted, the entire state can be reconstructed by scanning the trailing metadata of every `.seg` file.
+The **Segment Footer** is a page-aligned (4KB) block at the absolute EOF. If the primary `.meta` index file is corrupted or missing, the entire state can be reconstructed by scanning the trailing metadata of every `.seg` file.
 
 ```text
 SEGMENT METADATA BLOCK (N * 4KB Aligned)
@@ -496,7 +500,7 @@ gc 19 @445.447s 0%: 0.075+7.8+0.026 ms clock, 2.2+0.23/60/159+0.85 ms cpu, 223->
 - 0% CPU overhead throughout the entire 882-second benchmark
 
 **What occupies the ~100 MB Go heap?**
-1. **Index Metadata:** Skipmap nodes and `Entry` structs
+1. **Index Metadata:** Arena index shards, `Item` structs, and map buckets
 2. **Bloom Filter:** Bitset for 1M+ keys
 3. **Goroutine Stacks:** 32 P workers and flush goroutines
 4. **Benchmark Infrastructure:** HDR histograms and counters
@@ -587,7 +591,7 @@ For workloads with known memory headroom and read-heavy access patterns, buffere
 ## 7. Compression Strategy: Distributed In-Thread Compression
 
 ### 7.1 Distributed Ingestion & The "1/8th" Heuristic
-BlobCache utilizes a distributed compression model where data transformation is performed by the calling goroutine during the `Put()` operation. By offloading this burden to the ingestion threads, the system prevents background flush workers from becoming a CPU bottleneck, ensuring NVMe write saturation even under high load. This effectively increases MemTable density, as compressed payloads allow each 128MB physical slab to host a significantly larger volume of logical data before requiring a flush to disk.
+BlobCache utilizes a distributed compression model where data transformation is performed by the calling goroutine during the `Put()` operation. By offloading this burden to the ingestion threads, the system prevents background flush workers from becoming a CPU bottleneck, ensuring NVMe write saturation even under high load. This effectively increases MemTable density, as compressed payloads allow each physical slab (default: 64MB) to host a significantly larger volume of logical data before requiring a flush to disk.
 
 To prevent wasting cycles on incompressible data, the system employs a **"1/8th Early Abort"** heuristic inspired by ZFS. The compression algorithm is provided a destination buffer exactly 12.5% smaller than the source; if the buffer is filled before the blob is fully processed, the operation is aborted and the blob is stored raw. This "savings rule" ensures CPU time is only invested in data yielding meaningful footprint reductions while signaling that the data may already be compressed or contain high entropy.
 
@@ -597,7 +601,7 @@ The decision to compress individual blobs rather than larger logical chunks is c
 Alternative "chunked" designs were rejected because they introduce **reclamation friction**: segment drain requires knowing exactly which items are dead. If multiple blobs share a compressed block, the segment cannot be drained until every blob within that block has been evicted, artificially inflating the live-item count and delaying space reclamation.
 
 ### 7.3 Dual-Size Metadata & Zero-Allocation Reads
-To maximize retrieval efficiency, the Skipmap and Segment Footer track both the **Logical (Uncompressed)** and **Physical (Stored)** sizes. This dual-size tracking enables a **Zero-Allocation** retrieval path: by knowing the logical size upfront, the system can pre-allocate a destination buffer of the exact required size, eliminating the CPU and GC overhead of dynamic buffer growth during a `Get()` request.
+To maximize retrieval efficiency, the in-memory index and Segment Footer track both the **Logical (Uncompressed)** and **Physical (Stored)** sizes. This dual-size tracking enables a **Zero-Allocation** retrieval path: by knowing the logical size upfront, the system can pre-allocate a destination buffer of the exact required size, eliminating the CPU and GC overhead of dynamic buffer growth during a `Get()` request.
 
 Furthermore, these metrics provide high-fidelity, real-time observability into compression ratios across the 1TB NVMe tier. This metadata allows the Retrieval Accelerator to execute a single `pread()` for the exact physical byte range, eliminating "Read Amplification" where a small request would otherwise force the disk to pull in a much larger compressed chunk.
 
@@ -634,7 +638,7 @@ This design prevents the "32-bit funnel" bug where truncating hashes causes corr
 Standard Bloom filters cannot handle deletions. As Sieve evicts blobs, the filter decays with "ghost" entries.
 1. **Proactive Tracking:** Rebuilds when ghosts exceed 10%.
 2. **Reactive Monitoring:** Rebuilds if Observed FPR spikes.
-   Rebuilds are non-blocking; the system snapshots the Skipmap and swaps the filter pointer atomically.
+   Rebuilds are non-blocking; the system snapshots the in-memory index and swaps the filter pointer atomically.
 
 ---
 
@@ -642,7 +646,7 @@ Standard Bloom filters cannot handle deletions. As Sieve evicts blobs, the filte
 When a background I/O error occurs (e.g., `Disk Full`), BlobCache enters **Degraded Mode** to maintain availability:
 
 1.  **Worker Halt:** Background flushers stop permanently to prevent inconsistent index states.
-2.  **In-Memory FIFO Eviction:** The `MmapPool` stops blocking. Instead, the `MemTable` begins dropping the oldest unflushed memfiles from memory to make room for new `Put` calls.
+2.  **In-Memory FIFO Eviction:** The `MmapPool` stops blocking. Instead, the `MemTable` begins dropping the oldest unflushed slabs from memory to make room for new `Put` calls.
 3.  **Pragmatic Resilience:** In this mode, BlobCache functions as a high-speed, volatile cache. While durability is suspended, the system remains alive, serving hits for most-recent data and avoiding a complete service outage.
 
 ---
@@ -831,53 +835,42 @@ In cache mode, the Leapfrog Hazard is irrelevant: segment drain deletes entire s
 The optimization of the read path is a spectrum of strategies determined by the workload's access patterns. By default, BlobCache utilizes **Buffered I/O**, relying on the operating system’s decades of optimization.
 
 ### 11.1 The Default: Buffered I/O and the Kernel Page Cache
-By default, any read that misses the Resident Segment Cache is satisfied via standard `pread`.
+By default, any read that misses the Librarian's in-memory slab cache is satisfied via standard `pread`.
 * **Mechanism:** The kernel intercepts the request and checks its own Page Cache (Unified Buffer Cache). If the data is missing, the kernel fetches it from NVMe, stores it in its own pages, and copies it into the application buffer.
 * **Workload Implication:** This is the most efficient path for workloads with high temporal or spatial locality, as the kernel provides sophisticated read-ahead and prefetching "for free".
 * **The "Double Tax" & Tail Latency:** Under heavy memory pressure, the kernel’s background page reclamation (kswapd) can introduce unpredictable stalls. Furthermore, data exists in both Kernel RAM and application RAM, reducing total caching capacity.
 
-### 11.2 `WithDirectIORead`: Bypassing the Page Cache
-Enabling `WithDirectIORead` uses `O_DIRECT` to bypass the kernel's Page Cache entirely.
-* **High-Entropy Efficiency:** This is optimal for "Write-Once, Read-Once" workloads where data is unlikely to be requested again. It prevents the kernel from polluting its cache with one-time-use data that would otherwise evict critical system metadata.
-* **Predictability:** Read latencies remain bound strictly to the hardware’s physical performance, avoiding the "stutter" of kernel-driven eviction.
+### 11.2 Future: Direct I/O Reads (Planned)
+For "Write-Once, Read-Once" workloads where data is unlikely to be requested again, a future `WithDirectIORead` option could use `O_DIRECT` to bypass the kernel's Page Cache entirely:
+* **High-Entropy Efficiency:** Prevents the kernel from polluting its cache with one-time-use data that would otherwise evict critical system metadata.
+* **Predictability:** Read latencies would remain bound strictly to the hardware's physical performance, avoiding the "stutter" of kernel-driven eviction.
 
-
-### 11.3 `WithCacheAfterRead`: The Promotion Buffer
-The `WithCacheAfterRead` option provides a mechanism to promote cold data into the user-space "Hot" zone without wasting memory.
-* **The Circular Promotion Arena:** To avoid the fragmentation of 128MB slabs, promoted blobs are written into a dedicated `MmapBuffer` managed as a circular arena.
-* **Granular Packing:** Unlike the "Sealed" write segments, this promotion buffer allows for granular packing of disparate blobs from different disk segments into a single contiguous memory region.
-* **Indexing:** Once a blob is "promoted" into this RAM arena, the Skipmap is updated to point to these memory coordinates. This allows the system to serve future hits with zero-copy speed without needing a complex, sharded block-caching subsystem.
+### 11.3 Future: Read Promotion Buffer (Planned)
+A future `WithCacheAfterRead` option could provide a mechanism to promote cold data into the user-space "Hot" zone:
+* **Circular Promotion Arena:** Promoted blobs written into a dedicated `MmapBuffer` managed as a circular arena, avoiding slab-sized fragmentation.
+* **Granular Packing:** Disparate blobs from different disk segments packed into a single contiguous memory region.
+* **Indexing:** The in-memory index updated to point to promoted coordinates, enabling zero-copy reads without a sharded block-caching subsystem.
 
 ```text
 [ USER GET(Key) ]
                |
                v
      +-------------------+       HIT        +--------------------+
-     | Resident L1 Check | ---------------> | Return App Pointer |
-     +-------------------+                  +--------------------+
-               |
+     | Librarian L1 Check| ---------------> | Return App Pointer |
+     +-------------------+                  | (Zero-Copy View)   |
+               |                            +--------------------+
                | MISS
                v
      +-------------------+                  +-------------------------+
-     | Option: DirectIO? | ---- NO -------> |   KERNEL PAGE CACHE     |
-     +-------------------+ (Default Path)   | (Buffered I/O + Copy)   |
-               |                            +-------------------------+
-               | YES (O_DIRECT)                          |
-               v                                         | UBC Miss
-     +-------------------+                  +-------------------------+
-     |   NVMe STORAGE    | <----------------|    PHYSICAL NVMe I/O    |
+     | KERNEL PAGE CACHE | <-- pread() ---> |   PHYSICAL NVMe I/O     |
+     | (Buffered I/O)    |                  | (Page cache miss)       |
      +-------------------+                  +-------------------------+
                |
-               | Data Returned
-               v
-     +-----------------------+       YES      +-----------------------+
-     | Option: CacheOnRead?  | -------------> | CIRCULAR PROMO ARENA  |
-     +-----------------------+                +-----------------------+
-               |                  
-               | NO
                v
        [ Return to User ]
 ```
+
+The current read path is straightforward: Librarian hit (zero-copy from mmap'd slab) or buffered `pread()` from segment file (leveraging kernel page cache). The planned extensions above (Direct I/O reads, promotion arena) would add branches to this path.
 
 ---
 
@@ -897,7 +890,7 @@ The engine operates in two modes sharing the same `sys` primitives, optimized fo
 | Durability | Memory-only until flush |
 | Linux I/O | `O_DIRECT` (Bulk Dump) |
 | Darwin I/O | `F_NOCACHE` (Bulk Dump) |
-| Flush Action | Bulk Write via `wal.WriteBulk` |
+| Flush Action | Direct segment write via `flushViaMerge` |
 
 **Durable Mode (Safe):**
 

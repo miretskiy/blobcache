@@ -41,15 +41,15 @@ In workloads with high miss rates (e.g., >50%), traditional caches suffer from c
 
 ### 2.3 The Background Persistence Pipeline
 Once a slab is full, it is "frozen" and handed off to background **Flush Workers**.
-* **Segments:** Large, append-only files (2GB+) that amortize the overhead of filesystem syscalls by packing thousands of blobs into single sequential write streams.
-* **Durable Index:** A combination of a memory-resident **Skipmap** for O(log N) retrieval and an append-only **Bitcask-style log** for durable restartability and birth-order tracking.
+* **Segments:** MemTable-sized append-only files (~64MB, matching `WriteBufferSize`) that amortize the overhead of filesystem syscalls by packing blobs into sequential write streams.
+* **Durable Index:** A sharded arena-backed hash table for O(1) retrieval, with per-segment `.meta` files for crash recovery and durable metadata tracking.
 
-### 2.4 Intelligent Reclamation: Sieve & Hole Punching
-Unlike simple FIFO caches that must delete entire files to reclaim space, BlobCache uses the **Sieve Algorithm** coupled with **Physical Hole Punching**.
+### 2.4 Intelligent Reclamation: Spatial SIEVE & Segment Drain
+Unlike simple FIFO caches that must delete entire files to reclaim space, BlobCache uses **Spatial SIEVE eviction** coupled with **Segment Drain** for zero-write-amplification space reclamation.
 
-* **Sieve Eviction:** When the cache hits `MaxSize`, the **Sieve algorithm** identifies victim blobs in RAM. This provides a "cache-conscious" eviction policy that is significantly faster and more precise than standard LRU for high-volume blob traffic.
-* **Durable Commitment:** Victims are first unlinked from the Skipmap and then committed to the durable Bitcask log. This "Commit Phase" ensures that an eviction is never lost across a system restart.
-* **Hole Punching:** Once the metadata is secure, the system utilizes `fallocate(FALLOC_FL_PUNCH_HOLE)` to reclaim the physical blocks of evicted blobs directly from the middle of immutable segments.
+* **Spatial SIEVE Eviction:** When the cache hits `MaxSize`, the **SIEVE algorithm** identifies a cold "anchor" blob, then expands spatially to co-evict physically adjacent items in the same segment. This creates large contiguous dead regions instead of "Swiss cheese" fragmentation.
+* **Durable Commitment:** Victims are marked as tombstones in the segment's `.meta` file and removed from the RAM index.
+* **Segment Drain:** When a segment becomes sufficiently sparse (90%+ dead items), the remaining live items are force-evicted from the RAM index and the entire segment file is deleted. Zero write amplification — no data is rewritten, only deleted.
 
 ---
 
@@ -418,7 +418,7 @@ BlobCache uses **Go 1.24's `runtime.AddCleanup`**. The buffer only returns to th
 ## 6. The I/O Tier: Segments and Direct I/O
 
 ### 6.1 Amortizing the Syscall Tax
-In a high-traffic environment, writing 10,000 blobs as individual files requires 30,000 syscalls (`open`/`write`/`close`). This involves heavy inode allocation, kernel-level locking, and file-system journaling for every small object. By packing blobs into **Segments** (2GB+), BlobCache converts thousands of random file-system metadata operations into a single sequential write stream. This reduces the "syscall tax" to near-zero and allows the NVMe controller to operate in its most efficient sequential mode.
+In a high-traffic environment, writing 10,000 blobs as individual files requires 30,000 syscalls (`open`/`write`/`close`). This involves heavy inode allocation, kernel-level locking, and file-system journaling for every small object. By packing blobs into **Segments** (~64MB, matching `WriteBufferSize`), BlobCache converts thousands of random file-system metadata operations into a single sequential write stream. This reduces the "syscall tax" to near-zero and allows the NVMe controller to operate in its most efficient sequential mode. The MemTable-sized segments enable efficient WAL-rename (zero-copy promotion), fast crash recovery (smaller files to scan), and effective space reclamation (easier to identify sparse segments for drain).
 
 ### 6.2 Segment Footers: Defense in Depth
 The **Segment Footer** is a page-aligned (4KB) block at the absolute EOF. If the primary Bitcask index is corrupted, the entire state can be reconstructed by scanning the trailing metadata of every `.seg` file.
@@ -591,10 +591,10 @@ BlobCache utilizes a distributed compression model where data transformation is 
 
 To prevent wasting cycles on incompressible data, the system employs a **"1/8th Early Abort"** heuristic inspired by ZFS. The compression algorithm is provided a destination buffer exactly 12.5% smaller than the source; if the buffer is filled before the blob is fully processed, the operation is aborted and the blob is stored raw. This "savings rule" ensures CPU time is only invested in data yielding meaningful footprint reductions while signaling that the data may already be compressed or contain high entropy.
 
-### 7.2 Preservation of Physical Reclamation
-The decision to compress individual blobs rather than larger logical chunks is critical to the efficacy of the **Sieve eviction policy** and **physical hole-punching**. Because each blob remains an independent unit of compression, the system can utilize `FALLOC_FL_PUNCH_HOLE` at the granularity of a single object's 4KB-aligned blocks the moment it is evicted from the cache.
+### 7.2 Per-Blob Compression and Space Reclamation
+The decision to compress individual blobs rather than larger logical chunks is critical to the efficacy of the **Sieve eviction policy** and **segment drain**. Because each blob remains an independent unit of compression, the segment metadata can precisely track which items are live vs. dead, enabling accurate waste ratio calculation for drain candidate selection.
 
-Alternative "chunked" designs were rejected because they introduce **reclamation friction**: physical space cannot be recovered until every blob within a compressed block has been evicted, effectively forcing expensive compaction cycles to recover fragmented space. Path A ensures the logical unit of eviction always matches the physical unit of reclamation.
+Alternative "chunked" designs were rejected because they introduce **reclamation friction**: segment drain requires knowing exactly which items are dead. If multiple blobs share a compressed block, the segment cannot be drained until every blob within that block has been evicted, artificially inflating the live-item count and delaying space reclamation.
 
 ### 7.3 Dual-Size Metadata & Zero-Allocation Reads
 To maximize retrieval efficiency, the Skipmap and Segment Footer track both the **Logical (Uncompressed)** and **Physical (Stored)** sizes. This dual-size tracking enables a **Zero-Allocation** retrieval path: by knowing the logical size upfront, the system can pre-allocate a destination buffer of the exact required size, eliminating the CPU and GC overhead of dynamic buffer growth during a `Get()` request.
@@ -649,39 +649,116 @@ When a background I/O error occurs (e.g., `Disk Full`), BlobCache enters **Degra
 
 ## 10. Eviction & Space Reclamation
 
-### 10.1 The Three-Phase Eviction Lifecycle
-1. **Selection (Sieve):** Victims are unlinked from the Skipmap (Logical Deletion).
-2. **Commit:** Deletion is persisted to the Bitcask log (Durability).
-3. **Reclamation (Hole Punching):** `fallocate(FALLOC_FL_PUNCH_HOLE)` reclaims physical SSD blocks without rewriting immutable segments.
+BlobCache uses different space reclamation strategies depending on the operating mode:
+
+- **Cache Mode:** Spatial SIEVE eviction + Segment Drain (zero write amplification)
+- **WAL/CAS Mode:** SIEVE eviction + Tombstone Compaction (metadata-only maintenance)
+
+### 10.1 Spatial SIEVE Eviction
+
+When the cache exceeds `MaxSize`, the maintenance worker runs eviction in a loop until the cache is below the hysteresis target (93% of `MaxSize`).
+
+Each eviction iteration has two phases:
+
+1. **Anchor Selection (SIEVE):** The SIEVE algorithm picks the coldest item from the RAM index — this is the "anchor."
+2. **Spatial Expansion:** The anchor's segment manifest is read from the in-memory cache (zero disk I/O in steady state). Items physically adjacent to the anchor are co-evicted by walking outward in both directions from the anchor's offset, picking the closer neighbor at each step. Each bystander is verified and removed atomically via `deleteIfAt` (no TOCTOU race with concurrent writes).
 
 ```text
-SEGMENT FILE STRUCTURE (Physical View)
-4KB Blocks: | B1 | B2 | B3 | B4 | B5 | B6 | B7 | B8 |
+SPATIAL EXPANSION (Walking outward from anchor)
 
-    LOGICAL BLOB:      [======= BLOB B =======]
-    (Un-aligned)          ^               ^
-                          |               |
-                    Starts mid-B2    Ends mid-B6
-    
-    ACTION: fallocate(PUNCH_HOLE, B3_Start, B5_End)
-    
-    RESULTING DISK STATE:
-    | B1 | B2 |  HOLE (B3-B5)  | B6 | B7 | B8 |
+Manifest items (sorted by offset):
+  [A] [B] [C] [ANCHOR] [D] [E] [F]
+               ^^^^^^^^^
+               Cold victim (SIEVE picked)
+
+Walk: D (closer), C, E, B, F, A  (alternating, closest first)
+Budget: MaxBystanderBytes limits the blast radius
+
+Result: Contiguous dead region instead of scattered holes
 ```
 
-### 10.2 Sparse Segment Compaction
-Hole punching creates "Swiss Cheese" segments—files that remain physically large on disk but contain mostly empty space.
-* **The Compaction Ticker:** A background task periodically calculates the "Fullness Percentage" ($LiveBytes / TotalPhysicalSize$).
-* **Migration:** Segments falling below a threshold (e.g., 20%) are marked for compaction. Remaining live blobs are read and re-inserted into the `MemTable` as new `Put()` operations.
-* **Recycling:** Once live blobs are safely persisted in new, dense segments, the old sparse segment is physically deleted. This ensures long-term disk efficiency and maximizes NVMe storage utilization.
+**Why Spatial Expansion?**
 
-### 10.3 The Deletion Model: Tombstones and Consistency
+Without spatial expansion, SIEVE eviction creates scattered dead items across many segments ("Swiss cheese"). Each segment accumulates small holes that individually don't justify deletion. Spatial co-eviction concentrates dead items in fewer segments, accelerating their progression toward the drain threshold.
+
+Bystanders may be warm or hot — they are evicted only because they are physically adjacent to the cold anchor. `MaxBystanderBytes` (default: `WriteBufferSize / 8`) bounds the "innocent bystander" damage. Set to 0 to disable spatial expansion (pure SIEVE).
+
+### 10.2 Segment Drain (Cache Mode)
+
+Segment drain is the zero-write-amplification replacement for merge compaction. When a segment is sufficiently sparse (90%+ dead items by default), the remaining live items are force-evicted from the RAM index and the entire segment file is deleted.
+
+```text
+SEGMENT DRAIN LIFECYCLE:
+
+   Segment waste ratio crosses DrainWasteThreshold (0.90)
+        |
+        v
+   [Cooling period check]         <-- Must be aged past Librarian cache
+        |
+        v
+   [Exclusive segment lock]       <-- Blocks Delete() during drain
+        |
+        v
+   [DrainSegment()]               <-- Atomic: remove each live item via deleteIfAt
+        |                              (verifies segID+offset match, safe skip if relocated)
+        v
+   [Drop archivist FD cache]      <-- Close cached file handle
+        |
+        v
+   [Delete .seg + .meta files]    <-- Physical space reclaimed
+        |
+        v
+   [Update approxSize + bloom]    <-- Accounting
+```
+
+**Key Properties:**
+- **Zero write amplification:** No data is rewritten. The entire file is simply deleted.
+- **Cache misses are acceptable:** Drained live items (~10% or fewer) become cache misses. They were in nearly-dead segments anyway — the cost of re-fetching from origin is low compared to the benefit of reclaiming disk space.
+- **Bounded burst:** At most `maxDrainsPerCycle` (4) segments are drained per maintenance pass, limiting the burst of cache misses.
+- **WAL mode excluded:** WAL/CAS mode cannot tolerate data loss from drain. It uses tombstone compaction instead (see 10.5).
+
+**Configuration:**
+```go
+// Default: drain segments that are 90%+ dead
+cache, _ := blobcache.New(path, blobcache.WithDrainWasteThreshold(0.90))
+
+// More aggressive: drain at 80% dead (more space reclamation, more cache misses)
+cache, _ := blobcache.New(path, blobcache.WithDrainWasteThreshold(0.80))
+
+// Disable segment drain entirely
+cache, _ := blobcache.New(path, blobcache.WithDrainWasteThreshold(0))
+```
+
+### 10.3 Why Not Merge Compaction? (The copy_file_range False Start)
+
+BlobCache initially implemented merge compaction using Linux's `copy_file_range` syscall, which uses server-side copy (reflinks on supported filesystems) to merge sparse segments into dense output without reading data into userspace. The theory was compelling: zero-copy, kernel-optimized, O_DIRECT-compatible.
+
+**What went wrong:**
+
+1. **Fragmented output files.** `copy_file_range` with reflinks produces output files whose physical extents mirror the source files' layout. When copying live records from a sparse segment, the output file inherits the fragmented block allocation pattern — the "holes" between live records become allocated-but-discontiguous extents rather than sequential blocks. The resulting segment is logically dense but physically fragmented, defeating the purpose of compaction.
+
+2. **Filesystem dependence.** Reflink behavior varies dramatically across filesystems (XFS, ext4, Btrfs) and even across kernel versions. Some fall back to full data copy (2x write amplification), some refuse cross-file reflinks, some silently produce fragmented output. This made the optimization unreliable in production.
+
+3. **Complexity tax.** Merge compaction requires: contiguity validation (Leapfrog Hazard prevention), atomic `Relocate` with CAS semantics, rate limiting to avoid saturating I/O bandwidth, cooling period coordination, and tombstone GC logic. This machinery adds ~750 lines of code and several subtle concurrency protocols.
+
+4. **Write amplification.** Even with reflinks, merge compaction has write amplification > 0: writing the output segment footer, updating the index, and the copy syscall overhead. Segment drain achieves true 0.00x write amplification — it only deletes files.
+
+**The insight:** For cache workloads, the remaining ~10% of live items in a sparse segment are not worth preserving. They can be re-fetched from the origin on cache miss. Segment drain exploits this by simply deleting the entire segment, trading a small increase in miss rate for zero I/O cost and zero code complexity.
+
+### 10.4 The Deletion Model: Tombstones and Consistency
 
 BlobCache uses a **soft delete (tombstone)** model rather than immediate removal. When `Delete(key)` is called:
 
-1. **WAL Write:** If WAL is enabled, a delete record is appended (crash consistency)
-2. **Hole Punch:** Immediate space reclamation via `fallocate(PUNCH_HOLE)`
-3. **Tombstone:** The index entry is marked with `IsDeleted()` flag rather than removed
+**Cache Mode (no WAL):**
+1. **Tombstone:** Write tombstone to segment's `.meta` file (incremental log)
+2. **Mark deleted in RAM:** Set `IsDeleted()` flag in the in-memory index
+3. **Update segment metadata:** Track waste ratio for drain candidate selection
+
+**CAS Mode (WAL enabled):**
+1. **WAL Write:** Append delete record to WAL (crash consistency)
+2. **Tombstone:** Write tombstone to segment's `.meta` file
+3. **Mark deleted in RAM:** Set `IsDeleted()` flag
+4. **Update segment metadata:** Track tombstone count for compaction candidate selection
 
 ```text
 DELETE LIFECYCLE:
@@ -689,76 +766,63 @@ DELETE LIFECYCLE:
    Delete(key)
         |
         v
-   [WAL: Append Delete Record]  <-- Crash consistency
+   [WAL: Append Delete Record]    <-- CAS mode only (crash consistency)
         |
         v
-   [Hole Punch Blob Data]       <-- Immediate space reclamation
+   [Tombstone in .meta]           <-- Incremental append to segment metadata
         |
         v
-   [Mark Item as Tombstone]     <-- Soft delete in RAM + persistence
+   [Mark Item as Deleted in RAM]  <-- Soft delete (IsDeleted flag)
         |
         v
-   [Compaction drops tombstone] <-- Final cleanup (deferred)
+   [Update Segment Metadata]      <-- Track waste ratio / tombstone count
+        |
+        v
+   [Segment Drain or Tombstone    <-- Deferred cleanup by maintenance worker
+    Compaction]
 ```
 
-**Why Tombstones?** Tombstones prevent the "Leapfrog Hazard"—a subtle bug that can resurrect deleted keys during compaction.
+**Why Tombstones (in WAL mode)?** Tombstones prevent the "Leapfrog Hazard"—a subtle bug that can resurrect deleted keys if compaction ever merges non-contiguous segments. See Section 10.6.
 
-### 10.4 The Strict Contiguity Rule
+### 10.5 Tombstone Compaction (WAL/CAS Mode)
 
-Compaction must only merge **contiguous** segment ranges. This invariant prevents the Leapfrog Hazard:
+In WAL mode, tombstones accumulate as incremental appendages to `.meta` files. Over time, a segment's `.meta` file grows: `[footer block] [tombstone batch 1] [batch 2] ...`. Tombstone compaction is a metadata-only operation that collapses these appendages back into the footer entries.
+
+**When it triggers:**
+- Segment crosses `TombstoneCompactionThreshold` (100 tombstones)
+- Segment has cooled past `MaxCachedSlabs + CoolingPeriodMargin` segment IDs
+
+**What it does:**
+1. Read the full manifest (footer + all tombstone batches merged)
+2. Rewrite the `.meta` file with tombstones baked into footer entry flags
+3. Result: smaller `.meta` file, faster startup scans, bounded metadata growth
+
+This is purely a metadata maintenance operation — no blob data is read or written.
+
+### 10.6 The Leapfrog Hazard and Strict Contiguity
+
+The Leapfrog Hazard is a correctness concern for any system that merges segments while tombstones exist. It is primarily relevant to WAL/CAS mode where data must not be lost:
 
 ```text
-THE LEAPFROG HAZARD (Why Tombstones + Contiguity Matter)
+THE LEAPFROG HAZARD
 
 Timeline:
   T1: Key K exists in Segment A (oldest)
-  T2: Key K deleted → tombstone in Segment A
-  T3: Key K re-written → new entry in Segment C (newest)
+  T2: Key K deleted -> tombstone in Segment A
+  T3: Key K re-written -> new entry in Segment C (newest)
 
 Segments: [A: tombstone(K)] [B: ...] [C: live(K)]
 
 WRONG: Compact A + C, skipping B
-  - Merge A and C into D
-  - Tombstone from A "wins" over live entry from C (older segment)
+  - Tombstone from A "wins" over live entry from C
   - Result: K is deleted, even though it was re-written!
 
 CORRECT: Only compact contiguous ranges [A, B] or [B, C] or [A, B, C]
-  - Ensures temporal ordering is preserved
-  - Newer writes always supersede older tombstones
 ```
 
-### 10.5 Tail GC: When Tombstones Can Be Dropped
+**Tail GC:** Tombstones can only be safely dropped when compacting the oldest (tail) segment, because by definition no older segment exists that could have a conflicting entry.
 
-Tombstones can only be garbage collected when compacting the **oldest (tail) segment**:
-
-* **Non-tail compaction:** Tombstones must be preserved. A newer segment might contain a re-write of the same key.
-* **Tail compaction:** Safe to drop tombstones. By definition, no older segment exists that could have a conflicting entry.
-
-```text
-SEGMENT TIMELINE (oldest → newest):
-
-  [Seg 1] [Seg 2] [Seg 3] [Seg 4]
-     ^                        ^
-   TAIL                    HEAD
-   (oldest)              (newest)
-
-Compacting Seg 1 (tail): Can drop tombstones
-Compacting Seg 2-4: Must preserve tombstones
-```
-
-### 10.6 Compaction Algorithm
-
-The compaction flow:
-
-1. **Select segments:** Choose contiguous range `[A, B, C]` based on waste score
-2. **Read items:** Collect all items from source segments
-3. **Filter:** If tail compaction, drop tombstones
-4. **Copy data:** Write blob data to new segment file
-5. **Write metadata:** `IngestBatch(newSegID, items, maxSeqID)`
-6. **Relocate RAM:** For each item, `Relocate(key, oldSeg, oldOff, newSeg, newOff)`
-7. **Cleanup:** Delete old segment files and metadata
-
-The `Relocate` method provides atomic compare-and-swap semantics: if a concurrent write updated the item to a newer segment, the relocation fails (safe), and we skip that item—it now lives in the newer segment.
+In cache mode, the Leapfrog Hazard is irrelevant: segment drain deletes entire segments (it doesn't merge them), and data loss from drain is acceptable (items become cache misses).
 
 ---
 

@@ -125,7 +125,7 @@ func BenchmarkBlobCache(b *testing.B) {
 
 	// --- SYSTEM MONITOR (Background Heartbeat) ---
 	ctx, cancel := context.WithCancel(context.Background())
-	metricsChan := startSystemMonitor(ctx, &totalWriteBytes, &totalReadBytes, &cache.approxSize, tmpDir)
+	metricsChan := startSystemMonitor(ctx, &totalWriteBytes, &totalReadBytes, &cache.approxSize, &numReads, &numFound, tmpDir)
 
 	// Reinterpret b.N: each iteration = one write
 	// e.g., -benchtime=1000000x means 1M writes (~1TB at 1MB/write)
@@ -198,11 +198,15 @@ func BenchmarkBlobCache(b *testing.B) {
 					}
 				} else if op < ColdReadBound {
 					baseID := rng.Uint64() % (maxID - 4)
+					var coldHits int64
 					for i := uint64(0); i < 4; i++ {
 						k := fastFormatKey(keyBuf, "key-", baseID+i)
-						cache.View(k, viewFn)
+						if cache.View(k, viewFn) {
+							coldHits++
+						}
 					}
 					numReads.Add(4)
+					numFound.Add(coldHits)
 				} else {
 					k := fastFormatKey(keyBuf, "miss-", rng.Uint64())
 					cache.Get(k)
@@ -343,7 +347,7 @@ func reportLatency(b *testing.B, name string, h *hdrhistogram.Histogram) {
 }
 
 func startSystemMonitor(
-	ctx context.Context, logicalWriteBytes, logicalReadBytes, liveSizeBytes *atomic.Int64, cachePath string,
+	ctx context.Context, logicalWriteBytes, logicalReadBytes, liveSizeBytes, readCount, hitCount *atomic.Int64, cachePath string,
 ) <-chan SystemMetrics {
 	out := make(chan SystemMetrics, 1)
 	go func() {
@@ -356,6 +360,8 @@ func startSystemMonitor(
 			v1, _           = disk.IOCounters()
 			prevLogWrite    = logicalWriteBytes.Load()
 			prevLogRead     = logicalReadBytes.Load()
+			prevReads       = readCount.Load()
+			prevHits        = hitCount.Load()
 		)
 		defer ticker.Stop()
 
@@ -433,14 +439,30 @@ func startSystemMonitor(
 					diskRatio = onDiskGB / writtenGB
 				}
 
+				// 7. Hit/Miss accounting
+				currReads := readCount.Load()
+				currHits := hitCount.Load()
+				intervalReads := currReads - prevReads
+				intervalHits := currHits - prevHits
+				intervalMisses := intervalReads - intervalHits
+				hitRate := 0.0
+				if intervalReads > 0 {
+					hitRate = float64(intervalHits) / float64(intervalReads) * 100
+				}
+				readsPerSec := float64(intervalReads) / interval.Seconds()
+				hitsPerSec := float64(intervalHits) / interval.Seconds()
+				missesPerSec := float64(intervalMisses) / interval.Seconds()
+
 				fmt.Printf("\n[HEARTBEAT %s]\n"+
 					"  MEM:   RSS: %.2fGB\n"+
 					"  DISK:  IO Depth: %.2f | Phys-Read: %.2f GB/s | Phys-Write: %.2f GB/s | Free: %.1fGB\n"+
 					"  CACHE: Written: %.2fGB | OnDisk: %.2fGB | Live: %.2fGB | Ratio: %.2f\n"+
-					"  TPUT:  Log-Write: %.2f GB/s | Log-Read: %.2f GB/s\n",
+					"  TPUT:  Log-Write: %.2f GB/s | Log-Read: %.2f GB/s\n"+
+					"  READS: %.0f/s total | %.0f/s hits | %.0f/s misses | HitRate: %.1f%%\n",
 					time.Now().Format("15:04:05"), rss, currentQD, physReadTP, physWriteTP, freeGB,
 					writtenGB, onDiskGB, liveGB, diskRatio,
-					logWriteTP, logReadTP)
+					logWriteTP, logReadTP,
+					readsPerSec, hitsPerSec, missesPerSec, hitRate)
 
 				// Update states
 				totalQD += currentQD
@@ -448,6 +470,8 @@ func startSystemMonitor(
 				v1 = v2
 				prevLogWrite = currLogWrite
 				prevLogRead = currLogRead
+				prevReads = currReads
+				prevHits = currHits
 			}
 		}
 	}()

@@ -49,6 +49,12 @@ func OpenFileForRead(path string, _ OpenFlag) (*os.File, error) {
 	return os.OpenFile(path, os.O_RDONLY, 0)
 }
 
+// CopyFileRange copies data between two files.
+// Delegates to emulated ReadAt/WriteAt fallback on unsupported platforms.
+func CopyFileRange(srcFile, dstFile *os.File, srcOff, dstOff *int64, length int) (int, error) {
+	return copyFileRangeEmulated(srcFile, dstFile, srcOff, dstOff, length)
+}
+
 // PreadAligned reads from a file at the specified offset.
 // No alignment enforcement on unsupported platforms.
 func PreadAligned(f *os.File, buf []byte, offset int64, _ OpenFlag) (int, error) {

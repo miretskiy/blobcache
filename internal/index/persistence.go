@@ -1127,6 +1127,27 @@ func (p *persistence) getDrainCandidates(maxEligibleID uint32) []SparseSegment {
 	return candidates
 }
 
+// getRewriteCandidates returns cooled segment IDs with waste ratio at or above
+// the threshold, sorted ascending. Includes 100% dead segments (caller handles
+// "all dead → just delete" separately).
+func (p *persistence) getRewriteCandidates(maxEligibleID uint32, wasteThreshold float64) []uint32 {
+	p.segments.RLock()
+	defer p.segments.RUnlock()
+
+	var candidates []uint32
+	for segID, meta := range p.segments.byID {
+		if segID >= maxEligibleID {
+			continue
+		}
+		if meta.WasteRatio() >= wasteThreshold {
+			candidates = append(candidates, segID)
+		}
+	}
+
+	slices.Sort(candidates)
+	return candidates
+}
+
 // getInMemoryManifest returns the cached manifest for a segment, if available.
 // Returns false if the segment has no cached entries (e.g., test-registered segments).
 func (p *persistence) getInMemoryManifest(segID uint32) (SegmentManifest, bool) {

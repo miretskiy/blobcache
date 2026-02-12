@@ -497,6 +497,20 @@ func (idx *DurableIndex) GetDrainCandidates(maxEligibleID uint32) []SparseSegmen
 	return idx.segments.getDrainCandidates(maxEligibleID)
 }
 
+// GetRewriteCandidates returns cooled segment IDs with waste ratio at or above
+// the threshold, sorted ascending. Used by WAL-mode compaction to find segments
+// that should be rewritten. Includes 100% dead segments.
+func (idx *DurableIndex) GetRewriteCandidates(maxEligibleID uint32, wasteThreshold float64) []uint32 {
+	return idx.segments.getRewriteCandidates(maxEligibleID, wasteThreshold)
+}
+
+// GetSegmentMetadata returns the metadata for a segment, or nil if not found.
+func (idx *DurableIndex) GetSegmentMetadata(segID uint32) *SegmentMetadata {
+	idx.segments.segments.RLock()
+	defer idx.segments.segments.RUnlock()
+	return idx.segments.segments.byID[segID]
+}
+
 // VerifyNoSegmentsInRange checks that no segments exist in the open interval (startID, endID).
 // Used during compaction to validate the Strict Contiguity Rule.
 //

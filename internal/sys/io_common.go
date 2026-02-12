@@ -133,6 +133,31 @@ func AlignForHolePunch(offset, length int64) (int64, int64, bool) {
 	return alignedOffset, length, true
 }
 
+// copyFileRangeEmulated copies data between two files using ReadAt/WriteAt.
+// Used as fallback on platforms without kernel copy_file_range support.
+func copyFileRangeEmulated(srcFile, dstFile *os.File, srcOff, dstOff *int64, length int) (int, error) {
+	const maxChunk = 1 << 20 // 1MB
+	buf := make([]byte, min(length, maxChunk))
+	var total int
+	for total < length {
+		toRead := min(length-total, len(buf))
+		n, err := srcFile.ReadAt(buf[:toRead], *srcOff)
+		if n > 0 {
+			nw, werr := dstFile.WriteAt(buf[:n], *dstOff)
+			*srcOff += int64(nw)
+			*dstOff += int64(nw)
+			total += nw
+			if werr != nil {
+				return total, werr
+			}
+		}
+		if err != nil {
+			return total, err
+		}
+	}
+	return total, nil
+}
+
 // IsTransientIOError returns true if the error is likely temporary and
 // the operation might succeed if retried. This is used to distinguish
 // between "data is gone" and "the system is busy."

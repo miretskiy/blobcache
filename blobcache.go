@@ -847,10 +847,10 @@ func (c *Cache) maintenanceWorker() {
 				}
 			}
 
-			// Phase 2: Tombstone compaction (WAL/durable mode only)
+			// Phase 2: Segment compaction (WAL/durable mode only)
 			if c.wal != nil && !c.IsDegraded() {
-				if err := c.maybeCompactTombstones(); err != nil {
-					c.ReportError(fmt.Errorf("tombstone compaction: %w", err))
+				if err := c.maybeRewriteSegments(); err != nil {
+					c.ReportError(fmt.Errorf("segment compaction: %w", err))
 					return
 				}
 			}
@@ -951,49 +951,6 @@ func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
 	}
 
 	return nil
-}
-
-// maybeCompactTombstones identifies segments with many tombstones and compacts them.
-// Collapses the tombstone incremental log into the segment manifest (metadata-only).
-// Only used in WAL/durable mode where tombstones accumulate indefinitely.
-func (c *Cache) maybeCompactTombstones() error {
-	segments := c.selectSegmentsForTombstoneCompaction()
-	if len(segments) == 0 {
-		return nil
-	}
-
-	log.Debug("tombstone compaction starting", "segment_count", len(segments))
-
-	for _, segID := range segments {
-		// Acquire shared lock: allows concurrent compactions, blocks Delete.
-		shard := c.index.SegmentLockShard(segID)
-		shard.RLock()
-		err := c.index.CompactTombstones(segID)
-		shard.RUnlock()
-
-		if err != nil {
-			return fmt.Errorf("compact tombstones segment %d: %w", segID, err)
-		}
-
-		c.index.AcknowledgeTombstoneCompaction(segID)
-	}
-
-	return nil
-}
-
-// selectSegmentsForTombstoneCompaction returns cooled segments eligible for
-// tombstone compaction. Cooling ensures segments are fully flushed and out of
-// Librarian cache before compaction rewrites their .meta files.
-func (c *Cache) selectSegmentsForTombstoneCompaction() []uint32 {
-	currentSegID := c.segIDs.CurrentSegmentID()
-	coolingGap := uint32(c.MaxCachedSlabs + index.CoolingPeriodMargin)
-
-	if currentSegID <= coolingGap {
-		return nil
-	}
-
-	maxEligibleID := currentSegID - coolingGap
-	return c.index.GetTombstoneCompactionCandidates(maxEligibleID)
 }
 
 // maybeDrainSegments is pressure-driven disk reclamation for cache mode.

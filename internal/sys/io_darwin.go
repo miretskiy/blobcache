@@ -171,6 +171,12 @@ func OpenFileForRead(path string, flags OpenFlag) (*os.File, error) {
 	return f, nil
 }
 
+// CopyFileRange copies data between two files.
+// Darwin does not have copy_file_range; delegates to emulated ReadAt/WriteAt fallback.
+func CopyFileRange(srcFile, dstFile *os.File, srcOff, dstOff *int64, length int) (int, error) {
+	return copyFileRangeEmulated(srcFile, dstFile, srcOff, dstOff, length)
+}
+
 // PreadAligned reads from a file at the specified offset.
 // Darwin's F_NOCACHE does not require strict alignment like Linux O_DIRECT,
 // but we validate for API consistency when FlDirectIO is set.

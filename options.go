@@ -59,16 +59,17 @@ type config struct {
 	MaxInflightSlabs int   // Max slabs queueing for flush
 	MaxCachedSlabs   int   // Max slabs kept in memory for reading
 
-	FlushConcurrency   int
-	BloomFPRate        float64
-	BloomEstimatedKeys int
-	IO                 IOConfig
-	Resilience         ResilienceConfig
-	Compression        CompressionConfig
-	WAL                WALConfig
-	DegradedMode       DegradedMode // How to handle degraded mode (default: memory-only)
-	TrustHash          bool         // Skip key verification on reads (cache mode optimization)
-	BallastSize        int          // Heap ballast size in bytes (default: 1GB, 0 = disabled)
+	FlushConcurrency         int
+	BloomFPRate              float64
+	BloomEstimatedKeys       int
+	IO                       IOConfig
+	Resilience               ResilienceConfig
+	Compression              CompressionConfig
+	WAL                      WALConfig
+	DegradedMode             DegradedMode // How to handle degraded mode (default: memory-only)
+	TrustHash                bool         // Skip key verification on reads (cache mode optimization)
+	BallastSize              int          // Heap ballast size in bytes (default: 1GB, 0 = disabled)
+	CompactionWasteThreshold float64      // Waste ratio to trigger segment rewrite (WAL mode, default: 0.25)
 
 	knobs *TestingKnobs
 }
@@ -218,20 +219,28 @@ func WithBallast(size int) Option {
 	return funcOpt(func(c *config) { c.BallastSize = max(0, size) })
 }
 
+// WithCompactionWasteThreshold sets the waste ratio that triggers segment rewrite
+// in WAL mode. When a segment's tombstone ratio exceeds this threshold, it becomes
+// a candidate for compaction. Default: 0.25 (25%).
+func WithCompactionWasteThreshold(ratio float64) Option {
+	return funcOpt(func(c *config) { c.CompactionWasteThreshold = ratio })
+}
+
 func defaultConfig(path string) config {
 	return config{
-		Path:               path,
-		MaxSize:            0,
-		Shards:             0,
-		WriteBufferSize:    64 << 20, // 64MB
-		MaxInflightSlabs:   6,
-		MaxCachedSlabs:     8, // Keep ~1GB of recently written data in RAM
-		FlushConcurrency:   2,
-		BloomFPRate:        0.01,
-		BloomEstimatedKeys: 1_000_000,
-		DegradedMode:       DegradedMemoryOnly,
-		TrustHash:          true,    // Cache mode: trust hash, skip key verification
-		BallastSize:        1 << 30, // 1GB heap ballast to reduce GC frequency
+		Path:                     path,
+		MaxSize:                  0,
+		Shards:                   0,
+		WriteBufferSize:          64 << 20, // 64MB
+		MaxInflightSlabs:         6,
+		MaxCachedSlabs:           8, // Keep ~1GB of recently written data in RAM
+		FlushConcurrency:         2,
+		BloomFPRate:              0.01,
+		BloomEstimatedKeys:       1_000_000,
+		DegradedMode:             DegradedMemoryOnly,
+		TrustHash:                true,    // Cache mode: trust hash, skip key verification
+		BallastSize:              1 << 30, // 1GB heap ballast to reduce GC frequency
+		CompactionWasteThreshold: 0.25,    // 25% waste triggers segment rewrite
 		IO: IOConfig{
 			FDataSync:     false,
 			Fadvise:       sys.UseFadvise,

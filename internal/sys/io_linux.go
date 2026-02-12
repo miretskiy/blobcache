@@ -89,6 +89,13 @@ func OpenFileForRead(path string, flags OpenFlag) (*os.File, error) {
 	return os.OpenFile(path, osFlags, 0)
 }
 
+// CopyFileRange copies data between two files using the copy_file_range(2) syscall.
+// On XFS with reflinks, this is a metadata-only operation (zero I/O).
+func CopyFileRange(srcFile, dstFile *os.File, srcOff, dstOff *int64, length int) (int, error) {
+	n, err := unix.CopyFileRange(int(srcFile.Fd()), srcOff, int(dstFile.Fd()), dstOff, length, 0)
+	return n, err
+}
+
 // PreadAligned reads from a file at an aligned offset into an aligned buffer.
 // For O_DIRECT, offset and len(buf) must be multiples of BlockSize.
 func PreadAligned(f *os.File, buf []byte, offset int64, flags OpenFlag) (int, error) {

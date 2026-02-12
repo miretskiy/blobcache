@@ -195,7 +195,7 @@ func TestSegmentDrain_CoolingPeriod(t *testing.T) {
 }
 
 // TestSegmentDrain_WALModeSkipped verifies that segment drain is NOT triggered
-// in WAL/CAS mode (WAL mode uses tombstone compaction instead).
+// in WAL/CAS mode (WAL mode uses segment compaction instead of drain).
 func TestSegmentDrain_WALModeSkipped(t *testing.T) {
 	tmpDir := t.TempDir()
 
@@ -203,7 +203,8 @@ func TestSegmentDrain_WALModeSkipped(t *testing.T) {
 		WithWAL(),
 		WithMaxCachedSlabs(0),
 		WithWriteBufferSize(1<<20),
-		WithMaxSize(2<<20), // 2MB — would trigger drain in cache mode
+		WithMaxSize(2<<20),                // 2MB — would trigger drain in cache mode
+		WithCompactionWasteThreshold(1.0), // Disable compaction to isolate drain behavior
 	)
 	require.NoError(t, err)
 	cache.Start()
@@ -239,7 +240,7 @@ func TestSegmentDrain_WALModeSkipped(t *testing.T) {
 	}
 
 	// In WAL mode, maintenanceWorker skips drain (Phase 3 is guarded by c.wal == nil).
-	// We verify the segment file is still present.
+	// With compaction disabled, we verify the segment file is still present.
 	segPath := getSegmentPath(cache.Path, cache.Shards, segID)
 	_, err = os.Stat(segPath)
 	require.NoError(t, err, "WAL mode should NOT drain segments")

@@ -135,8 +135,8 @@ func physicalRecordLen(e *record.FooterEntry) int64 {
 // efficient re-compaction (reflinks on XFS).
 //
 // The caller must hold the segment shard RLock before calling.
-func (c *Cache) rewriteSegment(segID uint32) (RewriteResult, error) {
-	result := RewriteResult{OldSegID: segID}
+func (c *Cache) rewriteSegment(segID uint32) (result RewriteResult, retErr error) {
+	result = RewriteResult{OldSegID: segID}
 
 	// 1. Get manifest from in-memory cache.
 	manifest, err := c.index.GetSegmentManifestRaw(segID)
@@ -193,30 +193,36 @@ func (c *Cache) rewriteSegment(segID uint32) (RewriteResult, error) {
 	if err != nil {
 		return result, fmt.Errorf("open source segment %d: %w", segID, err)
 	}
-	defer func() { _ = srcFile.Close() }()
+	defer func() {
+		if err := srcFile.Close(); err != nil && retErr == nil {
+			retErr = fmt.Errorf("close source segment %d: %w", segID, err)
+		}
+	}()
 
 	// 6. Allocate new segment ID.
 	newSegID := c.segIDs.NextSegmentID()
 	result.NewSegID = newSegID
 
-	// 7. Calculate output file size: header block + page-aligned runs.
-	// Runs are already page-aligned, so just sum them.
-	dstSize := int64(sys.BlockSize) // File header (padded to 4KB)
-	for _, run := range runs {
-		dstSize += run.length
-	}
-
-	// 8. Create temp output file with O_DIRECT.
+	// 7. Create temp output file with O_DIRECT.
+	// Do NOT pre-allocate (fallocate) — the file must remain sparse so that
+	// copy_file_range on XFS can share source extents via reflinks (metadata-only
+	// COW). Pre-allocating would fill the range with zeroed extents, forcing
+	// actual data copies instead of reflinks.
 	dstPath := getSegmentPath(c.Path, c.Shards, newSegID)
 	tmpPath := dstPath + ".compact.tmp"
-	dstFile, err := sys.CreateAndAllocateFile(tmpPath, sys.FlDirectIO, dstSize)
+	dstFile, err := sys.CreateFile(tmpPath, sys.FlDirectIO)
 	if err != nil {
 		return result, fmt.Errorf("create compaction output: %w", err)
 	}
 	defer func() {
 		if dstFile != nil {
-			_ = dstFile.Close()
-			_ = os.Remove(tmpPath)
+			if err := dstFile.Close(); err != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("close compaction temp: %w", err))
+				return // Don't remove if close failed
+			}
+			if err := os.Remove(tmpPath); err != nil && !os.IsNotExist(err) {
+				retErr = errors.Join(retErr, fmt.Errorf("remove compaction temp: %w", err))
+			}
 		}
 	}()
 

@@ -11,9 +11,8 @@
 //! # Architecture Parity with BlobCache
 //! - **Zero-copy values**: `bytes::Bytes` for O(1) internal clones within foyer
 //!   (eliminates Vec<u8> memcpy on every insert/clone inside the cache)
-//! - **Token-bucket backpressure**: Semaphore (2GB burst) + background replenisher
-//!   (1.1 GB/s sustained) mimics Go's `WithMaxInflightSlabs(32)` which caps
-//!   inflight write data at 2GB
+//! - **Inflight backpressure**: Semaphore limits inflight write data to 2GB,
+//!   matching Go's `WithMaxInflightSlabs(32) * WriteBufferSize(64MB)`
 //!
 //! # Usage
 //! ```bash
@@ -23,7 +22,7 @@
 use bytes::Bytes;
 use clap::Parser;
 use foyer::{HybridCache, HybridCacheBuilder, HybridCachePolicy};
-use foyer_storage::{BlockEngineBuilder, DeviceBuilder, FsDeviceBuilder, Throttle};
+use foyer_storage::{BlockEngineBuilder, DeviceBuilder, FsDeviceBuilder};
 use hdrhistogram::Histogram;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -73,11 +72,6 @@ struct Args {
     #[arg(short, long, default_value_t = 400)]
     capacity_gb: usize,
 
-    /// Sustained write rate limit in MB/s (token bucket replenish rate).
-    /// The semaphore allows 2GB burst; this controls how fast permits are
-    /// replenished, capping sustained write throughput.
-    #[arg(long, default_value_t = 1100)]
-    write_rate_limit_mb: usize,
 }
 
 struct WorkerStats {
@@ -144,9 +138,8 @@ async fn run_worker(
                 // 30% Write - Variable blob sizes (100KB - 2MB)
                 let blob_size = BLOB_SIZE_LO + rng.gen_range(0..BLOB_SIZE_HI_RNG);
 
-                // Token bucket backpressure: blocks when inflight exceeds 2GB burst.
-                // Permits are forgotten (consumed); background replenisher returns
-                // them at the sustained rate (default 1.1 GB/s).
+                // Backpressure: blocks when inflight data exceeds 2GB budget
+                // (matches Go's MaxInflightSlabs(32) * WriteBufferSize(64MB)).
                 let permit = limiter.acquire_many(blob_size as u32).await.unwrap();
 
                 let id = stats.write_head.fetch_add(1, Ordering::Relaxed);
@@ -163,8 +156,8 @@ async fn run_worker(
                     .fetch_add(blob_size as u64, Ordering::Relaxed);
                 local_put.record(start.elapsed().as_nanos() as u64).ok();
 
-                // Forget permit: consumed tokens are replenished by background task.
-                permit.forget();
+                // Release budget after foyer acknowledges queueing.
+                drop(permit);
                 data_written = true;
             } else if adjusted_op < HOT_READ_BOUND {
                 // 30% Hot Read - Zipfian distribution targeting recent keys
@@ -360,10 +353,7 @@ async fn main() -> anyhow::Result<()> {
     println!("  Buffer pool: 2GB (matches inflight: 32 slabs x 64MB)");
     println!("  Block size: 64MB (matches write_buffer_size)");
     println!("  Flushers: 2 (matches flush_concurrency)");
-    println!(
-        "  Backpressure: token-bucket semaphore (2GB burst, {} MB/s sustained)",
-        args.write_rate_limit_mb
-    );
+    println!("  Backpressure: semaphore (2GB inflight limit)");
     println!("  Policy: WriteOnInsertion (all writes go to disk)");
     println!("  Direct I/O: ENABLED (bypass page cache)");
     println!("  Value type: bytes::Bytes (zero-copy refcounting)");
@@ -386,16 +376,13 @@ async fn main() -> anyhow::Result<()> {
     rng.fill(&mut entropy[..]);
     let entropy = Arc::new(entropy);
 
-    // Token bucket semaphore: 2GB burst capacity.
-    // Workers consume permits on each write (via forget()), and a background
-    // replenisher adds permits at the sustained rate. This provides both
-    // burst absorption and sustained rate limiting.
+    // Inflight limiter: 2GB budget (matches Go's MaxInflightSlabs(32) * 64MB).
+    // Workers acquire permits before insert and release after foyer queues the data.
     let inflight_limiter = Arc::new(Semaphore::new(INFLIGHT_LIMIT_BYTES));
 
     // Build foyer cache with BlobCache-matched configuration
     let device = FsDeviceBuilder::new(&args.path)
-        .with_capacity((args.capacity_gb + 100) * 1024 * 1024 * 1024)
-        .with_throttle(Throttle::new()) // Unlimited (we do our own backpressure)
+        .with_capacity(args.capacity_gb * 1024 * 1024 * 1024)
         .with_direct(true) // Direct I/O to bypass page cache
         .build()?;
 
@@ -408,8 +395,7 @@ async fn main() -> anyhow::Result<()> {
     let engine = BlockEngineBuilder::new(device)
         .with_flushers(2)                                    // Match flush_concurrency
         .with_block_size(64 * 1024 * 1024)                   // 64MB blocks (match write_buffer_size)
-        .with_buffer_pool_size(2 * 1024 * 1024 * 1024)       // 2GB buffer pool (match inflight slabs)
-        .with_submit_queue_size_threshold(2 * 1024 * 1024 * 1024); // 2GB queue threshold
+        .with_buffer_pool_size(2 * 1024 * 1024 * 1024);      // 2GB buffer pool (match inflight slabs)
 
     let cache: Arc<HybridCache<Bytes, Bytes>> = Arc::new(
         HybridCacheBuilder::new()
@@ -466,37 +452,10 @@ async fn main() -> anyhow::Result<()> {
         system_monitor(monitor_stop, monitor_bytes, monitor_path)
     });
 
-    // --- TOKEN BUCKET REPLENISHER ---
-    // Adds permits back at the sustained write rate, capped at INFLIGHT_LIMIT_BYTES.
-    // This creates real backpressure: when the 2GB burst is exhausted, writers block
-    // until permits are replenished at the sustained rate.
-    let replenisher_handle = tokio::spawn({
-        let limiter = Arc::clone(&inflight_limiter);
-        let stop = Arc::clone(&stop_flag);
-        let rate_bytes_per_sec = (args.write_rate_limit_mb as u64) * 1024 * 1024;
-        async move {
-            let tick = Duration::from_millis(100); // 10 Hz replenish
-            let permits_per_tick = (rate_bytes_per_sec / 10) as usize;
-            let mut interval = tokio::time::interval(tick);
-            loop {
-                interval.tick().await;
-                if stop.load(Ordering::Relaxed) {
-                    break;
-                }
-                // Cap at INFLIGHT_LIMIT_BYTES to prevent unbounded growth
-                let avail = limiter.available_permits();
-                let to_add = permits_per_tick.min(INFLIGHT_LIMIT_BYTES.saturating_sub(avail));
-                if to_add > 0 {
-                    limiter.add_permits(to_add);
-                }
-            }
-        }
-    });
-
     // --- MAIN BENCHMARK ---
     println!(
-        "Starting benchmark ({} iterations, token-bucket @ {} MB/s, 2GB burst)...",
-        args.iterations, args.write_rate_limit_mb
+        "Starting benchmark ({} iterations, 2GB inflight limit)...",
+        args.iterations
     );
     let benchmark_start = Instant::now();
 
@@ -544,7 +503,6 @@ async fn main() -> anyhow::Result<()> {
     // Stop background tasks
     stop_flag.store(true, Ordering::Release);
     let peak_rss = monitor_handle.join().unwrap_or(0.0);
-    replenisher_handle.abort();
 
     // --- FINAL REPORT ---
     println!();

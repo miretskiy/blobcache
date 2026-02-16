@@ -2,11 +2,11 @@
 //!
 //! This benchmark uses the same workload distribution as BlobCache for fair comparison:
 //!
-//! # Workload Distribution (40/40/10/10 - write-heavy to saturate NVMe)
+//! # Workload Distribution (30/30/30/10 - balanced read/write)
 //!
-//! - 40% Write (new data, 100KB - 2MB per blob)
-//! - 40% Hot Read (Zipfian: top 10-15% of keys = 60-70% of accesses)
-//! - 10% Cold Read (sequential scan pattern)
+//! - 30% Write (new data, 100KB - 2MB per blob)
+//! - 30% Hot Read (Zipfian: top 10-15% of keys = 60-70% of accesses)
+//! - 30% Cold Read (sequential scan pattern)
 //! - 10% Miss (negative lookups, tests bloom filter)
 //!
 //! # Usage
@@ -77,15 +77,15 @@ impl Pacer {
     }
 }
 
-// --- WORKLOAD CONFIGURATION (matches BlobCache 40/40/10/10) ---
-// Higher write percentage to saturate NVMe bandwidth
-const WRITE_WEIGHT: u32 = 40;
-const HOT_READ_WEIGHT: u32 = 40;
-const COLD_READ_WEIGHT: u32 = 10;
+// --- WORKLOAD CONFIGURATION (matches BlobCache 30/30/30/10) ---
+// Balanced read/write to exercise both paths equally
+const WRITE_WEIGHT: u32 = 30;
+const HOT_READ_WEIGHT: u32 = 30;
+const COLD_READ_WEIGHT: u32 = 30;
 
-const WRITE_BOUND: u32 = WRITE_WEIGHT;           // 40% writes
-const HOT_READ_BOUND: u32 = WRITE_BOUND + HOT_READ_WEIGHT;    // 80% (40+40)
-const COLD_READ_BOUND: u32 = HOT_READ_BOUND + COLD_READ_WEIGHT; // 90% (80+10), remaining 10% = miss
+const WRITE_BOUND: u32 = WRITE_WEIGHT;           // 30% writes
+const HOT_READ_BOUND: u32 = WRITE_BOUND + HOT_READ_WEIGHT;    // 60% (30+30)
+const COLD_READ_BOUND: u32 = HOT_READ_BOUND + COLD_READ_WEIGHT; // 90% (60+30), remaining 10% = miss
 
 const WARMUP_KEYS: u64 = 10000;
 const READ_MIN_KEYS: u64 = 5000;
@@ -184,7 +184,7 @@ async fn run_worker(
             let start = Instant::now();
 
             if adjusted_op < WRITE_BOUND {
-                // 10% Write - Variable blob sizes (100KB - 2MB)
+                // 30% Write - Variable blob sizes (100KB - 2MB)
                 let blob_size = BLOB_SIZE_LO + rng.gen_range(0..BLOB_SIZE_HI_RNG);
                 let offset: usize = rng.gen_range(0..entropy.len().saturating_sub(blob_size));
 
@@ -206,7 +206,7 @@ async fn run_worker(
 
                 data_written = true;
             } else if adjusted_op < HOT_READ_BOUND {
-                // 40% Hot Read - Zipfian distribution targeting recent keys
+                // 30% Hot Read - Zipfian distribution targeting recent keys
                 if max_id > 0 {
                     let zipf_val = zipf.sample(&mut rng) as u64 % max_id;
                     let id = max_id.saturating_sub(1).saturating_sub(zipf_val);
@@ -221,7 +221,7 @@ async fn run_worker(
                     local_get.record(start.elapsed().as_nanos() as u64).ok();
                 }
             } else if adjusted_op < COLD_READ_BOUND {
-                // 25% Cold Read - Sequential scan of 4 consecutive keys
+                // 30% Cold Read - Sequential scan of 4 consecutive keys
                 if max_id > 4 {
                     let base_id = rng.gen_range(0..max_id.saturating_sub(4));
                     for i in 0..4u64 {
@@ -231,7 +231,7 @@ async fn run_worker(
                     stats.num_reads.fetch_add(4, Ordering::Relaxed);
                 }
             } else {
-                // 25% Miss - Negative lookups (bloom filter test)
+                // 10% Miss - Negative lookups (bloom filter test)
                 let miss_id: u64 = rng.gen();
                 let key = format!("miss-{}", miss_id).into_bytes();
 
@@ -395,10 +395,10 @@ async fn main() -> anyhow::Result<()> {
     );
     println!();
     println!("Configuration (matching Ferum/Go):");
-    println!("  Memory tier: 12GB (matches Ferum slab pool)");
-    println!("  Buffer pool: 12GB");
-    println!("  Block size: 128MB (matches write_buffer_size)");
-    println!("  Flushers: 6 (matches flush_concurrency)");
+    println!("  Memory tier: 6GB (matches Ferum slab pool: 96 slabs × 64MB)");
+    println!("  Buffer pool: 2GB (matches inflight: 32 slabs × 64MB)");
+    println!("  Block size: 64MB (matches write_buffer_size)");
+    println!("  Flushers: 2 (matches flush_concurrency)");
     println!("  Policy: WriteOnInsertion (all writes go to disk)");
     println!("  Direct I/O: ENABLED (bypass page cache)");
     if args.write_rate_limit_mb > 0 {
@@ -410,10 +410,10 @@ async fn main() -> anyhow::Result<()> {
         println!("  Rate limit: NONE (may OOM without backpressure!)");
     }
     println!();
-    println!("Workload distribution (40/40/10/10 - write-heavy):");
-    println!("  40% Write  (100KB - 2MB per blob)");
-    println!("  40% Hot    (Zipfian: top 10-15% keys = 60-70% accesses)");
-    println!("  10% Cold   (Sequential scan of 4 keys)");
+    println!("Workload distribution (30/30/30/10 - balanced):");
+    println!("  30% Write  (100KB - 2MB per blob)");
+    println!("  30% Hot    (Zipfian: top 10-15% keys = 60-70% accesses)");
+    println!("  30% Cold   (Sequential scan of 4 keys)");
     println!("  10% Miss   (Negative lookups)");
     println!();
 
@@ -431,10 +431,10 @@ async fn main() -> anyhow::Result<()> {
     // Build foyer cache
     // Configuration to match Ferum/Go BlobCache for fair comparison:
     // - WriteOnInsertion: Every write goes to disk (like Ferum/Go)
-    // - 12GB memory: Matches Ferum's slab pool (98 slabs × 128MB)
-    // - 12GB buffer pool: Prevents data drops under load
-    // - 6 flushers: Matches Ferum's flush_concurrency
-    // - 128MB block size: Matches Ferum's write_buffer_size
+    // - 6GB memory: Matches Ferum's slab pool (96 slabs × 64MB)
+    // - 2GB buffer pool: Matches inflight (32 slabs × 64MB)
+    // - 2 flushers: Matches Ferum's flush_concurrency
+    // - 64MB block size: Matches Ferum's write_buffer_size
     let device = FsDeviceBuilder::new(&args.path)
         .with_capacity((args.capacity_gb + 100) * 1024 * 1024 * 1024) // usize capacity
         .with_throttle(Throttle::new()) // Unlimited
@@ -442,22 +442,22 @@ async fn main() -> anyhow::Result<()> {
         .build()?;
 
     // Match Ferum configuration:
-    // - flush_concurrency: 6
-    // - write_buffer_size: 128MB
-    // - max_inflight_slabs: 32 (32 × 128MB = 4GB inflight)
-    // - max_cached_slabs: 64 (64 × 128MB = 8GB cached)
-    // Total slab pool: ~12GB
+    // - flush_concurrency: 2
+    // - write_buffer_size: 64MB
+    // - max_inflight_slabs: 32 (32 × 64MB = 2GB inflight)
+    // - max_cached_slabs: 64 (64 × 64MB = 4GB cached)
+    // Total slab pool: ~6GB
     let engine = BlockEngineBuilder::new(device)
-        .with_flushers(6)                                    // Match flush_concurrency
-        .with_block_size(128 * 1024 * 1024)                  // 128MB blocks (match write_buffer_size)
-        .with_buffer_pool_size(12 * 1024 * 1024 * 1024)      // 12GB buffer pool (match slab pool)
-        .with_submit_queue_size_threshold(12 * 1024 * 1024 * 1024); // 12GB queue threshold
+        .with_flushers(2)                                    // Match flush_concurrency
+        .with_block_size(64 * 1024 * 1024)                   // 64MB blocks (match write_buffer_size)
+        .with_buffer_pool_size(2 * 1024 * 1024 * 1024)       // 2GB buffer pool (match inflight slabs)
+        .with_submit_queue_size_threshold(2 * 1024 * 1024 * 1024); // 2GB queue threshold
 
     let cache: Arc<HybridCache<Vec<u8>, Vec<u8>>> = Arc::new(
         HybridCacheBuilder::new()
             .with_name("foyer-bench")
             .with_policy(HybridCachePolicy::WriteOnInsertion) // Write to disk on every insert
-            .memory(12 * 1024 * 1024 * 1024)                  // 12GB memory (match Ferum's slab pool)
+            .memory(6 * 1024 * 1024 * 1024)                   // 6GB memory (match Ferum's slab pool)
             .with_weighter(|_k: &Vec<u8>, v: &Vec<u8>| v.len())
             .storage()
             .with_engine_config(engine)

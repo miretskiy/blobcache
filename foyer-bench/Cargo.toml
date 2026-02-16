@@ -7,13 +7,13 @@ edition = "2021"
 # Use official published foyer crate
 foyer = "0.21"
 foyer-storage = "0.21"
+bytes = { version = "1", features = ["serde"] }
 tokio = { version = "1", features = ["full"] }
 rand = "0.8"
 rand_distr = "0.4"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 num_cpus = "1"
-leaky-bucket = "1"
 hdrhistogram = "7"
 sysinfo = "0.33"
 libc = "0.2"

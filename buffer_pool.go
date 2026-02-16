@@ -111,3 +111,13 @@ func (bh *BufferHandle) Release() {
 
 	bh.h = nil
 }
+
+func (bh *BufferHandle) SetBytes(b []byte) {
+	if bh.h != nil {
+		bh.h.buf = b
+	}
+}
+
+func (bh *BufferHandle) IsZero() bool {
+	return bh.h == nil
+}

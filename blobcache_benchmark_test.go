@@ -37,18 +37,18 @@ import (
 //	-benchtime=256000x    →  256,000 writes ≈ 256GB
 //	-benchtime=1000000x   →  1M writes      ≈ 1TB (tests eviction + hole punching)
 //
-// Write/Read Distribution (40/40/10/10 - write-heavy to saturate NVMe):
+// Write/Read Distribution (30/30/30/10 - balanced read/write):
 //
-//	40% Write (new data)
-//	40% Hot Read (Zipfian: 10% of cache is hot)
-//	10% Cold Read (sequential scan pattern)
+//	30% Write (new data)
+//	30% Hot Read (Zipfian: 10% of cache is hot)
+//	30% Cold Read (sequential scan pattern)
 //	10% Miss (negative lookups, tests bloom filter)
 //
 // -------------------------------------------------------------------------
 const (
-	WriteWeight    = 40
-	HotReadWeight  = 40
-	ColdReadWeight = 10
+	WriteWeight    = 30
+	HotReadWeight  = 30
+	ColdReadWeight = 30
 
 	WriteBound    = WriteWeight
 	HotReadBound  = WriteBound + HotReadWeight
@@ -347,7 +347,9 @@ func reportLatency(b *testing.B, name string, h *hdrhistogram.Histogram) {
 }
 
 func startSystemMonitor(
-	ctx context.Context, logicalWriteBytes, logicalReadBytes, liveSizeBytes, readCount, hitCount *atomic.Int64, cachePath string,
+		ctx context.Context,
+		logicalWriteBytes, logicalReadBytes, liveSizeBytes, readCount, hitCount *atomic.Int64,
+		cachePath string,
 ) <-chan SystemMetrics {
 	out := make(chan SystemMetrics, 1)
 	go func() {
@@ -454,11 +456,11 @@ func startSystemMonitor(
 				missesPerSec := float64(intervalMisses) / interval.Seconds()
 
 				fmt.Printf("\n[HEARTBEAT %s]\n"+
-					"  MEM:   RSS: %.2fGB\n"+
-					"  DISK:  IO Depth: %.2f | Phys-Read: %.2f GB/s | Phys-Write: %.2f GB/s | Free: %.1fGB\n"+
-					"  CACHE: OnDisk: %.2fGB | Live: %.2fGB | Waste: %.2fGB (%.1f%%)\n"+
-					"  TPUT:  Log-Write: %.2f GB/s | Log-Read: %.2f GB/s\n"+
-					"  READS: %.0f/s total | %.0f/s hits | %.0f/s misses | HitRate: %.1f%%\n",
+						"  MEM:   RSS: %.2fGB\n"+
+						"  DISK:  IO Depth: %.2f | Phys-Read: %.2f GB/s | Phys-Write: %.2f GB/s | Free: %.1fGB\n"+
+						"  CACHE: OnDisk: %.2fGB | Live: %.2fGB | Waste: %.2fGB (%.1f%%)\n"+
+						"  TPUT:  Log-Write: %.2f GB/s | Log-Read: %.2f GB/s\n"+
+						"  READS: %.0f/s total | %.0f/s hits | %.0f/s misses | HitRate: %.1f%%\n",
 					time.Now().Format("15:04:05"), rss, currentQD, physReadTP, physWriteTP, freeGB,
 					onDiskGB, liveGB, wasteGB, wastePct,
 					logWriteTP, logReadTP,

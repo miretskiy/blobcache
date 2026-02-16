@@ -1,57 +1,53 @@
 package blobcache
 
 import (
+	"math/bits"
 	"sync"
 	"sync/atomic"
 )
 
 // handle is the internal pooled buffer structure.
 type handle struct {
-	buf   []byte
-	pool  *sync.Pool
-	inUse int32
+	buf     []byte
+	poolIdx int // Index in the pools array; -1 if not pooled
+	inUse   int32
 }
 
-// Size constants
 const (
-	sizeSmall  = 4 * 1024   // 4KB
-	sizeMedium = 64 * 1024  // 64KB
-	sizeLarge  = 256 * 1024 // 256KB
+	minShift    = 12 // 4KB
+	maxShift    = 21 // 2MB
+	numPools    = maxShift - minShift + 1
+	jumboIdx    = numPools         // The extra catch-all bucket
+	maxPoolSize = 16 * 1024 * 1024 // 16MB ceiling for pooling
 )
 
-// 1. Declare the pools (zero-value is safe, New will be assigned in init)
-var (
-	poolSmall  sync.Pool
-	poolMedium sync.Pool
-	poolLarge  sync.Pool
-)
+// We define (numPools + 1) to include the Jumbo bucket
+var pools [numPools + 1]sync.Pool
 
-// 2. Initialize the New functions in init() to break the cyclic dependency
 func init() {
-	poolSmall.New = func() any {
-		return &handle{
-			buf:  make([]byte, 0, sizeSmall),
-			pool: &poolSmall,
+	// 1. Initialize Power-of-Two Buckets (4KB to 2MB)
+	for i := 0; i < numPools; i++ {
+		idx := i
+		capacity := 1 << (i + minShift)
+		pools[i].New = func() any {
+			return &handle{
+				buf:     make([]byte, 0, capacity),
+				poolIdx: idx,
+			}
 		}
 	}
-	poolMedium.New = func() any {
+
+	// 2. Initialize the Jumbo Catch-all Bucket
+	pools[jumboIdx].New = func() any {
 		return &handle{
-			buf:  make([]byte, 0, sizeMedium),
-			pool: &poolMedium,
-		}
-	}
-	poolLarge.New = func() any {
-		return &handle{
-			buf:  make([]byte, 0, sizeLarge),
-			pool: &poolLarge,
+			buf:     make([]byte, 0, 1<<(maxShift+1)), // Starts at 4MB
+			poolIdx: jumboIdx,
 		}
 	}
 }
 
-// BufferHandle is the public wrapper
 type BufferHandle struct {
 	h *handle
-	_ noCopy
 }
 
 func (bh *BufferHandle) Bytes() []byte {
@@ -61,14 +57,40 @@ func (bh *BufferHandle) Bytes() []byte {
 	return bh.h.buf
 }
 
-func (bh *BufferHandle) SetBytes(b []byte) {
-	if bh.h != nil {
-		bh.h.buf = b
-	}
-}
+// AcquireBuffer picks a bucket. If it's a jumbo request, it allows the
+// slice to be reallocated and returned to the jumbo pool.
+func AcquireBuffer(length, capacity int) BufferHandle {
+	var h *handle
 
-func (bh *BufferHandle) IsZero() bool {
-	return bh.h == nil
+	if capacity > maxPoolSize {
+		// Outlier: Too big to pool safely without pinning massive RSS
+		h = &handle{buf: make([]byte, 0, capacity), poolIdx: -1}
+	} else if capacity > (1 << maxShift) {
+		// Jumbo: Use the stretching pool
+		h = pools[jumboIdx].Get().(*handle)
+		if cap(h.buf) < capacity {
+			h.buf = make([]byte, 0, capacity)
+		}
+	} else {
+		// Standard: Power-of-two buckets
+		effCap := capacity
+		if effCap < (1 << minShift) {
+			effCap = 1 << minShift
+		}
+		idx := bits.Len32(uint32(effCap-1)) - minShift
+		if idx < 0 {
+			idx = 0
+		}
+		h = pools[idx].Get().(*handle)
+	}
+
+	// Safety check for concurrent development/debugging
+	if !atomic.CompareAndSwapInt32(&h.inUse, 0, 1) {
+		panic("bufferpool: ALIASING DETECTED")
+	}
+
+	h.buf = h.buf[:length]
+	return BufferHandle{h: h}
 }
 
 func (bh *BufferHandle) Release() {
@@ -76,61 +98,16 @@ func (bh *BufferHandle) Release() {
 		return
 	}
 
-	// Poison pill
 	if !atomic.CompareAndSwapInt32(&bh.h.inUse, 1, 0) {
 		panic("bufferpool: DOUBLE RELEASE detected")
 	}
 
-	// Reset length, keep capacity
-	bh.h.buf = bh.h.buf[:0:cap(bh.h.buf)]
-
-	// Return to home pool
-	if bh.h.pool != nil {
-		bh.h.pool.Put(bh.h)
+	idx := bh.h.poolIdx
+	if idx >= 0 && idx < len(pools) {
+		// Reset length, keep capacity (even if reallocated in Jumbo)
+		bh.h.buf = bh.h.buf[:0:cap(bh.h.buf)]
+		pools[idx].Put(bh.h)
 	}
 
 	bh.h = nil
 }
-
-// AcquireBuffer selects the right bucket
-func AcquireBuffer(length, capacity int) BufferHandle {
-	var h *handle
-
-	// Select Pool
-	if capacity <= sizeSmall {
-		h = poolSmall.Get().(*handle)
-	} else if capacity <= sizeMedium {
-		h = poolMedium.Get().(*handle)
-	} else if capacity <= sizeLarge {
-		h = poolLarge.Get().(*handle)
-	} else {
-		// Fallback for huge allocs
-		h = &handle{
-			buf:  make([]byte, 0, capacity),
-			pool: nil,
-		}
-	}
-
-	// Detect Aliasing / Set Use
-	if !atomic.CompareAndSwapInt32(&h.inUse, 0, 1) {
-		if h.pool != nil {
-			panic("bufferpool: ALIASING DETECTED! Pool returned in-use handle.")
-		}
-		h.inUse = 1
-	}
-
-	// Safety Valve: Grow if needed (should be rare/impossible with correct logic)
-	if cap(h.buf) < capacity {
-		h.buf = make([]byte, 0, capacity)
-		h.pool = nil
-	}
-
-	h.buf = h.buf[:length]
-
-	return BufferHandle{h: h}
-}
-
-type noCopy struct{}
-
-func (*noCopy) Lock()   {}
-func (*noCopy) Unlock() {}

@@ -27,6 +27,7 @@ type IOConfig struct {
 	FDataSync     bool // Use fdatasync for durability
 	Fadvise       bool // Use fadvise to provide data access hints to the kernel.
 	DirectIOWrite bool // Use O_DIRECT (Linux) or F_NOCACHE (Darwin) for segment writes
+	DirectIORead  bool // Use O_DIRECT (Linux) or F_NOCACHE (Darwin) for segment reads
 }
 
 // ResilienceConfig holds data integrity settings
@@ -149,6 +150,13 @@ func WithFadvise(enabled bool) Option {
 
 func WithDirectIOWrite(enabled bool) Option {
 	return funcOpt(func(c *config) { c.IO.DirectIOWrite = enabled })
+}
+
+// WithDirectIORead enables O_DIRECT (Linux) or F_NOCACHE (Darwin) for segment reads.
+// Bypasses kernel page cache, which can reduce tail latency under heavy write I/O pressure.
+// Default: false (leverage kernel page cache for reads).
+func WithDirectIORead(enabled bool) Option {
+	return funcOpt(func(c *config) { c.IO.DirectIORead = enabled })
 }
 
 // WithCompression enables compression with the specified codec.

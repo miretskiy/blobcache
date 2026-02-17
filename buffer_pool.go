@@ -4,12 +4,16 @@ import (
 	"math/bits"
 	"sync"
 	"sync/atomic"
+	"unsafe"
+
+	"github.com/miretskiy/blobcache/internal/sys"
 )
 
 // handle is the internal pooled buffer structure.
 type handle struct {
 	buf     []byte
-	poolIdx int // Index in the pools array; -1 if not pooled
+	raw     []byte // Original allocation before alignment shift; nil for standard buffers.
+	poolIdx int    // Index in the pools array; -1 if not pooled
 	inUse   int32
 }
 
@@ -57,9 +61,8 @@ func (bh *BufferHandle) Bytes() []byte {
 	return bh.h.buf
 }
 
-// AcquireBuffer picks a bucket. If it's a jumbo request, it allows the
-// slice to be reallocated and returned to the jumbo pool.
-func AcquireBuffer(length, capacity int) BufferHandle {
+// acquireHandle gets a handle from the appropriate pool bucket for the given capacity.
+func acquireHandle(capacity int) *handle {
 	var h *handle
 
 	if capacity > maxPoolSize {
@@ -84,12 +87,30 @@ func AcquireBuffer(length, capacity int) BufferHandle {
 		h = pools[idx].Get().(*handle)
 	}
 
-	// Safety check for concurrent development/debugging
 	if !atomic.CompareAndSwapInt32(&h.inUse, 0, 1) {
 		panic("bufferpool: ALIASING DETECTED")
 	}
+	return h
+}
 
+// AcquireBuffer picks a bucket. If it's a jumbo request, it allows the
+// slice to be reallocated and returned to the jumbo pool.
+func AcquireBuffer(length, capacity int) BufferHandle {
+	h := acquireHandle(capacity)
 	h.buf = h.buf[:length]
+	return BufferHandle{h: h}
+}
+
+// AcquireAlignedBuffer returns a BufferHandle whose Bytes() slice is 4KB-aligned
+// for O_DIRECT I/O. Requests one extra page from the pool to guarantee alignment,
+// then shifts the slice to the first page-aligned address.
+func AcquireAlignedBuffer(length, capacity int) BufferHandle {
+	h := acquireHandle(capacity + sys.BlockSize)
+	full := h.buf[:cap(h.buf)]
+	addr := uintptr(unsafe.Pointer(&full[0]))
+	shift := int((sys.BlockSize - (addr & uintptr(sys.BlockMask))) & uintptr(sys.BlockMask))
+	h.raw = full
+	h.buf = full[shift : shift+length]
 	return BufferHandle{h: h}
 }
 
@@ -104,8 +125,13 @@ func (bh *BufferHandle) Release() {
 
 	idx := bh.h.poolIdx
 	if idx >= 0 && idx < len(pools) {
-		// Reset length, keep capacity (even if reallocated in Jumbo)
-		bh.h.buf = bh.h.buf[:0:cap(bh.h.buf)]
+		// Restore original allocation if this was an aligned buffer.
+		if bh.h.raw != nil {
+			bh.h.buf = bh.h.raw[:0:cap(bh.h.raw)]
+			bh.h.raw = nil
+		} else {
+			bh.h.buf = bh.h.buf[:0:cap(bh.h.buf)]
+		}
 		pools[idx].Put(bh.h)
 	}
 

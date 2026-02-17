@@ -56,7 +56,14 @@ func (a *Archivist) ReadBlob(e index.Item, expectedKey []byte) ([]byte, Releaser
 		return nil, Releaser{}, fmt.Errorf("storage: segment %d not found: %w", e.SegmentID, err)
 	}
 
-	// Single read of entire record
+	if a.IO.DirectIORead {
+		return a.readBlobDirect(sf, e, expectedKey)
+	}
+	return a.readBlobBuffered(sf, e, expectedKey)
+}
+
+// readBlobBuffered reads a record using buffered I/O (kernel page cache).
+func (a *Archivist) readBlobBuffered(sf *os.File, e index.Item, expectedKey []byte) ([]byte, Releaser, error) {
 	handle := AcquireBuffer(int(e.PhysicalLen), int(e.PhysicalLen))
 	buf := handle.Bytes()
 	if _, err := sf.ReadAt(buf, int64(e.Offset)); err != nil {
@@ -64,23 +71,44 @@ func (a *Archivist) ReadBlob(e index.Item, expectedKey []byte) ([]byte, Releaser
 		return nil, Releaser{}, fmt.Errorf("storage: read failed: %w", err)
 	}
 
-	// Parse header to locate key and value
-	hdr, err := record.DecodeHeader(buf[:record.HeaderSize])
-	if err != nil {
+	return a.parseRecord(buf, e, expectedKey, Releaser{bh: &handle}, func() { handle.Release() })
+}
+
+// readBlobDirect reads a record using Direct I/O with aligned buffers.
+func (a *Archivist) readBlobDirect(sf *os.File, e index.Item, expectedKey []byte) ([]byte, Releaser, error) {
+	alignedOff, alignedLen := sys.AlignRange(int64(e.Offset), int(e.PhysicalLen))
+	handle := AcquireAlignedBuffer(int(alignedLen), int(alignedLen))
+	buf := handle.Bytes()
+
+	if _, err := sys.PreadAligned(sf, buf, alignedOff, sys.FlDirectIO); err != nil {
 		handle.Release()
+		return nil, Releaser{}, fmt.Errorf("storage: direct read failed: %w", err)
+	}
+
+	lead := int(int64(e.Offset) - alignedOff)
+	rec := buf[lead : lead+int(e.PhysicalLen)]
+
+	return a.parseRecord(rec, e, expectedKey, Releaser{bh: &handle}, func() { handle.Release() })
+}
+
+// parseRecord parses a record buffer, handles decompression and checksum verification.
+// owner is the Releaser that owns the buffer backing rec. onError is called to free
+// the buffer on failure paths (before decompression replaces it).
+func (a *Archivist) parseRecord(rec []byte, e index.Item, expectedKey []byte, owner Releaser, onError func()) ([]byte, Releaser, error) {
+	hdr, err := record.DecodeHeader(rec[:record.HeaderSize])
+	if err != nil {
+		onError()
 		return nil, Releaser{}, fmt.Errorf("storage: invalid header: %w", err)
 	}
 
-	// Verify key matches (skip if expectedKey is nil - TrustHash mode)
 	keyEnd := record.HeaderSize + int(hdr.KeyLen)
-	if expectedKey != nil && !bytes.Equal(buf[record.HeaderSize:keyEnd], expectedKey) {
-		handle.Release()
+	if expectedKey != nil && !bytes.Equal(rec[record.HeaderSize:keyEnd], expectedKey) {
+		onError()
 		return nil, Releaser{}, record.ErrKeyMismatch
 	}
 
-	// Extract value
-	valueData := buf[keyEnd:]
-	releaser := Releaser{bh: &handle}
+	valueData := rec[keyEnd:]
+	releaser := owner
 
 	if e.IsCompressed() {
 		decompressedHandle := AcquireBuffer(int(hdr.LogicalSize), int(hdr.LogicalSize))
@@ -95,16 +123,15 @@ func (a *Archivist) ReadBlob(e index.Item, expectedKey []byte) ([]byte, Releaser
 				"dst_buf_len", len(dstBuf),
 				"dst_buf_cap", cap(dstBuf),
 				"error", err)
-			handle.Release()
+			onError()
 			decompressedHandle.Release()
 			return nil, Releaser{}, err
 		}
-		handle.Release()
+		owner.Release() // Free the read buffer; decompressed data is independent.
 		valueData = decompressedHandle.Bytes()
 		releaser = Releaser{bh: &decompressedHandle}
 	}
 
-	// Optional Integrity Layer
 	if a.Resilience.VerifyOnRead && hdr.HasValidCRC() && a.Resilience.ChecksumHasher != nil {
 		if err := verifyChecksum(valueData, a.Resilience.ChecksumHasher, hdr.CRC()); err != nil {
 			releaser.Release()
@@ -131,25 +158,27 @@ func GetFooterPath(basePath string, numShards int, segmentID uint32) string {
 
 // getSegmentFile returns cached SegmentFile or opens it
 func (a *Archivist) getSegmentFile(segmentID uint32) (*os.File, error) {
-	// 1. Check the LRU/Map handle cache
 	if cached, ok := a.cache.Load(segmentID); ok {
 		return cached.(*os.File), nil
 	}
 
-	// 2. OpenIndex the file
 	path := getSegmentPath(a.Path, a.Shards, segmentID)
-	f, err := os.OpenFile(path, os.O_RDWR, 0644)
+	var flags sys.OpenFlag
+	if a.IO.DirectIORead {
+		flags |= sys.FlDirectIO
+	}
+	f, err := sys.OpenFileForRead(path, flags)
 	if err != nil {
 		return nil, err
 	}
 
-	if a.IO.Fadvise {
+	// fadvise is meaningless with Direct I/O (no page cache).
+	if a.IO.Fadvise && !a.IO.DirectIORead {
 		if err := sys.Fadvise(f.Fd(), 0, 0, sys.FadvRandom); err != nil {
 			log.Warn("fadvise failed", "segID", segmentID, "err", err)
 		}
 	}
 
-	// 2. Cache the handle
 	actual, loaded := a.cache.LoadOrStore(segmentID, f)
 	if loaded {
 		_ = f.Close()

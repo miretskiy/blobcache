@@ -21,12 +21,12 @@
 //! cargo run --release --example blobcache_bench -- --iterations 10000 --max-size 100 --threads 4
 //! ```
 //!
-//! # Workload Distribution
+//! # Workload Distribution (30/30/30/10 - balanced read/write)
 //!
-//! - 10% Write (new data, 100KB - 2MB per blob)
-//! - 40% Hot Read (Zipfian: top 10-15% of keys = 60-70% of accesses)
-//! - 25% Cold Read (sequential scan pattern)
-//! - 25% Miss (negative lookups, tests bloom filter)
+//! - 30% Write (new data, 100KB - 2MB per blob)
+//! - 30% Hot Read (Zipfian: top 10-15% of keys = 60-70% of accesses)
+//! - 30% Cold Read (sequential scan pattern)
+//! - 10% Miss (negative lookups, tests bloom filter)
 
 use std::env;
 use std::path::PathBuf;
@@ -41,10 +41,10 @@ use rand::prelude::*;
 use rand_distr::{Distribution, Zipf};
 use sysinfo::{System, ProcessRefreshKind};
 
-// --- WORKLOAD CONFIGURATION ---
-const WRITE_WEIGHT: u32 = 10;
-const HOT_READ_WEIGHT: u32 = 40;
-const COLD_READ_WEIGHT: u32 = 25;
+// --- WORKLOAD CONFIGURATION (30/30/30/10 - balanced read/write) ---
+const WRITE_WEIGHT: u32 = 30;
+const HOT_READ_WEIGHT: u32 = 30;
+const COLD_READ_WEIGHT: u32 = 30;
 
 const WRITE_BOUND: u32 = WRITE_WEIGHT;
 const HOT_READ_BOUND: u32 = WRITE_BOUND + HOT_READ_WEIGHT;
@@ -491,8 +491,8 @@ fn print_help() {
     println!("    cargo run --release --example blobcache_bench -- -n 256000");
     println!();
     println!("WORKLOAD DISTRIBUTION:");
-    println!("    10% Write  - New data (100KB - 2MB per blob)");
-    println!("    40% Hot    - Zipfian reads (top 10-15% keys = 60-70% accesses)");
-    println!("    25% Cold   - Sequential scan (4 keys per operation)");
-    println!("    25% Miss   - Negative lookups (bloom filter test)");
+    println!("    30% Write  - New data (100KB - 2MB per blob)");
+    println!("    30% Hot    - Zipfian reads (top 10-15% keys = 60-70% accesses)");
+    println!("    30% Cold   - Sequential scan (4 keys per operation)");
+    println!("    10% Miss   - Negative lookups (bloom filter test)");
 }

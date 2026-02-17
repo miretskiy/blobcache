@@ -147,9 +147,9 @@ fn bench_get_miss(c: &mut Criterion) {
 /// Benchmark mixed read/write workload with Zipfian distribution.
 ///
 /// This is the Rust equivalent of Go's BenchmarkBlobCache:
-/// - 40% writes with ~1MB blob sizes (write-heavy to saturate NVMe)
-/// - 40% hot reads (Zipfian distribution)
-/// - 10% cold reads (sequential scan)
+/// - 30% writes with ~1MB blob sizes
+/// - 30% hot reads (Zipfian distribution)
+/// - 30% cold reads (sequential scan)
 /// - 10% misses (bloom filter test)
 ///
 /// Configuration matches Go EXACTLY:
@@ -198,10 +198,10 @@ fn bench_blobcache(c: &mut Criterion) {
     const BLOB_SIZE_LO: usize = 100_000;
     const BLOB_SIZE_HI_RNG: usize = 1_900_000;
 
-    // Workload weights (40/40/10/10 - write-heavy to saturate NVMe)
-    const WRITE_BOUND: u32 = 40;      // 40% writes
-    const HOT_READ_BOUND: u32 = 80;   // 40% hot reads (40 + 40)
-    const COLD_READ_BOUND: u32 = 90;  // 10% cold reads (80 + 10), remaining 10% = miss
+    // Workload weights (30/30/30/10 - balanced read/write)
+    const WRITE_BOUND: u32 = 30;      // 30% writes
+    const HOT_READ_BOUND: u32 = 60;   // 30% hot reads (30 + 30)
+    const COLD_READ_BOUND: u32 = 90;  // 30% cold reads (60 + 30), remaining 10% = miss
 
     // Warmup phase (10000 keys like Go)
     const WARMUP_KEYS: u64 = 10_000;
@@ -368,15 +368,15 @@ fn bench_parallel_blobcache(c: &mut Criterion) {
     // Pre-generate entropy buffer (32MB)
     let entropy: Arc<Vec<u8>> = Arc::new(random_data(32 << 20));
 
-    // Constants matching Go (updated weights: 40/40/10/10)
+    // Constants matching Go (updated weights: 30/30/30/10)
     // Can override write percentage via BENCH_WRITE_PCT env var (e.g., 100 for write-only)
     const BLOB_SIZE_LO: usize = 100_000;
     const BLOB_SIZE_HI_RNG: usize = 1_900_000;
-    // Write percentage (default 40%, set BENCH_WRITE_PCT=100 for write-only Direct I/O test)
+    // Write percentage (default 30%, set BENCH_WRITE_PCT=100 for write-only Direct I/O test)
     let write_pct: u32 = std::env::var("BENCH_WRITE_PCT")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(40)
+        .unwrap_or(30)
         .min(100);  // Cap at 100%
     let write_bound = write_pct;
     // Scale reads into remaining percentage

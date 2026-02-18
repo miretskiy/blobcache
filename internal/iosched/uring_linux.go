@@ -164,7 +164,20 @@ func (s *URingScheduler) ReadAt(fd int, buf []byte, offset int64) (int, error) {
 	}
 
 	// Block until the coordinator signals completion.
-	<-req.done
+	select {
+	case <-req.done:
+	case <-s.stopCh:
+		// Coordinator stopped while we were waiting. Its deferred drain
+		// may have already failed this request — check once.
+		select {
+		case <-req.done:
+		default:
+			// Orphaned: request is in submitCh but the coordinator exited
+			// before processing it. Abandon the req to avoid data races.
+			runtime.KeepAlive(buf)
+			return 0, errSchedulerClosed
+		}
+	}
 
 	n, err := req.n, req.err
 	s.putReq(req)
@@ -199,7 +212,10 @@ func (s *URingScheduler) putReq(req *uringReq) {
 // stop signals the coordinator to shut down. Safe to call multiple times
 // (from Close and from the coordinator on fatal ring error).
 func (s *URingScheduler) stop() {
-	s.stopOnce.Do(func() { close(s.stopCh) })
+	s.stopOnce.Do(func() {
+		s.setFatalErr(errSchedulerClosed)
+		close(s.stopCh)
+	})
 }
 
 // err returns the fatal error if one has been set, or nil.

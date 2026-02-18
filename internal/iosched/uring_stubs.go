@@ -4,9 +4,9 @@ package iosched
 
 import "errors"
 
-// Available reports whether io_uring is supported on the running kernel.
-// Always returns false on non-Linux platforms.
-func Available() bool { return false }
+// IOUringAvailable reports whether io_uring is supported on the running
+// platform and kernel. Always false on non-Linux.
+const IOUringAvailable = false
 
 // URingConfig configures the io_uring scheduler.
 // On non-Linux platforms, NewURingScheduler always returns an error.

@@ -75,9 +75,14 @@ func (a *Archivist) ReadBlob(e index.Item, expectedKey []byte) ([]byte, Releaser
 func (a *Archivist) readBlobBuffered(sf *os.File, e index.Item, expectedKey []byte) ([]byte, Releaser, error) {
 	handle := AcquireBuffer(int(e.PhysicalLen), int(e.PhysicalLen))
 	buf := handle.Bytes()
-	if _, err := a.sched.ReadAt(int(sf.Fd()), buf, int64(e.Offset)); err != nil {
+	n, err := a.sched.ReadAt(int(sf.Fd()), buf, int64(e.Offset))
+	if err != nil {
 		handle.Release()
 		return nil, Releaser{}, fmt.Errorf("storage: read failed: %w", err)
+	}
+	if n < len(buf) {
+		handle.Release()
+		return nil, Releaser{}, fmt.Errorf("storage: short read: got %d of %d bytes", n, len(buf))
 	}
 
 	return a.parseRecord(buf, e, expectedKey, Releaser{bh: &handle}, func() { handle.Release() })
@@ -89,9 +94,14 @@ func (a *Archivist) readBlobDirect(sf *os.File, e index.Item, expectedKey []byte
 	handle := AcquireAlignedBuffer(int(alignedLen), int(alignedLen))
 	buf := handle.Bytes()
 
-	if _, err := a.sched.ReadAt(int(sf.Fd()), buf, alignedOff); err != nil {
+	n, err := a.sched.ReadAt(int(sf.Fd()), buf, alignedOff)
+	if err != nil {
 		handle.Release()
 		return nil, Releaser{}, fmt.Errorf("storage: direct read failed: %w", err)
+	}
+	if n < len(buf) {
+		handle.Release()
+		return nil, Releaser{}, fmt.Errorf("storage: short direct read: got %d of %d bytes", n, len(buf))
 	}
 
 	lead := int(int64(e.Offset) - alignedOff)

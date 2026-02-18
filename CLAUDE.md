@@ -641,6 +641,10 @@ cache, _ := blobcache.New("/data/cas",
     - Use `errors.Join` to preserve context in cleanup paths
     - Log benign errors, propagate critical errors
 
+11. **NEVER run `go clean -cache`**:
+    - Rebuilding the cache is extremely expensive, especially on remote machines
+    - If you suspect stale cache, ask the user first
+
 ## Zero-Copy Abstractions
 
 **ZeroCopyView** (returned by `Get()` in Librarian hits):

@@ -16,14 +16,14 @@ import (
 func TestURingScheduler_Available(t *testing.T) {
 	// On Linux CI, io_uring should be available (kernel 5.1+).
 	// If not, the rest of the tests will be skipped.
-	if !iosched.Available() {
+	if !iosched.IOUringAvailable {
 		t.Skip("io_uring not available on this kernel")
 	}
 }
 
 func newURingSched(t *testing.T) *iosched.URingScheduler {
 	t.Helper()
-	if !iosched.Available() {
+	if !iosched.IOUringAvailable {
 		t.Skip("io_uring not available")
 	}
 	s, err := iosched.NewURingScheduler(iosched.URingConfig{
@@ -218,7 +218,7 @@ func TestURingScheduler_CloseThenRead(t *testing.T) {
 }
 
 func TestURingScheduler_Interface(t *testing.T) {
-	if !iosched.Available() {
+	if !iosched.IOUringAvailable {
 		t.Skip("io_uring not available")
 	}
 	s, err := iosched.NewURingScheduler(iosched.URingConfig{})
@@ -230,7 +230,7 @@ func TestURingScheduler_Interface(t *testing.T) {
 }
 
 func TestURingScheduler_SQPOLL(t *testing.T) {
-	if !iosched.Available() {
+	if !iosched.IOUringAvailable {
 		t.Skip("io_uring not available")
 	}
 

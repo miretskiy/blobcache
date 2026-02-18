@@ -7,6 +7,11 @@ require (
 	github.com/HdrHistogram/hdrhistogram-go v1.2.0
 	github.com/klauspost/compress v1.18.2
 	github.com/pawelgaczynski/giouring v0.0.0-20230826085535-69588b89acb9
+)
+
+replace github.com/pawelgaczynski/giouring => ../giouring
+
+require (
 	github.com/pierrec/lz4/v4 v4.1.23
 	github.com/shirou/gopsutil/v3 v3.24.5
 	github.com/stretchr/testify v1.11.1
@@ -30,6 +35,6 @@ require (
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
 	github.com/zhangyunhao116/skipmap v0.10.1
-	golang.org/x/sys v0.39.0
+	golang.org/x/sys v0.41.0
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )

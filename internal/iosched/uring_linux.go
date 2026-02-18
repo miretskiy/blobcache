@@ -14,23 +14,16 @@ import (
 	"github.com/pawelgaczynski/giouring"
 )
 
-// available caches the result of the runtime io_uring probe.
-var available atomic.Int32 // 0=unknown, 1=yes, -1=no
+// IOUringAvailable reports whether io_uring is supported on the running kernel.
+// Probed once at package init time.
+var IOUringAvailable = probeIOUring()
 
-// Available reports whether io_uring is supported on the running kernel.
-// The result is cached after the first call.
-func Available() bool {
-	if v := available.Load(); v != 0 {
-		return v > 0
-	}
+func probeIOUring() bool {
 	ring := giouring.NewRing()
-	err := ring.QueueInit(1, 0)
-	if err != nil {
-		available.Store(-1)
+	if err := ring.QueueInit(1, 0); err != nil {
 		return false
 	}
 	ring.QueueExit()
-	available.Store(1)
 	return true
 }
 
@@ -92,6 +85,8 @@ type uringReq struct {
 	done   chan struct{}
 }
 
+var errSchedulerClosed = errors.New("iosched: scheduler closed")
+
 // URingScheduler is an asynchronous IOScheduler backed by io_uring.
 //
 // Architecture: a single coordinator goroutine owns the ring and
@@ -99,63 +94,44 @@ type uringReq struct {
 // under concurrency, multiple ReadAt calls naturally coalesce into
 // a single io_uring_enter.
 type URingScheduler struct {
-	ring     *giouring.Ring
 	submitCh chan *uringReq
 	reqPool  sync.Pool
 
-	// inflight maps slot index -> request. Fixed-size array indexed by
-	// SQE UserData. Slot allocation via a freelist channel.
-	inflight []atomic.Pointer[uringReq]
-	freeSlot chan uint64 // stack of available slot indices
+	// stopCh is closed to signal shutdown (by Close or fatal ring error).
+	// submitCh is never closed — ReadAt selects on both channels.
+	stopCh   chan struct{}
+	stopOnce sync.Once
 
-	batchSize int
-	closed    atomic.Bool
-	wg        sync.WaitGroup
+	// fatalErr stores the first non-recoverable ring error.
+	// Once set, all subsequent ReadAt calls return this error.
+	fatalErr atomic.Pointer[error]
+
+	wg sync.WaitGroup
 }
 
 // NewURingScheduler creates an io_uring-backed scheduler.
-// Returns an error if io_uring is not available on this kernel.
+// The ring is created inside the coordinator goroutine; if ring setup
+// fails, the error is returned synchronously via a ready channel.
 func NewURingScheduler(cfg URingConfig) (*URingScheduler, error) {
-	if !Available() {
+	if !IOUringAvailable {
 		return nil, errors.New("iosched: io_uring not available on this kernel")
 	}
 
-	depth := cfg.ringDepth()
-
-	var flags uint32
-	if cfg.SQPOLL {
-		flags |= giouring.SetupSQPoll
-	}
-
-	ring := giouring.NewRing()
-	if err := ring.QueueInit(depth, flags); err != nil {
-		return nil, fmt.Errorf("iosched: io_uring_setup: %w", err)
-	}
-
-	batchSize := cfg.batchSize()
-	if batchSize > int(depth) {
-		batchSize = int(depth)
-	}
-
 	s := &URingScheduler{
-		ring:      ring,
-		submitCh:  make(chan *uringReq, cfg.chanBuffer()),
-		inflight:  make([]atomic.Pointer[uringReq], depth),
-		freeSlot:  make(chan uint64, depth),
-		batchSize: batchSize,
+		submitCh: make(chan *uringReq, cfg.chanBuffer()),
+		stopCh:   make(chan struct{}),
 	}
 	s.reqPool.New = func() any {
 		return &uringReq{done: make(chan struct{}, 1)}
 	}
 
-	// Populate free slot stack.
-	for i := uint64(0); i < uint64(depth); i++ {
-		s.freeSlot <- i
-	}
-
+	readyCh := make(chan error, 1)
 	s.wg.Add(1)
-	go s.loop()
+	go s.loop(cfg, readyCh)
 
+	if err := <-readyCh; err != nil {
+		return nil, err
+	}
 	return s, nil
 }
 
@@ -163,33 +139,35 @@ func NewURingScheduler(cfg URingConfig) (*URingScheduler, error) {
 // until the kernel completes it. The buffer must remain valid and
 // must not be moved by GC (heap-allocated or mmap'd).
 func (s *URingScheduler) ReadAt(fd int, buf []byte, offset int64) (int, error) {
-	if s.closed.Load() {
-		return 0, errors.New("iosched: scheduler closed")
+	if err := s.err(); err != nil {
+		return 0, err
 	}
 	if len(buf) == 0 {
 		return 0, nil
 	}
 
-	req := s.reqPool.Get().(*uringReq)
+	req := s.getReq()
 	req.fd = fd
 	req.buf = buf
 	req.offset = offset
 	req.n = 0
 	req.err = nil
 
-	// Drain stale signal from a previous cycle.
 	select {
-	case <-req.done:
-	default:
+	case s.submitCh <- req:
+	case <-s.stopCh:
+		s.putReq(req)
+		if err := s.err(); err != nil {
+			return 0, err
+		}
+		return 0, errSchedulerClosed
 	}
-
-	s.submitCh <- req
 
 	// Block until the coordinator signals completion.
 	<-req.done
 
 	n, err := req.n, req.err
-	s.reqPool.Put(req)
+	s.putReq(req)
 
 	// Prevent GC from collecting buf before we've read the result.
 	runtime.KeepAlive(buf)
@@ -198,16 +176,43 @@ func (s *URingScheduler) ReadAt(fd int, buf []byte, offset int64) (int, error) {
 }
 
 // Close shuts down the coordinator goroutine and releases the ring.
-// Any pending ReadAt calls will return after their in-flight operations
-// complete or are failed.
 func (s *URingScheduler) Close() error {
-	if !s.closed.CompareAndSwap(false, true) {
-		return nil
-	}
-	close(s.submitCh)
+	s.stop()
 	s.wg.Wait()
-	s.ring.QueueExit()
 	return nil
+}
+
+func (s *URingScheduler) getReq() *uringReq {
+	return s.reqPool.Get().(*uringReq)
+}
+
+func (s *URingScheduler) putReq(req *uringReq) {
+	req.buf = nil // release reference to caller's buffer
+	// Drain stale signal so the next Get returns a clean req.
+	select {
+	case <-req.done:
+	default:
+	}
+	s.reqPool.Put(req)
+}
+
+// stop signals the coordinator to shut down. Safe to call multiple times
+// (from Close and from the coordinator on fatal ring error).
+func (s *URingScheduler) stop() {
+	s.stopOnce.Do(func() { close(s.stopCh) })
+}
+
+// err returns the fatal error if one has been set, or nil.
+func (s *URingScheduler) err() error {
+	if p := s.fatalErr.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
+
+// setFatalErr stores a fatal error. Only the first call takes effect.
+func (s *URingScheduler) setFatalErr(err error) {
+	s.fatalErr.CompareAndSwap(nil, &err)
 }
 
 // loop is the coordinator goroutine. It exclusively owns the ring.
@@ -222,34 +227,86 @@ func (s *URingScheduler) Close() error {
 // Under low concurrency, a single read goes through immediately (no
 // batching delay). Under high concurrency, requests naturally coalesce
 // into one io_uring_enter call.
-func (s *URingScheduler) loop() {
+func (s *URingScheduler) loop(cfg URingConfig, readyCh chan<- error) {
 	defer s.wg.Done()
 
-	batch := make([]*uringReq, 0, s.batchSize)
+	depth := cfg.ringDepth()
+	var flags uint32
+	if cfg.SQPOLL {
+		flags |= giouring.SetupSQPoll
+	}
+
+	ring := giouring.NewRing()
+	if err := ring.QueueInit(depth, flags); err != nil {
+		readyCh <- fmt.Errorf("iosched: io_uring_setup: %w", err)
+		return
+	}
+	defer ring.QueueExit()
+
+	batchSize := min(cfg.batchSize(), int(depth))
+
+	inflight := make([]atomic.Pointer[uringReq], depth)
+	freeSlot := make(chan uint64, depth)
+	for i := uint64(0); i < uint64(depth); i++ {
+		freeSlot <- i
+	}
+
+	readyCh <- nil // signal constructor: ring is ready
+
+	batch := make([]*uringReq, 0, batchSize)
 	inflightCount := 0
+
+	// drainPending fails all buffered and inflight requests on exit.
+	defer func() {
+		// Fail inflight requests that the kernel hasn't completed.
+		for i := range inflight {
+			if req := inflight[i].Swap(nil); req != nil {
+				req.n = 0
+				req.err = errSchedulerClosed
+				req.done <- struct{}{}
+			}
+		}
+		// Fail requests still queued in submitCh.
+		for {
+			select {
+			case req := <-s.submitCh:
+				req.n = 0
+				req.err = errSchedulerClosed
+				req.done <- struct{}{}
+			default:
+				return
+			}
+		}
+	}()
 
 	for {
 		batch = batch[:0]
 
 		// ── Phase 1: Collect ─────────────────────────────────
 		if inflightCount == 0 {
-			// Nothing in-flight: safe to block on channel.
-			req, ok := <-s.submitCh
-			if !ok {
-				return // channel closed, shutdown
+			// Nothing in-flight: safe to block for work or stop.
+			select {
+			case req := <-s.submitCh:
+				batch = append(batch, req)
+			case <-s.stopCh:
+				return
 			}
-			batch = append(batch, req)
 		}
 
 		// Opportunistic non-blocking drain.
 	drain:
-		for len(batch) < s.batchSize {
+		for len(batch) < batchSize {
 			select {
-			case req, ok := <-s.submitCh:
-				if !ok {
-					break drain // channel closed
-				}
+			case req := <-s.submitCh:
 				batch = append(batch, req)
+			case <-s.stopCh:
+				// Fail the batch we've collected so far.
+				for _, req := range batch {
+					req.n = 0
+					req.err = errSchedulerClosed
+					req.done <- struct{}{}
+				}
+				return
 			default:
 				break drain
 			}
@@ -257,19 +314,19 @@ func (s *URingScheduler) loop() {
 
 		// ── Phase 2: Submit ──────────────────────────────────
 		for _, req := range batch {
-			slot := <-s.freeSlot
-			s.inflight[slot].Store(req)
+			slot := <-freeSlot
+			inflight[slot].Store(req)
 
-			sqe := s.ring.GetSQE()
+			sqe := ring.GetSQE()
 			if sqe == nil {
 				// SQ full: flush what we have and retry once.
-				if _, err := s.ring.Submit(); err != nil && !errors.Is(err, syscall.EINTR) {
-					s.completeReq(slot, req, 0, err)
+				if _, err := ring.Submit(); err != nil && !errors.Is(err, syscall.EINTR) {
+					completeReq(inflight[:], freeSlot, slot, req, 0, err)
 					continue
 				}
-				sqe = s.ring.GetSQE()
+				sqe = ring.GetSQE()
 				if sqe == nil {
-					s.completeReq(slot, req, 0, errors.New("iosched: SQ ring full"))
+					completeReq(inflight[:], freeSlot, slot, req, 0, errors.New("iosched: SQ ring full"))
 					continue
 				}
 			}
@@ -286,42 +343,27 @@ func (s *URingScheduler) loop() {
 
 		// ── Phase 3: Submit to kernel + reap completions ─────
 		if inflightCount > 0 {
-			_, err := s.ring.SubmitAndWait(1)
+			_, err := ring.SubmitAndWait(1)
 			if err != nil && !errors.Is(err, syscall.EINTR) {
-				s.failAll(err)
-				inflightCount = 0
-
-				// If channel is closed and nothing left, exit.
-				if s.closed.Load() {
-					return
-				}
-				continue
+				s.setFatalErr(fmt.Errorf("iosched: ring error: %w", err))
+				failAll(inflight[:], freeSlot, err)
+				s.stop()
+				return
 			}
 
-			reaped := s.reapCompletions()
+			reaped := reapCompletions(ring, inflight[:], freeSlot)
 			inflightCount -= reaped
-		}
-
-		// If channel is closed and nothing in-flight, we're done.
-		if s.closed.Load() && inflightCount == 0 {
-			// Drain any remaining requests that arrived before close.
-			for req := range s.submitCh {
-				req.err = errors.New("iosched: scheduler closed")
-				req.done <- struct{}{}
-			}
-			return
 		}
 	}
 }
 
 // reapCompletions processes all available CQEs and signals the waiters.
-// Returns the number of completions reaped.
-func (s *URingScheduler) reapCompletions() int {
+func reapCompletions(ring *giouring.Ring, inflight []atomic.Pointer[uringReq], freeSlot chan uint64) int {
 	var count uint32
-	s.ring.ForEachCQE(func(cqe *giouring.CompletionQueueEvent) {
+	ring.ForEachCQE(func(cqe *giouring.CompletionQueueEvent) {
 		count++
 		slot := cqe.GetData64()
-		req := s.inflight[slot].Swap(nil)
+		req := inflight[slot].Swap(nil)
 		if req == nil {
 			return
 		}
@@ -334,31 +376,32 @@ func (s *URingScheduler) reapCompletions() int {
 		}
 
 		req.done <- struct{}{}
-		s.freeSlot <- slot
+		freeSlot <- slot
 	})
 
 	if count > 0 {
-		s.ring.CQAdvance(count)
+		ring.CQAdvance(count)
 	}
 	return int(count)
 }
 
 // completeReq signals a request as failed without going through the ring.
-func (s *URingScheduler) completeReq(slot uint64, req *uringReq, n int, err error) {
+func completeReq(inflight []atomic.Pointer[uringReq], freeSlot chan uint64, slot uint64, req *uringReq, n int, err error) {
 	req.n = n
 	req.err = err
 	req.done <- struct{}{}
-	s.inflight[slot].Store(nil)
-	s.freeSlot <- slot
+	inflight[slot].Store(nil)
+	freeSlot <- slot
 }
 
 // failAll completes all in-flight requests with the given error.
-func (s *URingScheduler) failAll(err error) {
-	for i := range s.inflight {
-		if req := s.inflight[i].Swap(nil); req != nil {
+func failAll(inflight []atomic.Pointer[uringReq], freeSlot chan uint64, err error) {
+	for i := range inflight {
+		if req := inflight[i].Swap(nil); req != nil {
+			req.n = 0
 			req.err = fmt.Errorf("iosched: ring error: %w", err)
 			req.done <- struct{}{}
-			s.freeSlot <- uint64(i)
+			freeSlot <- uint64(i)
 		}
 	}
 }

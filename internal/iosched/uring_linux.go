@@ -239,10 +239,16 @@ type coordinator struct {
 	sched     *URingScheduler
 	ring      *giouring.Ring
 	inflight  []*uringReq // slot index → pending request (nil = free)
-	free      []uint64    // stack of available slot indices
+	free      []uint64    // LIFO stack of available slot indices
 	batch     []*uringReq
 	batchSize int
-	nflight   int
+}
+
+// hasInflight reports whether any requests are pending in the kernel.
+// Derived from the free stack: cap(free) == ring depth, so
+// len(free) < cap(free) means slots are in use.
+func (c *coordinator) hasInflight() bool {
+	return len(c.free) < cap(c.free)
 }
 
 // loop is the coordinator goroutine. It exclusively owns the ring.
@@ -289,7 +295,7 @@ func (s *URingScheduler) loop(cfg URingConfig, readyCh chan<- error) {
 			return
 		}
 		c.submit()
-		if c.nflight > 0 {
+		if c.hasInflight() {
 			if !c.reap() {
 				return
 			}
@@ -307,7 +313,7 @@ func (c *coordinator) collect() bool {
 		return true // all slots in use; proceed to reap
 	}
 
-	if c.nflight == 0 {
+	if !c.hasInflight() {
 		select {
 		case req := <-c.sched.submitCh:
 			c.batch = append(c.batch, req)
@@ -320,6 +326,8 @@ func (c *coordinator) collect() bool {
 		select {
 		case req := <-c.sched.submitCh:
 			c.batch = append(c.batch, req)
+		case <-c.sched.stopCh:
+			return false
 		default:
 			return true
 		}
@@ -356,7 +364,6 @@ func (c *coordinator) submit() {
 			uint64(req.offset),
 		)
 		sqe.SetData64(slot)
-		c.nflight++
 	}
 }
 
@@ -388,7 +395,6 @@ func (c *coordinator) reap() bool {
 		}
 		req.done <- struct{}{}
 		c.freeSlot(slot)
-		c.nflight--
 	})
 	if count > 0 {
 		c.ring.CQAdvance(count)
@@ -423,13 +429,20 @@ func (c *coordinator) failAll(err error) {
 			req.done <- struct{}{}
 			c.inflight[i] = nil
 			c.freeSlot(uint64(i))
-			c.nflight--
 		}
 	}
 }
 
-// drainPending fails all in-flight and queued requests on coordinator exit.
+// drainPending fails all pending requests on coordinator exit:
+// batch items not yet submitted, in-flight kernel requests, and
+// requests still queued in the submission channel.
 func (c *coordinator) drainPending() {
+	for _, req := range c.batch {
+		req.err = errSchedulerClosed
+		req.done <- struct{}{}
+	}
+	c.batch = c.batch[:0]
+
 	for i, req := range c.inflight {
 		if req != nil {
 			req.err = errSchedulerClosed
@@ -437,6 +450,7 @@ func (c *coordinator) drainPending() {
 			c.inflight[i] = nil
 		}
 	}
+
 	for {
 		select {
 		case req := <-c.sched.submitCh:

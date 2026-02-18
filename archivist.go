@@ -11,6 +11,7 @@ import (
 
 	"github.com/miretskiy/blobcache/compression"
 	"github.com/miretskiy/blobcache/internal/index"
+	"github.com/miretskiy/blobcache/internal/iosched"
 	"github.com/miretskiy/blobcache/internal/record"
 	"github.com/miretskiy/blobcache/internal/sys"
 )
@@ -20,17 +21,22 @@ import (
 type Archivist struct {
 	config
 	index *index.DurableIndex
+	sched iosched.IOScheduler
 	cache sync.Map // segmentID (uint32) -> *os.File
 }
 
-func NewArchivist(cfg config, idx *index.DurableIndex) *Archivist {
+func NewArchivist(cfg config, idx *index.DurableIndex, sched iosched.IOScheduler) *Archivist {
+	if sched == nil {
+		sched = iosched.NewPreadScheduler()
+	}
 	return &Archivist{
 		config: cfg,
 		index:  idx,
+		sched:  sched,
 	}
 }
 
-// Close closes all cached segment mu
+// Close closes all cached segment file handles and the I/O scheduler.
 func (a *Archivist) Close() error {
 	var errs []error
 	a.cache.Range(func(key, value any) bool {
@@ -42,6 +48,9 @@ func (a *Archivist) Close() error {
 		a.cache.Delete(key)
 		return true
 	})
+	if err := a.sched.Close(); err != nil {
+		errs = append(errs, err)
+	}
 	return errors.Join(errs...)
 }
 
@@ -66,7 +75,7 @@ func (a *Archivist) ReadBlob(e index.Item, expectedKey []byte) ([]byte, Releaser
 func (a *Archivist) readBlobBuffered(sf *os.File, e index.Item, expectedKey []byte) ([]byte, Releaser, error) {
 	handle := AcquireBuffer(int(e.PhysicalLen), int(e.PhysicalLen))
 	buf := handle.Bytes()
-	if _, err := sf.ReadAt(buf, int64(e.Offset)); err != nil {
+	if _, err := a.sched.ReadAt(int(sf.Fd()), buf, int64(e.Offset)); err != nil {
 		handle.Release()
 		return nil, Releaser{}, fmt.Errorf("storage: read failed: %w", err)
 	}
@@ -80,7 +89,7 @@ func (a *Archivist) readBlobDirect(sf *os.File, e index.Item, expectedKey []byte
 	handle := AcquireAlignedBuffer(int(alignedLen), int(alignedLen))
 	buf := handle.Bytes()
 
-	if _, err := sys.PreadAligned(sf, buf, alignedOff, sys.FlDirectIO); err != nil {
+	if _, err := a.sched.ReadAt(int(sf.Fd()), buf, alignedOff); err != nil {
 		handle.Release()
 		return nil, Releaser{}, fmt.Errorf("storage: direct read failed: %w", err)
 	}

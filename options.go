@@ -5,6 +5,7 @@ import (
 	"hash/crc32"
 
 	"github.com/miretskiy/blobcache/compression"
+	"github.com/miretskiy/blobcache/internal/iosched"
 	"github.com/miretskiy/blobcache/internal/sys"
 	"github.com/miretskiy/blobcache/internal/wal"
 )
@@ -71,6 +72,8 @@ type config struct {
 	TrustHash                bool         // Skip key verification on reads (cache mode optimization)
 	BallastSize              int          // Heap ballast size in bytes (default: 1GB, 0 = disabled)
 	CompactionWasteThreshold float64      // Waste ratio to trigger segment rewrite (WAL mode, default: 0.25)
+
+	IOScheduler iosched.IOScheduler // Pluggable I/O backend for reads (default: pread)
 
 	knobs *TestingKnobs
 }
@@ -232,6 +235,13 @@ func WithBallast(size int) Option {
 // a candidate for compaction. Default: 0.25 (25%).
 func WithCompactionWasteThreshold(ratio float64) Option {
 	return funcOpt(func(c *config) { c.CompactionWasteThreshold = ratio })
+}
+
+// WithIOScheduler sets the I/O scheduler used for segment reads.
+// Default: PreadScheduler (synchronous pread). Use [iosched.NewURingScheduler]
+// for async io_uring on Linux.
+func WithIOScheduler(sched iosched.IOScheduler) Option {
+	return funcOpt(func(c *config) { c.IOScheduler = sched })
 }
 
 func defaultConfig(path string) config {

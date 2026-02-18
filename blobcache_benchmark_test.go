@@ -347,9 +347,9 @@ func reportLatency(b *testing.B, name string, h *hdrhistogram.Histogram) {
 }
 
 func startSystemMonitor(
-		ctx context.Context,
-		logicalWriteBytes, logicalReadBytes, liveSizeBytes, readCount, hitCount *atomic.Int64,
-		cachePath string,
+	ctx context.Context,
+	logicalWriteBytes, logicalReadBytes, liveSizeBytes, readCount, hitCount *atomic.Int64,
+	cachePath string,
 ) <-chan SystemMetrics {
 	out := make(chan SystemMetrics, 1)
 	go func() {
@@ -456,11 +456,11 @@ func startSystemMonitor(
 				missesPerSec := float64(intervalMisses) / interval.Seconds()
 
 				fmt.Printf("\n[HEARTBEAT %s]\n"+
-						"  MEM:   RSS: %.2fGB\n"+
-						"  DISK:  IO Depth: %.2f | Phys-Read: %.2f GB/s | Phys-Write: %.2f GB/s | Free: %.1fGB\n"+
-						"  CACHE: OnDisk: %.2fGB | Live: %.2fGB | Waste: %.2fGB (%.1f%%)\n"+
-						"  TPUT:  Log-Write: %.2f GB/s | Log-Read: %.2f GB/s\n"+
-						"  READS: %.0f/s total | %.0f/s hits | %.0f/s misses | HitRate: %.1f%%\n",
+					"  MEM:   RSS: %.2fGB\n"+
+					"  DISK:  IO Depth: %.2f | Phys-Read: %.2f GB/s | Phys-Write: %.2f GB/s | Free: %.1fGB\n"+
+					"  CACHE: OnDisk: %.2fGB | Live: %.2fGB | Waste: %.2fGB (%.1f%%)\n"+
+					"  TPUT:  Log-Write: %.2f GB/s | Log-Read: %.2f GB/s\n"+
+					"  READS: %.0f/s total | %.0f/s hits | %.0f/s misses | HitRate: %.1f%%\n",
 					time.Now().Format("15:04:05"), rss, currentQD, physReadTP, physWriteTP, freeGB,
 					onDiskGB, liveGB, wasteGB, wastePct,
 					logWriteTP, logReadTP,

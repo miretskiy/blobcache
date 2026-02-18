@@ -36,7 +36,7 @@ func RecoverIndex(path string, opts ...Option) (*Cache, error) {
 	c := &Cache{
 		config:    cfg,
 		index:     idx,
-		archivist: NewArchivist(cfg, idx),
+		archivist: NewArchivist(cfg, idx, cfg.IOScheduler),
 		segIDs:    newSegmentIDProvider(cfg.Path, cfg.Shards),
 		stopCh:    make(chan struct{}),
 	}

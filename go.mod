@@ -6,6 +6,7 @@ require (
 	github.com/DataDog/zstd v1.5.7
 	github.com/HdrHistogram/hdrhistogram-go v1.2.0
 	github.com/klauspost/compress v1.18.2
+	github.com/pawelgaczynski/giouring v0.0.0-20230826085535-69588b89acb9
 	github.com/pierrec/lz4/v4 v4.1.23
 	github.com/shirou/gopsutil/v3 v3.24.5
 	github.com/stretchr/testify v1.11.1

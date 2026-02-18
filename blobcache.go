@@ -223,7 +223,7 @@ func open(cfg config) (*Cache, bool, error) {
 	c := &Cache{
 		config:             cfg,
 		index:              idx,
-		archivist:          NewArchivist(cfg, idx),
+		archivist:          NewArchivist(cfg, idx, cfg.IOScheduler),
 		segIDs:             newSegmentIDProvider(cfg.Path, cfg.Shards),
 		maintenanceTrigger: make(chan struct{}, 1),
 		stopCh:             make(chan struct{}),

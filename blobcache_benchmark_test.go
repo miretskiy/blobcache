@@ -19,6 +19,7 @@ import (
 
 	"github.com/HdrHistogram/hdrhistogram-go"
 	"github.com/miretskiy/blobcache/internal/index"
+	"github.com/miretskiy/blobcache/internal/iosched"
 	"github.com/shirou/gopsutil/v3/disk"
 	"github.com/shirou/gopsutil/v3/process"
 )
@@ -75,6 +76,10 @@ func BenchmarkBlobCache(b *testing.B) {
 	// Toggle DirectIO via environment variable for A/B testing
 	directIO := os.Getenv("BLOBCACHE_BUFFERED_IO") != "1"
 
+	sched, err := iosched.NewURingScheduler(iosched.URingConfig{})
+	if err != nil {
+		b.Fatal(err)
+	}
 	cache, err := New(tmpDir,
 		WithMaxSize(400<<30),
 		WithWriteBufferSize(64<<20),
@@ -84,6 +89,7 @@ func BenchmarkBlobCache(b *testing.B) {
 		WithDirectIOWrite(directIO),
 		// WithWAL(),
 		WithFDataSync(true),
+		WithIOScheduler(sched),
 		WithDegradedMode(DegradedPanic), // Crash on errors during benchmarks
 	)
 	if err != nil {
@@ -125,7 +131,7 @@ func BenchmarkBlobCache(b *testing.B) {
 
 	// --- SYSTEM MONITOR (Background Heartbeat) ---
 	ctx, cancel := context.WithCancel(context.Background())
-	metricsChan := startSystemMonitor(ctx, &totalWriteBytes, &totalReadBytes, &cache.approxSize, &numReads, &numFound, tmpDir)
+	metricsChan := startSystemMonitor(ctx, &totalWriteBytes, &totalReadBytes, &cache.approxSize, &numReads, &numFound, tmpDir, sched)
 
 	// Reinterpret b.N: each iteration = one write
 	// e.g., -benchtime=1000000x means 1M writes (~1TB at 1MB/write)
@@ -350,6 +356,7 @@ func startSystemMonitor(
 	ctx context.Context,
 	logicalWriteBytes, logicalReadBytes, liveSizeBytes, readCount, hitCount *atomic.Int64,
 	cachePath string,
+	ioSched iosched.IOScheduler,
 ) <-chan SystemMetrics {
 	out := make(chan SystemMetrics, 1)
 	go func() {
@@ -455,16 +462,25 @@ func startSystemMonitor(
 				hitsPerSec := float64(intervalHits) / interval.Seconds()
 				missesPerSec := float64(intervalMisses) / interval.Seconds()
 
+				uringLine := ""
+				if sp, ok := ioSched.(interface{ Stats() iosched.Stats }); ok {
+					st := sp.Stats()
+					uringLine = fmt.Sprintf("  URING: Batches: %d | Reqs: %d | MaxBatch: %d | AvgBatch: %.1f\n",
+						st.Batches, st.Requests, st.MaxBatch, st.AvgBatch)
+				}
+
 				fmt.Printf("\n[HEARTBEAT %s]\n"+
 					"  MEM:   RSS: %.2fGB\n"+
 					"  DISK:  IO Depth: %.2f | Phys-Read: %.2f GB/s | Phys-Write: %.2f GB/s | Free: %.1fGB\n"+
 					"  CACHE: OnDisk: %.2fGB | Live: %.2fGB | Waste: %.2fGB (%.1f%%)\n"+
 					"  TPUT:  Log-Write: %.2f GB/s | Log-Read: %.2f GB/s\n"+
-					"  READS: %.0f/s total | %.0f/s hits | %.0f/s misses | HitRate: %.1f%%\n",
+					"  READS: %.0f/s total | %.0f/s hits | %.0f/s misses | HitRate: %.1f%%\n"+
+					"%s",
 					time.Now().Format("15:04:05"), rss, currentQD, physReadTP, physWriteTP, freeGB,
 					onDiskGB, liveGB, wasteGB, wastePct,
 					logWriteTP, logReadTP,
-					readsPerSec, hitsPerSec, missesPerSec, hitRate)
+					readsPerSec, hitsPerSec, missesPerSec, hitRate,
+					uringLine)
 
 				// Update states
 				totalQD += currentQD

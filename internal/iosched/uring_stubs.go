@@ -8,19 +8,7 @@ import "errors"
 // platform and kernel. Always false on non-Linux.
 const IOUringAvailable = false
 
-// URingConfig configures the io_uring scheduler.
-// On non-Linux platforms, NewURingScheduler always returns an error.
-type URingConfig struct {
-	RingDepth  uint32
-	ChanBuffer int
-	BatchSize  int
-	SQPOLL     bool
-}
-
-// URingScheduler is not available on non-Linux platforms.
-type URingScheduler struct{}
-
 // NewURingScheduler returns an error on non-Linux platforms.
-func NewURingScheduler(_ URingConfig) (*URingScheduler, error) {
+func NewURingScheduler(_ URingConfig) (IOScheduler, error) {
 	return nil, errors.New("iosched: io_uring requires Linux")
 }

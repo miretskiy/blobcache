@@ -60,6 +60,12 @@ func (a *Archivist) Close() error {
 //
 // expectedKey is used to verify the stored key matches (detects 128-bit hash collisions).
 func (a *Archivist) ReadBlob(e index.Item, expectedKey []byte) ([]byte, Releaser, error) {
+	// 1. Acquire read lock: Prevent segment deletion & FD close during I/O
+	shard := a.index.SegmentLockShard(e.SegmentID)
+	shard.RLock()
+	defer shard.RUnlock()
+
+	// 2. Do the read.
 	sf, err := a.getSegmentFile(e.SegmentID)
 	if err != nil {
 		return nil, Releaser{}, fmt.Errorf("storage: segment %d not found: %w", e.SegmentID, err)
@@ -72,7 +78,9 @@ func (a *Archivist) ReadBlob(e index.Item, expectedKey []byte) ([]byte, Releaser
 }
 
 // readBlobBuffered reads a record using buffered I/O (kernel page cache).
-func (a *Archivist) readBlobBuffered(sf *os.File, e index.Item, expectedKey []byte) ([]byte, Releaser, error) {
+func (a *Archivist) readBlobBuffered(
+	sf *os.File, e index.Item, expectedKey []byte,
+) ([]byte, Releaser, error) {
 	handle := AcquireBuffer(int(e.PhysicalLen), int(e.PhysicalLen))
 	buf := handle.Bytes()
 	n, err := a.sched.ReadAt(int(sf.Fd()), buf, int64(e.Offset))
@@ -89,7 +97,9 @@ func (a *Archivist) readBlobBuffered(sf *os.File, e index.Item, expectedKey []by
 }
 
 // readBlobDirect reads a record using Direct I/O with aligned buffers.
-func (a *Archivist) readBlobDirect(sf *os.File, e index.Item, expectedKey []byte) ([]byte, Releaser, error) {
+func (a *Archivist) readBlobDirect(
+	sf *os.File, e index.Item, expectedKey []byte,
+) ([]byte, Releaser, error) {
 	alignedOff, alignedLen := sys.AlignRange(int64(e.Offset), int(e.PhysicalLen))
 	handle := AcquireAlignedBuffer(int(alignedLen), int(alignedLen))
 	buf := handle.Bytes()
@@ -113,7 +123,9 @@ func (a *Archivist) readBlobDirect(sf *os.File, e index.Item, expectedKey []byte
 // parseRecord parses a record buffer, handles decompression and checksum verification.
 // owner is the Releaser that owns the buffer backing rec. onError is called to free
 // the buffer on failure paths (before decompression replaces it).
-func (a *Archivist) parseRecord(rec []byte, e index.Item, expectedKey []byte, owner Releaser, onError func()) ([]byte, Releaser, error) {
+func (a *Archivist) parseRecord(
+	rec []byte, e index.Item, expectedKey []byte, owner Releaser, onError func(),
+) ([]byte, Releaser, error) {
 	hdr, err := record.DecodeHeader(rec[:record.HeaderSize])
 	if err != nil {
 		onError()

@@ -27,9 +27,7 @@ func newURingSched(t *testing.T) *iosched.URingScheduler {
 		t.Skip("io_uring not available")
 	}
 	s, err := iosched.NewURingScheduler(iosched.URingConfig{
-		RingDepth:  64,
-		ChanBuffer: 128,
-		BatchSize:  16,
+		RingDepth: 64,
 	})
 	if err != nil {
 		t.Fatal(err)

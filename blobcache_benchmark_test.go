@@ -236,6 +236,11 @@ func BenchmarkBlobCache(b *testing.B) {
 	reportLatency(b, "GET", globalGet)
 	reportLatency(b, "PUT", globalPut)
 
+	// Disk read latency from the I/O scheduler.
+	if h := sched.Stats().ReadLatency; h != nil {
+		reportLatency(b, "DISK", h)
+	}
+
 	b.ReportMetric(warmupThroughput, "warmup-GB/s")
 	b.ReportMetric(finalMetrics.PeakRSS, "Peak-RSS-GB")
 	b.ReportMetric(finalMetrics.AvgUtil, "Disk-Util-%")
@@ -361,16 +366,16 @@ func startSystemMonitor(
 	out := make(chan SystemMetrics, 1)
 	go func() {
 		var (
-			maxRSS, totalQD float64
-			samples         int
-			interval        = 30 * time.Second
-			ticker          = time.NewTicker(interval)
-			proc, _         = process.NewProcess(int32(os.Getpid()))
-			v1, _           = disk.IOCounters()
-			prevLogWrite    = logicalWriteBytes.Load()
-			prevLogRead     = logicalReadBytes.Load()
-			prevReads       = readCount.Load()
-			prevHits        = hitCount.Load()
+			maxRSS, totalQD, totalUtil float64
+			samples                    int
+			interval                   = 30 * time.Second
+			ticker                     = time.NewTicker(interval)
+			proc, _                    = process.NewProcess(int32(os.Getpid()))
+			v1, _                      = disk.IOCounters()
+			prevLogWrite               = logicalWriteBytes.Load()
+			prevLogRead                = logicalReadBytes.Load()
+			prevReads                  = readCount.Load()
+			prevHits                   = hitCount.Load()
 		)
 		defer ticker.Stop()
 
@@ -380,6 +385,7 @@ func startSystemMonitor(
 				res := SystemMetrics{PeakRSS: maxRSS}
 				if samples > 0 {
 					res.AvgQueue = totalQD / float64(samples)
+					res.AvgUtil = totalUtil / float64(samples)
 				}
 				out <- res
 				return
@@ -391,24 +397,31 @@ func startSystemMonitor(
 					maxRSS = rss
 				}
 
-				// 2. IO Pressure (Queue Depth) - only count physical devices (nvme*, sd*)
+				// 2. IO Pressure — only count physical devices (nvme*, sd*)
 				v2, _ := disk.IOCounters()
-				var currentQD, physWriteBytes, physReadBytes float64
+				var currentQD, physWriteBytes, physReadBytes, maxUtil float64
 				for name, stat2 := range v2 {
-					// Only count physical devices, skip dm-*/loop* to avoid double-counting
 					if !strings.HasPrefix(name, "nvme") && !strings.HasPrefix(name, "sd") {
 						continue
 					}
 					if stat1, ok := v1[name]; ok {
 						intervalMs := float64(interval.Milliseconds())
 
-						// Guard against uint64 underflow: counters are monotonic,
-						// but stale v1 entries or device re-enumeration can cause
-						// stat2 < stat1, wrapping the unsigned subtraction.
 						if stat2.WeightedIO >= stat1.WeightedIO && stat2.WeightedIO-stat1.WeightedIO > 0 {
 							currentQD += float64(stat2.WeightedIO-stat1.WeightedIO) / intervalMs
 						} else if stat2.IoTime >= stat1.IoTime {
 							currentQD += float64(stat2.IoTime-stat1.IoTime) / intervalMs
+						}
+
+						// Utilization %: IoTime delta / interval length.
+						if stat2.IoTime >= stat1.IoTime {
+							util := (float64(stat2.IoTime-stat1.IoTime) / intervalMs) * 100.0
+							if util > 100.0 {
+								util = 100.0
+							}
+							if util > maxUtil {
+								maxUtil = util
+							}
 						}
 
 						physWriteBytes += float64(stat2.WriteBytes - stat1.WriteBytes)
@@ -462,21 +475,23 @@ func startSystemMonitor(
 				hitsPerSec := float64(intervalHits) / interval.Seconds()
 				missesPerSec := float64(intervalMisses) / interval.Seconds()
 
+				// 8. I/O Scheduler stats
+				st := ioSched.Stats()
 				uringLine := ""
-				if sp, ok := ioSched.(interface{ Stats() iosched.Stats }); ok {
-					st := sp.Stats()
+				if st.Batches > 0 {
 					uringLine = fmt.Sprintf("  URING: Batches: %d | Reqs: %d | MaxBatch: %d | AvgBatch: %.1f\n",
 						st.Batches, st.Requests, st.MaxBatch, st.AvgBatch)
 				}
 
 				fmt.Printf("\n[HEARTBEAT %s]\n"+
 					"  MEM:   RSS: %.2fGB\n"+
-					"  DISK:  IO Depth: %.2f | Phys-Read: %.2f GB/s | Phys-Write: %.2f GB/s | Free: %.1fGB\n"+
+					"  DISK:  Util: %.1f%% | QD: %.2f | Phys-Read: %.2f GB/s | Phys-Write: %.2f GB/s | Free: %.1fGB\n"+
 					"  CACHE: OnDisk: %.2fGB | Live: %.2fGB | Waste: %.2fGB (%.1f%%)\n"+
 					"  TPUT:  Log-Write: %.2f GB/s | Log-Read: %.2f GB/s\n"+
 					"  READS: %.0f/s total | %.0f/s hits | %.0f/s misses | HitRate: %.1f%%\n"+
 					"%s",
-					time.Now().Format("15:04:05"), rss, currentQD, physReadTP, physWriteTP, freeGB,
+					time.Now().Format("15:04:05"), rss,
+					maxUtil, currentQD, physReadTP, physWriteTP, freeGB,
 					onDiskGB, liveGB, wasteGB, wastePct,
 					logWriteTP, logReadTP,
 					readsPerSec, hitsPerSec, missesPerSec, hitRate,
@@ -484,6 +499,7 @@ func startSystemMonitor(
 
 				// Update states
 				totalQD += currentQD
+				totalUtil += maxUtil
 				samples++
 				v1 = v2
 				prevLogWrite = currLogWrite

@@ -27,7 +27,7 @@ type Archivist struct {
 
 func NewArchivist(cfg config, idx *index.DurableIndex, sched iosched.IOScheduler) *Archivist {
 	if sched == nil {
-		sched = iosched.NewPreadScheduler()
+		sched = &iosched.PreadScheduler{}
 	}
 	return &Archivist{
 		config: cfg,

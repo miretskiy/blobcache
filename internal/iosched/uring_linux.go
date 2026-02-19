@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/pawelgaczynski/giouring"
@@ -50,6 +51,8 @@ var errSchedulerClosed = errors.New("iosched: scheduler closed")
 // SubmitAndWait(1) to wait for at least one completion, reaps all ready
 // CQEs, and loops. The ring stays full, maximizing NVMe utilization.
 type URingScheduler struct {
+	readLatency
+
 	mu      sync.Mutex
 	pending []*uringReq
 
@@ -72,7 +75,7 @@ type URingScheduler struct {
 	maxBatch atomic.Int64
 }
 
-// Stats returns batching effectiveness counters.
+// Stats returns scheduler statistics including latency and batching counters.
 func (s *URingScheduler) Stats() Stats {
 	batches := s.batches.Load()
 	reqs := s.requests.Load()
@@ -81,10 +84,11 @@ func (s *URingScheduler) Stats() Stats {
 		avg = float64(reqs) / float64(batches)
 	}
 	return Stats{
-		Batches:  batches,
-		Requests: reqs,
-		MaxBatch: s.maxBatch.Load(),
-		AvgBatch: avg,
+		ReadLatency: s.latencySnapshot(),
+		Batches:     batches,
+		Requests:    reqs,
+		MaxBatch:    s.maxBatch.Load(),
+		AvgBatch:    avg,
 	}
 }
 
@@ -100,6 +104,7 @@ func NewURingScheduler(cfg URingConfig) (*URingScheduler, error) {
 		signal: make(chan struct{}, 1),
 		stopCh: make(chan struct{}),
 	}
+	s.initLatency()
 	s.reqPool.New = func() any {
 		return &uringReq{done: make(chan struct{}, 1)}
 	}
@@ -126,6 +131,7 @@ func (s *URingScheduler) ReadAt(fd int, buf []byte, offset int64) (int, error) {
 		return 0, nil
 	}
 
+	start := time.Now()
 	req := s.getReq(fd, buf, offset)
 
 	// Append to pending queue under lock.
@@ -155,6 +161,7 @@ func (s *URingScheduler) ReadAt(fd int, buf []byte, offset int64) (int, error) {
 
 	n, err := req.n, req.err
 	s.putReq(req)
+	s.recordRead(start)
 
 	// Prevent GC from collecting buf before we've read the result.
 	runtime.KeepAlive(buf)

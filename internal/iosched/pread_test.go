@@ -11,6 +11,12 @@ import (
 	"github.com/miretskiy/blobcache/internal/iosched"
 )
 
+func must[T any](v T, err error) T {
+	if err != nil {
+		panic(err)
+	}
+	return v
+}
 func TestPreadScheduler_BasicRead(t *testing.T) {
 	data := make([]byte, 4096)
 	if _, err := rand.Read(data); err != nil {
@@ -28,7 +34,7 @@ func TestPreadScheduler_BasicRead(t *testing.T) {
 	}
 	defer f.Close()
 
-	sched := iosched.NewPreadScheduler()
+	sched := must(iosched.NewPreadScheduler())
 	defer sched.Close()
 
 	buf := make([]byte, len(data))
@@ -63,7 +69,7 @@ func TestPreadScheduler_PartialRead(t *testing.T) {
 	}
 	defer f.Close()
 
-	sched := iosched.NewPreadScheduler()
+	sched := must(iosched.NewPreadScheduler())
 	defer sched.Close()
 
 	// Read from offset 4096, 1024 bytes.
@@ -104,7 +110,7 @@ func TestPreadScheduler_Concurrent(t *testing.T) {
 	}
 	defer f.Close()
 
-	sched := iosched.NewPreadScheduler()
+	sched := must(iosched.NewPreadScheduler())
 	defer sched.Close()
 
 	var wg sync.WaitGroup
@@ -155,7 +161,7 @@ func TestPreadScheduler_EmptyBuf(t *testing.T) {
 	}
 	defer f.Close()
 
-	sched := iosched.NewPreadScheduler()
+	sched := must(iosched.NewPreadScheduler())
 	n, err := sched.ReadAt(int(f.Fd()), nil, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -163,9 +169,4 @@ func TestPreadScheduler_EmptyBuf(t *testing.T) {
 	if n != 0 {
 		t.Fatalf("expected 0, got %d", n)
 	}
-}
-
-func TestPreadScheduler_Interface(t *testing.T) {
-	// Verify PreadScheduler implements IOScheduler.
-	var _ iosched.IOScheduler = iosched.NewPreadScheduler()
 }

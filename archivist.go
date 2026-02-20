@@ -219,6 +219,21 @@ func (a *Archivist) getSegmentFile(segmentID uint32) (*os.File, error) {
 	return f, nil
 }
 
+// ReadChunkAt reads len(buf) bytes from segment segID at the given offset.
+// Acquires the segment read lock to prevent concurrent deletion during I/O.
+// buf must be page-aligned for Direct I/O compatibility.
+func (a *Archivist) ReadChunkAt(segID uint32, buf []byte, offset int64) (int, error) {
+	shard := a.index.SegmentLockShard(segID)
+	shard.RLock()
+	defer shard.RUnlock()
+
+	sf, err := a.getSegmentFile(segID)
+	if err != nil {
+		return 0, fmt.Errorf("storage: segment %d not found: %w", segID, err)
+	}
+	return a.sched.ReadAt(int(sf.Fd()), buf, offset)
+}
+
 // DropSegmentCache closes and removes a segment's cached file handle.
 // Called before deleting segment files during compaction.
 func (a *Archivist) DropSegmentCache(segmentID uint32) {

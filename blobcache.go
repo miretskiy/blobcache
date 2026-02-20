@@ -51,7 +51,8 @@ type Cache struct {
 
 	// --- ARCHITECTURE COMPONENTS ---
 	memTable  *MemTable  // The Write Engine (Producer)
-	librarian *Librarian // The Read Cache (Consumer)
+	librarian *Librarian // The Write-Path Read Cache (Consumer)
+	readCache *ReadCache // The User-Space Read Cache (nil if disabled)
 	// Global monotonic sequence counter for operation ordering.
 	// Initialized to time.Now().UnixNano() for continuity across restarts.
 	// This ensures sequences are always increasing even after crashes,
@@ -251,6 +252,22 @@ func open(cfg config) (*Cache, bool, error) {
 	c.approxSize.Store(totalSize)
 	c.oldestLiveSegmentID.Store(oldestSegID)
 	c.Knobs = cfg.knobs
+
+	// Initialize read cache if enabled (before memtable — no dependency).
+	if cfg.ReadCacheSlabs > 0 {
+		rcSlabSize := cfg.ReadCacheSlabSize
+		if rcSlabSize <= 0 {
+			rcSlabSize = cfg.WriteBufferSize
+		}
+		c.readCache = NewReadCache(
+			rcSlabSize,
+			cfg.ReadCacheSlabs,
+			c.archivist,
+			c,
+			cfg.ReadCacheEvictionStrategy,
+		)
+	}
+
 	c.memTable = NewMemTable(c.config, c, c, c.librarian, c.wal, c.segIDs)
 	c.memTable.Knobs = c.Knobs
 
@@ -296,7 +313,12 @@ func (c *Cache) Close() error {
 	// 2. Close Read Path (Releases pinned slabs back to pool)
 	c.librarian.Close()
 
-	// 3. Release pool memory (must be after librarian returns slabs)
+	// 3. Close Read Cache (releases mmap arenas back to its dedicated pool)
+	if c.readCache != nil {
+		c.readCache.Close()
+	}
+
+	// 4. Release pool memory (must be after librarian returns slabs)
 	c.memTable.ClosePools()
 
 	c.wg.Wait()
@@ -373,7 +395,7 @@ func (c *Cache) search(key []byte) (data []byte, rel Releaser, ok bool) {
 		c.bloomStats.hits.Add(128)
 	}
 
-	// 2. RAM Hit (Librarian)
+	// 2. RAM Hit (Librarian — write-path cache)
 	if ramData, storedKey, releaser, found := c.librarian.Acquire(h); found {
 		// Verify key to detect hash collision
 		if !c.hot.trustHash && !bytes.Equal(storedKey, key) {
@@ -384,7 +406,19 @@ func (c *Cache) search(key []byte) (data []byte, rel Releaser, ok bool) {
 		return ramData, releaser, true
 	}
 
-	// 3. Disk Hit (Storage)
+	// 3. Read Cache Hit (user-space read cache)
+	if c.readCache != nil {
+		if rcData, storedKey, releaser, found := c.readCache.Acquire(h); found {
+			if !c.hot.trustHash && !bytes.Equal(storedKey, key) {
+				releaser.Release()
+				c.bloomStats.ghosts.Add(1)
+				return nil, Releaser{}, false
+			}
+			return rcData, releaser, true
+		}
+	}
+
+	// 4. Disk Hit (Storage)
 	entry, found := c.index.Get(h)
 	if !found || entry.IsDeleted() {
 		// BLOOM GHOST: Bloom said yes, Index said no (or item is deleted).
@@ -392,18 +426,29 @@ func (c *Cache) search(key []byte) (data []byte, rel Releaser, ok bool) {
 		return nil, Releaser{}, false
 	}
 
-	// 4. Check corruption flag
+	// 5. Check corruption flag
 	if entry.HasError() {
 		log.Debug("blob marked as corrupt", "hash", h, "errno", entry.Errno())
 		return nil, Releaser{}, false
 	}
 
-	// 5. Read from disk (with key verification for collision detection)
-	// Pass nil key when TrustHash enabled to skip verification
+	// 6. Read from disk (with key verification for collision detection)
 	verifyKey := key
 	if c.TrustHash {
 		verifyKey = nil
 	}
+
+	// 7. Fetch via Read Cache (singleflight + prefetch + populate) if enabled
+	if c.readCache != nil {
+		data, diskReleaser, err := c.readCache.FetchAndPopulate(entry, verifyKey)
+		if err != nil {
+			c.handleStorageError(h, entry, err)
+			return nil, Releaser{}, false
+		}
+		return data, diskReleaser, true
+	}
+
+	// 8. Direct disk read (read cache disabled)
 	data, diskReleaser, err := c.archivist.ReadBlob(entry, verifyKey)
 	if err != nil {
 		c.handleStorageError(h, entry, err)
@@ -480,8 +525,11 @@ func (c *Cache) Delete(key []byte) error {
 		return nil
 	}
 
-	// Invalidate Librarian cache to prevent serving stale data
+	// Invalidate caches to prevent serving stale data
 	c.librarian.Invalidate(h)
+	if c.readCache != nil {
+		c.readCache.Invalidate(h)
+	}
 
 	if c.wal != nil {
 		return c.deleteInCASMode(key, h, item)
@@ -861,6 +909,11 @@ func (c *Cache) maintenanceWorker() {
 					c.ReportError(fmt.Errorf("segment drain: %w", err))
 					return
 				}
+			}
+
+			// Phase 4: Read cache visited-count decay
+			if c.readCache != nil {
+				c.readCache.DecayVisitedCounts()
 			}
 
 		case <-c.stopCh:

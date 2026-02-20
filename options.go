@@ -75,6 +75,11 @@ type config struct {
 
 	IOScheduler iosched.IOScheduler // Pluggable I/O backend for reads (default: pread)
 
+	// --- Read Cache Configuration ---
+	ReadCacheSlabs            int              // Number of read cache slabs (0 = disabled)
+	ReadCacheSlabSize         int64            // Size of each read cache slab (default: WriteBufferSize)
+	ReadCacheEvictionStrategy EvictionStrategy // Eviction strategy (default: DropStrategy)
+
 	knobs *TestingKnobs
 }
 
@@ -242,6 +247,25 @@ func WithCompactionWasteThreshold(ratio float64) Option {
 // for async io_uring on Linux.
 func WithIOScheduler(sched iosched.IOScheduler) Option {
 	return funcOpt(func(c *config) { c.IOScheduler = sched })
+}
+
+// WithReadCacheSlabs enables the read cache with the specified number of mmap arenas.
+// Each arena is ReadCacheSlabSize bytes. Total read cache memory = n * slabSize.
+// Set to 0 to disable (default). Recommended: 16 (1GB at 64MB slabs).
+func WithReadCacheSlabs(n int) Option {
+	return funcOpt(func(c *config) { c.ReadCacheSlabs = n })
+}
+
+// WithReadCacheSlabSize sets the size of each read cache slab.
+// Default: same as WriteBufferSize.
+func WithReadCacheSlabSize(size int64) Option {
+	return funcOpt(func(c *config) { c.ReadCacheSlabSize = size })
+}
+
+// WithReadCacheEvictionStrategy sets the eviction strategy for read cache slabs.
+// Default: DropStrategy (zero overhead, drops all items).
+func WithReadCacheEvictionStrategy(strategy EvictionStrategy) Option {
+	return funcOpt(func(c *config) { c.ReadCacheEvictionStrategy = strategy })
 }
 
 func defaultConfig(path string) config {

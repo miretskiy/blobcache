@@ -15,4 +15,13 @@ type TestingKnobs struct {
 	// SequenceVendor overrides the default sequence ID generation.
 	// If set, NextSeq() calls are delegated to this interface.
 	SequenceVendor SequenceVendor
+
+	// OnReadCacheMiss is called when the read cache misses for a key.
+	OnReadCacheMiss func(hashKey Key)
+
+	// OnReadCacheHit is called when the read cache hits for a key.
+	OnReadCacheHit func(hashKey Key)
+
+	// OnReadCacheEvict is called when a read cache slab is evicted.
+	OnReadCacheEvict func(totalItems int32, visitedCount int32)
 }

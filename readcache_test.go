@@ -345,6 +345,43 @@ func TestReadCache_Close_Idempotent(t *testing.T) {
 	rc.Close()
 }
 
+func TestReadCache_Stats(t *testing.T) {
+	rc := newTestReadCache(1<<20, 4)
+	defer rc.Close()
+
+	// Initially all zeros.
+	s := rc.Stats()
+	require.Zero(t, s.Hits)
+	require.Zero(t, s.Misses)
+	require.Zero(t, s.Inserts)
+	require.Zero(t, s.Evictions)
+	require.Zero(t, s.Slabs)
+
+	// Insert a record.
+	key := []byte("stats-key")
+	value := []byte("stats-value")
+	rawRec := makeRawRecord(t, key, value)
+	h := hashKey(key)
+	rc.Insert(h, rawRec)
+
+	s = rc.Stats()
+	require.Equal(t, int64(1), s.Inserts)
+
+	// Acquire should count as hit.
+	_, _, rel, found := rc.Acquire(h)
+	require.True(t, found)
+	rel.Release()
+
+	s = rc.Stats()
+	require.Equal(t, int64(1), s.Hits)
+
+	// Miss on unknown key.
+	_, _, _, found = rc.Acquire(hashKey([]byte("no-such-key")))
+	require.False(t, found)
+	// Misses are only counted in FetchAndPopulate, not Acquire.
+	require.Equal(t, int64(0), s.Misses)
+}
+
 // --- flightKey ---
 
 func TestFlightKey_Encoding(t *testing.T) {

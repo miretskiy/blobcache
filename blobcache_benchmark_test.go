@@ -90,6 +90,7 @@ func BenchmarkBlobCache(b *testing.B) {
 		// WithWAL(),
 		WithFDataSync(true),
 		WithIOScheduler(sched),
+		WithReadCacheSlabs(16), // 16 * 64MB = 1GB user-space read cache
 		WithDegradedMode(DegradedPanic), // Crash on errors during benchmarks
 	)
 	if err != nil {
@@ -131,7 +132,7 @@ func BenchmarkBlobCache(b *testing.B) {
 
 	// --- SYSTEM MONITOR (Background Heartbeat) ---
 	ctx, cancel := context.WithCancel(context.Background())
-	metricsChan := startSystemMonitor(ctx, &totalWriteBytes, &totalReadBytes, &cache.approxSize, &numReads, &numFound, tmpDir, sched)
+	metricsChan := startSystemMonitor(ctx, &totalWriteBytes, &totalReadBytes, &cache.approxSize, &numReads, &numFound, tmpDir, sched, cache.readCache)
 
 	// Reinterpret b.N: each iteration = one write
 	// e.g., -benchtime=1000000x means 1M writes (~1TB at 1MB/write)
@@ -239,6 +240,20 @@ func BenchmarkBlobCache(b *testing.B) {
 	// Disk read latency from the I/O scheduler.
 	if h := sched.Stats().ReadLatency; h != nil {
 		reportLatency(b, "DISK", h)
+	}
+
+	// Read cache final summary.
+	if cache.readCache != nil {
+		rcs := cache.readCache.Stats()
+		total := rcs.Hits + rcs.Misses
+		rcHitRate := 0.0
+		if total > 0 {
+			rcHitRate = float64(rcs.Hits) / float64(total) * 100
+		}
+		fmt.Printf("\n--- READ CACHE SUMMARY ---\n")
+		fmt.Printf("  Hits: %d | Misses: %d | HitRate: %.1f%% | Inserts: %d | Evictions: %d | Slabs: %d\n",
+			rcs.Hits, rcs.Misses, rcHitRate, rcs.Inserts, rcs.Evictions, rcs.Slabs)
+		b.ReportMetric(rcHitRate, "RC-HitRate-%")
 	}
 
 	b.ReportMetric(warmupThroughput, "warmup-GB/s")
@@ -362,6 +377,7 @@ func startSystemMonitor(
 	logicalWriteBytes, logicalReadBytes, liveSizeBytes, readCount, hitCount *atomic.Int64,
 	cachePath string,
 	ioSched iosched.IOScheduler,
+	readCache *ReadCache,
 ) <-chan SystemMetrics {
 	out := make(chan SystemMetrics, 1)
 	go func() {
@@ -376,6 +392,8 @@ func startSystemMonitor(
 			prevLogRead                = logicalReadBytes.Load()
 			prevReads                  = readCount.Load()
 			prevHits                   = hitCount.Load()
+			prevRCHits                 int64
+			prevRCMisses               int64
 		)
 		defer ticker.Stop()
 
@@ -483,19 +501,37 @@ func startSystemMonitor(
 						st.Batches, st.Requests, st.MaxBatch, st.AvgBatch)
 				}
 
+				// 9. Read cache stats
+				rcLine := ""
+				if readCache != nil {
+					rcs := readCache.Stats()
+					intRCHits := rcs.Hits - prevRCHits
+					intRCMisses := rcs.Misses - prevRCMisses
+					rcHitRate := 0.0
+					if intRCHits+intRCMisses > 0 {
+						rcHitRate = float64(intRCHits) / float64(intRCHits+intRCMisses) * 100
+					}
+					rcLine = fmt.Sprintf("  RCACHE: %.0f/s hits | %.0f/s misses | HitRate: %.1f%% | Inserts: %d | Evictions: %d | Slabs: %d\n",
+						float64(intRCHits)/interval.Seconds(),
+						float64(intRCMisses)/interval.Seconds(),
+						rcHitRate, rcs.Inserts, rcs.Evictions, rcs.Slabs)
+					prevRCHits = rcs.Hits
+					prevRCMisses = rcs.Misses
+				}
+
 				fmt.Printf("\n[HEARTBEAT %s]\n"+
 					"  MEM:   RSS: %.2fGB\n"+
 					"  DISK:  Util: %.1f%% | QD: %.2f | Phys-Read: %.2f GB/s | Phys-Write: %.2f GB/s | Free: %.1fGB\n"+
 					"  CACHE: OnDisk: %.2fGB | Live: %.2fGB | Waste: %.2fGB (%.1f%%)\n"+
 					"  TPUT:  Log-Write: %.2f GB/s | Log-Read: %.2f GB/s\n"+
 					"  READS: %.0f/s total | %.0f/s hits | %.0f/s misses | HitRate: %.1f%%\n"+
-					"%s",
+					"%s%s",
 					time.Now().Format("15:04:05"), rss,
 					maxUtil, currentQD, physReadTP, physWriteTP, freeGB,
 					onDiskGB, liveGB, wasteGB, wastePct,
 					logWriteTP, logReadTP,
 					readsPerSec, hitsPerSec, missesPerSec, hitRate,
-					uringLine)
+					rcLine, uringLine)
 
 				// Update states
 				totalQD += currentQD

@@ -19,6 +19,15 @@ import (
 // from temporal prefetch (neighboring records in the same chunk are also cached).
 const prefetchChunkSize = 64 * 1024
 
+// ReadCacheStats holds a point-in-time snapshot of read cache counters.
+type ReadCacheStats struct {
+	Hits      int64 // Acquire found the key in a sealed or active slab
+	Misses    int64 // FetchAndPopulate called (cache miss, went to disk)
+	Inserts   int64 // Records successfully inserted into the cache
+	Evictions int64 // Slabs evicted to free pool arenas
+	Slabs     int   // Current number of sealed slabs
+}
+
 // ReadCache is a user-space read cache backed by mmap arenas.
 // It sits between the Librarian (write-path cache) and the Archivist (disk I/O)
 // in the read path.
@@ -55,6 +64,12 @@ type ReadCache struct {
 	// Dependencies.
 	archivist   *Archivist
 	errReporter ErrorReporter
+
+	// Stats counters (atomics for lock-free updates).
+	hits      atomic.Int64
+	misses    atomic.Int64
+	inserts   atomic.Int64
+	evictions atomic.Int64
 
 	closed atomic.Bool
 }
@@ -123,6 +138,7 @@ func (rc *ReadCache) Acquire(hashKey Key) ([]byte, []byte, Releaser, bool) {
 		}
 		if ok {
 			slab.RecordHit(hashKey)
+			rc.hits.Add(1)
 			return data, keyBytes, releaser, true
 		}
 	}
@@ -142,6 +158,7 @@ func (rc *ReadCache) Acquire(hashKey Key) ([]byte, []byte, Releaser, bool) {
 			return nil, nil, Releaser{}, false
 		}
 		if ok {
+			rc.hits.Add(1)
 			return data, keyBytes, releaser, true
 		}
 	}
@@ -197,6 +214,7 @@ func (rc *ReadCache) Insert(hashKey Key, rawRecord []byte) bool {
 	rc.active.bloom.Add(hashKey)
 	rc.active.index.Put(hashKey, entry)
 
+	rc.inserts.Add(1)
 	return true
 }
 
@@ -234,6 +252,7 @@ func (rc *ReadCache) sealAndRotateLocked() {
 			rc.evictor.BeforeEvict(newList[victimIdx], nil)
 			newList[victimIdx].buf.Unpin() // Returns arena to pool
 			newList = append(newList[:victimIdx], newList[victimIdx+1:]...)
+			rc.evictions.Add(1)
 		}
 	}
 
@@ -262,6 +281,7 @@ func (rc *ReadCache) sealAndRotateLocked() {
 func (rc *ReadCache) FetchAndPopulate(
 	item index.Item, expectedKey []byte,
 ) ([]byte, Releaser, error) {
+	rc.misses.Add(1)
 	blobLen := int64(item.PhysicalLen)
 
 	if blobLen > rc.slabSize {
@@ -473,4 +493,15 @@ func (rc *ReadCache) Close() {
 
 	// Release pool memory.
 	rc.pool.Close()
+}
+
+// Stats returns a point-in-time snapshot of read cache counters.
+func (rc *ReadCache) Stats() ReadCacheStats {
+	return ReadCacheStats{
+		Hits:      rc.hits.Load(),
+		Misses:    rc.misses.Load(),
+		Inserts:   rc.inserts.Load(),
+		Evictions: rc.evictions.Load(),
+		Slabs:     len(*rc.sealed.Load()),
+	}
 }

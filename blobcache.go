@@ -259,9 +259,16 @@ func open(cfg config) (*Cache, bool, error) {
 		if rcSlabSize <= 0 {
 			rcSlabSize = cfg.WriteBufferSize
 		}
+		rcMaxItemSize := cfg.ReadCacheMaxItemSize
+		if rcMaxItemSize == 0 {
+			rcMaxItemSize = rcSlabSize / 64 // Default: ensure ≥64 items per slab
+		} else if rcMaxItemSize < 0 {
+			rcMaxItemSize = 0 // -1 = no limit → pass 0 to ReadCache
+		}
 		c.readCache = NewReadCache(
 			rcSlabSize,
 			cfg.ReadCacheSlabs,
+			rcMaxItemSize,
 			c.archivist,
 			c,
 			cfg.ReadCacheEvictionStrategy,

@@ -26,6 +26,7 @@ type ReadCacheStats struct {
 	Inserts   int64 // Records successfully inserted into the cache
 	Evictions int64 // Slabs evicted to free pool arenas
 	Compacted int64 // Items preserved via CompactStrategy during eviction
+	Skipped   int64 // Items rejected by admission policy (too large)
 	Slabs     int   // Current number of sealed slabs
 }
 
@@ -52,9 +53,10 @@ type ReadCache struct {
 	active *ActiveSlab
 
 	// Dedicated arena pool (separate from write-path pool).
-	pool     *MmapPool
-	slabSize int64
-	maxSlabs int
+	pool        *MmapPool
+	slabSize    int64
+	maxSlabs    int
+	maxItemSize int64 // Items larger than this bypass the cache (0 = no limit)
 
 	// Sharded coalescing map for thundering herd protection.
 	flights *inflightGroup
@@ -72,6 +74,7 @@ type ReadCache struct {
 	inserts   atomic.Int64
 	evictions atomic.Int64
 	compacted atomic.Int64
+	skipped   atomic.Int64
 
 	closed atomic.Bool
 }
@@ -83,6 +86,7 @@ type ReadCache struct {
 func NewReadCache(
 	slabSize int64,
 	maxSlabs int,
+	maxItemSize int64,
 	archivist *Archivist,
 	reporter ErrorReporter,
 	evictor EvictionStrategy,
@@ -94,9 +98,10 @@ func NewReadCache(
 	rc := &ReadCache{
 		// +1 over-provision: during compaction we hold the victim slab open
 		// while writing into the new active slab, requiring maxSlabs+1 arenas.
-		pool:     NewMmapPool("readcache", slabSize, maxSlabs+1),
-		slabSize: slabSize,
+		pool:        NewMmapPool("readcache", slabSize, maxSlabs+1),
+		slabSize:    slabSize,
 		maxSlabs:    maxSlabs,
+		maxItemSize: maxItemSize,
 		flights:     newInflightGroup(),
 		evictor:     evictor,
 		archivist:   archivist,
@@ -182,6 +187,10 @@ func (rc *ReadCache) Insert(hashKey Key, rawRecord []byte) bool {
 	recordLen := len(rawRecord)
 	if int64(recordLen) > rc.slabSize {
 		return false // Record larger than slab
+	}
+	if rc.maxItemSize > 0 && int64(recordLen) > rc.maxItemSize {
+		rc.skipped.Add(1)
+		return false // Rejected by admission policy
 	}
 
 	hdr, err := record.DecodeHeader(rawRecord[:record.HeaderSize])
@@ -304,6 +313,12 @@ func (rc *ReadCache) FetchAndPopulate(
 
 	if blobLen > rc.slabSize {
 		// Too large to cache. Direct disk read.
+		return rc.archivist.ReadBlob(item, expectedKey)
+	}
+
+	if rc.maxItemSize > 0 && blobLen > rc.maxItemSize {
+		// Rejected by admission policy — serve from disk, don't pollute cache.
+		rc.skipped.Add(1)
 		return rc.archivist.ReadBlob(item, expectedKey)
 	}
 
@@ -521,6 +536,7 @@ func (rc *ReadCache) Stats() ReadCacheStats {
 		Inserts:   rc.inserts.Load(),
 		Evictions: rc.evictions.Load(),
 		Compacted: rc.compacted.Load(),
+		Skipped:   rc.skipped.Load(),
 		Slabs:     len(*rc.sealed.Load()),
 	}
 }

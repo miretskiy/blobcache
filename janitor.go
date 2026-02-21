@@ -3,16 +3,20 @@ package blobcache
 import (
 	"sync/atomic"
 	"time"
+
+	"github.com/miretskiy/blobcache/bloom"
+	"github.com/miretskiy/blobcache/internal/xmap"
 )
 
 // ReadSlab extends SharedSlab with hit-tracking for slab-level eviction.
 // Once sealed (published to the read cache's sealed list), the SharedSlab
-// fields are read-only. Only visitedCount is mutated, atomically.
+// fields are read-only. Only visitedCount and visited are mutated, atomically.
 type ReadSlab struct {
 	SharedSlab
 	totalItems   int32        // Set once when slab is sealed (immutable after)
 	visitedCount atomic.Int32 // Sampled increments (1/16 probability) on cache hit
 	createdAt    int64        // UnixNano timestamp for age-based tiebreaking
+	visited      *bloom.Filter // Per-item visited tracking (stays mutable, atomic Add)
 }
 
 // visitSampleShift controls the probabilistic sampling rate for RecordHit.
@@ -52,6 +56,10 @@ func (rs *ReadSlab) ColdScore() float64 {
 // This samples a uniform 1/16 of distinct keys rather than 1/16 of hits,
 // which is ideal for slab-level cold/hot ratio estimation.
 func (rs *ReadSlab) RecordHit(h Key) {
+	// Per-item visited flag for CompactStrategy (always set, not sampled).
+	rs.visited.Add(h)
+
+	// Per-slab aggregate counter for ColdScore (sampled 1/16).
 	if h.Lo&(visitSampleFactor-1) == 0 {
 		rs.visitedCount.Add(1)
 	}
@@ -71,6 +79,62 @@ type DropStrategy struct{}
 
 // BeforeEvict does nothing — all items are dropped.
 func (DropStrategy) BeforeEvict(_ *ReadSlab, _ *ActiveSlab) int { return 0 }
+
+// CompactStrategy copies visited (proven-hot) items from the victim slab into
+// the destination active slab before eviction. Items start with visited=0 in
+// the new slab — they must prove they're hot again (SIEVE invariant).
+//
+// This prevents the "popular item eviction" problem where coarse-grained
+// slab eviction drops hot items mixed with cold ones.
+type CompactStrategy struct{}
+
+// BeforeEvict iterates the victim's index, checks the per-item visited bloom,
+// and copies visited items into dst. Returns the number of preserved items.
+func (CompactStrategy) BeforeEvict(victim *ReadSlab, dst *ActiveSlab) int {
+	if dst == nil {
+		return 0
+	}
+
+	preserved := 0
+	buf := victim.buf.Bytes()
+
+	victim.index.ForEach(func(key xmap.Key, entry SlabEntry, _ *xmap.Pad32) bool {
+		if !victim.visited.Test(key) {
+			return true // Not visited — drop
+		}
+
+		totalSize := entry.Header.TotalSize()
+		if totalSize <= 0 {
+			return true
+		}
+
+		// Extract raw record from victim's mmap buffer.
+		pos := int(entry.Pos)
+		if pos+totalSize > len(buf) {
+			return true // Shouldn't happen, but guard
+		}
+		rawRecord := buf[pos : pos+totalSize]
+
+		// Allocate in destination slab and copy.
+		dstBuf, dstPos := dst.Alloc(totalSize)
+		if dstBuf == nil {
+			return false // Destination full — stop compaction
+		}
+		copy(dstBuf, rawRecord)
+
+		// Re-index in destination (visited=0 — must prove hot again).
+		dstEntry := SlabEntry{
+			Header: entry.Header,
+			Pos:    dstPos,
+		}
+		dst.bloom.Add(key)
+		dst.index.Put(key, dstEntry)
+		preserved++
+		return true
+	})
+
+	return preserved
+}
 
 // selectVictim returns the index of the coldest slab in the list.
 // Returns -1 if the list is empty.
@@ -114,10 +178,17 @@ func decayVisitedCounts(slabs []*ReadSlab) {
 }
 
 // newReadSlab wraps a SharedSlab as a ReadSlab with eviction metadata.
+// The visited bloom is sized to the actual item count with 1% FPR.
+// Minimum 16 items to avoid degenerate bloom filter sizing.
 func newReadSlab(ss SharedSlab, totalItems int32) *ReadSlab {
+	n := uint(totalItems)
+	if n < 16 {
+		n = 16
+	}
 	return &ReadSlab{
 		SharedSlab: ss,
 		totalItems: totalItems,
 		createdAt:  time.Now().UnixNano(),
+		visited:    bloom.New(n, 0.01),
 	}
 }

@@ -263,7 +263,7 @@ func WithReadCacheSlabSize(size int64) Option {
 }
 
 // WithReadCacheEvictionStrategy sets the eviction strategy for read cache slabs.
-// Default: DropStrategy (zero overhead, drops all items).
+// Default: CompactStrategy (copies visited items to new slab before evicting).
 func WithReadCacheEvictionStrategy(strategy EvictionStrategy) Option {
 	return funcOpt(func(c *config) { c.ReadCacheEvictionStrategy = strategy })
 }

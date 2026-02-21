@@ -25,6 +25,7 @@ type ReadCacheStats struct {
 	Misses    int64 // FetchAndPopulate called (cache miss, went to disk)
 	Inserts   int64 // Records successfully inserted into the cache
 	Evictions int64 // Slabs evicted to free pool arenas
+	Compacted int64 // Items preserved via CompactStrategy during eviction
 	Slabs     int   // Current number of sealed slabs
 }
 
@@ -70,6 +71,7 @@ type ReadCache struct {
 	misses    atomic.Int64
 	inserts   atomic.Int64
 	evictions atomic.Int64
+	compacted atomic.Int64
 
 	closed atomic.Bool
 }
@@ -86,12 +88,14 @@ func NewReadCache(
 	evictor EvictionStrategy,
 ) *ReadCache {
 	if evictor == nil {
-		evictor = DropStrategy{}
+		evictor = CompactStrategy{}
 	}
 
 	rc := &ReadCache{
-		pool:        NewMmapPool("readcache", slabSize, maxSlabs),
-		slabSize:    slabSize,
+		// +1 over-provision: during compaction we hold the victim slab open
+		// while writing into the new active slab, requiring maxSlabs+1 arenas.
+		pool:     NewMmapPool("readcache", slabSize, maxSlabs+1),
+		slabSize: slabSize,
 		maxSlabs:    maxSlabs,
 		flights:     newInflightGroup(),
 		evictor:     evictor,
@@ -138,7 +142,6 @@ func (rc *ReadCache) Acquire(hashKey Key) ([]byte, []byte, Releaser, bool) {
 		}
 		if ok {
 			slab.RecordHit(hashKey)
-			rc.hits.Add(1)
 			return data, keyBytes, releaser, true
 		}
 	}
@@ -158,7 +161,6 @@ func (rc *ReadCache) Acquire(hashKey Key) ([]byte, []byte, Releaser, bool) {
 			return nil, nil, Releaser{}, false
 		}
 		if ok {
-			rc.hits.Add(1)
 			return data, keyBytes, releaser, true
 		}
 	}
@@ -249,19 +251,35 @@ func (rc *ReadCache) sealAndRotateLocked() {
 	if len(newList) >= rc.maxSlabs {
 		victimIdx := selectVictim(newList)
 		if victimIdx >= 0 {
-			rc.evictor.BeforeEvict(newList[victimIdx], nil)
-			newList[victimIdx].buf.Unpin() // Returns arena to pool
+			victim := newList[victimIdx]
 			newList = append(newList[:victimIdx], newList[victimIdx+1:]...)
+
+			// Publish updated sealed list BEFORE acquiring new active.
+			// Readers can no longer see the victim in the sealed list.
+			rc.sealed.Store(&newList)
+
+			// Acquire new active slab. The pool is over-provisioned by +1,
+			// so this succeeds even while the victim is still pinned.
+			rc.active = rc.newActiveSlab()
+
+			// Compact: copy visited (proven-hot) items from victim into
+			// the fresh active slab. Items start with visited=0 — must
+			// prove themselves hot again (SIEVE invariant).
+			preserved := rc.evictor.BeforeEvict(victim, rc.active)
+			rc.compacted.Add(int64(preserved))
+
+			// Release victim arena back to pool.
+			victim.buf.Unpin()
 			rc.evictions.Add(1)
+			return
 		}
 	}
 
 	rc.sealed.Store(&newList)
 
-	// Acquire new active slab. Normally instant (victim Unpin returned the
-	// arena). May block briefly if a reader still holds a TryInc reference on
-	// the victim — the arena returns to the pool only when refCount hits 0.
-	// This is the same pattern as Librarian and is bounded by reader latency.
+	// Acquire new active slab. Normally instant due to pool over-provision.
+	// May block briefly if a reader still holds a TryInc reference on a
+	// recently evicted slab — bounded by reader latency.
 	rc.active = rc.newActiveSlab()
 }
 
@@ -502,6 +520,7 @@ func (rc *ReadCache) Stats() ReadCacheStats {
 		Misses:    rc.misses.Load(),
 		Inserts:   rc.inserts.Load(),
 		Evictions: rc.evictions.Load(),
+		Compacted: rc.compacted.Load(),
 		Slabs:     len(*rc.sealed.Load()),
 	}
 }

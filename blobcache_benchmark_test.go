@@ -251,8 +251,8 @@ func BenchmarkBlobCache(b *testing.B) {
 			rcHitRate = float64(rcs.Hits) / float64(total) * 100
 		}
 		fmt.Printf("\n--- READ CACHE SUMMARY ---\n")
-		fmt.Printf("  Hits: %d | Misses: %d | HitRate: %.1f%% | Inserts: %d | Evictions: %d | Slabs: %d\n",
-			rcs.Hits, rcs.Misses, rcHitRate, rcs.Inserts, rcs.Evictions, rcs.Slabs)
+		fmt.Printf("  Hits: %d | Misses: %d | HitRate: %.1f%% | Inserts: %d | Evictions: %d | Compacted: %d | Slabs: %d\n",
+			rcs.Hits, rcs.Misses, rcHitRate, rcs.Inserts, rcs.Evictions, rcs.Compacted, rcs.Slabs)
 		b.ReportMetric(rcHitRate, "RC-HitRate-%")
 	}
 
@@ -511,10 +511,10 @@ func startSystemMonitor(
 					if intRCHits+intRCMisses > 0 {
 						rcHitRate = float64(intRCHits) / float64(intRCHits+intRCMisses) * 100
 					}
-					rcLine = fmt.Sprintf("  RCACHE: %.0f/s hits | %.0f/s misses | HitRate: %.1f%% | Inserts: %d | Evictions: %d | Slabs: %d\n",
+					rcLine = fmt.Sprintf("  RCACHE: %.0f/s hits | %.0f/s misses | HitRate: %.1f%% | Inserts: %d | Evictions: %d | Compacted: %d | Slabs: %d\n",
 						float64(intRCHits)/interval.Seconds(),
 						float64(intRCMisses)/interval.Seconds(),
-						rcHitRate, rcs.Inserts, rcs.Evictions, rcs.Slabs)
+						rcHitRate, rcs.Inserts, rcs.Evictions, rcs.Compacted, rcs.Slabs)
 					prevRCHits = rcs.Hits
 					prevRCMisses = rcs.Misses
 				}

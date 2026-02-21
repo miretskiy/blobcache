@@ -47,7 +47,7 @@ func (noopReporter) ReportBlobError(_ Key, _ base.BlobErrno) {}
 // The caller should defer rc.Close(). Do NOT close the pool separately —
 // ReadCache.Close() handles it.
 func newTestReadCache(slabSize int64, maxSlabs int) *ReadCache {
-	pool := NewMmapPool("test-rc", slabSize, maxSlabs)
+	pool := NewMmapPool("test-rc", slabSize, maxSlabs+1) // +1 for compaction buffer
 	rc := &ReadCache{
 		pool:        pool,
 		slabSize:    slabSize,
@@ -345,6 +345,105 @@ func TestReadCache_Close_Idempotent(t *testing.T) {
 	rc.Close()
 }
 
+func TestCompactStrategy_PreservesVisitedItems(t *testing.T) {
+	// 3 slabs with tiny size. ~25 records per 4096-byte slab at ~160 bytes each.
+	// After manual seal: sealed=[slab0], active=slab1
+	// Fill slab1 → sealed=[slab1,slab0], active=slab2
+	// Fill slab2 → sealed has 3 >= maxSlabs=3 → eviction of coldest (slab0)
+	rc := newTestReadCache(4096, 3)
+	rc.evictor = CompactStrategy{}
+	defer rc.Close()
+
+	// Phase 1: Insert records to fill slab 0.
+	var hotKeys []Key
+	for i := 0; i < 20; i++ {
+		key := []byte(fmt.Sprintf("compact-key-%04d", i))
+		value := make([]byte, 100)
+		rawRec := makeRawRecord(t, key, value)
+		h := hashKey(key)
+		rc.Insert(h, rawRec)
+		if i < 5 {
+			hotKeys = append(hotKeys, h)
+		}
+	}
+
+	// Phase 2: Force rotation — slab 0 becomes sealed.
+	rc.mu.Lock()
+	rc.sealAndRotateLocked()
+	rc.mu.Unlock()
+
+	// Phase 3: Mark hot keys as visited in sealed slab 0.
+	for _, h := range hotKeys {
+		_, _, rel, found := rc.Acquire(h)
+		require.True(t, found, "hot key should be in sealed slab")
+		rel.Release()
+	}
+
+	// Phase 4: Fill 2 more slabs to trigger eviction of slab 0.
+	for i := 20; i < 80; i++ {
+		key := []byte(fmt.Sprintf("compact-key-%04d", i))
+		value := make([]byte, 100)
+		rawRec := makeRawRecord(t, key, value)
+		h := hashKey(key)
+		rc.Insert(h, rawRec)
+	}
+
+	// Verify eviction happened.
+	require.Greater(t, rc.evictions.Load(), int64(0), "should have evicted at least once")
+
+	// Phase 5: Hot keys should have survived the first eviction via compaction.
+	// They were copied to the new active slab with visited=0.
+	survivedCount := 0
+	for _, h := range hotKeys {
+		_, _, rel, found := rc.Acquire(h)
+		if found {
+			survivedCount++
+			rel.Release()
+		}
+	}
+	require.Greater(t, survivedCount, 0,
+		"visited keys should survive one eviction cycle via compaction")
+}
+
+func TestCompactStrategy_DropsUnvisitedItems(t *testing.T) {
+	rc := newTestReadCache(4096, 3)
+	rc.evictor = CompactStrategy{}
+	defer rc.Close()
+
+	// Insert records but never access them after sealing.
+	var coldKeys []Key
+	for i := 0; i < 20; i++ {
+		key := []byte(fmt.Sprintf("cold-key-%04d", i))
+		value := make([]byte, 100)
+		rawRec := makeRawRecord(t, key, value)
+		h := hashKey(key)
+		rc.Insert(h, rawRec)
+		coldKeys = append(coldKeys, h)
+	}
+
+	// Seal slab — no Acquire calls, so visited bloom is empty.
+	rc.mu.Lock()
+	rc.sealAndRotateLocked()
+	rc.mu.Unlock()
+
+	// Fill more to trigger eviction.
+	for i := 20; i < 100; i++ {
+		key := []byte(fmt.Sprintf("cold-key-%04d", i))
+		value := make([]byte, 100)
+		rawRec := makeRawRecord(t, key, value)
+		h := hashKey(key)
+		rc.Insert(h, rawRec)
+	}
+
+	require.Greater(t, rc.evictions.Load(), int64(0))
+
+	// Cold keys should NOT survive — they were never visited.
+	for _, h := range coldKeys {
+		_, _, _, found := rc.Acquire(h)
+		require.False(t, found, "unvisited keys should be dropped on eviction")
+	}
+}
+
 func TestReadCache_Stats(t *testing.T) {
 	rc := newTestReadCache(1<<20, 4)
 	defer rc.Close()
@@ -367,13 +466,14 @@ func TestReadCache_Stats(t *testing.T) {
 	s = rc.Stats()
 	require.Equal(t, int64(1), s.Inserts)
 
-	// Acquire should count as hit.
+	// Acquire does NOT count hits — hits are counted at the Cache.search()
+	// call site to avoid inflating stats with self-hits from acquireOrFallback.
 	_, _, rel, found := rc.Acquire(h)
 	require.True(t, found)
 	rel.Release()
 
 	s = rc.Stats()
-	require.Equal(t, int64(1), s.Hits)
+	require.Equal(t, int64(0), s.Hits, "Acquire alone should not count hits")
 
 	// Miss on unknown key.
 	_, _, _, found = rc.Acquire(hashKey([]byte("no-such-key")))

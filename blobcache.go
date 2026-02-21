@@ -414,6 +414,7 @@ func (c *Cache) search(key []byte) (data []byte, rel Releaser, ok bool) {
 				c.bloomStats.ghosts.Add(1)
 				return nil, Releaser{}, false
 			}
+			c.readCache.hits.Add(1)
 			return rcData, releaser, true
 		}
 	}

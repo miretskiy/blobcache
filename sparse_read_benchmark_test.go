@@ -175,6 +175,83 @@ func punchHoles(b *testing.B, path string, fileSize, holeSize, holeStride int64)
 
 // computeReadOffsets returns offsets into data (non-hole) regions.
 // All returned offsets are multiples of blobSize (1MB), safe for O_DIRECT.
+// BenchmarkDirectIOReadSize measures raw Direct I/O read latency at different
+// read sizes (4KB, 8KB, 16KB, 32KB, 64KB) on a dense data file.
+//
+// This isolates the NVMe I/O cost from any application-level overhead,
+// answering: "how much does a 64KB read cost vs a 4KB read?"
+//
+// Run on Linux/NVMe for meaningful results:
+//
+//	go test -bench=BenchmarkDirectIOReadSize -benchtime=10000x -v
+func BenchmarkDirectIOReadSize(b *testing.B) {
+	const fileSize = 64 << 20 // 64MB dense file
+
+	tmpDir := "/instance_storage/dio_bench"
+	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
+		tmpDir = b.TempDir()
+	} else {
+		b.Cleanup(func() { os.RemoveAll(tmpDir) })
+	}
+
+	srcPath := filepath.Join(tmpDir, "dense.seg")
+	createDenseFile(b, srcPath, fileSize)
+
+	sizes := []struct {
+		name string
+		size int
+	}{
+		{"4KB", 4 << 10},
+		{"8KB", 8 << 10},
+		{"16KB", 16 << 10},
+		{"32KB", 32 << 10},
+		{"64KB", 64 << 10},
+	}
+
+	for _, sz := range sizes {
+		b.Run(sz.name, func(b *testing.B) {
+			f, err := sys.OpenFileForRead(srcPath, sys.FlDirectIO)
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer f.Close()
+
+			buf := sys.AllocAligned(sz.size)
+			defer sys.FreeAligned(buf)
+
+			// Pre-compute page-aligned offsets that fit the read size.
+			var offsets []int64
+			for off := int64(0); off+int64(sz.size) <= fileSize; off += int64(sz.size) {
+				offsets = append(offsets, off)
+			}
+
+			b.SetBytes(int64(sz.size))
+			b.ResetTimer()
+
+			var totalLatency time.Duration
+			for i := range b.N {
+				off := offsets[i%len(offsets)]
+				start := time.Now()
+				n, err := f.ReadAt(buf, off)
+				elapsed := time.Since(start)
+				if err != nil {
+					b.Fatalf("read %d bytes at offset %d: %v", sz.size, off, err)
+				}
+				if n != sz.size {
+					b.Fatalf("short read: %d/%d", n, sz.size)
+				}
+				totalLatency += elapsed
+			}
+
+			b.StopTimer()
+			avgLatency := totalLatency / time.Duration(b.N)
+			throughputMBs := float64(b.N) * float64(sz.size) / (1 << 20) / totalLatency.Seconds()
+			b.ReportMetric(float64(avgLatency.Microseconds()), "avg_us/read")
+			b.ReportMetric(throughputMBs, "MB/s")
+		})
+	}
+}
+
 func computeReadOffsets(fileSize, blobSize, holeSize, holeStride int64, holeFrac float64) []int64 {
 	if holeFrac == 0 {
 		var offsets []int64

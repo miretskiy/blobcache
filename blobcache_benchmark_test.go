@@ -261,24 +261,31 @@ func BenchmarkBlobCache(b *testing.B) {
 	b.ReportMetric(finalMetrics.AvgUtil, "Disk-Util-%")
 }
 
-// BenchmarkBlobCache_SmallBlobs exercises the ReadCache with small items (4-16KB).
+// BenchmarkBlobCache_SmallBlobs measures ReadCache effectiveness in isolation.
 //
-// This workload is designed to validate user-space read cache effectiveness.
-// Small blobs pack densely into 64MB slabs (~5,000 items/slab), giving items
-// enough residence time to accumulate visits and survive CompactStrategy eviction.
+// Structure:
+//
+//	Phase 1 (Populate): Write 200K keys (4-20KB, avg ~12KB) ≈ 2.4GB, then close.
+//	Phase 2 (ReadOnly): Reopen and run pure Zipfian reads. The Librarian is empty
+//	    after reopen, so every read either hits the ReadCache or goes to disk.
+//	    Two sub-benchmarks: with and without ReadCache.
+//
+// This isolates the ReadCache's value by removing the Librarian from the equation.
+// The Librarian dominates in mixed read/write workloads (GET p50 <1µs), making
+// ReadCache overhead invisible. By reopening, we force all reads through the
+// ReadCache-or-disk path.
 //
 // Configuration:
 //
-//	MaxSize:         4GB   — triggers SIEVE eviction at ~400K items
+//	MaxSize:         10GB  — holds all populated data (no SIEVE eviction during reads)
 //	WriteBufferSize: 64MB  — ~5,000 items per slab at 12KB avg
-//	ReadCacheSlabs:  16    — 1GB cache holding ~85K items
+//	ReadCacheSlabs:  16    — 1GB cache holding ~85K items (~42% of 200K keyspace)
 //	Blob sizes:      4KB-20KB (avg ~12KB)
+//	Zipfian s=1.1:   top 15% of keys → ~65% of accesses
 //
-// Example workloads:
+// Example:
 //
-//	-benchtime=50000x    →  50K writes  ≈ 600MB  (pre-eviction, cache warming)
-//	-benchtime=500000x   →  500K writes ≈ 6GB    (exercises eviction + cache)
-//	-benchtime=2000000x  →  2M writes   ≈ 24GB   (sustained steady-state)
+//	go test -bench=BenchmarkBlobCache_SmallBlobs -benchtime=500000x
 func BenchmarkBlobCache_SmallBlobs(b *testing.B) {
 	tmpDir := os.TempDir() + "/bench-blobcache-small"
 	if _, err := os.Stat("/instance_storage"); err == nil {
@@ -287,187 +294,175 @@ func BenchmarkBlobCache_SmallBlobs(b *testing.B) {
 	os.RemoveAll(tmpDir)
 	defer os.RemoveAll(tmpDir)
 
-	const blobSizeLo = 4_000
-	const blobSizeHiRng = 16_000 // 4KB-20KB, avg ~12KB
+	const (
+		blobSizeLo   = 4_000
+		blobSizeHiRng = 16_000 // 4KB-20KB, avg ~12KB
+		populateKeys = 200_000
+	)
 
 	directIO := os.Getenv("BLOBCACHE_BUFFERED_IO") != "1"
 
-	// Try io_uring, fall back to pread on non-Linux.
-	var sched iosched.IOScheduler
-	if uringSched, err := iosched.NewURingScheduler(iosched.URingConfig{}); err == nil {
-		sched = uringSched
-	} else {
-		preadSched, err := iosched.NewPreadScheduler()
+	// --- PHASE 1: POPULATE (not timed) ---
+	// Write keys, drain to disk, close. This gives us a clean on-disk dataset
+	// that both sub-benchmarks reopen from.
+	fmt.Printf(">>> Populate: Writing %d keys (4-20KB)...\n", populateKeys)
+	{
+		sched, err := newBenchScheduler()
 		if err != nil {
 			b.Fatal(err)
 		}
-		sched = preadSched
-	}
-
-	cache, err := New(tmpDir,
-		WithMaxSize(4<<30),          // 4GB — eviction at ~340K items
-		WithWriteBufferSize(64<<20), // 64MB slabs
-		WithMaxInflightSlabs(8),
-		WithMaxCachedSlabs(16),
-		WithFlushConcurrency(2),
-		WithDirectIOWrite(directIO),
-		WithDirectIORead(directIO),
-		WithFDataSync(true),
-		WithIOScheduler(sched),
-		WithReadCacheSlabs(16),      // 16 * 64MB = 1GB read cache (~85K items)
-		WithDegradedMode(DegradedPanic),
-	)
-	if err != nil {
-		b.Fatal(err)
-	}
-	cache.Start()
-	defer cache.Close()
-
-	entropy := make([]byte, 1<<20) // 1MB entropy (small blobs don't need 32MB)
-	crand.Read(entropy)
-
-	var (
-		numReads, numFound, totalWriteBytes, totalReadBytes atomic.Int64
-		writeHead                                           atomic.Uint64
-		workerID                                            atomic.Int64
-
-		mu        sync.Mutex
-		globalPut = hdrhistogram.New(10, 10_000_000_000, 3)
-		globalGet = hdrhistogram.New(10, 10_000_000_000, 3)
-	)
-
-	// --- WARMUP: seed enough keys for Zipfian hot reads ---
-	const warmupKeys = 50_000
-	fmt.Printf(">>> SmallBlobs Warmup: Writing %d keys (4-20KB)...\n", warmupKeys)
-	warmupStart := time.Now()
-	var warmupBytes int64
-	rng0 := rand.New(rand.NewPCG(42, 0))
-	for i := 0; i < warmupKeys; i++ {
-		blobSize := blobSizeLo + rng0.IntN(blobSizeHiRng)
-		k := fastFormatKey(make([]byte, 32), "key-", uint64(i))
-		if err := cache.Put(k, entropy[:blobSize]); err != nil {
+		cache, err := New(tmpDir,
+			WithMaxSize(10<<30),
+			WithWriteBufferSize(64<<20),
+			WithMaxInflightSlabs(8),
+			WithMaxCachedSlabs(4),
+			WithFlushConcurrency(2),
+			WithDirectIOWrite(directIO),
+			WithFDataSync(true),
+			WithIOScheduler(sched),
+			WithBallast(0),
+			WithDegradedMode(DegradedPanic),
+		)
+		if err != nil {
 			b.Fatal(err)
 		}
-		warmupBytes += int64(blobSize)
+		cache.Start()
+
+		entropy := make([]byte, 1<<20)
+		crand.Read(entropy)
+		rng := rand.New(rand.NewPCG(42, 0))
+		for i := 0; i < populateKeys; i++ {
+			blobSize := blobSizeLo + rng.IntN(blobSizeHiRng)
+			k := fastFormatKey(make([]byte, 32), "key-", uint64(i))
+			if err := cache.Put(k, entropy[:blobSize]); err != nil {
+				b.Fatal(err)
+			}
+		}
+		cache.Drain()
+		if err := cache.Close(); err != nil {
+			b.Fatal(err)
+		}
+		sched.Close()
 	}
-	cache.Drain()
-	warmupThroughput := (float64(warmupBytes) / (1 << 30)) / time.Since(warmupStart).Seconds()
-	writeHead.Store(warmupKeys)
+	fmt.Printf(">>> Populate complete. Running read-only benchmarks...\n")
 
-	ctx, cancel := context.WithCancel(context.Background())
-	metricsChan := startSystemMonitor(ctx, &totalWriteBytes, &totalReadBytes, &cache.approxSize, &numReads, &numFound, tmpDir, sched, cache.readCache)
+	// --- PHASE 2: READ-ONLY SUB-BENCHMARKS ---
+	// Each sub-benchmark reopens from the same on-disk data.
+	// Librarian is empty after reopen — reads go through ReadCache (if enabled) or disk.
 
-	b.ResetTimer()
-	b.RunParallel(func(pb *testing.PB) {
-		wid := workerID.Add(1)
-		rng := rand.New(rand.NewPCG(uint64(time.Now().UnixNano()), uint64(wid)))
-		zipf := rand.NewZipf(rng, 1.1, 1.0, 1<<25)
-		if zipf == nil {
-			b.Fatal("Zipf nil")
+	runReadOnly := func(b *testing.B, name string, rcSlabs int) {
+		sched, err := newBenchScheduler()
+		if err != nil {
+			b.Fatal(err)
+		}
+		defer sched.Close()
+
+		opts := []Option{
+			WithMaxSize(10 << 30),
+			WithWriteBufferSize(64 << 20),
+			WithMaxInflightSlabs(4),
+			WithMaxCachedSlabs(0), // Librarian disabled — isolate ReadCache
+			WithFlushConcurrency(1),
+			WithDirectIOWrite(directIO),
+			WithDirectIORead(directIO),
+			WithFDataSync(true),
+			WithIOScheduler(sched),
+			WithBallast(0),
+			WithDegradedMode(DegradedPanic),
+		}
+		if rcSlabs > 0 {
+			opts = append(opts, WithReadCacheSlabs(rcSlabs))
 		}
 
-		keyBuf := make([]byte, 64)
-		localPut := hdrhistogram.New(10, 10_000_000_000, 3)
-		localGet := hdrhistogram.New(10, 10_000_000_000, 3)
+		cache, err := New(tmpDir, opts...)
+		if err != nil {
+			b.Fatal(err)
+		}
+		cache.Start()
+		defer cache.Close()
 
-		viewFn := func(b []byte) {
-			if len(b) > 0 {
-				_ = b[0]
-				totalReadBytes.Add(int64(len(b)))
+		var (
+			numReads, numFound, totalReadBytes atomic.Int64
+			workerID                           atomic.Int64
+			zeroBytes                          atomic.Int64 // unused, needed for monitor signature
+			mu                                 sync.Mutex
+			globalGet                          = hdrhistogram.New(10, 10_000_000_000, 3)
+		)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		metricsChan := startSystemMonitor(ctx, &zeroBytes, &totalReadBytes, &cache.approxSize, &numReads, &numFound, tmpDir, sched, cache.readCache)
+
+		b.ResetTimer()
+		b.RunParallel(func(pb *testing.PB) {
+			wid := workerID.Add(1)
+			rng := rand.New(rand.NewPCG(uint64(time.Now().UnixNano()), uint64(wid)))
+			// Zipfian over the populated keyspace. Unlike the mixed benchmark,
+			// we don't bias toward newest keys — all keys are equally old.
+			zipf := rand.NewZipf(rng, 1.1, 1.0, populateKeys-1)
+			if zipf == nil {
+				b.Fatal("Zipf nil")
 			}
-		}
 
-		for pb.Next() {
-			dataWritten := false
-			for !dataWritten {
-				op := rng.IntN(100)
-				maxID := writeHead.Load()
+			keyBuf := make([]byte, 64)
+			localGet := hdrhistogram.New(10, 10_000_000_000, 3)
 
-				if maxID < 5000 {
-					if op < 50 {
-						op = 0
-					} else {
-						op = 99
-					}
+			viewFn := func(data []byte) {
+				if len(data) > 0 {
+					_ = data[0]
+					totalReadBytes.Add(int64(len(data)))
 				}
+			}
 
+			for pb.Next() {
+				id := zipf.Uint64()
+				k := fastFormatKey(keyBuf, "key-", id)
 				start := time.Now()
-
-				if op < WriteBound {
-					id := writeHead.Add(1)
-					k := fastFormatKey(keyBuf, "key-", id)
-					blobSize := blobSizeLo + rng.IntN(blobSizeHiRng)
-					offset := rng.IntN(len(entropy) - blobSize)
-					if err := cache.Put(k, entropy[offset:offset+blobSize]); err != nil {
-						b.Fatal(err)
-					}
-					totalWriteBytes.Add(int64(blobSize))
-					localPut.RecordValue(time.Since(start).Nanoseconds())
-					dataWritten = true
-				} else if op < HotReadBound {
-					zipfVal := zipf.Uint64() % maxID
-					id := maxID - 1 - zipfVal
-					k := fastFormatKey(keyBuf, "key-", id)
-					found := cache.View(k, viewFn)
-					localGet.RecordValue(time.Since(start).Nanoseconds())
-					numReads.Add(1)
-					if found {
-						numFound.Add(1)
-					}
-				} else if op < ColdReadBound {
-					baseID := rng.Uint64() % (maxID - 4)
-					var coldHits int64
-					for i := uint64(0); i < 4; i++ {
-						k := fastFormatKey(keyBuf, "key-", baseID+i)
-						if cache.View(k, viewFn) {
-							coldHits++
-						}
-					}
-					numReads.Add(4)
-					numFound.Add(coldHits)
-				} else {
-					k := fastFormatKey(keyBuf, "miss-", rng.Uint64())
-					cache.Get(k)
-					numReads.Add(1)
+				found := cache.View(k, viewFn)
+				localGet.RecordValue(time.Since(start).Nanoseconds())
+				numReads.Add(1)
+				if found {
+					numFound.Add(1)
 				}
 			}
+
+			mu.Lock()
+			globalGet.Merge(localGet)
+			mu.Unlock()
+		})
+
+		b.StopTimer()
+		cancel()
+
+		finalMetrics := <-metricsChan
+		fmt.Printf("\n--- %s: LATENCY (ns) ---\n", name)
+		reportLatency(b, "GET", globalGet)
+		if h := sched.Stats().ReadLatency; h != nil {
+			reportLatency(b, "DISK", h)
 		}
 
-		mu.Lock()
-		globalPut.Merge(localPut)
-		globalGet.Merge(localGet)
-		mu.Unlock()
+		if cache.readCache != nil {
+			rcs := cache.readCache.Stats()
+			total := rcs.Hits + rcs.Misses
+			rcHitRate := 0.0
+			if total > 0 {
+				rcHitRate = float64(rcs.Hits) / float64(total) * 100
+			}
+			fmt.Printf("  RCACHE: Hits: %d | Misses: %d | HitRate: %.1f%% | Inserts: %d | Evictions: %d | Compacted: %d | Skipped: %d | Slabs: %d\n",
+				rcs.Hits, rcs.Misses, rcHitRate, rcs.Inserts, rcs.Evictions, rcs.Compacted, rcs.Skipped, rcs.Slabs)
+			b.ReportMetric(rcHitRate, "RC-HitRate-%")
+		}
+
+		b.ReportMetric(finalMetrics.PeakRSS, "Peak-RSS-GB")
+		b.ReportMetric(finalMetrics.AvgUtil, "Disk-Util-%")
+	}
+
+	b.Run("WithReadCache", func(b *testing.B) {
+		runReadOnly(b, "WithReadCache", 16)
 	})
 
-	cache.Drain()
-	b.StopTimer()
-	cancel()
-
-	finalMetrics := <-metricsChan
-	fmt.Printf("\n--- FINAL LATENCY (clat) REPORT (ns) ---\n")
-	reportLatency(b, "GET", globalGet)
-	reportLatency(b, "PUT", globalPut)
-
-	if h := sched.Stats().ReadLatency; h != nil {
-		reportLatency(b, "DISK", h)
-	}
-
-	if cache.readCache != nil {
-		rcs := cache.readCache.Stats()
-		total := rcs.Hits + rcs.Misses
-		rcHitRate := 0.0
-		if total > 0 {
-			rcHitRate = float64(rcs.Hits) / float64(total) * 100
-		}
-		fmt.Printf("\n--- READ CACHE SUMMARY ---\n")
-		fmt.Printf("  Hits: %d | Misses: %d | HitRate: %.1f%% | Inserts: %d | Evictions: %d | Compacted: %d | Skipped: %d | Slabs: %d\n",
-			rcs.Hits, rcs.Misses, rcHitRate, rcs.Inserts, rcs.Evictions, rcs.Compacted, rcs.Skipped, rcs.Slabs)
-		b.ReportMetric(rcHitRate, "RC-HitRate-%")
-	}
-
-	b.ReportMetric(warmupThroughput, "warmup-GB/s")
-	b.ReportMetric(finalMetrics.PeakRSS, "Peak-RSS-GB")
-	b.ReportMetric(finalMetrics.AvgUtil, "Disk-Util-%")
+	b.Run("NoReadCache", func(b *testing.B) {
+		runReadOnly(b, "NoReadCache", 0)
+	})
 }
 
 func BenchmarkBlobCacheLookupMemory(b *testing.B) {
@@ -569,6 +564,14 @@ func BenchmarkBlobCacheLookupMemory(b *testing.B) {
 	b.StopTimer()
 	fmt.Printf("\n--- FINAL LATENCY (clat) REPORT (ns) ---\n")
 	reportLatency(b, "GET", globalGet)
+}
+
+// newBenchScheduler creates an IOScheduler, preferring io_uring on Linux.
+func newBenchScheduler() (iosched.IOScheduler, error) {
+	if sched, err := iosched.NewURingScheduler(iosched.URingConfig{}); err == nil {
+		return sched, nil
+	}
+	return iosched.NewPreadScheduler()
 }
 
 func reportLatency(b *testing.B, name string, h *hdrhistogram.Histogram) {

@@ -166,10 +166,16 @@ func (a *Archivist) prefetchAndParse(e index.Item, expectedKey []byte) ([]byte, 
 	blobLen := int(e.PhysicalLen)
 
 	// Determine read region: 64KB chunk for small blobs, exact for large.
+	// The read must always cover the entire target blob. When a blob starts
+	// near the end of a chunk, its tail may extend beyond — extend the read.
 	var readOff, readLen int64
 	if blobLen <= prefetchChunkSize {
 		chunkOff := blobOff &^ (int64(prefetchChunkSize) - 1)
-		readOff, readLen = sys.AlignRange(chunkOff, prefetchChunkSize)
+		neededLen := int(blobOff-chunkOff) + blobLen
+		if neededLen < prefetchChunkSize {
+			neededLen = prefetchChunkSize
+		}
+		readOff, readLen = sys.AlignRange(chunkOff, neededLen)
 	} else {
 		readOff, readLen = sys.AlignRange(blobOff, blobLen)
 	}

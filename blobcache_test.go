@@ -5,6 +5,7 @@ import (
 	crand "crypto/rand"
 	"fmt"
 	"os"
+	"path/filepath"
 	"syscall"
 	"testing"
 	"time"
@@ -916,4 +917,73 @@ func TestCache_Compression_LZ4(t *testing.T) {
 
 	require.True(t, entry.IsCompressed(), "blob should be compressed with LZ4")
 	require.Equal(t, compression.CodexLZ4, entry.Compression())
+}
+
+// TestArchivist_PrefetchStraddlesChunkBoundary exercises readBlobWithPrefetch
+// when a blob starts near the end of a 64KB chunk and extends into the next.
+// This is the exact condition that caused "short prefetch read" errors.
+func TestArchivist_PrefetchStraddlesChunkBoundary(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Create a real DurableIndex (Archivist needs SegmentLockShard).
+	idx, err := index.OpenIndex(tmpDir, 1, 1024)
+	require.NoError(t, err)
+	defer idx.Close()
+
+	// Build a record: 42-byte header + key + 20KB value = ~20KB total.
+	key := []byte("straddle-key")
+	value := make([]byte, 20_000)
+	crand.Read(value)
+	rec := record.NewRecord(1, key, value, int64(len(value)))
+	recBytes := make([]byte, rec.EncodedSize())
+	rec.EncodeTo(recBytes)
+
+	// Place the record at offset 60000 in the segment file.
+	// This is inside the first 64KB chunk (0–65535) but the record extends
+	// to 60000 + ~20054 = ~80054, straddling into the second chunk.
+	const blobOffset = 60_000
+	const segID = 1
+	segFile := getSegmentPath(tmpDir, 1, segID)
+	require.NoError(t, os.MkdirAll(filepath.Dir(segFile), 0o755))
+	fileSize := blobOffset + len(recBytes)
+	segData := make([]byte, fileSize)
+	copy(segData[blobOffset:], recBytes)
+	require.NoError(t, os.WriteFile(segFile, segData, 0o644))
+
+	// Register the segment in the index so SegmentLockShard works.
+	h := xxh3.Hash128(key)
+	entries := []record.FooterEntry{{
+		Key:          h,
+		Pos:          blobOffset,
+		PhysicalSize: int64(len(value)),
+		LogicalSize:  int64(len(value)),
+		SeqID:        1,
+		KeyLen:       uint16(len(key)),
+	}}
+	idx.AddSegmentFromEntries(segID, entries)
+
+	item, found := idx.Get(h)
+	require.True(t, found)
+	require.Equal(t, uint32(blobOffset), item.Offset)
+
+	// Set up Archivist with ReadCache enabled.
+	cfg := defaultConfig(tmpDir)
+	cfg.Shards = 1
+	archivist := NewArchivist(cfg, idx, nil)
+	defer archivist.Close()
+
+	rc := NewReadCache(1<<20, 4, 0, noopReporter{}, nil)
+	defer rc.Close()
+	archivist.readCache = rc
+
+	// ReadBlob should succeed — the prefetch read must cover the full blob.
+	data, rel, err := archivist.ReadBlob(item, key)
+	require.NoError(t, err, "prefetch should handle blob straddling 64KB chunk boundary")
+	defer rel.Release()
+	require.Equal(t, value, data)
+
+	// Verify it went through the ReadCache path (miss → populate → parse).
+	stats := rc.Stats()
+	require.Equal(t, int64(1), stats.Misses, "should have 1 cache miss")
+	require.Greater(t, stats.Inserts, int64(0), "should have populated cache")
 }

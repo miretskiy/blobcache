@@ -294,12 +294,11 @@ func (rc *ReadCache) sealAndRotateLocked() {
 	rc.active = rc.newActiveSlab()
 }
 
-// Lookup checks the cache for the item. On miss, fetches from disk via
-// readChunk, populates the cache, and re-checks. Returns (data, storedKey,
-// releaser, found). No error return — internal failures result in found=false,
-// and the caller falls back to direct disk I/O.
+// Lookup checks the cache for the item. On hit, returns the cached data.
+// On miss, populates the cache (for future reads) and returns found=false
+// so the caller falls back to direct disk I/O.
 func (rc *ReadCache) Lookup(item index.Item) ([]byte, []byte, Releaser, bool) {
-	// Step 1: Check cache.
+	// Check cache.
 	if data, storedKey, rel, found := rc.Acquire(item.Key); found {
 		rc.hits.Add(1)
 		return data, storedKey, rel, true
@@ -308,7 +307,7 @@ func (rc *ReadCache) Lookup(item index.Item) ([]byte, []byte, Releaser, bool) {
 	rc.misses.Add(1)
 	blobLen := int64(item.PhysicalLen)
 
-	// Step 2: Admission check — skip items too large for the cache.
+	// Admission check — skip items too large for the cache.
 	if blobLen > rc.slabSize {
 		return nil, nil, Releaser{}, false
 	}
@@ -317,17 +316,12 @@ func (rc *ReadCache) Lookup(item index.Item) ([]byte, []byte, Releaser, bool) {
 		return nil, nil, Releaser{}, false
 	}
 
-	// Step 3: Populate cache via coalesced disk fetch.
+	// Populate cache for future reads (best-effort, current request
+	// falls back to disk via Archivist.readBlobFromDisk).
 	if blobLen > prefetchChunkSize {
 		rc.populateLargeBlob(item)
 	} else {
 		rc.populateWithPrefetch(item)
-	}
-
-	// Step 4: Re-check cache after populate.
-	if data, storedKey, rel, found := rc.Acquire(item.Key); found {
-		rc.hits.Add(1)
-		return data, storedKey, rel, true
 	}
 
 	return nil, nil, Releaser{}, false

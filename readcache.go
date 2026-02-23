@@ -6,9 +6,7 @@ import (
 
 	"github.com/miretskiy/blobcache/base"
 	"github.com/miretskiy/blobcache/bloom"
-	"github.com/miretskiy/blobcache/internal/index"
 	"github.com/miretskiy/blobcache/internal/record"
-	"github.com/miretskiy/blobcache/internal/sys"
 	"github.com/miretskiy/blobcache/internal/xmap"
 	"github.com/zeebo/xxh3"
 )
@@ -17,10 +15,6 @@ import (
 // 64KB aligns with NVMe optimal I/O size. Blobs smaller than this benefit
 // from temporal prefetch (neighboring records in the same chunk are also cached).
 const prefetchChunkSize = 64 * 1024
-
-// ChunkReadFunc reads raw bytes from a segment at the given offset.
-// buf must be page-aligned for Direct I/O. Returns bytes read.
-type ChunkReadFunc func(segID uint32, buf []byte, offset int64) (int, error)
 
 // ReadCacheStats holds a point-in-time snapshot of read cache counters.
 type ReadCacheStats struct {
@@ -60,14 +54,10 @@ type ReadCache struct {
 	maxSlabs    int
 	maxItemSize int64 // Items larger than this bypass the cache (0 = no limit)
 
-	// Sharded coalescing map for thundering herd protection.
-	flights *inflightGroup
-
 	// Pluggable eviction strategy (default: DropStrategy).
 	evictor EvictionStrategy
 
 	// Dependencies.
-	readChunk   ChunkReadFunc
 	errReporter ErrorReporter
 
 	// Stats counters (atomics for lock-free updates).
@@ -89,7 +79,6 @@ func NewReadCache(
 	slabSize int64,
 	maxSlabs int,
 	maxItemSize int64,
-	readChunk ChunkReadFunc,
 	reporter ErrorReporter,
 	evictor EvictionStrategy,
 ) *ReadCache {
@@ -104,9 +93,7 @@ func NewReadCache(
 		slabSize:    slabSize,
 		maxSlabs:    maxSlabs,
 		maxItemSize: maxItemSize,
-		flights:     newInflightGroup(),
 		evictor:     evictor,
-		readChunk:   readChunk,
 		errReporter: reporter,
 	}
 
@@ -294,138 +281,42 @@ func (rc *ReadCache) sealAndRotateLocked() {
 	rc.active = rc.newActiveSlab()
 }
 
-// Lookup checks the cache for the item. On hit, returns the cached data.
-// On miss, populates the cache (for future reads) and returns found=false
-// so the caller falls back to direct disk I/O.
-func (rc *ReadCache) Lookup(item index.Item) ([]byte, []byte, Releaser, bool) {
-	// Check cache.
-	if data, storedKey, rel, found := rc.Acquire(item.Key); found {
-		rc.hits.Add(1)
-		return data, storedKey, rel, true
+// Admissible returns true if a blob of the given physical size should be
+// cached. Returns false for blobs that exceed the slab size or the
+// configured maxItemSize admission threshold.
+func (rc *ReadCache) Admissible(physLen int64) bool {
+	if physLen > rc.slabSize {
+		return false
 	}
-
-	rc.misses.Add(1)
-	blobLen := int64(item.PhysicalLen)
-
-	// Admission check — skip items too large for the cache.
-	if blobLen > rc.slabSize {
-		return nil, nil, Releaser{}, false
-	}
-	if rc.maxItemSize > 0 && blobLen > rc.maxItemSize {
+	if rc.maxItemSize > 0 && physLen > rc.maxItemSize {
 		rc.skipped.Add(1)
-		return nil, nil, Releaser{}, false
+		return false
 	}
-
-	// Populate cache for future reads (best-effort, current request
-	// falls back to disk via Archivist.readBlobFromDisk).
-	if blobLen > prefetchChunkSize {
-		rc.populateLargeBlob(item)
-	} else {
-		rc.populateWithPrefetch(item)
-	}
-
-	return nil, nil, Releaser{}, false
+	return true
 }
 
-// populateWithPrefetch reads a 64KB-aligned chunk from disk, parses all valid
-// records in the chunk, and inserts them into the read cache. Populate-only:
-// does not return the data — caller re-checks via Acquire.
-func (rc *ReadCache) populateWithPrefetch(item index.Item) {
-	blobOffset := int64(item.Offset)
-
-	// Compute the 64KB-aligned region containing the blob.
-	alignedOff := blobOffset &^ (prefetchChunkSize - 1)
-
-	// Coalesce concurrent misses for the same chunk.
-	key := flightKey(item.SegmentID, alignedOff)
-	rc.flights.DoOnce(key, func() {
-		// Page-align for Direct I/O compatibility.
-		dioOff, dioLen := sys.AlignRange(alignedOff, prefetchChunkSize)
-		rc.fetchChunk(item.SegmentID, dioOff, int(dioLen))
-	})
-}
-
-// populateLargeBlob handles blobs that are larger than the prefetch chunk size
-// but still fit in a slab. Reads the exact blob's on-disk bytes and inserts
-// them into the read cache. Populate-only.
-func (rc *ReadCache) populateLargeBlob(item index.Item) {
-	// Coalesce on the blob's own (segID, offset) to prevent thundering herd.
-	key := flightKey(item.SegmentID, int64(item.Offset))
-	rc.flights.DoOnce(key, func() {
-		rc.insertFromDisk(item)
-	})
-}
-
-// insertFromDisk reads a single blob's raw on-disk bytes and inserts them
-// into the read cache. Used for large blobs that don't benefit from chunk prefetch.
-func (rc *ReadCache) insertFromDisk(item index.Item) {
-	// Page-align the read for Direct I/O.
-	dioOff, dioLen := sys.AlignRange(int64(item.Offset), int(item.PhysicalLen))
-
-	handle := AcquireAlignedBuffer(int(dioLen), int(dioLen))
-	defer handle.Release()
-	buf := handle.Bytes()
-
-	n, err := rc.readChunk(item.SegmentID, buf, dioOff)
-	if err != nil || n < int(dioLen) {
-		return
-	}
-
-	// Extract the exact record bytes from the aligned read.
-	lead := int(int64(item.Offset) - dioOff)
-	if lead+int(item.PhysicalLen) > len(buf) {
-		return
-	}
-	rawRecord := buf[lead : lead+int(item.PhysicalLen)]
-
-	// Verify header before inserting.
-	if len(rawRecord) < record.HeaderSize {
-		return
-	}
-	hdr, err := record.DecodeHeader(rawRecord[:record.HeaderSize])
-	if err != nil || !hdr.IsValid() {
-		return
-	}
-
-	// Compute hash from the key bytes in the record.
-	keyEnd := record.HeaderSize + int(hdr.KeyLen)
-	if keyEnd > len(rawRecord) {
-		return
-	}
-	h := xxh3.Hash128(rawRecord[record.HeaderSize:keyEnd])
-
-	rc.Insert(h, rawRecord)
-}
-
-// fetchChunk reads a page-aligned chunk from a segment and inserts all valid
-// records into the read cache. Best-effort: parse errors are silently skipped.
+// PopulateChunk scans a raw disk buffer for valid records and inserts each
+// one into the cache. Best-effort: parse errors are silently skipped.
 //
-// Records in segments are densely packed. The chunk may start mid-record, so
-// we scan for RecordMagic (0xB10BCAFE) + HeaderCRC verification to find valid
-// record boundaries. False positive rate is ~1/2^64 (Magic + CRC32).
-func (rc *ReadCache) fetchChunk(segID uint32, alignedOff int64, alignedLen int) {
-	handle := AcquireAlignedBuffer(alignedLen, alignedLen)
-	defer handle.Release()
-	buf := handle.Bytes()
-
-	n, err := rc.readChunk(segID, buf, alignedOff)
-	if err != nil || n < alignedLen {
-		return
-	}
-
-	// Scan for valid records.
+// Records in segments are densely packed. The buffer may start mid-record,
+// so we scan for RecordMagic (0xB10BCAFE) + HeaderCRC verification to find
+// valid record boundaries. False positive rate is ~1/2^64 (Magic + CRC32).
+//
+// The caller (Archivist) owns the buffer and performs the single disk read.
+// PopulateChunk does NO disk I/O.
+func (rc *ReadCache) PopulateChunk(buf []byte) {
+	bufLen := len(buf)
 	offset := 0
-	for offset+record.HeaderSize <= alignedLen {
+	for offset+record.HeaderSize <= bufLen {
 		hdr, err := record.DecodeHeader(buf[offset : offset+record.HeaderSize])
 		if err != nil || !hdr.IsValid() {
-			// Not a valid record start. Advance past potential Magic alignment.
 			offset += 4
 			continue
 		}
 
 		totalSize := hdr.TotalSize()
-		if totalSize <= 0 || offset+totalSize > alignedLen {
-			break // Record extends beyond chunk or corrupt size
+		if totalSize <= 0 || offset+totalSize > bufLen {
+			break
 		}
 
 		rawRecord := buf[offset : offset+totalSize]

@@ -13,9 +13,9 @@ import (
 // fields are read-only. Only visitedCount and visited are mutated, atomically.
 type ReadSlab struct {
 	SharedSlab
-	totalItems   int32        // Set once when slab is sealed (immutable after)
-	visitedCount atomic.Int32 // Sampled increments (1/16 probability) on cache hit
-	createdAt    int64        // UnixNano timestamp for age-based tiebreaking
+	totalItems   int32         // Set once when slab is sealed (immutable after)
+	visitedCount atomic.Int32  // Sampled increments (1/16 probability) on cache hit
+	createdAt    int64         // UnixNano timestamp for age-based tiebreaking
 	visited      *bloom.Filter // Per-item visited tracking (stays mutable, atomic Add)
 }
 

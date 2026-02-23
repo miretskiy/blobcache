@@ -52,7 +52,6 @@ func newTestReadCache(slabSize int64, maxSlabs int) *ReadCache {
 		pool:        pool,
 		slabSize:    slabSize,
 		maxSlabs:    maxSlabs,
-		flights:     newInflightGroup(),
 		evictor:     DropStrategy{},
 		errReporter: noopReporter{},
 	}
@@ -133,86 +132,6 @@ func TestDecayVisitedCounts(t *testing.T) {
 
 	require.Equal(t, int32(10), slabs[0].visitedCount.Load())
 	require.Equal(t, int32(5), slabs[1].visitedCount.Load())
-}
-
-// --- inflightGroup ---
-
-func TestInflightGroup_SingleFlight(t *testing.T) {
-	g := newInflightGroup()
-	var callCount atomic.Int32
-
-	const numGoroutines = 100
-	var ready sync.WaitGroup
-	ready.Add(numGoroutines)
-	gate := make(chan struct{})        // Holds all goroutines until everyone is spawned.
-	leaderBlock := make(chan struct{}) // Holds the leader in fn() so others queue up.
-
-	var wg sync.WaitGroup
-	for i := 0; i < numGoroutines; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			ready.Done()
-			<-gate
-			g.DoOnce(42, func() {
-				callCount.Add(1)
-				<-leaderBlock // Hold flight open for others to join.
-			})
-		}()
-	}
-
-	ready.Wait() // All goroutines spawned and waiting at the gate.
-	close(gate)  // Release them all at once.
-
-	// Give goroutines time to enter DoOnce. The leader blocks in fn();
-	// all others wait on the shard's Cond.
-	time.Sleep(100 * time.Millisecond)
-
-	close(leaderBlock) // Release the leader; all waiters unblock.
-	wg.Wait()
-
-	require.Equal(t, int32(1), callCount.Load(),
-		"exactly 1 goroutine should execute fn, got %d", callCount.Load())
-}
-
-func TestInflightGroup_DifferentKeysRunConcurrently(t *testing.T) {
-	g := newInflightGroup()
-	var callCount atomic.Int32
-	barrier := make(chan struct{})
-
-	// Two different keys should both run their fn.
-	var wg sync.WaitGroup
-	for _, key := range []uint64{1, 2} {
-		wg.Add(1)
-		go func(k uint64) {
-			defer wg.Done()
-			g.DoOnce(k, func() {
-				callCount.Add(1)
-				<-barrier // Block until released
-			})
-		}(key)
-	}
-
-	// Wait a bit for both goroutines to enter fn, then release.
-	// Both should be running concurrently.
-	close(barrier)
-	wg.Wait()
-
-	require.Equal(t, int32(2), callCount.Load(),
-		"different keys should run independently")
-}
-
-func TestInflightGroup_SequentialReuse(t *testing.T) {
-	g := newInflightGroup()
-	var callCount atomic.Int32
-
-	// First call.
-	g.DoOnce(42, func() { callCount.Add(1) })
-	// After completion, same key should trigger a new call.
-	g.DoOnce(42, func() { callCount.Add(1) })
-
-	require.Equal(t, int32(2), callCount.Load(),
-		"after first flight completes, same key should re-execute")
 }
 
 // --- ReadCache Core ---
@@ -466,7 +385,7 @@ func TestReadCache_Stats(t *testing.T) {
 	s = rc.Stats()
 	require.Equal(t, int64(1), s.Inserts)
 
-	// Acquire does NOT count hits — hits are counted inside Lookup.
+	// Acquire does NOT count hits — hits/misses are counted by Archivist.ReadBlob.
 	_, _, rel, found := rc.Acquire(h)
 	require.True(t, found)
 	rel.Release()
@@ -477,8 +396,88 @@ func TestReadCache_Stats(t *testing.T) {
 	// Miss on unknown key.
 	_, _, _, found = rc.Acquire(hashKey([]byte("no-such-key")))
 	require.False(t, found)
-	// Misses are only counted in Lookup, not Acquire.
+	// Misses are only counted by Archivist.ReadBlob, not Acquire.
 	require.Equal(t, int64(0), s.Misses)
+}
+
+// --- inflightGroup ---
+
+func TestInflightGroup_SingleFlight(t *testing.T) {
+	g := newInflightGroup()
+	var callCount atomic.Int32
+
+	const numGoroutines = 100
+	var ready sync.WaitGroup
+	ready.Add(numGoroutines)
+	gate := make(chan struct{})        // Holds all goroutines until everyone is spawned.
+	leaderBlock := make(chan struct{}) // Holds the leader in fn() so others queue up.
+
+	var wg sync.WaitGroup
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ready.Done()
+			<-gate
+			g.DoOnce(42, func() {
+				callCount.Add(1)
+				<-leaderBlock // Hold flight open for others to join.
+			})
+		}()
+	}
+
+	ready.Wait() // All goroutines spawned and waiting at the gate.
+	close(gate)  // Release them all at once.
+
+	// Give goroutines time to enter DoOnce. The leader blocks in fn();
+	// all others wait on the shard's Cond.
+	time.Sleep(100 * time.Millisecond)
+
+	close(leaderBlock) // Release the leader; all waiters unblock.
+	wg.Wait()
+
+	require.Equal(t, int32(1), callCount.Load(),
+		"exactly 1 goroutine should execute fn, got %d", callCount.Load())
+}
+
+func TestInflightGroup_DifferentKeysRunConcurrently(t *testing.T) {
+	g := newInflightGroup()
+	var callCount atomic.Int32
+	barrier := make(chan struct{})
+
+	// Two different keys should both run their fn.
+	var wg sync.WaitGroup
+	for _, key := range []uint64{1, 2} {
+		wg.Add(1)
+		go func(k uint64) {
+			defer wg.Done()
+			g.DoOnce(k, func() {
+				callCount.Add(1)
+				<-barrier // Block until released
+			})
+		}(key)
+	}
+
+	// Wait a bit for both goroutines to enter fn, then release.
+	// Both should be running concurrently.
+	close(barrier)
+	wg.Wait()
+
+	require.Equal(t, int32(2), callCount.Load(),
+		"different keys should run independently")
+}
+
+func TestInflightGroup_SequentialReuse(t *testing.T) {
+	g := newInflightGroup()
+	var callCount atomic.Int32
+
+	// First call.
+	g.DoOnce(42, func() { callCount.Add(1) })
+	// After completion, same key should trigger a new call.
+	g.DoOnce(42, func() { callCount.Add(1) })
+
+	require.Equal(t, int32(2), callCount.Load(),
+		"after first flight completes, same key should re-execute")
 }
 
 // --- flightKey ---

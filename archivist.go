@@ -27,6 +27,7 @@ type Archivist struct {
 	sched     iosched.IOScheduler
 	cache     sync.Map   // segmentID (uint32) -> *os.File
 	readCache *ReadCache // nil if disabled
+	flights   *inflightGroup
 }
 
 func NewArchivist(cfg config, idx *index.DurableIndex, sched iosched.IOScheduler) *Archivist {
@@ -34,9 +35,10 @@ func NewArchivist(cfg config, idx *index.DurableIndex, sched iosched.IOScheduler
 		sched = &iosched.PreadScheduler{}
 	}
 	return &Archivist{
-		config: cfg,
-		index:  idx,
-		sched:  sched,
+		config:  cfg,
+		index:   idx,
+		sched:   sched,
+		flights: newInflightGroup(),
 	}
 }
 
@@ -68,25 +70,138 @@ func (a *Archivist) Close() error {
 // It handles decompression and checksum verification.
 // The caller MUST call the returned Releaser when done with the data.
 //
-// If a ReadCache is configured, it is checked first (transparent to the caller).
-// On cache hit, the raw record is served from mmap arenas. On miss, falls
-// through to direct disk I/O.
+// If a ReadCache is configured, it is checked first. On cache miss, the
+// Archivist performs exactly ONE disk read. If the blob is admissible for
+// caching, the disk read may be widened to a 64KB chunk and the raw bytes
+// are populated into the cache inline (no extra goroutines).
 //
 // expectedKey is used to verify the stored key matches (detects 128-bit hash collisions).
 func (a *Archivist) ReadBlob(e index.Item, expectedKey []byte) ([]byte, Releaser, error) {
-	// Check read cache first (if enabled).
 	if a.readCache != nil {
-		if data, storedKey, rel, found := a.readCache.Lookup(e); found {
+		// Check cache first.
+		if data, storedKey, rel, found := a.readCache.Acquire(e.Key); found {
+			a.readCache.hits.Add(1)
 			if expectedKey != nil && !bytes.Equal(storedKey, expectedKey) {
 				rel.Release()
 				return nil, Releaser{}, record.ErrKeyMismatch
 			}
 			return data, rel, nil
 		}
+
+		a.readCache.misses.Add(1)
+
+		// Cache miss — if admissible, do a single widened read and populate.
+		if a.readCache.Admissible(int64(e.PhysicalLen)) {
+			return a.readBlobWithPrefetch(e, expectedKey)
+		}
 	}
 
-	// Direct disk read (cache miss or cache disabled).
+	// No cache or blob not admissible — standard disk read.
 	return a.readBlobFromDisk(e, expectedKey)
+}
+
+// readBlobWithPrefetch coalesces concurrent cache misses for the same disk
+// region. The "leader" goroutine performs exactly ONE disk read, populates
+// the ReadCache, and parses the target record from the read buffer.
+// "Waiter" goroutines block until the leader finishes, then serve from cache.
+//
+// For small blobs (≤ prefetchChunkSize): reads a 64KB aligned chunk and
+// populates all valid records in the chunk (temporal prefetch).
+// For large blobs (> prefetchChunkSize): reads the exact blob with page
+// alignment and inserts only that record.
+func (a *Archivist) readBlobWithPrefetch(e index.Item, expectedKey []byte) ([]byte, Releaser, error) {
+	blobOff := int64(e.Offset)
+	blobLen := int(e.PhysicalLen)
+
+	// Compute coalescing key. Small blobs in the same 64KB chunk share a key.
+	var fkey uint64
+	if blobLen <= prefetchChunkSize {
+		chunkOff := blobOff &^ (int64(prefetchChunkSize) - 1)
+		fkey = flightKey(e.SegmentID, chunkOff)
+	} else {
+		fkey = flightKey(e.SegmentID, blobOff)
+	}
+
+	// Leader captures its result through the closure.
+	var leaderData []byte
+	var leaderRel Releaser
+	var leaderErr error
+
+	isLeader := a.flights.DoOnce(fkey, func() {
+		leaderData, leaderRel, leaderErr = a.prefetchAndParse(e, expectedKey)
+	})
+
+	if isLeader {
+		return leaderData, leaderRel, leaderErr
+	}
+
+	// Waiter: leader populated the cache. Re-check.
+	if data, storedKey, rel, found := a.readCache.Acquire(e.Key); found {
+		a.readCache.hits.Add(1)
+		if expectedKey != nil && !bytes.Equal(storedKey, expectedKey) {
+			rel.Release()
+			return nil, Releaser{}, record.ErrKeyMismatch
+		}
+		return data, rel, nil
+	}
+
+	// Cache miss after leader finished (e.g., chunk at segment boundary,
+	// or record was at the edge and couldn't be parsed). Fall back.
+	return a.readBlobFromDisk(e, expectedKey)
+}
+
+// prefetchAndParse performs the single disk read, populates the cache, and
+// parses the target record. Called only by the flight leader.
+func (a *Archivist) prefetchAndParse(e index.Item, expectedKey []byte) ([]byte, Releaser, error) {
+	shard := a.index.SegmentLockShard(e.SegmentID)
+	shard.RLock()
+	defer shard.RUnlock()
+
+	sf, err := a.getSegmentFile(e.SegmentID)
+	if err != nil {
+		return nil, Releaser{}, fmt.Errorf("storage: segment %d not found: %w", e.SegmentID, err)
+	}
+
+	blobOff := int64(e.Offset)
+	blobLen := int(e.PhysicalLen)
+
+	// Determine read region: 64KB chunk for small blobs, exact for large.
+	var readOff, readLen int64
+	if blobLen <= prefetchChunkSize {
+		chunkOff := blobOff &^ (int64(prefetchChunkSize) - 1)
+		readOff, readLen = sys.AlignRange(chunkOff, prefetchChunkSize)
+	} else {
+		readOff, readLen = sys.AlignRange(blobOff, blobLen)
+	}
+
+	handle := AcquireAlignedBuffer(int(readLen), int(readLen))
+	buf := handle.Bytes()
+
+	n, err := a.sched.ReadAt(int(sf.Fd()), buf, readOff)
+	if err != nil {
+		handle.Release()
+		return nil, Releaser{}, fmt.Errorf("storage: prefetch read failed: %w", err)
+	}
+
+	// Ensure we read enough for the target record.
+	targetEnd := int(blobOff-readOff) + blobLen
+	if n < targetEnd {
+		handle.Release()
+		return nil, Releaser{}, fmt.Errorf("storage: short prefetch read: got %d, need %d", n, targetEnd)
+	}
+
+	// Populate cache BEFORE parseRecord (which may release handle on decompression).
+	if blobLen <= prefetchChunkSize {
+		a.readCache.PopulateChunk(buf[:n])
+	} else {
+		lead := int(blobOff - readOff)
+		a.readCache.Insert(e.Key, buf[lead:lead+blobLen])
+	}
+
+	// Extract and parse the target record.
+	lead := int(blobOff - readOff)
+	rec := buf[lead : lead+blobLen]
+	return a.parseRecord(rec, e, expectedKey, Releaser{bh: &handle}, func() { handle.Release() })
 }
 
 // readBlobFromDisk performs the disk read with segment locking.
@@ -247,21 +362,6 @@ func (a *Archivist) getSegmentFile(segmentID uint32) (*os.File, error) {
 	}
 
 	return f, nil
-}
-
-// ReadChunkAt reads len(buf) bytes from segment segID at the given offset.
-// Acquires the segment read lock to prevent concurrent deletion during I/O.
-// buf must be page-aligned for Direct I/O compatibility.
-func (a *Archivist) ReadChunkAt(segID uint32, buf []byte, offset int64) (int, error) {
-	shard := a.index.SegmentLockShard(segID)
-	shard.RLock()
-	defer shard.RUnlock()
-
-	sf, err := a.getSegmentFile(segID)
-	if err != nil {
-		return 0, fmt.Errorf("storage: segment %d not found: %w", segID, err)
-	}
-	return a.sched.ReadAt(int(sf.Fd()), buf, offset)
 }
 
 // DropSegmentCache closes and removes a segment's cached file handle.

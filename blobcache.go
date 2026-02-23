@@ -269,7 +269,6 @@ func open(cfg config) (*Cache, bool, error) {
 			rcSlabSize,
 			cfg.ReadCacheSlabs,
 			rcMaxItemSize,
-			c.archivist.ReadChunkAt,
 			c,
 			cfg.ReadCacheEvictionStrategy,
 		)

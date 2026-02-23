@@ -90,7 +90,7 @@ func BenchmarkBlobCache(b *testing.B) {
 		// WithWAL(),
 		WithFDataSync(true),
 		WithIOScheduler(sched),
-		WithReadCacheSlabs(16), // 16 * 64MB = 1GB user-space read cache
+		WithReadCacheSlabs(16),          // 16 * 64MB = 1GB user-space read cache
 		WithDegradedMode(DegradedPanic), // Crash on errors during benchmarks
 	)
 	if err != nil {
@@ -295,9 +295,9 @@ func BenchmarkBlobCache_SmallBlobs(b *testing.B) {
 	defer os.RemoveAll(tmpDir)
 
 	const (
-		blobSizeLo   = 4_000
+		blobSizeLo    = 4_000
 		blobSizeHiRng = 16_000 // 4KB-20KB, avg ~12KB
-		populateKeys = 200_000
+		populateKeys  = 200_000
 	)
 
 	directIO := os.Getenv("BLOBCACHE_BUFFERED_IO") != "1"

@@ -165,7 +165,7 @@ func TestInflightGroup_SingleFlight(t *testing.T) {
 	close(gate)  // Release them all at once.
 
 	// Give goroutines time to enter DoOnce. The leader blocks in fn();
-	// all others queue on the flight's done channel.
+	// all others wait on the shard's Cond.
 	time.Sleep(100 * time.Millisecond)
 
 	close(leaderBlock) // Release the leader; all waiters unblock.
@@ -466,8 +466,7 @@ func TestReadCache_Stats(t *testing.T) {
 	s = rc.Stats()
 	require.Equal(t, int64(1), s.Inserts)
 
-	// Acquire does NOT count hits — hits are counted at the Cache.search()
-	// call site to avoid inflating stats with self-hits from acquireOrFallback.
+	// Acquire does NOT count hits — hits are counted inside Lookup.
 	_, _, rel, found := rc.Acquire(h)
 	require.True(t, found)
 	rel.Release()
@@ -478,7 +477,7 @@ func TestReadCache_Stats(t *testing.T) {
 	// Miss on unknown key.
 	_, _, _, found = rc.Acquire(hashKey([]byte("no-such-key")))
 	require.False(t, found)
-	// Misses are only counted in FetchAndPopulate, not Acquire.
+	// Misses are only counted in Lookup, not Acquire.
 	require.Equal(t, int64(0), s.Misses)
 }
 

@@ -1,7 +1,6 @@
 package blobcache
 
 import (
-	"bytes"
 	"sync"
 	"sync/atomic"
 
@@ -19,10 +18,14 @@ import (
 // from temporal prefetch (neighboring records in the same chunk are also cached).
 const prefetchChunkSize = 64 * 1024
 
+// ChunkReadFunc reads raw bytes from a segment at the given offset.
+// buf must be page-aligned for Direct I/O. Returns bytes read.
+type ChunkReadFunc func(segID uint32, buf []byte, offset int64) (int, error)
+
 // ReadCacheStats holds a point-in-time snapshot of read cache counters.
 type ReadCacheStats struct {
-	Hits      int64 // Acquire found the key in a sealed or active slab
-	Misses    int64 // FetchAndPopulate called (cache miss, went to disk)
+	Hits      int64 // Lookup found the key in a sealed or active slab
+	Misses    int64 // Lookup called (cache miss, attempted disk fetch)
 	Inserts   int64 // Records successfully inserted into the cache
 	Evictions int64 // Slabs evicted to free pool arenas
 	Compacted int64 // Items preserved via CompactStrategy during eviction
@@ -31,8 +34,7 @@ type ReadCacheStats struct {
 }
 
 // ReadCache is a user-space read cache backed by mmap arenas.
-// It sits between the Librarian (write-path cache) and the Archivist (disk I/O)
-// in the read path.
+// It sits between the index lookup and disk I/O in the read path.
 //
 // Architecture:
 //   - One "active" slab for writing new entries (sequential Alloc)
@@ -65,7 +67,7 @@ type ReadCache struct {
 	evictor EvictionStrategy
 
 	// Dependencies.
-	archivist   *Archivist
+	readChunk   ChunkReadFunc
 	errReporter ErrorReporter
 
 	// Stats counters (atomics for lock-free updates).
@@ -87,7 +89,7 @@ func NewReadCache(
 	slabSize int64,
 	maxSlabs int,
 	maxItemSize int64,
-	archivist *Archivist,
+	readChunk ChunkReadFunc,
 	reporter ErrorReporter,
 	evictor EvictionStrategy,
 ) *ReadCache {
@@ -104,7 +106,7 @@ func NewReadCache(
 		maxItemSize: maxItemSize,
 		flights:     newInflightGroup(),
 		evictor:     evictor,
-		archivist:   archivist,
+		readChunk:   readChunk,
 		errReporter: reporter,
 	}
 
@@ -292,51 +294,49 @@ func (rc *ReadCache) sealAndRotateLocked() {
 	rc.active = rc.newActiveSlab()
 }
 
-// FetchAndPopulate reads a blob from disk, populating the read cache with
-// the result (and neighboring records for small blobs via prefetch).
-//
-// Uses the sharded coalescing map to ensure exactly one disk I/O per
-// overlapping region, even under thousands of concurrent cache misses.
-//
-// CONTRACT: Errors returned from this method MUST originate from the
-// Archivist (real disk I/O failures or key mismatches), never from
-// cache-internal failures (pool exhaustion, flight issues, scan errors).
-// The caller (Cache.search) passes errors to handleStorageError which
-// marks blobs as corrupt — cache hiccups must not corrupt healthy data.
-// Internal failures are handled by falling back to Archivist.ReadBlob
-// via acquireOrFallback.
-func (rc *ReadCache) FetchAndPopulate(
-	item index.Item, expectedKey []byte,
-) ([]byte, Releaser, error) {
+// Lookup checks the cache for the item. On miss, fetches from disk via
+// readChunk, populates the cache, and re-checks. Returns (data, storedKey,
+// releaser, found). No error return — internal failures result in found=false,
+// and the caller falls back to direct disk I/O.
+func (rc *ReadCache) Lookup(item index.Item) ([]byte, []byte, Releaser, bool) {
+	// Step 1: Check cache.
+	if data, storedKey, rel, found := rc.Acquire(item.Key); found {
+		rc.hits.Add(1)
+		return data, storedKey, rel, true
+	}
+
 	rc.misses.Add(1)
 	blobLen := int64(item.PhysicalLen)
 
+	// Step 2: Admission check — skip items too large for the cache.
 	if blobLen > rc.slabSize {
-		// Too large to cache. Direct disk read.
-		return rc.archivist.ReadBlob(item, expectedKey)
+		return nil, nil, Releaser{}, false
 	}
-
 	if rc.maxItemSize > 0 && blobLen > rc.maxItemSize {
-		// Rejected by admission policy — serve from disk, don't pollute cache.
 		rc.skipped.Add(1)
-		return rc.archivist.ReadBlob(item, expectedKey)
+		return nil, nil, Releaser{}, false
 	}
 
+	// Step 3: Populate cache via coalesced disk fetch.
 	if blobLen > prefetchChunkSize {
-		// Large blob: read exact blob, insert into cache, no chunk prefetch.
-		return rc.fetchLargeBlob(item, expectedKey)
+		rc.populateLargeBlob(item)
+	} else {
+		rc.populateWithPrefetch(item)
 	}
 
-	// Normal path: 64KB chunk prefetch with coalescing.
-	return rc.fetchWithPrefetch(item, expectedKey)
+	// Step 4: Re-check cache after populate.
+	if data, storedKey, rel, found := rc.Acquire(item.Key); found {
+		rc.hits.Add(1)
+		return data, storedKey, rel, true
+	}
+
+	return nil, nil, Releaser{}, false
 }
 
-// fetchWithPrefetch reads a 64KB-aligned chunk from disk, parses all valid
-// records in the chunk, and inserts them into the read cache. The requested
-// blob is guaranteed to be within the chunk.
-func (rc *ReadCache) fetchWithPrefetch(
-	item index.Item, expectedKey []byte,
-) ([]byte, Releaser, error) {
+// populateWithPrefetch reads a 64KB-aligned chunk from disk, parses all valid
+// records in the chunk, and inserts them into the read cache. Populate-only:
+// does not return the data — caller re-checks via Acquire.
+func (rc *ReadCache) populateWithPrefetch(item index.Item) {
 	blobOffset := int64(item.Offset)
 
 	// Compute the 64KB-aligned region containing the blob.
@@ -349,24 +349,17 @@ func (rc *ReadCache) fetchWithPrefetch(
 		dioOff, dioLen := sys.AlignRange(alignedOff, prefetchChunkSize)
 		rc.fetchChunk(item.SegmentID, dioOff, int(dioLen))
 	})
-
-	// After the flight completes, data should be in the cache.
-	return rc.acquireOrFallback(item, expectedKey)
 }
 
-// fetchLargeBlob handles blobs that are larger than the prefetch chunk size
+// populateLargeBlob handles blobs that are larger than the prefetch chunk size
 // but still fit in a slab. Reads the exact blob's on-disk bytes and inserts
-// them into the read cache.
-func (rc *ReadCache) fetchLargeBlob(
-	item index.Item, expectedKey []byte,
-) ([]byte, Releaser, error) {
+// them into the read cache. Populate-only.
+func (rc *ReadCache) populateLargeBlob(item index.Item) {
 	// Coalesce on the blob's own (segID, offset) to prevent thundering herd.
 	key := flightKey(item.SegmentID, int64(item.Offset))
 	rc.flights.DoOnce(key, func() {
 		rc.insertFromDisk(item)
 	})
-
-	return rc.acquireOrFallback(item, expectedKey)
 }
 
 // insertFromDisk reads a single blob's raw on-disk bytes and inserts them
@@ -379,7 +372,7 @@ func (rc *ReadCache) insertFromDisk(item index.Item) {
 	defer handle.Release()
 	buf := handle.Bytes()
 
-	n, err := rc.archivist.ReadChunkAt(item.SegmentID, buf, dioOff)
+	n, err := rc.readChunk(item.SegmentID, buf, dioOff)
 	if err != nil || n < int(dioLen) {
 		return
 	}
@@ -421,7 +414,7 @@ func (rc *ReadCache) fetchChunk(segID uint32, alignedOff int64, alignedLen int) 
 	defer handle.Release()
 	buf := handle.Bytes()
 
-	n, err := rc.archivist.ReadChunkAt(segID, buf, alignedOff)
+	n, err := rc.readChunk(segID, buf, alignedOff)
 	if err != nil || n < alignedLen {
 		return
 	}
@@ -457,25 +450,6 @@ func (rc *ReadCache) fetchChunk(segID uint32, alignedOff int64, alignedLen int) 
 
 		offset += totalSize
 	}
-}
-
-// acquireOrFallback attempts to read from the cache after a fetch completes.
-// If the data is not in the cache (e.g., slab was evicted between insert and
-// lookup, or parse failed), falls back to a direct Archivist read.
-func (rc *ReadCache) acquireOrFallback(
-	item index.Item, expectedKey []byte,
-) ([]byte, Releaser, error) {
-	data, storedKey, rel, found := rc.Acquire(item.Key)
-	if found {
-		if expectedKey != nil && !bytes.Equal(storedKey, expectedKey) {
-			rel.Release()
-			return nil, Releaser{}, record.ErrKeyMismatch
-		}
-		return data, rel, nil
-	}
-
-	// Fallback: direct disk read.
-	return rc.archivist.ReadBlob(item, expectedKey)
 }
 
 // Invalidate removes a key from all slabs (sealed and active).

@@ -18,11 +18,15 @@ import (
 
 // Archivist manages read-only access to persisted segments.
 // It uses the Index Item contract: Offset points to Magic, PhysicalLen = 42 + KeyLen + PhysSize.
+//
+// If readCache is non-nil, ReadBlob checks it before going to disk.
+// The ReadCache is transparent to callers — they see the same API.
 type Archivist struct {
 	config
-	index *index.DurableIndex
-	sched iosched.IOScheduler
-	cache sync.Map // segmentID (uint32) -> *os.File
+	index     *index.DurableIndex
+	sched     iosched.IOScheduler
+	cache     sync.Map   // segmentID (uint32) -> *os.File
+	readCache *ReadCache // nil if disabled
 }
 
 func NewArchivist(cfg config, idx *index.DurableIndex, sched iosched.IOScheduler) *Archivist {
@@ -36,8 +40,14 @@ func NewArchivist(cfg config, idx *index.DurableIndex, sched iosched.IOScheduler
 	}
 }
 
-// Close closes all cached segment file handles and the I/O scheduler.
+// Close closes the read cache (if any), all cached segment file handles,
+// and the I/O scheduler.
 func (a *Archivist) Close() error {
+	// Close read cache first (before closing segment FDs it depends on).
+	if a.readCache != nil {
+		a.readCache.Close()
+	}
+
 	var errs []error
 	a.cache.Range(func(key, value any) bool {
 		if closer, ok := value.(io.Closer); ok {
@@ -58,14 +68,34 @@ func (a *Archivist) Close() error {
 // It handles decompression and checksum verification.
 // The caller MUST call the returned Releaser when done with the data.
 //
+// If a ReadCache is configured, it is checked first (transparent to the caller).
+// On cache hit, the raw record is served from mmap arenas. On miss, falls
+// through to direct disk I/O.
+//
 // expectedKey is used to verify the stored key matches (detects 128-bit hash collisions).
 func (a *Archivist) ReadBlob(e index.Item, expectedKey []byte) ([]byte, Releaser, error) {
-	// 1. Acquire read lock: Prevent segment deletion & FD close during I/O
+	// Check read cache first (if enabled).
+	if a.readCache != nil {
+		if data, storedKey, rel, found := a.readCache.Lookup(e); found {
+			if expectedKey != nil && !bytes.Equal(storedKey, expectedKey) {
+				rel.Release()
+				return nil, Releaser{}, record.ErrKeyMismatch
+			}
+			return data, rel, nil
+		}
+	}
+
+	// Direct disk read (cache miss or cache disabled).
+	return a.readBlobFromDisk(e, expectedKey)
+}
+
+// readBlobFromDisk performs the disk read with segment locking.
+func (a *Archivist) readBlobFromDisk(e index.Item, expectedKey []byte) ([]byte, Releaser, error) {
+	// Acquire read lock: Prevent segment deletion & FD close during I/O
 	shard := a.index.SegmentLockShard(e.SegmentID)
 	shard.RLock()
 	defer shard.RUnlock()
 
-	// 2. Do the read.
 	sf, err := a.getSegmentFile(e.SegmentID)
 	if err != nil {
 		return nil, Releaser{}, fmt.Errorf("storage: segment %d not found: %w", e.SegmentID, err)

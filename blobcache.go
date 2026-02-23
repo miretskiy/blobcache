@@ -265,14 +265,16 @@ func open(cfg config) (*Cache, bool, error) {
 		} else if rcMaxItemSize < 0 {
 			rcMaxItemSize = 0 // -1 = no limit → pass 0 to ReadCache
 		}
-		c.readCache = NewReadCache(
+		rc := NewReadCache(
 			rcSlabSize,
 			cfg.ReadCacheSlabs,
 			rcMaxItemSize,
-			c.archivist,
+			c.archivist.ReadChunkAt,
 			c,
 			cfg.ReadCacheEvictionStrategy,
 		)
+		c.archivist.readCache = rc
+		c.readCache = rc // Keep for lifecycle: Close, Delete/Invalidate, Stats, Decay
 	}
 
 	c.memTable = NewMemTable(c.config, c, c, c.librarian, c.wal, c.segIDs)
@@ -390,6 +392,9 @@ func checkOrInitialize(cfg config) (*index.DurableIndex, error) {
 // For disk hits, reads the entire blob into memory.
 // It acts as the Single Source of Truth for Bloom metrics (Hits vs Ghosts).
 // Key verification happens on both paths to detect 128-bit hash collisions.
+//
+// The ReadCache (if enabled) is transparent inside Archivist.ReadBlob —
+// search() does not interact with it directly.
 func (c *Cache) search(key []byte) (data []byte, rel Releaser, ok bool) {
 	h := xxh3.Hash128(key)
 
@@ -413,20 +418,7 @@ func (c *Cache) search(key []byte) (data []byte, rel Releaser, ok bool) {
 		return ramData, releaser, true
 	}
 
-	// 3. Read Cache Hit (user-space read cache)
-	if c.readCache != nil {
-		if rcData, storedKey, releaser, found := c.readCache.Acquire(h); found {
-			if !c.hot.trustHash && !bytes.Equal(storedKey, key) {
-				releaser.Release()
-				c.bloomStats.ghosts.Add(1)
-				return nil, Releaser{}, false
-			}
-			c.readCache.hits.Add(1)
-			return rcData, releaser, true
-		}
-	}
-
-	// 4. Disk Hit (Storage)
+	// 3. Index lookup (O(1) sharded hash table)
 	entry, found := c.index.Get(h)
 	if !found || entry.IsDeleted() {
 		// BLOOM GHOST: Bloom said yes, Index said no (or item is deleted).
@@ -434,29 +426,18 @@ func (c *Cache) search(key []byte) (data []byte, rel Releaser, ok bool) {
 		return nil, Releaser{}, false
 	}
 
-	// 5. Check corruption flag
+	// 4. Check corruption flag
 	if entry.HasError() {
 		log.Debug("blob marked as corrupt", "hash", h, "errno", entry.Errno())
 		return nil, Releaser{}, false
 	}
 
-	// 6. Read from disk (with key verification for collision detection)
+	// 5. Archivist.ReadBlob (ReadCache is inside, transparent)
 	verifyKey := key
 	if c.TrustHash {
 		verifyKey = nil
 	}
 
-	// 7. Fetch via Read Cache (singleflight + prefetch + populate) if enabled
-	if c.readCache != nil {
-		data, diskReleaser, err := c.readCache.FetchAndPopulate(entry, verifyKey)
-		if err != nil {
-			c.handleStorageError(h, entry, err)
-			return nil, Releaser{}, false
-		}
-		return data, diskReleaser, true
-	}
-
-	// 8. Direct disk read (read cache disabled)
 	data, diskReleaser, err := c.archivist.ReadBlob(entry, verifyKey)
 	if err != nil {
 		c.handleStorageError(h, entry, err)

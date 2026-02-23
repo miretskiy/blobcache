@@ -6,10 +6,16 @@ import "sync"
 //
 // When thousands of goroutines experience a cache miss for the same disk region
 // simultaneously, inflightGroup ensures exactly ONE goroutine performs the
-// disk I/O. The others block on a channel and are woken when the fetch completes.
+// disk I/O. The others block on a per-shard sync.Cond and are woken when the
+// fetch completes.
 //
 // Unlike singleflight.Group (which uses a single mutex), this uses 64 shards
 // for minimal contention under high concurrency.
+//
+// Unlike the channel-based approach, this uses a single sync.Cond per shard
+// (allocated once at init time) instead of allocating a channel per flight.
+// With 64 shards and ~50-100 active flights, each shard has ~1-2 concurrent
+// flights, so Broadcast wakes at most a few goroutines per shard.
 type inflightGroup struct {
 	shards [numFlightShards]inflightShard
 }
@@ -18,19 +24,15 @@ const numFlightShards = 64
 
 type inflightShard struct {
 	mu      sync.Mutex
-	flights map[uint64]*flight
-}
-
-// flight represents a single in-progress disk fetch.
-// The done channel is closed when the fetch completes, unblocking all waiters.
-type flight struct {
-	done chan struct{}
+	cond    *sync.Cond
+	flights map[uint64]struct{} // zero-size values
 }
 
 func newInflightGroup() *inflightGroup {
 	g := &inflightGroup{}
 	for i := range g.shards {
-		g.shards[i].flights = make(map[uint64]*flight)
+		g.shards[i].flights = make(map[uint64]struct{})
+		g.shards[i].cond = sync.NewCond(&g.shards[i].mu)
 	}
 	return g
 }
@@ -49,34 +51,38 @@ func flightKey(segID uint32, alignedOff int64) uint64 {
 // If no flight is in progress for this key, the caller becomes the "leader":
 // it runs fn(), and when fn returns, all blocked waiters are unblocked.
 //
-// If a flight is already in progress, the caller blocks on the flight's done
-// channel until the leader finishes.
+// If a flight is already in progress, the caller blocks on the shard's Cond
+// until the leader finishes. Spurious wakes are handled by re-checking the
+// flight map in a loop.
 //
 // Returns true if this goroutine was the leader (ran fn).
 func (g *inflightGroup) DoOnce(key uint64, fn func()) bool {
 	shard := &g.shards[key%numFlightShards]
 
 	shard.mu.Lock()
-	if f, ok := shard.flights[key]; ok {
+	if _, inflight := shard.flights[key]; inflight {
 		// Another goroutine is already fetching. Wait for it.
+		for {
+			shard.cond.Wait()
+			if _, still := shard.flights[key]; !still {
+				break
+			}
+		}
 		shard.mu.Unlock()
-		<-f.done
 		return false
 	}
 
 	// We are the leader. Register our flight.
-	f := &flight{done: make(chan struct{})}
-	shard.flights[key] = f
+	shard.flights[key] = struct{}{}
 	shard.mu.Unlock()
 
 	// Perform the disk read + cache population.
 	fn()
 
 	// Wake all waiters and clean up.
-	close(f.done)
-
 	shard.mu.Lock()
 	delete(shard.flights, key)
+	shard.cond.Broadcast()
 	shard.mu.Unlock()
 
 	return true

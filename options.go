@@ -249,9 +249,12 @@ func WithIOScheduler(sched iosched.IOScheduler) Option {
 	return funcOpt(func(c *config) { c.IOScheduler = sched })
 }
 
-// WithReadCacheSlabs enables the read cache with the specified number of mmap arenas.
-// Each arena is ReadCacheSlabSize bytes. Total read cache memory = n * slabSize.
-// Set to 0 to disable (default). Recommended: 16 (1GB at 64MB slabs).
+// WithReadCacheSlabs enables the optional second-tier read cache for disk-resident
+// blobs. The primary read path (Librarian) handles recently written data with
+// zero-copy sub-microsecond latency; this cache is only useful for temporally
+// distant reads or when the kernel page cache is under external pressure.
+// Each arena is ReadCacheSlabSize bytes. Total memory = n * slabSize.
+// Default: 0 (disabled — Librarian + kernel page cache is sufficient for most workloads).
 func WithReadCacheSlabs(n int) Option {
 	return funcOpt(func(c *config) { c.ReadCacheSlabs = n })
 }

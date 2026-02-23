@@ -26,13 +26,23 @@ type ReadCacheStats struct {
 	Slabs     int   // Current number of sealed slabs
 }
 
-// ReadCache is a user-space read cache backed by mmap arenas.
-// It sits between the index lookup and disk I/O in the read path.
+// ReadCache is an optional second-tier user-space read cache for disk-resident
+// blobs. Disabled by default.
 //
-// Architecture:
-//   - One "active" slab for writing new entries (sequential Alloc)
-//   - A Librarian managing sealed slabs with FIFO eviction
-//   - A dedicated MmapPool providing bounded mmap arenas
+// The primary in-memory read path is Librarian, which provides zero-copy access
+// to recently written data still in mmap'd slabs (~seconds of writes). Librarian
+// covers the hot write-after-read window with sub-microsecond latency and needs
+// no additional memory beyond the write-path arenas.
+//
+// ReadCache exists for a narrower scenario: reads of data that has already fallen
+// out of the Librarian window but is still accessed frequently enough to justify
+// caching in user-space rather than relying solely on the kernel page cache.
+// Typical use case: temporally distant reads-after-write, or workloads where the
+// kernel page cache is under pressure from other processes.
+//
+// Internally, ReadCache composes a Librarian for its sealed slab list, giving it
+// the same lock-free Acquire and FIFO eviction. The only addition is an active
+// slab for inserting records populated from disk reads (via Archivist).
 //
 // Thread safety:
 //   - Acquire is lock-free for sealed slabs (delegated to Librarian)

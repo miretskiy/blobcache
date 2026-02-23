@@ -78,8 +78,7 @@ type config struct {
 	// --- Read Cache Configuration ---
 	ReadCacheSlabs            int              // Number of read cache slabs (0 = disabled)
 	ReadCacheSlabSize         int64            // Size of each read cache slab (default: WriteBufferSize)
-	ReadCacheMaxItemSize      int64            // Max item size to cache (0 = slabSize/64, -1 = no limit)
-	ReadCacheEvictionStrategy EvictionStrategy // Eviction strategy (default: DropStrategy)
+	ReadCacheMaxItemSize int64 // Max item size to cache (0 = slabSize/64, -1 = no limit)
 
 	knobs *TestingKnobs
 }
@@ -270,12 +269,6 @@ func WithReadCacheSlabSize(size int64) Option {
 // Use -1 to disable the limit (cache all items regardless of size).
 func WithReadCacheMaxItemSize(size int64) Option {
 	return funcOpt(func(c *config) { c.ReadCacheMaxItemSize = size })
-}
-
-// WithReadCacheEvictionStrategy sets the eviction strategy for read cache slabs.
-// Default: CompactStrategy (copies visited items to new slab before evicting).
-func WithReadCacheEvictionStrategy(strategy EvictionStrategy) Option {
-	return funcOpt(func(c *config) { c.ReadCacheEvictionStrategy = strategy })
 }
 
 func defaultConfig(path string) config {

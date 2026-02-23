@@ -19,6 +19,9 @@ type Librarian struct {
 	closed      atomic.Bool
 	maxCached   int
 	errReporter ErrorReporter
+
+	hits      atomic.Int64 // Incremented in Acquire on hit
+	evictions atomic.Int64 // Incremented in Publish when victim dropped
 }
 
 func NewLibrarian(maxCached int, reporter ErrorReporter) *Librarian {
@@ -61,6 +64,7 @@ func (l *Librarian) Publish(slab *SharedSlab) {
 			// Now we can safely unpin the victim.
 			if victim != nil {
 				victim.buf.Unpin()
+				l.evictions.Add(1)
 			}
 			return
 		}
@@ -89,6 +93,7 @@ func (l *Librarian) Acquire(hashKey Key) (value []byte, storedKey []byte, rel Re
 			return nil, nil, Releaser{}, false
 		}
 		if ok {
+			l.hits.Add(1)
 			return data, keyBytes, releaser, true
 		}
 	}

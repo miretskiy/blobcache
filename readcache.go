@@ -22,7 +22,6 @@ type ReadCacheStats struct {
 	Misses    int64 // Lookup called (cache miss, attempted disk fetch)
 	Inserts   int64 // Records successfully inserted into the cache
 	Evictions int64 // Slabs evicted to free pool arenas
-	Compacted int64 // Items preserved via CompactStrategy during eviction
 	Skipped   int64 // Items rejected by admission policy (too large)
 	Slabs     int   // Current number of sealed slabs
 }
@@ -32,17 +31,15 @@ type ReadCacheStats struct {
 //
 // Architecture:
 //   - One "active" slab for writing new entries (sequential Alloc)
-//   - A list of sealed ReadSlabs for lock-free lookups
+//   - A Librarian managing sealed slabs with FIFO eviction
 //   - A dedicated MmapPool providing bounded mmap arenas
-//   - Slab-level eviction: coldest slab is evicted when pool is exhausted
 //
 // Thread safety:
-//   - Acquire is lock-free (atomic pointer to sealed list + TryInc on buffers)
+//   - Acquire is lock-free for sealed slabs (delegated to Librarian)
 //   - Insert acquires mu for active slab writes
 type ReadCache struct {
-	// Sealed slabs visible to readers. Atomic swap for lock-free reads.
-	// List is ordered newest-first (same pattern as Librarian).
-	sealed atomic.Pointer[[]*ReadSlab]
+	// Sealed slab storage with FIFO eviction (lock-free Acquire).
+	lib *Librarian
 
 	// Active slab for inserting new entries.
 	mu     sync.Mutex
@@ -51,22 +48,17 @@ type ReadCache struct {
 	// Dedicated arena pool (separate from write-path pool).
 	pool        *MmapPool
 	slabSize    int64
-	maxSlabs    int
 	maxItemSize int64 // Items larger than this bypass the cache (0 = no limit)
-
-	// Pluggable eviction strategy (default: DropStrategy).
-	evictor EvictionStrategy
 
 	// Dependencies.
 	errReporter ErrorReporter
 
 	// Stats counters (atomics for lock-free updates).
-	hits      atomic.Int64
-	misses    atomic.Int64
-	inserts   atomic.Int64
-	evictions atomic.Int64
-	compacted atomic.Int64
-	skipped   atomic.Int64
+	// Evictions are read from lib.
+	hits    atomic.Int64
+	misses  atomic.Int64
+	inserts atomic.Int64
+	skipped atomic.Int64
 
 	closed atomic.Bool
 }
@@ -80,27 +72,19 @@ func NewReadCache(
 	maxSlabs int,
 	maxItemSize int64,
 	reporter ErrorReporter,
-	evictor EvictionStrategy,
 ) *ReadCache {
-	if evictor == nil {
-		evictor = CompactStrategy{}
-	}
-
 	rc := &ReadCache{
-		// +1 over-provision: during compaction we hold the victim slab open
+		// maxSlabs-1 sealed slots (1 reserved for active).
+		lib: NewLibrarian(maxSlabs-1, reporter),
+		// +1 over-provision: during eviction we hold the victim slab open
 		// while writing into the new active slab, requiring maxSlabs+1 arenas.
 		pool:        NewMmapPool("readcache", slabSize, maxSlabs+1),
 		slabSize:    slabSize,
-		maxSlabs:    maxSlabs,
 		maxItemSize: maxItemSize,
-		evictor:     evictor,
 		errReporter: reporter,
 	}
 
-	empty := make([]*ReadSlab, 0)
-	rc.sealed.Store(&empty)
 	rc.active = rc.newActiveSlab()
-
 	return rc
 }
 
@@ -123,21 +107,12 @@ func (rc *ReadCache) newActiveSlab() *ActiveSlab {
 // Acquire searches the read cache for the given key.
 // Returns (data, storedKey, releaser, found).
 //
-// Lock-free for sealed slabs (atomic pointer + TryInc).
+// Lock-free for sealed slabs (delegated to Librarian).
 // Briefly acquires mu to read the active slab pointer.
 func (rc *ReadCache) Acquire(hashKey Key) ([]byte, []byte, Releaser, bool) {
-	// 1. Check sealed slabs (newest first, same pattern as Librarian).
-	list := *rc.sealed.Load()
-	for _, slab := range list {
-		data, keyBytes, releaser, ok, errno := slab.SharedSlab.Acquire(hashKey)
-		if errno != base.ErrNone {
-			rc.errReporter.ReportBlobError(hashKey, errno)
-			return nil, nil, Releaser{}, false
-		}
-		if ok {
-			slab.RecordHit(hashKey)
-			return data, keyBytes, releaser, true
-		}
+	// 1. Check sealed slabs via Librarian (newest first, lock-free).
+	if data, keyBytes, rel, found := rc.lib.Acquire(hashKey); found {
+		return data, keyBytes, rel, true
 	}
 
 	// 2. Check active slab. We briefly hold mu to snapshot the pointer.
@@ -219,10 +194,7 @@ func (rc *ReadCache) Insert(hashKey Key, rawRecord []byte) bool {
 }
 
 // sealAndRotateLocked seals the current active slab, publishes it to the
-// sealed list, and acquires a new active slab from the pool.
-//
-// If the sealed list reaches maxSlabs-1, the coldest slab is evicted to
-// free a pool arena.
+// Librarian (which handles FIFO eviction), and acquires a new active slab.
 //
 // MUST be called with rc.mu held.
 func (rc *ReadCache) sealAndRotateLocked() {
@@ -234,50 +206,13 @@ func (rc *ReadCache) sealAndRotateLocked() {
 	// Freeze bloom for faster lookups (direct reads, no atomics).
 	old.bloom.Freeze()
 
-	totalItems := int32(old.index.Len())
-	rs := newReadSlab(old.SharedSlab, totalItems)
+	// Publish to Librarian. It handles TryInc + FIFO eviction + Unpin victim.
+	rc.lib.Publish(&old.SharedSlab)
 
-	// Publish to sealed list. Since we hold mu, we are the only writer —
-	// Store is sufficient (no CAS needed).
-	oldList := *rc.sealed.Load()
-	newList := make([]*ReadSlab, 0, len(oldList)+1)
-	newList = append(newList, rs) // Newest first
-	newList = append(newList, oldList...)
+	// Release our active reference.
+	old.buf.Unpin()
 
-	// Evict coldest slab if pool is exhausted.
-	// Reserve 1 slot for the new active slab we're about to acquire.
-	if len(newList) >= rc.maxSlabs {
-		victimIdx := selectVictim(newList)
-		if victimIdx >= 0 {
-			victim := newList[victimIdx]
-			newList = append(newList[:victimIdx], newList[victimIdx+1:]...)
-
-			// Publish updated sealed list BEFORE acquiring new active.
-			// Readers can no longer see the victim in the sealed list.
-			rc.sealed.Store(&newList)
-
-			// Acquire new active slab. The pool is over-provisioned by +1,
-			// so this succeeds even while the victim is still pinned.
-			rc.active = rc.newActiveSlab()
-
-			// Compact: copy visited (proven-hot) items from victim into
-			// the fresh active slab. Items start with visited=0 — must
-			// prove themselves hot again (SIEVE invariant).
-			preserved := rc.evictor.BeforeEvict(victim, rc.active)
-			rc.compacted.Add(int64(preserved))
-
-			// Release victim arena back to pool.
-			victim.buf.Unpin()
-			rc.evictions.Add(1)
-			return
-		}
-	}
-
-	rc.sealed.Store(&newList)
-
-	// Acquire new active slab. Normally instant due to pool over-provision.
-	// May block briefly if a reader still holds a TryInc reference on a
-	// recently evicted slab — bounded by reader latency.
+	// Acquire new active slab from pool.
 	rc.active = rc.newActiveSlab()
 }
 
@@ -340,24 +275,13 @@ func (rc *ReadCache) PopulateChunk(buf []byte) {
 // Invalidate removes a key from all slabs (sealed and active).
 // Called by Cache.Delete to prevent serving stale data.
 func (rc *ReadCache) Invalidate(key Key) {
-	list := *rc.sealed.Load()
-	for _, slab := range list {
-		slab.SharedSlab.Invalidate(key)
-	}
+	rc.lib.Invalidate(key)
 
 	rc.mu.Lock()
 	if rc.active != nil {
 		rc.active.SharedSlab.Invalidate(key)
 	}
 	rc.mu.Unlock()
-}
-
-// DecayVisitedCounts halves the visitedCount on all sealed slabs.
-// Called periodically from the maintenance worker to prevent ColdScore
-// convergence — without decay, long-lived slabs accumulate visits and
-// become unevictable even after their data goes cold.
-func (rc *ReadCache) DecayVisitedCounts() {
-	decayVisitedCounts(*rc.sealed.Load())
 }
 
 // Close releases all resources. All slabs are unpinned and arenas returned
@@ -367,13 +291,8 @@ func (rc *ReadCache) Close() {
 		return
 	}
 
-	// Release sealed slabs.
-	list := *rc.sealed.Load()
-	for _, slab := range list {
-		slab.buf.Unpin()
-	}
-	empty := make([]*ReadSlab, 0)
-	rc.sealed.Store(&empty)
+	// Release sealed slabs via Librarian.
+	rc.lib.Close()
 
 	// Release active slab.
 	rc.mu.Lock()
@@ -393,9 +312,8 @@ func (rc *ReadCache) Stats() ReadCacheStats {
 		Hits:      rc.hits.Load(),
 		Misses:    rc.misses.Load(),
 		Inserts:   rc.inserts.Load(),
-		Evictions: rc.evictions.Load(),
-		Compacted: rc.compacted.Load(),
+		Evictions: rc.lib.evictions.Load(),
 		Skipped:   rc.skipped.Load(),
-		Slabs:     len(*rc.sealed.Load()),
+		Slabs:     len(*rc.lib.view.Load()),
 	}
 }

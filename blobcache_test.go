@@ -972,7 +972,7 @@ func TestArchivist_PrefetchStraddlesChunkBoundary(t *testing.T) {
 	archivist := NewArchivist(cfg, idx, nil)
 	defer archivist.Close()
 
-	rc := NewReadCache(1<<20, 4, 0, noopReporter{}, nil)
+	rc := NewReadCache(1<<20, 4, 0, noopReporter{})
 	defer rc.Close()
 	archivist.readCache = rc
 

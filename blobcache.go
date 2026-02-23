@@ -270,7 +270,6 @@ func open(cfg config) (*Cache, bool, error) {
 			cfg.ReadCacheSlabs,
 			rcMaxItemSize,
 			c,
-			cfg.ReadCacheEvictionStrategy,
 		)
 		c.archivist.readCache = rc
 		c.readCache = rc // Keep for lifecycle: Close, Delete/Invalidate, Stats, Decay
@@ -897,11 +896,6 @@ func (c *Cache) maintenanceWorker() {
 					c.ReportError(fmt.Errorf("segment drain: %w", err))
 					return
 				}
-			}
-
-			// Phase 4: Read cache visited-count decay
-			if c.readCache != nil {
-				c.readCache.DecayVisitedCounts()
 			}
 
 		case <-c.stopCh:

@@ -47,91 +47,7 @@ func (noopReporter) ReportBlobError(_ Key, _ base.BlobErrno) {}
 // The caller should defer rc.Close(). Do NOT close the pool separately —
 // ReadCache.Close() handles it.
 func newTestReadCache(slabSize int64, maxSlabs int) *ReadCache {
-	pool := NewMmapPool("test-rc", slabSize, maxSlabs+1) // +1 for compaction buffer
-	rc := &ReadCache{
-		pool:        pool,
-		slabSize:    slabSize,
-		maxSlabs:    maxSlabs,
-		evictor:     DropStrategy{},
-		errReporter: noopReporter{},
-	}
-	empty := make([]*ReadSlab, 0)
-	rc.sealed.Store(&empty)
-	rc.active = rc.newActiveSlab()
-	return rc
-}
-
-// --- ReadSlab / ColdScore / RecordHit ---
-
-func TestReadSlab_ColdScore_Empty(t *testing.T) {
-	rs := &ReadSlab{totalItems: 0}
-	require.Equal(t, 1.0, rs.ColdScore(), "empty slab should be fully cold")
-}
-
-func TestReadSlab_ColdScore_AllVisited(t *testing.T) {
-	rs := &ReadSlab{totalItems: 160}
-	// With visitSampleFactor=16, we need 160/16 = 10 sampled visits to cover all items.
-	rs.visitedCount.Store(10)
-	require.Equal(t, 0.0, rs.ColdScore(), "fully visited slab should be fully hot")
-}
-
-func TestReadSlab_ColdScore_HalfVisited(t *testing.T) {
-	rs := &ReadSlab{totalItems: 320}
-	// 320 items, 10 sampled visits → estimated 160 visits → 160/320 = 0.5 visited → 0.5 cold
-	rs.visitedCount.Store(10)
-	require.InDelta(t, 0.5, rs.ColdScore(), 0.001)
-}
-
-func TestReadSlab_ColdScore_OverVisited(t *testing.T) {
-	rs := &ReadSlab{totalItems: 100}
-	// More estimated visits (200) than items (100) → clamped to 0.0
-	rs.visitedCount.Store(100) // 100 * 16 = 1600 >> 100
-	require.Equal(t, 0.0, rs.ColdScore())
-}
-
-func TestSelectVictim_ColdestFirst(t *testing.T) {
-	slabs := []*ReadSlab{
-		{totalItems: 100, createdAt: 1},
-		{totalItems: 100, createdAt: 2},
-		{totalItems: 100, createdAt: 3},
-	}
-	// slab[0] has 5 sampled visits (est. 80 → cold=0.2)
-	slabs[0].visitedCount.Store(5)
-	// slab[1] has 0 visits → cold=1.0 (coldest!)
-	// slab[2] has 3 sampled visits (est. 48 → cold=0.52)
-	slabs[2].visitedCount.Store(3)
-
-	victimIdx := selectVictim(slabs)
-	require.Equal(t, 1, victimIdx, "slab[1] is coldest (score=1.0)")
-}
-
-func TestSelectVictim_Tiebreak_OldestWins(t *testing.T) {
-	slabs := []*ReadSlab{
-		{totalItems: 100, createdAt: 300},
-		{totalItems: 100, createdAt: 100}, // Oldest
-		{totalItems: 100, createdAt: 200},
-	}
-	// All have cold score = 1.0 (no visits)
-	victimIdx := selectVictim(slabs)
-	require.Equal(t, 1, victimIdx, "on tie, oldest slab (createdAt=100) should be evicted")
-}
-
-func TestSelectVictim_Empty(t *testing.T) {
-	require.Equal(t, -1, selectVictim(nil))
-}
-
-func TestDecayVisitedCounts(t *testing.T) {
-	slabs := []*ReadSlab{
-		{totalItems: 100},
-		{totalItems: 100},
-	}
-	slabs[0].visitedCount.Store(20)
-	slabs[1].visitedCount.Store(10)
-
-	decayVisitedCounts(slabs)
-
-	require.Equal(t, int32(10), slabs[0].visitedCount.Load())
-	require.Equal(t, int32(5), slabs[1].visitedCount.Load())
+	return NewReadCache(slabSize, maxSlabs, 0, noopReporter{})
 }
 
 // --- ReadCache Core ---
@@ -188,7 +104,7 @@ func TestReadCache_SlabRotation(t *testing.T) {
 	}
 
 	// Verify sealed list has entries (rotation happened).
-	sealedList := *rc.sealed.Load()
+	sealedList := *rc.lib.view.Load()
 	require.Greater(t, len(sealedList), 0, "should have at least one sealed slab")
 
 	// All inserted keys should be findable (in sealed or active).
@@ -199,8 +115,9 @@ func TestReadCache_SlabRotation(t *testing.T) {
 	}
 }
 
-func TestReadCache_Eviction_ColdestSlab(t *testing.T) {
-	// 3 slabs total. After sealing 2 + active = 3, the next seal triggers eviction.
+func TestReadCache_Eviction_FIFO(t *testing.T) {
+	// 3 slabs total: 1 active + 2 sealed. When sealed list hits 2,
+	// the oldest (FIFO) slab is evicted on next rotation.
 	rc := newTestReadCache(4096, 3)
 	defer rc.Close()
 
@@ -214,9 +131,13 @@ func TestReadCache_Eviction_ColdestSlab(t *testing.T) {
 	}
 
 	// Verify sealed list doesn't exceed maxSlabs-1.
-	sealedList := *rc.sealed.Load()
-	require.LessOrEqual(t, len(sealedList), rc.maxSlabs-1,
-		"sealed list should not exceed maxSlabs-1 (%d), got %d", rc.maxSlabs-1, len(sealedList))
+	sealedList := *rc.lib.view.Load()
+	require.LessOrEqual(t, len(sealedList), 2,
+		"sealed list should not exceed maxSlabs-1 (2), got %d", len(sealedList))
+
+	// Evictions should have occurred.
+	stats := rc.Stats()
+	require.Greater(t, stats.Evictions, int64(0), "should have evicted at least one slab")
 }
 
 func TestReadCache_Invalidate(t *testing.T) {
@@ -262,105 +183,6 @@ func TestReadCache_Close_Idempotent(t *testing.T) {
 	// Close twice — should not panic.
 	rc.Close()
 	rc.Close()
-}
-
-func TestCompactStrategy_PreservesVisitedItems(t *testing.T) {
-	// 3 slabs with tiny size. ~25 records per 4096-byte slab at ~160 bytes each.
-	// After manual seal: sealed=[slab0], active=slab1
-	// Fill slab1 → sealed=[slab1,slab0], active=slab2
-	// Fill slab2 → sealed has 3 >= maxSlabs=3 → eviction of coldest (slab0)
-	rc := newTestReadCache(4096, 3)
-	rc.evictor = CompactStrategy{}
-	defer rc.Close()
-
-	// Phase 1: Insert records to fill slab 0.
-	var hotKeys []Key
-	for i := 0; i < 20; i++ {
-		key := []byte(fmt.Sprintf("compact-key-%04d", i))
-		value := make([]byte, 100)
-		rawRec := makeRawRecord(t, key, value)
-		h := hashKey(key)
-		rc.Insert(h, rawRec)
-		if i < 5 {
-			hotKeys = append(hotKeys, h)
-		}
-	}
-
-	// Phase 2: Force rotation — slab 0 becomes sealed.
-	rc.mu.Lock()
-	rc.sealAndRotateLocked()
-	rc.mu.Unlock()
-
-	// Phase 3: Mark hot keys as visited in sealed slab 0.
-	for _, h := range hotKeys {
-		_, _, rel, found := rc.Acquire(h)
-		require.True(t, found, "hot key should be in sealed slab")
-		rel.Release()
-	}
-
-	// Phase 4: Fill 2 more slabs to trigger eviction of slab 0.
-	for i := 20; i < 80; i++ {
-		key := []byte(fmt.Sprintf("compact-key-%04d", i))
-		value := make([]byte, 100)
-		rawRec := makeRawRecord(t, key, value)
-		h := hashKey(key)
-		rc.Insert(h, rawRec)
-	}
-
-	// Verify eviction happened.
-	require.Greater(t, rc.evictions.Load(), int64(0), "should have evicted at least once")
-
-	// Phase 5: Hot keys should have survived the first eviction via compaction.
-	// They were copied to the new active slab with visited=0.
-	survivedCount := 0
-	for _, h := range hotKeys {
-		_, _, rel, found := rc.Acquire(h)
-		if found {
-			survivedCount++
-			rel.Release()
-		}
-	}
-	require.Greater(t, survivedCount, 0,
-		"visited keys should survive one eviction cycle via compaction")
-}
-
-func TestCompactStrategy_DropsUnvisitedItems(t *testing.T) {
-	rc := newTestReadCache(4096, 3)
-	rc.evictor = CompactStrategy{}
-	defer rc.Close()
-
-	// Insert records but never access them after sealing.
-	var coldKeys []Key
-	for i := 0; i < 20; i++ {
-		key := []byte(fmt.Sprintf("cold-key-%04d", i))
-		value := make([]byte, 100)
-		rawRec := makeRawRecord(t, key, value)
-		h := hashKey(key)
-		rc.Insert(h, rawRec)
-		coldKeys = append(coldKeys, h)
-	}
-
-	// Seal slab — no Acquire calls, so visited bloom is empty.
-	rc.mu.Lock()
-	rc.sealAndRotateLocked()
-	rc.mu.Unlock()
-
-	// Fill more to trigger eviction.
-	for i := 20; i < 100; i++ {
-		key := []byte(fmt.Sprintf("cold-key-%04d", i))
-		value := make([]byte, 100)
-		rawRec := makeRawRecord(t, key, value)
-		h := hashKey(key)
-		rc.Insert(h, rawRec)
-	}
-
-	require.Greater(t, rc.evictions.Load(), int64(0))
-
-	// Cold keys should NOT survive — they were never visited.
-	for _, h := range coldKeys {
-		_, _, _, found := rc.Acquire(h)
-		require.False(t, found, "unvisited keys should be dropped on eviction")
-	}
 }
 
 func TestReadCache_Stats(t *testing.T) {

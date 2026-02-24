@@ -44,23 +44,13 @@ func writeTestFooterTS(t *testing.T, path string, segID uint32, items []Item) {
 	require.NoError(t, os.WriteFile(path, data, 0o644))
 }
 
-// createDummySSTFile creates an empty .sst file so scanSegment takes the .sst
-// code path. The actual reading is done by the mock ReadSSTFunc (which reads
-// the .meta footer block instead).
-func createDummySSTFile(t *testing.T, p *persistence, segID uint32) {
-	t.Helper()
-	sstPath := p.sstPath(segID)
-	require.NoError(t, os.MkdirAll(filepath.Dir(sstPath), 0o755))
-	require.NoError(t, os.WriteFile(sstPath, nil, 0o644))
-}
-
 // TestTombstone_WriteAndRead validates tombstone persistence and loading.
 func TestTombstone_WriteAndRead(t *testing.T) {
 	tmpDir := t.TempDir()
 	segDir := filepath.Join(tmpDir, "segments", "0000")
 	require.NoError(t, os.MkdirAll(segDir, 0o755))
 
-	p, err := newPersistence(tmpDir, 1, testReadSSTViaMeta())
+	p, err := newPersistence(tmpDir, 1)
 	require.NoError(t, err)
 	defer p.close()
 
@@ -69,22 +59,21 @@ func TestTombstone_WriteAndRead(t *testing.T) {
 	key2 := Key{Lo: 2, Hi: 200}
 	key3 := Key{Lo: 3, Hi: 300}
 
-	// Write the base manifest (footer to .meta, dummy .sst for readSegmentIndex).
+	// Write the base manifest (footer)
 	items := []Item{
 		{Key: key1, SegmentID: segID, Offset: 0, PhysicalLen: 100},
 		{Key: key2, SegmentID: segID, Offset: 100, PhysicalLen: 200},
 		{Key: key3, SegmentID: segID, Offset: 300, PhysicalLen: 300},
 	}
 	writeTestFooterTS(t, p.metaPath(segID), segID, items)
-	createDummySSTFile(t, p, segID)
 
-	// Write tombstones (goes to .del file).
+	// Write tombstones
 	require.NoError(t, p.tombstone(segID, key1, []byte("user-key-1")))
 	require.NoError(t, p.tombstone(segID, key2, nil)) // Eviction (no user key)
-	require.NoError(t, p.flushTombstoneFile(segID))
+	require.NoError(t, p.flushMetaFile(segID))
 
-	// Read back via readSegmentIndex (.sst mock + .del merge).
-	manifest, err := p.readSegmentIndex(segID)
+	// Read back and verify tombstones were applied
+	manifest, err := p.readMetaFile(segID)
 	require.NoError(t, err)
 
 	require.Len(t, manifest.Items, 3)
@@ -99,27 +88,26 @@ func TestTombstone_ScanSegmentMerge(t *testing.T) {
 	segDir := filepath.Join(tmpDir, "segments", "0000")
 	require.NoError(t, os.MkdirAll(segDir, 0o755))
 
-	p, err := newPersistence(tmpDir, 1, testReadSSTViaMeta())
+	p, err := newPersistence(tmpDir, 1)
 	require.NoError(t, err)
 	defer p.close()
 
 	segID := uint32(5)
 
-	// Write regular items.
+	// Write regular items
 	items := []Item{
 		{Key: Key{Lo: 1, Hi: 10}, SegmentID: segID, Offset: 0, PhysicalLen: 100},
 		{Key: Key{Lo: 2, Hi: 20}, SegmentID: segID, Offset: 100, PhysicalLen: 200},
 		{Key: Key{Lo: 3, Hi: 30}, SegmentID: segID, Offset: 300, PhysicalLen: 300},
 	}
 	writeTestFooterTS(t, p.metaPath(segID), segID, items)
-	createDummySSTFile(t, p, segID)
 
-	// Write tombstones for keys 1 and 3.
+	// Write tombstones for keys 1 and 3
 	require.NoError(t, p.tombstone(segID, items[0].Key, []byte("key-1")))
 	require.NoError(t, p.tombstone(segID, items[2].Key, nil)) // Eviction style
-	require.NoError(t, p.flushTombstoneFile(segID))
+	require.NoError(t, p.flushMetaFile(segID))
 
-	// Scan segment — should merge tombstones via .sst mock + .del.
+	// Scan segment - should merge tombstones
 	var scannedItems []Item
 	err = p.scanSegment(segID, func(m DurableBatch) bool {
 		scannedItems = append(scannedItems, m.Items...)
@@ -127,15 +115,15 @@ func TestTombstone_ScanSegmentMerge(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// Verify all 3 items present.
+	// Verify all 3 items present
 	require.Len(t, scannedItems, 3)
 
-	// Verify items 0 and 2 are marked deleted (tombstones applied).
+	// Verify items 0 and 2 are marked deleted (tombstones applied)
 	require.True(t, scannedItems[0].IsDeleted(), "item 0 should be deleted (tombstone)")
 	require.False(t, scannedItems[1].IsDeleted(), "item 1 should be live (no tombstone)")
 	require.True(t, scannedItems[2].IsDeleted(), "item 2 should be deleted (tombstone)")
 
-	// Verify keys match.
+	// Verify keys match
 	require.Equal(t, items[0].Key, scannedItems[0].Key)
 	require.Equal(t, items[1].Key, scannedItems[1].Key)
 	require.Equal(t, items[2].Key, scannedItems[2].Key)
@@ -147,25 +135,24 @@ func TestTombstone_NamespaceIsolation(t *testing.T) {
 	segDir := filepath.Join(tmpDir, "segments", "0000")
 	require.NoError(t, os.MkdirAll(segDir, 0o755))
 
-	p, err := newPersistence(tmpDir, 1, testReadSSTViaMeta())
+	p, err := newPersistence(tmpDir, 1)
 	require.NoError(t, err)
 	defer p.close()
 
 	segID := uint32(1)
 	keyHash := Key{Lo: 999, Hi: 888}
 
-	// Write regular item.
+	// Write regular item
 	items := []Item{
 		{Key: keyHash, SegmentID: segID, Offset: 0, PhysicalLen: 100},
 	}
 	writeTestFooterTS(t, p.metaPath(segID), segID, items)
-	createDummySSTFile(t, p, segID)
 
-	// Write tombstone with same hash (goes to .del).
+	// Write tombstone with same hash
 	require.NoError(t, p.tombstone(segID, keyHash, []byte("user-key")))
-	require.NoError(t, p.flushTombstoneFile(segID))
+	require.NoError(t, p.flushMetaFile(segID))
 
-	// Scan segment — should see item marked as deleted.
+	// Scan regular data - should see item marked as deleted
 	var regularItems []Item
 	err = p.scanSegment(segID, func(m DurableBatch) bool {
 		regularItems = append(regularItems, m.Items...)
@@ -173,7 +160,7 @@ func TestTombstone_NamespaceIsolation(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// Should see item marked as deleted (tombstone merged).
+	// Should see item marked as deleted (tombstone merged)
 	require.Len(t, regularItems, 1)
 	require.True(t, regularItems[0].IsDeleted(), "tombstone should have been merged")
 }
@@ -184,11 +171,11 @@ func TestTombstone_MultipleSegments(t *testing.T) {
 	segDir := filepath.Join(tmpDir, "segments", "0000")
 	require.NoError(t, os.MkdirAll(segDir, 0o755))
 
-	p, err := newPersistence(tmpDir, 1, testReadSSTViaMeta())
+	p, err := newPersistence(tmpDir, 1)
 	require.NoError(t, err)
 	defer p.close()
 
-	// Write items to different segments.
+	// Write items to different segments
 	seg10Items := []Item{
 		{Key: Key{Lo: 1, Hi: 10}, SegmentID: 10, Offset: 0, PhysicalLen: 100},
 	}
@@ -197,16 +184,14 @@ func TestTombstone_MultipleSegments(t *testing.T) {
 	}
 	writeTestFooterTS(t, p.metaPath(10), 10, seg10Items)
 	writeTestFooterTS(t, p.metaPath(20), 20, seg20Items)
-	createDummySSTFile(t, p, 10)
-	createDummySSTFile(t, p, 20)
 
-	// Write tombstones to both segments (each goes to its own .del).
+	// Write tombstones to both segments
 	require.NoError(t, p.tombstone(10, seg10Items[0].Key, []byte("key-10")))
 	require.NoError(t, p.tombstone(20, seg20Items[0].Key, []byte("key-20")))
-	require.NoError(t, p.flushTombstoneFile(10))
-	require.NoError(t, p.flushTombstoneFile(20))
+	require.NoError(t, p.flushMetaFile(10))
+	require.NoError(t, p.flushMetaFile(20))
 
-	// Scan segment 10 — should only see segment 10 tombstone.
+	// Scan segment 10 - should only see segment 10 tombstone
 	var items10 []Item
 	err = p.scanSegment(10, func(m DurableBatch) bool {
 		items10 = append(items10, m.Items...)
@@ -216,7 +201,7 @@ func TestTombstone_MultipleSegments(t *testing.T) {
 	require.Len(t, items10, 1)
 	require.True(t, items10[0].IsDeleted())
 
-	// Scan segment 20 — should only see segment 20 tombstone.
+	// Scan segment 20 - should only see segment 20 tombstone
 	var items20 []Item
 	err = p.scanSegment(20, func(m DurableBatch) bool {
 		items20 = append(items20, m.Items...)
@@ -233,31 +218,30 @@ func TestTombstone_Batch(t *testing.T) {
 	segDir := filepath.Join(tmpDir, "segments", "0000")
 	require.NoError(t, os.MkdirAll(segDir, 0o755))
 
-	p, err := newPersistence(tmpDir, 1, testReadSSTViaMeta())
+	p, err := newPersistence(tmpDir, 1)
 	require.NoError(t, err)
 	defer p.close()
 
 	segID := uint32(1)
 	numItems := 100
 
-	// Write base items.
+	// Write base items
 	items := make([]Item, numItems)
 	for i := range items {
 		items[i] = Item{Key: Key{Lo: uint64(i)}, SegmentID: segID, Offset: uint32(i * 100), PhysicalLen: 100}
 	}
 	writeTestFooterTS(t, p.metaPath(segID), segID, items)
-	createDummySSTFile(t, p, segID)
 
-	// Batch tombstone half of them.
+	// Batch tombstone half of them
 	toDelete := make([]Item, numItems/2)
 	for i := range toDelete {
 		toDelete[i] = items[i*2] // Delete even indices
 	}
 	require.NoError(t, p.tombstoneBatch(toDelete))
-	require.NoError(t, p.flushTombstoneFile(segID))
+	require.NoError(t, p.flushMetaFile(segID))
 
-	// Read back via readSegmentIndex (.sst mock + .del merge).
-	manifest, err := p.readSegmentIndex(segID)
+	// Read back and verify
+	manifest, err := p.readMetaFile(segID)
 	require.NoError(t, err)
 	require.Len(t, manifest.Items, numItems)
 
@@ -276,41 +260,47 @@ func TestTombstone_CompactTombstones(t *testing.T) {
 	segDir := filepath.Join(tmpDir, "segments", "0000")
 	require.NoError(t, os.MkdirAll(segDir, 0o755))
 
-	p, err := newPersistence(tmpDir, 1, testReadSSTViaMeta())
+	p, err := newPersistence(tmpDir, 1)
 	require.NoError(t, err)
 	defer p.close()
 
 	segID := uint32(1)
 
-	// Write base items.
+	// Write base items
 	items := []Item{
 		{Key: Key{Lo: 1}, SegmentID: segID, Offset: 0, PhysicalLen: 100},
 		{Key: Key{Lo: 2}, SegmentID: segID, Offset: 100, PhysicalLen: 100},
 		{Key: Key{Lo: 3}, SegmentID: segID, Offset: 200, PhysicalLen: 100},
 	}
 	writeTestFooterTS(t, p.metaPath(segID), segID, items)
-	createDummySSTFile(t, p, segID)
 
-	// Write tombstones (goes to .del).
+	// Write tombstones
 	require.NoError(t, p.tombstone(segID, Key{Lo: 1}, nil))
 	require.NoError(t, p.tombstone(segID, Key{Lo: 3}, nil))
-	require.NoError(t, p.flushTombstoneFile(segID))
+	require.NoError(t, p.flushMetaFile(segID))
 
-	// Verify tombstones are present before compaction.
-	manifest, err := p.readSegmentIndex(segID)
+	// Compact tombstones
+	err = p.compactTombstones(segID)
+	require.NoError(t, err)
+
+	// Read back - tombstones should be baked into items, no more tombstone batches
+	manifest, err := p.readMetaFile(segID)
 	require.NoError(t, err)
 	require.Len(t, manifest.Items, 3)
+
+	// Items 1 and 3 should be marked deleted
 	require.True(t, manifest.Items[0].IsDeleted())
 	require.False(t, manifest.Items[1].IsDeleted())
 	require.True(t, manifest.Items[2].IsDeleted())
 
-	// Compact tombstones — deletes .del file (tombstones tracked via RAM index).
-	err = p.compactTombstones(segID)
+	// Verify the file no longer has tombstone appendages
+	// (file size should equal footer block size)
+	stat, err := os.Stat(p.metaPath(segID))
 	require.NoError(t, err)
-
-	// Verify .del file is deleted.
-	_, err = os.Stat(p.delPath(segID))
-	require.True(t, os.IsNotExist(err), ".del file should be deleted after compaction")
+	footerBlockSize, err := findFooterBlockSize(p.metaPath(segID))
+	require.NoError(t, err)
+	require.Equal(t, footerBlockSize, stat.Size(),
+		"after compaction, file should have no tombstone appendages")
 }
 
 // TestTombstone_CompactNoOp validates compaction is a no-op when no tombstones.
@@ -319,7 +309,7 @@ func TestTombstone_CompactNoOp(t *testing.T) {
 	segDir := filepath.Join(tmpDir, "segments", "0000")
 	require.NoError(t, os.MkdirAll(segDir, 0o755))
 
-	p, err := newPersistence(tmpDir, 1, testReadSSTViaMeta())
+	p, err := newPersistence(tmpDir, 1)
 	require.NoError(t, err)
 	defer p.close()
 
@@ -329,13 +319,17 @@ func TestTombstone_CompactNoOp(t *testing.T) {
 		{Key: Key{Lo: 1}, SegmentID: segID, Offset: 0, PhysicalLen: 100},
 	}
 	writeTestFooterTS(t, p.metaPath(segID), segID, items)
-	createDummySSTFile(t, p, segID)
 
-	// Compact with no tombstones — no .del file exists, should be a no-op.
+	// Get file modification time before compaction
+	statBefore, err := os.Stat(p.metaPath(segID))
+	require.NoError(t, err)
+
+	// Compact with no tombstones — should be a no-op
 	err = p.compactTombstones(segID)
 	require.NoError(t, err)
 
-	// .meta file should be untouched.
-	_, err = os.Stat(p.metaPath(segID))
-	require.NoError(t, err, ".meta file should still exist")
+	// File should not have been rewritten (same size, same content)
+	statAfter, err := os.Stat(p.metaPath(segID))
+	require.NoError(t, err)
+	require.Equal(t, statBefore.Size(), statAfter.Size())
 }

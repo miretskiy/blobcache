@@ -220,7 +220,7 @@ func TestRecovery_InvalidSegmentID(t *testing.T) {
 	}
 }
 
-// TestRecovery_MissingIndexFile tests recovery when .sst/.meta files are missing but .seg exists.
+// TestRecovery_MissingIndexFile tests recovery when .meta files are missing but .seg exists.
 // This simulates a crash after writing segment data but before writing the index file.
 func TestRecovery_MissingIndexFile(t *testing.T) {
 	tmpDir := t.TempDir()
@@ -242,16 +242,22 @@ func TestRecovery_MissingIndexFile(t *testing.T) {
 	require.NoError(t, cache.Close())
 
 	// Remove all .sst and .meta files (simulating crash before index write)
-	segmentsDir := filepath.Join(tmpDir, "segments", "0000")
-	entries, err := os.ReadDir(segmentsDir)
-	require.NoError(t, err)
-
+	segmentsRoot := filepath.Join(tmpDir, "segments")
 	indexFilesRemoved := 0
-	for _, entry := range entries {
-		if strings.HasSuffix(entry.Name(), ".sst") || strings.HasSuffix(entry.Name(), ".meta") {
-			p := filepath.Join(segmentsDir, entry.Name())
-			require.NoError(t, os.Remove(p))
-			indexFilesRemoved++
+	shardDirs, err := os.ReadDir(segmentsRoot)
+	require.NoError(t, err)
+	for _, shardDir := range shardDirs {
+		if !shardDir.IsDir() {
+			continue
+		}
+		shardPath := filepath.Join(segmentsRoot, shardDir.Name())
+		entries, err := os.ReadDir(shardPath)
+		require.NoError(t, err)
+		for _, entry := range entries {
+			if strings.HasSuffix(entry.Name(), ".sst") || strings.HasSuffix(entry.Name(), ".meta") {
+				require.NoError(t, os.Remove(filepath.Join(shardPath, entry.Name())))
+				indexFilesRemoved++
+			}
 		}
 	}
 	require.Greater(t, indexFilesRemoved, 0, "expected to remove at least one .sst or .meta file")

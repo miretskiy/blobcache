@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/bits"
 	"os"
 	"path/filepath"
 	"runtime/debug"
@@ -78,6 +79,11 @@ type Cache struct {
 
 	// Knobs provides testing hooks. Set directly in tests: c.Knobs = &TestingKnobs{...}
 	Knobs *TestingKnobs
+
+	// keyIndex is the global Pebble-backed key index for ordered iteration.
+	// Rebuildable from segment files — not a durability layer.
+	// nil if not available (e.g., during recovery without path).
+	keyIndex *KeyIndex
 
 	// ballast is a heap allocation that reduces GC frequency by keeping
 	// the heap larger. Never accessed after initialization.
@@ -164,6 +170,15 @@ func New(path string, opts ...Option) (*Cache, error) {
 	cfg := defaultConfig(path)
 	for _, opt := range opts {
 		opt.apply(&cfg)
+	}
+
+	// Auto-compute shard count if not explicitly set.
+	// Target: ~1024 files per directory. Each segment produces up to 3 files
+	// (.seg, .sst, .del), so shards ≈ totalFiles/1024, rounded up to power of 2.
+	if cfg.Shards == 0 && cfg.MaxSize > 0 && cfg.WriteBufferSize > 0 {
+		totalFiles := cfg.MaxSize / cfg.WriteBufferSize * 3
+		shards := 1 << bits.Len(uint(max(1, totalFiles/1024)-1))
+		cfg.Shards = min(shards, 256)
 	}
 
 	// Iterative open with hard limit of 2 attempts:
@@ -275,7 +290,20 @@ func open(cfg config) (*Cache, bool, error) {
 		c.readCache = rc // Keep for lifecycle: Close, Delete/Invalidate, Stats, Decay
 	}
 
+	// Open global Pebble key index (rebuildable — non-fatal if it fails).
+	ki, kiErr := OpenKeyIndex(cfg.Path)
+	if kiErr != nil {
+		log.Warn("failed to open key index, iteration will be unavailable", "error", kiErr)
+	}
+	c.keyIndex = ki
+
+	// Reconcile Pebble key index with RAM index — rebuild missing segments.
+	if c.keyIndex != nil {
+		c.reconcileKeyIndex()
+	}
+
 	c.memTable = NewMemTable(c.config, c, c, c.librarian, c.wal, c.segIDs)
+	c.memTable.keyIndex = c.keyIndex
 	c.memTable.Knobs = c.Knobs
 
 	// Run WAL recovery after memtable is initialized
@@ -336,10 +364,16 @@ func (c *Cache) Close() error {
 		walErr = c.wal.Close()
 	}
 
+	var keyIndexErr error
+	if c.keyIndex != nil {
+		keyIndexErr = c.keyIndex.Close()
+	}
+
 	return errors.Join(
 		walErr,
 		c.archivist.Close(),
 		c.index.Close(),
+		keyIndexErr,
 	)
 }
 
@@ -360,7 +394,7 @@ func checkOrInitialize(cfg config) (*index.DurableIndex, error) {
 
 	// Check if already initialized
 	if _, err := os.Stat(markerPath); err == nil {
-		return index.OpenIndex(cfg.Path, cfg.Shards, capacityHint, ReadSST)
+		return index.OpenIndex(cfg.Path, cfg.Shards, capacityHint)
 	}
 
 	// Not initialized - create directory structure
@@ -371,7 +405,7 @@ func checkOrInitialize(cfg config) (*index.DurableIndex, error) {
 		}
 	}
 
-	idx, err := index.OpenIndex(cfg.Path, cfg.Shards, capacityHint, ReadSST)
+	idx, err := index.OpenIndex(cfg.Path, cfg.Shards, capacityHint)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open index: %w", err)
 	}
@@ -561,6 +595,13 @@ func (c *Cache) deleteInCASMode(key []byte, h Key, item index.Item) error {
 		return fmt.Errorf("write tombstone: %w", err)
 	}
 
+	// Remove from Pebble key index (best-effort — rebuildable).
+	if c.keyIndex != nil {
+		if err := c.keyIndex.DeleteByUserKey(key, h); err != nil {
+			log.Warn("keyindex delete failed", "error", err)
+		}
+	}
+
 	// Update segment metadata (for compaction selection)
 	c.index.UpdateSegmentOnDelete(segID, 1, int64(item.PhysicalLen))
 
@@ -584,6 +625,13 @@ func (c *Cache) deleteInCacheMode(key []byte, h Key, item index.Item) error {
 	// Write tombstone to incremental log (with user key)
 	if err := c.index.Tombstone(segID, h, key); err != nil {
 		return fmt.Errorf("write tombstone: %w", err)
+	}
+
+	// Remove from Pebble key index (best-effort — rebuildable).
+	if c.keyIndex != nil {
+		if err := c.keyIndex.DeleteByUserKey(key, h); err != nil {
+			log.Warn("keyindex delete failed", "error", err)
+		}
 	}
 
 	// Update segment metadata (for compaction selection)
@@ -704,6 +752,40 @@ func (c *Cache) handleStorageError(h Key, e index.Item, err error) {
 	errno := base.ToErrno(err)
 	log.Warn("permanent blob error detected", "hash", h, "errno", errno, "error", err)
 	c.ReportBlobError(h, errno)
+}
+
+// reconcileKeyIndex ensures the Pebble key index is in sync with the RAM index.
+// For each registered segment, checks for a sentinel in Pebble. If missing,
+// scans the .seg file to extract user keys and adds them to Pebble.
+func (c *Cache) reconcileKeyIndex() {
+	segIDs := c.index.SnapshotSegmentIDs()
+	var rebuilt int
+	for _, segID := range segIDs {
+		has, err := c.keyIndex.HasSentinel(segID)
+		if err != nil {
+			log.Warn("keyindex sentinel check failed", "segID", segID, "error", err)
+			continue
+		}
+		if has {
+			continue // Already in Pebble.
+		}
+
+		// Segment not in Pebble — rebuild from .seg file.
+		segPath := getSegmentPath(c.Path, c.Shards, segID)
+		entries, err := scanSegmentForUserKeys(segPath)
+		if err != nil {
+			log.Warn("keyindex rebuild scan failed", "segID", segID, "error", err)
+			continue
+		}
+		if err := c.keyIndex.AddEntries(segID, entries); err != nil {
+			log.Warn("keyindex rebuild add failed", "segID", segID, "error", err)
+			continue
+		}
+		rebuilt++
+	}
+	if rebuilt > 0 {
+		log.Info("keyindex reconciliation complete", "rebuilt", rebuilt, "total", len(segIDs))
+	}
 }
 
 func (c *Cache) rebuildBloom() error {
@@ -945,6 +1027,16 @@ func (c *Cache) runEvictionSieve(maxCacheSize int64) error {
 			return fmt.Errorf("eviction durability sync failed: %w", err)
 		}
 
+		// Remove evicted items from Pebble key index (best-effort).
+		// Uses reverse lookup: hash → user key.
+		if c.keyIndex != nil {
+			for _, v := range batch {
+				if err := c.keyIndex.DeleteByHash(v.Key); err != nil {
+					log.Warn("keyindex eviction delete failed", "error", err)
+				}
+			}
+		}
+
 		// Group by segment and update metadata.
 		segStats := make(map[uint32]struct {
 			count int32
@@ -1044,20 +1136,27 @@ func (c *Cache) maybeDrainSegments() error {
 			break
 		}
 
-		// Exclusive segment lock: blocks Delete() during drain.
+		// Exclusive segment lock: blocks concurrent reads and Delete() during drain.
+		// File deletion must happen inside the lock to prevent TOCTOU races where
+		// a reader has already resolved an Item but hasn't opened the file yet.
 		shard := c.index.SegmentLockShard(seg.ID)
 		shard.Lock()
 
 		drainedBytes, drainedCount := c.index.DrainSegment(seg.ID)
 		c.archivist.DropSegmentCache(seg.ID)
 
-		shard.Unlock()
-
-		// Delete .seg file (outside lock — file is already unreferenced).
-		// .meta was already deleted by DrainSegment; double-delete is harmless.
 		if err := DeleteSegmentFiles(c.Path, c.Shards, seg.ID); err != nil {
 			log.Warn("drain: delete segment file", "segID", seg.ID, "error", err)
 		}
+
+		// Remove all entries for this segment from Pebble key index.
+		if c.keyIndex != nil {
+			if err := c.keyIndex.DrainSegment(seg.ID); err != nil {
+				log.Warn("keyindex drain failed", "segID", seg.ID, "error", err)
+			}
+		}
+
+		shard.Unlock()
 
 		totalDrainedBytes += drainedBytes
 		totalDrainedCount += drainedCount

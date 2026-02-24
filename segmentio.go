@@ -66,8 +66,21 @@ func scanMaxSegmentID(basePath string, shards int) uint32 {
 	return maxID
 }
 
-// DeleteSegmentFiles removes segment, SSTable, tombstone, and legacy metadata files
-// for the given segment ID. Returns nil if files don't exist.
+// SegmentSSTPath returns the SSTable path for a segment (legacy migration cleanup).
+func SegmentSSTPath(segmentPath string) string {
+	ext := filepath.Ext(segmentPath)
+	return segmentPath[:len(segmentPath)-len(ext)] + ".sst"
+}
+
+// SegmentDelPath returns the tombstone log path for a segment (legacy migration cleanup).
+func SegmentDelPath(segmentPath string) string {
+	ext := filepath.Ext(segmentPath)
+	return segmentPath[:len(segmentPath)-len(ext)] + ".del"
+}
+
+// DeleteSegmentFiles removes segment and metadata files for the given segment ID.
+// Also cleans up legacy .sst/.del files from pre-Pebble migration.
+// Returns nil if files don't exist.
 func DeleteSegmentFiles(basePath string, shards int, segmentID uint32) error {
 	segPath := getSegmentPath(basePath, shards, segmentID)
 	var errs []error
@@ -76,20 +89,74 @@ func DeleteSegmentFiles(basePath string, shards int, segmentID uint32) error {
 	if err := os.Remove(segPath); err != nil && !os.IsNotExist(err) {
 		errs = append(errs, fmt.Errorf("delete segment %d file: %w", segmentID, err))
 	}
-	// Delete .sst SSTable index (may not exist for pre-migration segments).
-	if err := os.Remove(SegmentSSTPath(segPath)); err != nil && !os.IsNotExist(err) {
-		errs = append(errs, fmt.Errorf("delete segment %d sst: %w", segmentID, err))
-	}
-	// Delete .del tombstone log (may not exist if no tombstones).
-	if err := os.Remove(SegmentDelPath(segPath)); err != nil && !os.IsNotExist(err) {
-		errs = append(errs, fmt.Errorf("delete segment %d del: %w", segmentID, err))
-	}
-	// Delete legacy .meta file (migration cleanup — may not exist).
+	// Delete .meta metadata file.
 	if err := os.Remove(SegmentMetaPath(segPath)); err != nil && !os.IsNotExist(err) {
 		errs = append(errs, fmt.Errorf("delete segment %d meta: %w", segmentID, err))
 	}
+	// Delete legacy .sst file (migration cleanup — may not exist).
+	if err := os.Remove(SegmentSSTPath(segPath)); err != nil && !os.IsNotExist(err) {
+		errs = append(errs, fmt.Errorf("delete segment %d sst: %w", segmentID, err))
+	}
+	// Delete legacy .del file (migration cleanup — may not exist).
+	if err := os.Remove(SegmentDelPath(segPath)); err != nil && !os.IsNotExist(err) {
+		errs = append(errs, fmt.Errorf("delete segment %d del: %w", segmentID, err))
+	}
 
 	return errors.Join(errs...)
+}
+
+// scanSegmentForUserKeys scans a segment file to extract user key bytes and
+// their 128-bit hashes. Used to populate the KeyIndex when a segment's sentinel
+// is missing (first open or Pebble rebuild).
+//
+// This reads record headers sequentially, extracting only the key bytes and hash.
+// Deleted records are skipped. Performance: ~100MB/s sequential read.
+func scanSegmentForUserKeys(segPath string) ([]KeyIndexEntry, error) {
+	f, err := os.Open(segPath)
+	if err != nil {
+		return nil, fmt.Errorf("open segment for key scan: %w", err)
+	}
+	defer func() {
+		if closeErr := f.Close(); closeErr != nil {
+			log.Warn("close segment file after key scan", "path", segPath, "error", closeErr)
+		}
+	}()
+
+	info, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat segment for key scan: %w", err)
+	}
+
+	footer, err := record.ScanSegmentFile(f, info.Size(), 0)
+	if err != nil {
+		return nil, fmt.Errorf("scan segment for keys: %w", err)
+	}
+
+	// Re-read key bytes from disk for each entry.
+	var entries []KeyIndexEntry
+	for i := range footer.Entries {
+		entry := &footer.Entries[i]
+		if entry.IsDeleted() {
+			continue
+		}
+
+		keyLen := int(entry.KeyLen)
+		if keyLen == 0 {
+			continue
+		}
+
+		keyBuf := make([]byte, keyLen)
+		if _, err := f.ReadAt(keyBuf, entry.Pos+record.HeaderSize); err != nil {
+			continue // Skip unreadable entries.
+		}
+
+		entries = append(entries, KeyIndexEntry{
+			UserKey: keyBuf,
+			Hash:    entry.Key,
+		})
+	}
+
+	return entries, nil
 }
 
 // ErrEntryTooLarge is returned when a footer entry exceeds uint32 limits.

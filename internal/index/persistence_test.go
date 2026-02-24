@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -51,53 +50,6 @@ func footerEntryFromItem(item Item) record.FooterEntry {
 	}
 }
 
-// testReadSSTViaMeta creates a ReadSSTFunc that reads the .meta footer block
-// (without tombstones) and returns it as if it were an .sst file. This allows
-// tests that create .meta files to work with the new .sst + .del flow.
-func testReadSSTViaMeta() ReadSSTFunc {
-	return func(sstPath string, segmentID uint32) (DurableBatch, error) {
-		// Convert .sst path to .meta path.
-		metaPath := strings.TrimSuffix(sstPath, ".sst") + ".meta"
-
-		f, err := os.Open(metaPath)
-		if err != nil {
-			return DurableBatch{}, err
-		}
-		defer f.Close()
-
-		stat, err := f.Stat()
-		if err != nil {
-			return DurableBatch{}, err
-		}
-		if stat.Size() < record.TailSize {
-			return DurableBatch{}, fmt.Errorf("meta file too small: %d", stat.Size())
-		}
-
-		footerBlockSize, err := findFooterBlockSize(metaPath)
-		if err != nil {
-			return DurableBatch{}, err
-		}
-
-		footer, _, err := record.ReadFooterBlock(f, footerBlockSize, int64(segmentID))
-		if err != nil {
-			return DurableBatch{}, err
-		}
-
-		items := make([]Item, len(footer.Entries))
-		for i := range footer.Entries {
-			items[i] = footerEntryToItem(uint32(footer.SegmentID), &footer.Entries[i])
-		}
-
-		return DurableBatch{
-			SegmentID: uint32(footer.SegmentID),
-			CTime:     footer.CTime,
-			MaxSeqID:  footer.MaxSeqID,
-			Items:     items,
-			Entries:   footer.Entries,
-		}, nil
-	}
-}
-
 func TestPersistence(t *testing.T) {
 	tmp := t.TempDir()
 
@@ -105,8 +57,7 @@ func TestPersistence(t *testing.T) {
 	segDir := filepath.Join(tmp, "segments", "0000")
 	require.NoError(t, os.MkdirAll(segDir, 0o755))
 
-	readSST := testReadSSTViaMeta()
-	p, err := newPersistence(tmp, 1, readSST)
+	p, err := newPersistence(tmp, 1)
 	require.NoError(t, err)
 	defer p.close()
 
@@ -122,7 +73,6 @@ func TestPersistence(t *testing.T) {
 		// Write footer to .meta file
 		writeTestFooter(t, p.metaPath(segID), segID, entries, 12345)
 
-		// Read via readMetaFile (legacy path)
 		manifest, err := p.readMetaFile(segID)
 		require.NoError(t, err)
 		require.Equal(t, segID, manifest.SegmentID)
@@ -144,7 +94,7 @@ func TestPersistence(t *testing.T) {
 	})
 
 	t.Run("Tombstones", func(t *testing.T) {
-		// Write base manifest (acts as .sst via mock ReadSSTFunc)
+		// Write base manifest
 		var segID uint32 = 400
 		items := []Item{
 			{Key: Key{Lo: 1}, SegmentID: segID, PhysicalLen: 100},
@@ -157,12 +107,12 @@ func TestPersistence(t *testing.T) {
 		}
 		writeTestFooter(t, p.metaPath(segID), segID, entries, 0)
 
-		// Write tombstone for key 2 (goes to .del file)
+		// Write tombstone for key 2
 		require.NoError(t, p.tombstone(segID, Key{Lo: 2}, nil))
-		require.NoError(t, p.flushTombstoneFile(segID))
+		require.NoError(t, p.flushMetaFile(segID))
 
-		// Read back via readSegmentIndex (.sst mock + .del merge)
-		manifest, err := p.readSegmentIndex(segID)
+		// Read back and verify tombstone is applied
+		manifest, err := p.readMetaFile(segID)
 		require.NoError(t, err)
 		require.Len(t, manifest.Items, 3)
 
@@ -193,10 +143,9 @@ func TestPersistence(t *testing.T) {
 			{Key: Key{Lo: 10}, SegmentID: segID},
 			{Key: Key{Lo: 30}, SegmentID: segID},
 		}))
-		require.NoError(t, p.flushTombstoneFile(segID))
+		require.NoError(t, p.flushMetaFile(segID))
 
-		// Read back via readSegmentIndex (.sst mock + .del merge)
-		manifest, err := p.readSegmentIndex(segID)
+		manifest, err := p.readMetaFile(segID)
 		require.NoError(t, err)
 
 		deleted := 0
@@ -213,20 +162,18 @@ func TestPersistence(t *testing.T) {
 		writeTestFooter(t, p.metaPath(segID), segID,
 			[]record.FooterEntry{footerEntryFromItem(Item{Key: Key{Lo: 600}, SegmentID: segID})}, 0)
 
-		// Write a tombstone to create a .del file
-		require.NoError(t, p.tombstone(segID, Key{Lo: 600}, nil))
-		require.NoError(t, p.flushTombstoneFile(segID))
-
-		// Verify .del file exists
-		_, err := os.Stat(p.delPath(segID))
+		// Verify it exists
+		manifest, err := p.readMetaFile(segID)
 		require.NoError(t, err)
+		require.Len(t, manifest.Items, 1)
 
-		// Drop it (closes and deletes .del file)
+		// Drop it
 		require.NoError(t, p.dropSegment(segID))
 
-		// Verify .del file is gone
-		_, err = os.Stat(p.delPath(segID))
-		require.True(t, os.IsNotExist(err), ".del file should be deleted after drop")
+		// Verify it's gone
+		manifest, err = p.readMetaFile(segID)
+		require.NoError(t, err)
+		require.Empty(t, manifest.Items)
 	})
 }
 
@@ -239,7 +186,7 @@ func TestPersistence(t *testing.T) {
 func TestHasOlderShadow(t *testing.T) {
 	tmp := t.TempDir()
 
-	idx, err := OpenIndex(tmp, 0, 1000, nil)
+	idx, err := OpenIndex(tmp, 0, 1000)
 	require.NoError(t, err)
 	defer idx.Close()
 
@@ -319,7 +266,7 @@ func TestHasOlderShadow(t *testing.T) {
 func TestSegmentRegistry(t *testing.T) {
 	tmp := t.TempDir()
 
-	p, err := newPersistence(tmp, 1, nil)
+	p, err := newPersistence(tmp, 1)
 	require.NoError(t, err)
 	defer p.close()
 
@@ -407,10 +354,8 @@ func TestDurableIndex(t *testing.T) {
 	segDir := filepath.Join(tmp, "segments", "0000")
 	require.NoError(t, os.MkdirAll(segDir, 0o755))
 
-	readSST := testReadSSTViaMeta()
-
 	// Create index
-	idx, err := OpenIndex(tmp, 1, 1000, readSST)
+	idx, err := OpenIndex(tmp, 1, 1000)
 	require.NoError(t, err)
 
 	var segID uint32 = 1
@@ -445,11 +390,11 @@ func TestDurableIndex(t *testing.T) {
 	// Close and reopen
 	require.NoError(t, idx.Close())
 
-	idx2, err := OpenIndex(tmp, 1, 1000, readSST)
+	idx2, err := OpenIndex(tmp, 1, 1000)
 	require.NoError(t, err)
 	defer idx2.Close()
 
-	// Verify data survived (loaded from .meta file via migration)
+	// Verify data survived (loaded from .meta file)
 	require.Equal(t, 3, idx2.NumItems())
 	item, ok = idx2.Get(Key{Lo: 200})
 	require.True(t, ok)

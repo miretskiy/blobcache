@@ -22,7 +22,7 @@ func Benchmark_IndexLookup(b *testing.B) {
 			}
 			defer os.RemoveAll(tmpDir)
 
-			idx, err := OpenIndex(tmpDir, 0, numKeys, nil)
+			idx, err := OpenIndex(tmpDir, 0, numKeys)
 			if err != nil {
 				b.Fatal(err)
 			}

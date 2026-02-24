@@ -783,7 +783,7 @@ func BenchmarkEviction_SieveVictimSelection(b *testing.B) {
 	tmpDir := b.TempDir()
 	defer os.RemoveAll(tmpDir)
 
-	idx, err := index.OpenIndex(tmpDir, 0, 1_000_000, ReadSST)
+	idx, err := index.OpenIndex(tmpDir, 0, 1_000_000)
 	if err != nil {
 		b.Fatal(err)
 	}

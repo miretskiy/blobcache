@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"sort"
-	"time"
 
 	"github.com/miretskiy/blobcache/internal/index"
 	"github.com/miretskiy/blobcache/internal/record"
@@ -283,20 +282,7 @@ func (c *Cache) rewriteSegment(segID uint32) (result RewriteResult, retErr error
 		return result, fmt.Errorf("rename compaction output: %w", err)
 	}
 
-	// 14. Rewrite .sst for new segment by filtering source .sst.
-	// Build hash→new_offset mapping from outputMappings.
-	liveOffsets := make(map[Key]uint32, len(outputMappings))
-	for i := range outputMappings {
-		liveOffsets[outputMappings[i].entry.Key] = uint32(outputMappings[i].entry.Pos)
-	}
-
-	srcSSTPath := SegmentSSTPath(getSegmentPath(c.Path, c.Shards, segID))
-	dstSSTPath := SegmentSSTPath(dstPath)
-	if err := RewriteSSTable(srcSSTPath, dstSSTPath, newSegID, liveOffsets, tombstoneEntries, time.Now().Unix()); err != nil {
-		return result, fmt.Errorf("rewrite sst: %w", err)
-	}
-
-	// Build allEntries for index registration (live + tombstones).
+	// 14. Write .meta footer for the new segment.
 	outputEntries := make([]record.FooterEntry, len(outputMappings))
 	for i := range outputMappings {
 		outputEntries[i] = outputMappings[i].entry
@@ -308,6 +294,10 @@ func (c *Cache) rewriteSegment(segID uint32) (result RewriteResult, retErr error
 		tombstoneEntries[i].PhysicalSize = 0
 		tombstoneEntries[i].SetDeleted()
 		allEntries = append(allEntries, tombstoneEntries[i])
+	}
+
+	if err := WriteFooter(newSegID, allEntries, dstPath, 0); err != nil {
+		return result, fmt.Errorf("write compaction footer: %w", err)
 	}
 
 	// 15. Register new segment in index.
@@ -327,6 +317,17 @@ func (c *Cache) rewriteSegment(segID uint32) (result RewriteResult, retErr error
 		}
 	}
 	c.index.RelocateBatch(relocations)
+
+	// 16b. Update Pebble key index: relocate segment membership.
+	if c.keyIndex != nil {
+		hashes := make([]Key, len(outputMappings))
+		for i := range outputMappings {
+			hashes[i] = outputMappings[i].entry.Key
+		}
+		if err := c.keyIndex.RelocateSegment(segID, newSegID, hashes); err != nil {
+			log.Warn("keyindex relocate failed", "oldSeg", segID, "newSeg", newSegID, "error", err)
+		}
+	}
 
 	// 17. Drop old segment.
 	if err := c.index.DropSegment(segID); err != nil {
@@ -389,11 +390,10 @@ func (c *Cache) maybeRewriteSegments() error {
 					continue
 				}
 				c.archivist.DropSegmentCache(segID)
-				shard.Unlock()
-
 				if err := DeleteSegmentFiles(c.Path, c.Shards, segID); err != nil {
 					log.Warn("delete dead segment files", "segID", segID, "error", err)
 				}
+				shard.Unlock()
 				deleted++
 				continue
 			}
@@ -419,11 +419,10 @@ func (c *Cache) maybeRewriteSegments() error {
 				continue
 			}
 			c.archivist.DropSegmentCache(segID)
-			shard.Unlock()
-
 			if err := DeleteSegmentFiles(c.Path, c.Shards, segID); err != nil {
 				log.Warn("delete dead segment files", "segID", segID, "error", err)
 			}
+			shard.Unlock()
 			deleted++
 		} else {
 			rewritten++

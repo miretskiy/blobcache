@@ -18,10 +18,9 @@ type DurableIndex struct {
 }
 
 // OpenIndex creates a DurableIndex by loading persisted metadata from disk.
-// The basePath should contain a "segments" subdirectory with .sst/.del files.
-// readSST is the function used to read SSTable files (typically blobcache.ReadSST).
-func OpenIndex(basePath string, shards int, initialCapacity int, readSST ReadSSTFunc) (*DurableIndex, error) {
-	p, err := newPersistence(basePath, shards, readSST)
+// The basePath should contain a "segments" subdirectory with .meta files.
+func OpenIndex(basePath string, shards int, initialCapacity int) (*DurableIndex, error) {
+	p, err := newPersistence(basePath, shards)
 	if err != nil {
 		return nil, err
 	}
@@ -506,7 +505,7 @@ func (idx *DurableIndex) GetRewriteCandidates(maxEligibleID uint32, wasteThresho
 }
 
 // SnapshotSegmentIDs returns a sorted copy of all registered segment IDs.
-// Used by the iterator to capture a consistent view of segments.
+// Used by KeyIndex reconciliation to ensure Pebble matches the RAM index.
 func (idx *DurableIndex) SnapshotSegmentIDs() []uint32 {
 	return idx.segments.snapshotSegmentIDs()
 }

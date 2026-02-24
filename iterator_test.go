@@ -1,7 +1,6 @@
 package blobcache
 
 import (
-	"bytes"
 	"fmt"
 	"testing"
 
@@ -65,26 +64,34 @@ func TestIterator_SeekGE(t *testing.T) {
 	}
 	cache.Drain()
 
-	iter, err := cache.NewIterator(nil, nil)
-	require.NoError(t, err)
-	defer iter.Close()
-
 	t.Run("ExactMatch", func(t *testing.T) {
+		iter, err := cache.NewIterator(nil, nil)
+		require.NoError(t, err)
+		defer iter.Close()
 		require.True(t, iter.SeekGE([]byte("ccc")))
 		require.Equal(t, "ccc", string(iter.Key()))
 	})
 
 	t.Run("BetweenKeys", func(t *testing.T) {
+		iter, err := cache.NewIterator(nil, nil)
+		require.NoError(t, err)
+		defer iter.Close()
 		require.True(t, iter.SeekGE([]byte("ddd")))
 		require.Equal(t, "eee", string(iter.Key()))
 	})
 
 	t.Run("BeforeFirst", func(t *testing.T) {
+		iter, err := cache.NewIterator(nil, nil)
+		require.NoError(t, err)
+		defer iter.Close()
 		require.True(t, iter.SeekGE([]byte("a")))
 		require.Equal(t, "aaa", string(iter.Key()))
 	})
 
 	t.Run("AfterLast", func(t *testing.T) {
+		iter, err := cache.NewIterator(nil, nil)
+		require.NoError(t, err)
+		defer iter.Close()
 		require.False(t, iter.SeekGE([]byte("zzz")))
 	})
 }
@@ -129,8 +136,8 @@ func TestIterator_TombstoneFiltering(t *testing.T) {
 	}
 }
 
-// TestIterator_Dedup verifies that when the same key exists in multiple segments,
-// only the newest version is yielded.
+// TestIterator_Dedup verifies that when the same key is written twice,
+// it appears exactly once in iteration (Pebble stores one entry per user key).
 func TestIterator_Dedup(t *testing.T) {
 	tmpDir := t.TempDir()
 	cache, err := New(tmpDir, WithMaxSize(100<<20), WithWriteBufferSize(1<<20))
@@ -165,7 +172,7 @@ func TestIterator_Dedup(t *testing.T) {
 	}
 	require.NoError(t, iter.Error())
 
-	// Should appear exactly once (dedup by merging iter).
+	// Should appear exactly once (Pebble stores one key→hash mapping).
 	require.Equal(t, 1, dupCount, "duplicate key should appear exactly once")
 }
 
@@ -210,138 +217,3 @@ func TestIterator_Empty(t *testing.T) {
 	require.NoError(t, iter.Error())
 	require.False(t, iter.Valid())
 }
-
-// TestMergingIter_ManySegments verifies correct merge across many segments.
-func TestMergingIter_ManySegments(t *testing.T) {
-	// Create mock sources simulating many segments.
-	numSources := 50
-	keysPerSource := 10
-
-	var sources []mergeSource
-	for s := range numSources {
-		var entries []mockEntry
-		for k := range keysPerSource {
-			key := fmt.Appendf(nil, "seg%03d-key%03d", s, k)
-			entries = append(entries, mockEntry{key: key})
-		}
-		sources = append(sources, mergeSource{
-			segID: uint32(s + 1),
-			iter:  &mockIter{entries: entries, pos: -1},
-		})
-	}
-
-	m := newMergingIter(sources, bytes.Compare)
-	defer m.Close()
-
-	var collected []string
-	key, _, ok := m.First()
-	for ok {
-		collected = append(collected, string(key))
-		key, _, ok = m.Next()
-	}
-	require.NoError(t, m.Error())
-
-	// All keys should be present and sorted.
-	require.Len(t, collected, numSources*keysPerSource)
-	for i := 1; i < len(collected); i++ {
-		require.True(t, collected[i-1] < collected[i],
-			"keys not in order at position %d: %q >= %q", i, collected[i-1], collected[i])
-	}
-}
-
-// TestMergingIter_Dedup verifies same key across segments — newest wins.
-func TestMergingIter_Dedup(t *testing.T) {
-	sharedKey := []byte("shared")
-
-	sources := []mergeSource{
-		{segID: 1, iter: &mockIter{entries: []mockEntry{
-			{key: append([]byte(nil), sharedKey...), segID: 1},
-			{key: []byte("only-in-1")},
-		}, pos: -1}},
-		{segID: 3, iter: &mockIter{entries: []mockEntry{
-			{key: []byte("only-in-3")},
-			{key: append([]byte(nil), sharedKey...), segID: 3},
-		}, pos: -1}},
-		{segID: 2, iter: &mockIter{entries: []mockEntry{
-			{key: []byte("only-in-2")},
-			{key: append([]byte(nil), sharedKey...), segID: 2},
-		}, pos: -1}},
-	}
-
-	m := newMergingIter(sources, bytes.Compare)
-	defer m.Close()
-
-	var collected []string
-	var seenSharedSegID uint64
-	key, val, ok := m.First()
-	for ok {
-		collected = append(collected, string(key))
-		if string(key) == "shared" {
-			seenSharedSegID = val.Hash.Lo // We encode segID in the mock value
-		}
-		key, val, ok = m.Next()
-	}
-	require.NoError(t, m.Error())
-
-	// "shared" should appear exactly once.
-	sharedCount := 0
-	for _, k := range collected {
-		if k == "shared" {
-			sharedCount++
-		}
-	}
-	require.Equal(t, 1, sharedCount, "shared key should appear once")
-
-	// The version from segment 3 (highest segID) should win.
-	require.Equal(t, uint64(3), seenSharedSegID,
-		"highest segID should win for duplicate keys")
-}
-
-// --- Mock iterator for unit testing the merging iterator ---
-
-type mockEntry struct {
-	key   []byte
-	segID uint32 // stored in sstValue.Hash.Lo for dedup verification
-}
-
-type mockIter struct {
-	entries []mockEntry
-	pos     int
-}
-
-func (m *mockIter) First() ([]byte, []byte, bool) {
-	m.pos = 0
-	return m.current()
-}
-
-func (m *mockIter) Next() ([]byte, []byte, bool) {
-	m.pos++
-	return m.current()
-}
-
-func (m *mockIter) SeekGE(target []byte) ([]byte, []byte, bool) {
-	m.pos = 0
-	for m.pos < len(m.entries) {
-		if bytes.Compare(m.entries[m.pos].key, target) >= 0 {
-			return m.current()
-		}
-		m.pos++
-	}
-	return nil, nil, false
-}
-
-func (m *mockIter) current() ([]byte, []byte, bool) {
-	if m.pos >= len(m.entries) {
-		return nil, nil, false
-	}
-	e := &m.entries[m.pos]
-	// Encode a mock sstValue with segID in Hash.Lo for dedup tests.
-	val := encodeSSTValue(&sstEntry{
-		Hash:    Key{Lo: uint64(e.segID)},
-		KeyLen:  uint16(len(e.key)),
-	})
-	return e.key, val[:], true
-}
-
-func (m *mockIter) Close() error { return nil }
-func (m *mockIter) Error() error { return nil }

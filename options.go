@@ -278,7 +278,7 @@ func defaultConfig(path string) config {
 	return config{
 		Path:                     path,
 		MaxSize:                  0,
-		Shards:                   0,
+		Shards:                   0,        // 0 = auto-computed from MaxSize/WriteBufferSize
 		WriteBufferSize:          64 << 20, // 64MB
 		MaxInflightSlabs:         6,
 		MaxCachedSlabs:           8, // Keep ~1GB of recently written data in RAM

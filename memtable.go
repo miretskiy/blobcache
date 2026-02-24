@@ -1,13 +1,11 @@
 package blobcache
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"os"
 	"slices"
 	"sync"
-	"time"
 
 	"github.com/miretskiy/blobcache/bloom"
 	"github.com/miretskiy/blobcache/compression"
@@ -41,7 +39,8 @@ type MemTable struct {
 	segIDs    SegmentIDProvider
 	slabPool  *MmapPool
 	publisher Publisher
-	wal       *wal.WAL // nil if WAL disabled
+	wal       *wal.WAL  // nil if WAL disabled
+	keyIndex  *KeyIndex // nil if key index disabled
 
 	mu struct {
 		sync.Mutex
@@ -482,9 +481,9 @@ func (mt *MemTable) flushViaRename(as *ActiveSlab) error {
 	// 2. Sort by position for linear I/O
 	sortEntriesByPos(entries)
 
-	// 3. Collect SST entries (user key bytes from slab buffer, final coords from entries).
+	// 3. Collect key index entries (user key bytes from slab buffer).
 	// MUST happen while slab buffer is still pinned.
-	sstEntries := collectSSTEntries(as, entries)
+	kiEntries := collectKeyIndexEntries(as, entries)
 
 	// 4. Allocate segment ID
 	segmentID := mt.segIDs.NextSegmentID()
@@ -496,8 +495,8 @@ func (mt *MemTable) flushViaRename(as *ActiveSlab) error {
 		return fmt.Errorf("rename wal to segment: %w", err)
 	}
 
-	// 6. Finalize (write .sst + index update)
-	return mt.finalizeFlush(segmentID, segmentPath, entries, maxSeqID, sstEntries)
+	// 6. Finalize (write .meta + index update + key index update)
+	return mt.finalizeFlush(segmentID, segmentPath, entries, maxSeqID, kiEntries)
 }
 
 // flushViaMerge handles cache mode: writes slab data with XL payloads interleaved.
@@ -517,9 +516,9 @@ func (mt *MemTable) flushViaMerge(as *ActiveSlab) error {
 		adjustFilePositionsForXLWrites(entries, xlWrites, xlSeqIDs)
 	}
 
-	// 4. Collect SST entries (user key bytes from slab buffer, final coords from entries).
+	// 4. Collect key index entries (user key bytes from slab buffer).
 	// MUST happen while slab buffer is still pinned, AFTER position adjustment.
-	sstEntries := collectSSTEntries(as, entries)
+	kiEntries := collectKeyIndexEntries(as, entries)
 
 	// 5. Allocate segment ID and compute I/O flags
 	segmentID := mt.segIDs.NextSegmentID()
@@ -540,8 +539,8 @@ func (mt *MemTable) flushViaMerge(as *ActiveSlab) error {
 		}
 	}
 
-	// 7. Finalize (write .sst + index update)
-	return mt.finalizeFlush(segmentID, segmentPath, entries, maxSeqID, sstEntries)
+	// 7. Finalize (write .meta + index update + key index update)
+	return mt.finalizeFlush(segmentID, segmentPath, entries, maxSeqID, kiEntries)
 }
 
 // collectEntries extracts footer entries from the slab index.
@@ -592,28 +591,23 @@ func collectXLWrites(as *ActiveSlab) ([]SlabEntry, map[uint64]int) {
 	return xlWrites, xlSeqIDs
 }
 
-// collectSSTEntries extracts user key bytes from the slab buffer and pairs them
-// with final segment coordinates from the footer entries. Returns sorted sstEntry
-// slice ready for WriteSSTFile.
+// collectKeyIndexEntries extracts user key bytes from the slab buffer and pairs
+// them with their 128-bit hashes for insertion into the global Pebble key index.
 //
 // MUST be called while the slab buffer is still pinned (before Unpin).
-// entries MUST have their final Pos values (after adjustFilePositionsForXLWrites
-// in cache mode, or WalPos in WAL mode).
-func collectSSTEntries(as *ActiveSlab, entries []record.FooterEntry) []sstEntry {
-	// Build lookup from hash → entry index for final coordinates.
-	byHash := make(map[Key]int, len(entries))
+func collectKeyIndexEntries(as *ActiveSlab, entries []record.FooterEntry) []KeyIndexEntry {
+	result := make([]KeyIndexEntry, 0, len(entries))
+
+	// Build set of known hashes for validation.
+	known := make(map[Key]struct{}, len(entries))
 	for i := range entries {
-		byHash[entries[i].Key] = i
+		known[entries[i].Key] = struct{}{}
 	}
 
-	result := make([]sstEntry, 0, len(entries))
-
 	as.index.ForEach(func(key xmap.Key, e SlabEntry, _ *xmap.Pad32) bool {
-		idx, ok := byHash[key]
-		if !ok {
-			return true // Skip (shouldn't happen)
+		if _, ok := known[key]; !ok {
+			return true // Skip unknown entries.
 		}
-		fe := &entries[idx]
 
 		// Extract user key bytes from slab buffer.
 		var keyBytes []byte
@@ -629,22 +623,11 @@ func collectSSTEntries(as *ActiveSlab, entries []record.FooterEntry) []sstEntry 
 			copy(keyBytes, as.buf.Bytes()[start:start+int(e.KeyLen)])
 		}
 
-		result = append(result, sstEntry{
-			UserKey:      keyBytes,
-			Hash:         key,
-			Offset:       uint32(fe.Pos),
-			LogicalSize:  uint32(fe.LogicalSize),
-			PhysicalSize: uint32(fe.PhysicalSize),
-			SeqID:        fe.SeqID,
-			Flags:        uint32(fe.Flags),
-			KeyLen:       fe.KeyLen,
+		result = append(result, KeyIndexEntry{
+			UserKey: keyBytes,
+			Hash:    key,
 		})
 		return true
-	})
-
-	// Sort by user key bytes (lexicographic order, matching pebble.DefaultComparer).
-	slices.SortFunc(result, func(a, b sstEntry) int {
-		return bytes.Compare(a.UserKey, b.UserKey)
 	})
 
 	return result
@@ -697,10 +680,11 @@ func (mt *MemTable) ioFlags() sys.OpenFlag {
 	return flags
 }
 
-// finalizeFlush writes the .sst file and updates the index.
+// finalizeFlush writes the .meta footer, updates the RAM index, and updates the
+// Pebble key index (if available).
 func (mt *MemTable) finalizeFlush(
 	segmentID uint32, segmentPath string, entries []record.FooterEntry, maxSeqID uint64,
-	sstEntries []sstEntry,
+	kiEntries []KeyIndexEntry,
 ) error {
 	if mt.Knobs != nil && mt.Knobs.InjectIndexErr != nil {
 		if err := mt.Knobs.InjectIndexErr(); err != nil {
@@ -708,35 +692,21 @@ func (mt *MemTable) finalizeFlush(
 		}
 	}
 
-	// Compute min/max SeqID for SSTable properties.
-	var minSeqID uint64
-	if len(entries) > 0 {
-		minSeqID = entries[0].SeqID
-		for i := 1; i < len(entries); i++ {
-			if entries[i].SeqID < minSeqID {
-				minSeqID = entries[i].SeqID
-			}
-		}
+	// Write .meta footer — segment self-description (source of truth).
+	if err := WriteFooter(segmentID, entries, segmentPath, 0); err != nil {
+		return fmt.Errorf("write footer: %w", err)
 	}
 
-	// Write .sst BEFORE updating index.
-	// This ensures the SSTable exists before items become evictable/iterable.
-	sstPath := SegmentSSTPath(segmentPath)
-	meta := sstMeta{
-		SegmentID:   segmentID,
-		CTime:       time.Now().Unix(),
-		MinSeqID:    minSeqID,
-		MaxSeqID:    maxSeqID,
-		RecordCount: int64(len(entries)),
-	}
-	if err := WriteSSTFile(sstPath, sstEntries, meta); err != nil {
-		return fmt.Errorf("write sst: %w", err)
-	}
-
-	// Update index (items now visible to lookups and eviction).
-	// Passes raw entries for in-memory manifest caching.
+	// Update RAM index (items now visible to lookups and eviction).
 	if err := mt.PutBatch(segmentID, entries, maxSeqID); err != nil {
 		return fmt.Errorf("index update: %w", err)
+	}
+
+	// Update Pebble key index (best-effort — rebuildable).
+	if mt.keyIndex != nil && len(kiEntries) > 0 {
+		if err := mt.keyIndex.AddEntries(segmentID, kiEntries); err != nil {
+			log.Warn("keyindex update failed during flush", "segID", segmentID, "error", err)
+		}
 	}
 
 	return nil

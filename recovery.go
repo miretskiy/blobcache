@@ -2,6 +2,7 @@ package blobcache
 
 import (
 	"fmt"
+	"math/bits"
 
 	"github.com/miretskiy/blobcache/internal/index"
 )
@@ -23,12 +24,19 @@ func RecoverIndex(path string, opts ...Option) (*Cache, error) {
 		opt.apply(&cfg)
 	}
 
+	// Auto-compute shard count (same heuristic as New).
+	if cfg.Shards == 0 && cfg.MaxSize > 0 && cfg.WriteBufferSize > 0 {
+		totalFiles := cfg.MaxSize / int64(cfg.WriteBufferSize) * 3
+		shards := 1 << bits.Len(uint(max(1, totalFiles/1024)-1))
+		cfg.Shards = min(shards, 256)
+	}
+
 	log.Info("starting cache recovery", "path", path)
 
 	shards := max(1, cfg.Shards)
 
 	// OpenIndex handles all recovery automatically via scanAll
-	idx, err := index.OpenIndex(path, shards, 100000, ReadSST)
+	idx, err := index.OpenIndex(path, shards, 100000)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open index: %w", err)
 	}
@@ -42,7 +50,19 @@ func RecoverIndex(path string, opts ...Option) (*Cache, error) {
 	}
 	c.librarian = NewLibrarian(cfg.MaxCachedSlabs, c)
 	c.Knobs = cfg.knobs
+
+	// Open and reconcile key index.
+	ki, kiErr := OpenKeyIndex(cfg.Path)
+	if kiErr != nil {
+		log.Warn("failed to open key index during recovery", "error", kiErr)
+	}
+	c.keyIndex = ki
+	if c.keyIndex != nil {
+		c.reconcileKeyIndex()
+	}
+
 	c.memTable = NewMemTable(c.config, c, c, c.librarian, nil, c.segIDs) // No WAL during recovery
+	c.memTable.keyIndex = c.keyIndex
 	c.memTable.Knobs = c.Knobs
 
 	// Build Bloom Filter synchronously

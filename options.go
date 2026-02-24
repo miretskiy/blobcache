@@ -76,8 +76,8 @@ type config struct {
 	IOScheduler iosched.IOScheduler // Pluggable I/O backend for reads (default: pread)
 
 	// --- Read Cache Configuration ---
-	ReadCacheSlabs            int              // Number of read cache slabs (0 = disabled)
-	ReadCacheSlabSize         int64            // Size of each read cache slab (default: WriteBufferSize)
+	ReadCacheSlabs       int   // Number of read cache slabs (0 = disabled)
+	ReadCacheSlabSize    int64 // Size of each read cache slab (default: WriteBufferSize)
 	ReadCacheMaxItemSize int64 // Max item size to cache (0 = slabSize/64, -1 = no limit)
 
 	knobs *TestingKnobs

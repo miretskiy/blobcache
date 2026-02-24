@@ -18,9 +18,10 @@ type DurableIndex struct {
 }
 
 // OpenIndex creates a DurableIndex by loading persisted metadata from disk.
-// The basePath should contain a "segments" subdirectory with .meta files.
-func OpenIndex(basePath string, shards int, initialCapacity int) (*DurableIndex, error) {
-	p, err := newPersistence(basePath, shards)
+// The basePath should contain a "segments" subdirectory with .sst/.del files.
+// readSST is the function used to read SSTable files (typically blobcache.ReadSST).
+func OpenIndex(basePath string, shards int, initialCapacity int, readSST ReadSSTFunc) (*DurableIndex, error) {
+	p, err := newPersistence(basePath, shards, readSST)
 	if err != nil {
 		return nil, err
 	}
@@ -502,6 +503,12 @@ func (idx *DurableIndex) GetDrainCandidates(maxEligibleID uint32) []SparseSegmen
 // that should be rewritten. Includes 100% dead segments.
 func (idx *DurableIndex) GetRewriteCandidates(maxEligibleID uint32, wasteThreshold float64) []uint32 {
 	return idx.segments.getRewriteCandidates(maxEligibleID, wasteThreshold)
+}
+
+// SnapshotSegmentIDs returns a sorted copy of all registered segment IDs.
+// Used by the iterator to capture a consistent view of segments.
+func (idx *DurableIndex) SnapshotSegmentIDs() []uint32 {
+	return idx.segments.snapshotSegmentIDs()
 }
 
 // GetSegmentMetadata returns the metadata for a segment, or nil if not found.

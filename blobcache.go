@@ -360,7 +360,7 @@ func checkOrInitialize(cfg config) (*index.DurableIndex, error) {
 
 	// Check if already initialized
 	if _, err := os.Stat(markerPath); err == nil {
-		return index.OpenIndex(cfg.Path, cfg.Shards, capacityHint)
+		return index.OpenIndex(cfg.Path, cfg.Shards, capacityHint, ReadSST)
 	}
 
 	// Not initialized - create directory structure
@@ -371,7 +371,7 @@ func checkOrInitialize(cfg config) (*index.DurableIndex, error) {
 		}
 	}
 
-	idx, err := index.OpenIndex(cfg.Path, cfg.Shards, capacityHint)
+	idx, err := index.OpenIndex(cfg.Path, cfg.Shards, capacityHint, ReadSST)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open index: %w", err)
 	}

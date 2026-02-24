@@ -28,7 +28,7 @@ func RecoverIndex(path string, opts ...Option) (*Cache, error) {
 	shards := max(1, cfg.Shards)
 
 	// OpenIndex handles all recovery automatically via scanAll
-	idx, err := index.OpenIndex(path, shards, 100000)
+	idx, err := index.OpenIndex(path, shards, 100000, ReadSST)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open index: %w", err)
 	}

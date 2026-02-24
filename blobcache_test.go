@@ -436,11 +436,11 @@ func TestCache_XLRotation(t *testing.T) {
 		"should have multiple segments due to XL rotation (got %d)", len(segmentIDs))
 	t.Logf("XL rotation created %d segments for 5 XL writes", len(segmentIDs))
 
-	// Verify .iseg (footer) files exist for each segment - needed for disaster recovery
+	// Verify .sst (SSTable index) files exist for each segment.
 	for segID := range segmentIDs {
-		footerPath := GetFooterPath(tmpDir, cache.Shards, segID)
-		_, err := os.Stat(footerPath)
-		require.NoError(t, err, "footer file should exist: %s", footerPath)
+		sstPath := SegmentSSTPath(getSegmentPath(tmpDir, cache.Shards, segID))
+		_, err := os.Stat(sstPath)
+		require.NoError(t, err, "sst file should exist: %s", sstPath)
 	}
 }
 
@@ -926,7 +926,7 @@ func TestArchivist_PrefetchStraddlesChunkBoundary(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	// Create a real DurableIndex (Archivist needs SegmentLockShard).
-	idx, err := index.OpenIndex(tmpDir, 1, 1024)
+	idx, err := index.OpenIndex(tmpDir, 1, 1024, ReadSST)
 	require.NoError(t, err)
 	defer idx.Close()
 

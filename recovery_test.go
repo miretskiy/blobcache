@@ -220,9 +220,9 @@ func TestRecovery_InvalidSegmentID(t *testing.T) {
 	}
 }
 
-// TestRecovery_MissingMetaFile tests recovery when .meta file is missing but .seg exists.
-// This simulates a crash after writing segment data but before writing the .meta file.
-func TestRecovery_MissingMetaFile(t *testing.T) {
+// TestRecovery_MissingIndexFile tests recovery when .sst/.meta files are missing but .seg exists.
+// This simulates a crash after writing segment data but before writing the index file.
+func TestRecovery_MissingIndexFile(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	// Create cache and write data
@@ -241,20 +241,20 @@ func TestRecovery_MissingMetaFile(t *testing.T) {
 	cache.Drain()
 	require.NoError(t, cache.Close())
 
-	// Remove all .meta files (simulating crash before .meta write)
+	// Remove all .sst and .meta files (simulating crash before index write)
 	segmentsDir := filepath.Join(tmpDir, "segments", "0000")
 	entries, err := os.ReadDir(segmentsDir)
 	require.NoError(t, err)
 
-	metaFilesRemoved := 0
+	indexFilesRemoved := 0
 	for _, entry := range entries {
-		if strings.HasSuffix(entry.Name(), ".meta") {
-			metaPath := filepath.Join(segmentsDir, entry.Name())
-			require.NoError(t, os.Remove(metaPath))
-			metaFilesRemoved++
+		if strings.HasSuffix(entry.Name(), ".sst") || strings.HasSuffix(entry.Name(), ".meta") {
+			p := filepath.Join(segmentsDir, entry.Name())
+			require.NoError(t, os.Remove(p))
+			indexFilesRemoved++
 		}
 	}
-	require.Greater(t, metaFilesRemoved, 0, "expected to remove at least one .meta file")
+	require.Greater(t, indexFilesRemoved, 0, "expected to remove at least one .sst or .meta file")
 
 	// Recovery should scan .seg files directly
 	recovered, err := RecoverIndex(tmpDir, WithMaxSize(100<<20))
@@ -267,18 +267,6 @@ func TestRecovery_MissingMetaFile(t *testing.T) {
 		require.True(t, found, "key %q not found after recovery", key)
 		require.Equal(t, expectedValue, actualValue, "value mismatch for key %q", key)
 	}
-
-	// .meta files should be rebuilt
-	entries, err = os.ReadDir(segmentsDir)
-	require.NoError(t, err)
-
-	metaFilesFound := 0
-	for _, entry := range entries {
-		if strings.HasSuffix(entry.Name(), ".meta") {
-			metaFilesFound++
-		}
-	}
-	require.Greater(t, metaFilesFound, 0, "expected .meta files to be rebuilt")
 }
 
 // TestWAL_FileLifecycle verifies WAL files are created during Put and

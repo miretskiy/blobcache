@@ -66,17 +66,27 @@ func scanMaxSegmentID(basePath string, shards int) uint32 {
 	return maxID
 }
 
-// DeleteSegmentFiles removes segment and footer files for the given segment ID.
-// Returns nil if files don't exist.
+// DeleteSegmentFiles removes segment, SSTable, tombstone, and legacy metadata files
+// for the given segment ID. Returns nil if files don't exist.
 func DeleteSegmentFiles(basePath string, shards int, segmentID uint32) error {
 	segPath := getSegmentPath(basePath, shards, segmentID)
 	var errs []error
 
+	// Delete .seg data file.
 	if err := os.Remove(segPath); err != nil && !os.IsNotExist(err) {
 		errs = append(errs, fmt.Errorf("delete segment %d file: %w", segmentID, err))
 	}
+	// Delete .sst SSTable index (may not exist for pre-migration segments).
+	if err := os.Remove(SegmentSSTPath(segPath)); err != nil && !os.IsNotExist(err) {
+		errs = append(errs, fmt.Errorf("delete segment %d sst: %w", segmentID, err))
+	}
+	// Delete .del tombstone log (may not exist if no tombstones).
+	if err := os.Remove(SegmentDelPath(segPath)); err != nil && !os.IsNotExist(err) {
+		errs = append(errs, fmt.Errorf("delete segment %d del: %w", segmentID, err))
+	}
+	// Delete legacy .meta file (migration cleanup — may not exist).
 	if err := os.Remove(SegmentMetaPath(segPath)); err != nil && !os.IsNotExist(err) {
-		errs = append(errs, fmt.Errorf("delete segment %d footer: %w", segmentID, err))
+		errs = append(errs, fmt.Errorf("delete segment %d meta: %w", segmentID, err))
 	}
 
 	return errors.Join(errs...)

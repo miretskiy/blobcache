@@ -1,6 +1,7 @@
 package blobcache
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -139,7 +140,7 @@ func TestMemTable_Integration_Rotation(t *testing.T) {
 
 	for i := 0; i < blobCount; i++ {
 		key := xmap.Key{Lo: uint64(i), Hi: 0}
-		keyBytes := []byte("test-key")
+		keyBytes := fmt.Appendf(nil, "test-key-%04d", i)
 		require.NoError(t, mt.Put(uint64(i+1), key, keyBytes, data))
 	}
 

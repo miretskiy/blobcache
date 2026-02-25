@@ -7,6 +7,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -18,9 +19,9 @@ import (
 // BenchmarkIterator measures real iterator throughput over persisted data.
 //
 // Each benchmark iteration (-benchtime=Nx) writes ~1MB to populate the cache.
-// After populate → drain → close → reopen (Librarian empty, forces disk reads),
-// the benchmark runs several scan variants and reports throughput, IOPS, and
-// per-key latency.
+// After populate → drain → close, each scan variant reopens the cache fresh
+// (Librarian empty, page cache cold) and measures iteration with View() on
+// every key.
 //
 // Semantics:
 //
@@ -29,24 +30,34 @@ import (
 //	-benchtime=100000x   →  ~100GB
 //	-benchtime=1000000x  →  ~1TB
 //
-// Scan variants:
+// Dimensions (all combinations):
 //
-//	full_scan          — all keys, buffered I/O
-//	full_scan/directio — all keys, Direct I/O (bypasses page cache)
-//	bounded_10pct      — ~10% of keyspace
-//	concurrent/N       — N parallel iterators (N=2,4,8)
+//	Scope:       full (all keys) | subset (random non-overlapping ranges)
+//	I/O mode:    buffered | directio
+//	Parallelism: P=1, 2, 4, 8, 16, 32
+//
+// Benchmark names:
+//
+//	BenchmarkIterator/full/buffered/P=1
+//	BenchmarkIterator/full/directio/P=8
+//	BenchmarkIterator/subset/buffered/P=16
+//	BenchmarkIterator/subset/directio/P=32
 //
 // Run:
 //
 //	go test -bench=BenchmarkIterator -benchtime=10000x -v -timeout=30m
 //
+// Run a single variant:
+//
+//	go test -bench='BenchmarkIterator/full/directio' -benchtime=100000x -v -timeout=60m
+//
 // On Linux remote:
 //
-//	BENCH_DIR=/instance_storage/iter_bench go test -bench=BenchmarkIterator -benchtime=100000x -v -timeout=60m
+//	BENCH_DIR=/instance_storage/iter_bench go test -bench=BenchmarkIterator -benchtime=100000x -v -timeout=120m
 //
 // Monitor during run:
 //
-//	iostat -x 5   # disk utilization and IOPS
+//	iostat -d -m -x nvme1n1 5
 func BenchmarkIterator(b *testing.B) {
 	dir := benchDir(b)
 
@@ -103,56 +114,41 @@ func BenchmarkIterator(b *testing.B) {
 		populateElapsed.Round(time.Millisecond),
 		float64(totalPopulateBytes)/(1<<30)/populateElapsed.Seconds())
 
-	// --- Phase 2: Scan variants ---
+	// --- Phase 2: Scan matrix ---
 	type scanConfig struct {
-		name       string
-		directIO   bool
-		lower      []byte
-		upper      []byte
-		concurrent int
+		scope    string // "full" or "subset"
+		ioMode   string // "buffered" or "directio"
+		parallel int
 	}
 
-	configs := []scanConfig{
-		{"full_scan", false, nil, nil, 1},
-		{"full_scan/directio", true, nil, nil, 1},
-	}
-
-	// Bounded scan: ~10% of keyspace (padded keys sort lexicographically).
-	if numKeys >= 1000 {
-		lo := numKeys / 10
-		hi := numKeys / 5
-		lower := iterKey(make([]byte, 64), lo)
-		upper := iterKey(make([]byte, 64), hi)
-		// Make durable copies since iterKey reuses buffer.
-		lowerCopy := make([]byte, len(lower))
-		upperCopy := make([]byte, len(upper))
-		copy(lowerCopy, lower)
-		copy(upperCopy, upper)
-		configs = append(configs, scanConfig{"bounded_10pct", false, lowerCopy, upperCopy, 1})
-	}
-
-	for _, n := range []int{2, 4, 8, 16, 32} {
-		configs = append(configs, scanConfig{
-			fmt.Sprintf("concurrent/%d", n), false, nil, nil, n,
-		})
+	var configs []scanConfig
+	for _, scope := range []string{"full", "subset"} {
+		for _, ioMode := range []string{"buffered", "directio"} {
+			for _, p := range []int{1, 2, 4, 8, 16, 32} {
+				configs = append(configs, scanConfig{scope, ioMode, p})
+			}
+		}
 	}
 
 	for _, tc := range configs {
-		fmt.Printf("\n=== ITER: %s ===\n", tc.name)
-		runIterScan(b, dir, maxSizeBytes, tc.directIO, tc.lower, tc.upper, tc.concurrent)
+		name := fmt.Sprintf("%s/%s/P=%d", tc.scope, tc.ioMode, tc.parallel)
+		directIO := tc.ioMode == "directio"
+		fmt.Printf("\n=== ITER: %s ===\n", name)
+		runIterScan(b, dir, maxSizeBytes, numKeys, directIO, tc.scope == "subset", tc.parallel)
 	}
 }
 
-// runIterScan opens the cache from an existing data directory, creates one or
-// more iterators, and measures the throughput of a full scan with View() on
-// every key. The cache is reopened with an empty Librarian (no in-memory hits).
+// runIterScan opens the cache fresh from disk, creates P iterators, and
+// measures the throughput of scanning with View() on every key.
+// Each invocation reopens the cache to ensure an empty Librarian.
 func runIterScan(
 	b *testing.B,
 	dir string,
 	maxSize int64,
+	numKeys int,
 	directIO bool,
-	lower, upper []byte,
-	concurrent int,
+	subset bool,
+	parallel int,
 ) {
 	b.Helper()
 
@@ -182,10 +178,49 @@ func runIterScan(
 		}
 	}()
 
-	if concurrent <= 1 {
-		runSingleIterScan(b, cache, lower, upper)
+	// Compute per-iterator bounds.
+	ranges := make([]iterRange, parallel)
+	if subset {
+		// Assign each iterator a random non-overlapping slice of the keyspace.
+		// Shuffle key indices, then partition into P equal chunks.
+		// Each chunk becomes a contiguous range in the sorted keyspace.
+		chunkSize := max(numKeys/parallel, 1)
+		// Generate P random start offsets (non-overlapping chunks).
+		rng := rand.New(rand.NewPCG(99, 0))
+		starts := make([]int, parallel)
+		for i := range parallel {
+			starts[i] = rng.IntN(numKeys)
+		}
+		sort.Ints(starts)
+		// Deduplicate and ensure non-overlapping by spacing chunks.
+		for i := 1; i < len(starts); i++ {
+			if starts[i] < starts[i-1]+chunkSize {
+				starts[i] = starts[i-1] + chunkSize
+			}
+		}
+
+		buf := make([]byte, 64)
+		for i := range parallel {
+			lo := starts[i]
+			hi := min(lo+chunkSize, numKeys)
+			if lo >= numKeys {
+				// Wrap around — this iterator scans from near the start.
+				lo = 0
+				hi = chunkSize
+			}
+			lower := make([]byte, len(iterKey(buf, lo)))
+			copy(lower, iterKey(buf, lo))
+			upper := make([]byte, len(iterKey(buf, hi)))
+			copy(upper, iterKey(buf, hi))
+			ranges[i] = iterRange{lower: lower, upper: upper}
+		}
+	}
+	// For full scan, ranges stay nil,nil.
+
+	if parallel <= 1 {
+		runSingleIterScan(b, cache, ranges[0].lower, ranges[0].upper)
 	} else {
-		runConcurrentIterScan(b, cache, lower, upper, concurrent)
+		runConcurrentIterScan(b, cache, ranges, parallel)
 	}
 }
 
@@ -257,7 +292,7 @@ func runSingleIterScan(b *testing.B, cache *Cache, lower, upper []byte) {
 	reportLatency(b, "ITER-VIEW", hist)
 }
 
-func runConcurrentIterScan(b *testing.B, cache *Cache, lower, upper []byte, concurrent int) {
+func runConcurrentIterScan(b *testing.B, cache *Cache, ranges []iterRange, concurrent int) {
 	b.Helper()
 
 	var totalKeys, totalBytes atomic.Int64
@@ -276,8 +311,9 @@ func runConcurrentIterScan(b *testing.B, cache *Cache, lower, upper []byte, conc
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
+			r := ranges[id]
 			for range scansPerIter {
-				iter, err := cache.NewIterator(lower, upper)
+				iter, err := cache.NewIterator(r.lower, r.upper)
 				if err != nil {
 					scanErrors.Add(1)
 					return
@@ -358,4 +394,9 @@ func benchDir(b *testing.B) string {
 		return path
 	}
 	return b.TempDir()
+}
+
+// iterRange defines bounds for a single iterator.
+type iterRange struct {
+	lower, upper []byte // nil,nil = full scan
 }

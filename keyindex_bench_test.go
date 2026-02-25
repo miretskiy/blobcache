@@ -131,7 +131,7 @@ func BenchmarkIterator(b *testing.B) {
 		configs = append(configs, scanConfig{"bounded_10pct", false, lowerCopy, upperCopy, 1})
 	}
 
-	for _, n := range []int{2, 4, 8} {
+	for _, n := range []int{2, 4, 8, 16, 32} {
 		configs = append(configs, scanConfig{
 			fmt.Sprintf("concurrent/%d", n), false, nil, nil, n,
 		})

@@ -739,6 +739,14 @@ func (c *Cache) triggerMaintenance() {
 }
 
 func (c *Cache) handleStorageError(h Key, e index.Item, err error) {
+	// TOCTOU check: between index.Get() in search() and the disk read,
+	// drain or compaction may have removed/relocated the item. If so,
+	// the "segment not found" error is benign — not a real corruption.
+	current, found := c.index.Peek(h)
+	if !found || current.SegmentID != e.SegmentID {
+		return
+	}
+
 	// 1. Transient errors: Skip and retry later
 	if sys.IsTransientIOError(err) {
 		log.Error("transient storage error (skipping)", "hash", h, "error", err)

@@ -43,11 +43,12 @@ In workloads with high miss rates (e.g., >50%), traditional caches suffer from c
 Once a slab is full, it is "frozen" and handed off to background **Flush Workers**.
 * **Segments:** MemTable-sized append-only files (~64MB, matching `WriteBufferSize`) that amortize the overhead of filesystem syscalls by packing blobs into sequential write streams.
 * **Durable Index:** A sharded arena-backed hash table for O(1) retrieval, with per-segment `.meta` files for crash recovery and durable metadata tracking.
+* **Key Index (Pebble):** A rebuildable Pebble DB mapping user keys to 128-bit hashes and vice versa, enabling ordered iteration without storing user key bytes in RAM. Updated during flush, eviction, drain, and compaction. See Section 4.8.
 
 ### 2.4 Intelligent Reclamation: SIEVE Eviction & Pressure-Driven Drain
 Unlike simple FIFO caches that must delete entire files to reclaim space, BlobCache uses **SIEVE eviction** coupled with **pressure-driven Segment Drain** for zero-write-amplification space reclamation.
 
-* **SIEVE Eviction:** When the cache hits `MaxSize`, the **SIEVE algorithm** scans across all 256 shards to identify cold items and evict them in batches (up to 64 items per shard lock hold). Victims may span multiple segments.
+* **SIEVE Eviction:** When the cache hits `MaxSize`, the **SIEVE algorithm** scans across all 256 shards to identify cold items and evict them in batches (up to 64 items per shard lock hold). Victims may span multiple segments. Evicted items are also removed from the Pebble KeyIndex via reverse hash lookup (Section 4.8).
 * **Durable Commitment:** Victims are marked as tombstones in the segment's `.meta` file and removed from the RAM index.
 * **Pressure-Driven Drain:** When total on-disk footprint exceeds `MaxSize`, the sparsest segments (least live data) are deleted until disk usage fits within budget. Zero write amplification — no data is rewritten, only deleted.
 
@@ -128,11 +129,16 @@ type shard struct {
 
 
 ### 4.2 Durable Metadata (Per-Segment `.meta` Files)
-While blobs are stored in large Segment files, their metadata is persisted in **per-segment `.meta` files** stored alongside each `.seg` file. This provides crash-consistent metadata without a centralized metadata store.
+
+**Why Self-Describing Segments?**
+
+BlobCache learned from an earlier global Bitcask index that a single centralized metadata store creates a divergence risk: if the central index disagrees with what's on disk, the entire cache is corrupt. Self-describing segments (`.meta` files) make each segment independently recoverable. The primary index (sharded arena) is treated as a **rebuildable acceleration layer** — if it's lost or corrupt, it can be reconstructed by scanning `.meta` files. This same design principle applies to the Pebble KeyIndex (Section 4.8): any derived data structure that can be rebuilt from segments is explicitly non-authoritative.
+
+While blobs are stored in Segment files, their metadata is persisted in **per-segment `.meta` files** stored alongside each `.seg` file:
 
 * **Segment Footer Snapshots:** Each `.meta` file contains a segment footer block (array of `FooterEntry` records) capturing the initial state of all items in the segment at flush time.
 * **Incremental Tombstone Logs:** Deletions and evictions append tombstone batches to the `.meta` file without rewriting the footer. Over time: `[footer block] [tombstone batch 1] [batch 2] ...`.
-* **Tombstone Compaction:** When tombstone appendages accumulate past a threshold, the maintenance worker collapses them back into the footer entries (metadata-only rewrite, no blob data touched). See Section 10.5.
+* **Tombstone Compaction:** When tombstone appendages accumulate past a threshold, the maintenance worker collapses them back into the footer entries (metadata-only rewrite, no blob data touched). See Section 10.6.
 * **In-Memory Manifest Cache:** At startup, footer entries are loaded into RAM (`SegmentMetadata.Entries`) for zero disk I/O during segment drain and metadata operations.
 
 ### 4.3 The Sieve Eviction Policy
@@ -271,12 +277,17 @@ type Item struct {
 4. Allocate buffer of size `KeyLen + PhysicalSize`
 5. Read Key + Value
 
+**Integration with ReadCache and IOScheduler:**
+
+The Archivist composes an optional `ReadCache` (Section 11.2) and a pluggable `IOScheduler` (Section 11.4). When a ReadCache is configured, `ReadBlob` checks the cache first; on a miss for an admissible blob, the disk read may be widened to a 64KB chunk and all valid records in the chunk are populated into the cache inline. Flight coalescing via `inflightGroup` ensures that concurrent cache misses for the same disk region result in exactly one I/O operation (Section 11.3). All disk reads are issued through the IOScheduler, which defaults to synchronous `pread(2)` but can optionally use `io_uring` for batched asynchronous I/O on Linux.
+
 ### 4.6 Startup and Crash Recovery
 `OpenIndex` performs a **Persistence Scan**:
 1. It discovers all `.meta` files across shard directories via `scanAll`.
 2. For each segment, reads the `.meta` file (footer + any tombstone appendages), merging tombstones into footer entries.
 3. Populates the sharded arena index and SIEVE list in "Birth Order," ensuring the SIEVE "Hand" is positioned correctly for immediate eviction logic upon startup.
-4. Caches raw `FooterEntry` slices in `SegmentMetadata.Entries` for zero disk I/O during spatial SIEVE expansion.
+4. Caches raw `FooterEntry` slices in `SegmentMetadata.Entries` for zero disk I/O during segment drain and metadata operations.
+5. **KeyIndex Reconciliation:** After the RAM index is populated, the Pebble KeyIndex is opened and reconciled. For each registered segment, the system checks for a sentinel in Pebble. Missing sentinels trigger a targeted rebuild from the `.seg` file (see Section 4.8).
 
 ```go
 err = p.scanAll(func(m DurableBatch) bool {
@@ -312,6 +323,55 @@ The **Concurrency Guard** uses 256 sharded locks (indexed by key hash) to serial
 The overhead is minimal: one atomic increment (~10ns) plus a sharded lock acquisition (~20ns uncontended), totaling less than 100ns per write. The read path remains unchanged—sequence IDs are stored but never checked during retrieval, because the write-path guards guarantee that any visible entry is definitively the latest.
 
 Sequence IDs are also critical for WAL crash recovery (see Section 12). Sequence IDs embedded in WAL entries allow crash recovery to correctly skip replaying operations that were already persisted to segments, ensuring exactly-once semantics without complex coordination.
+
+### 4.8 The Key Index: Ordered Iteration via Pebble
+
+**The Problem: No User Keys in RAM**
+
+The RAM index is a hash table keyed by 128-bit XXH3 hashes — O(1) lookup, but no key ordering. User key bytes are intentionally excluded from the RAM index: keys can be 128–512 bytes, and storing them for 10M+ items would blow up memory by gigabytes. Ordered iteration over user keys requires accessing the original key bytes, but they only exist on disk inside segment record bodies.
+
+**Why a Global Pebble DB (Not Per-Segment SSTables)**
+
+An earlier design used per-segment SSTables for ordered iteration. This doesn't scale: with 5,000–10,000 segments, a range scan requires a k-way merge across thousands of file handles. Each additional segment adds file descriptor pressure and merge overhead. A single global Pebble DB provides O(1) seek, O(1) next, and zero file-handle management regardless of segment count.
+
+**Critical Invariant: Rebuildable, Not Authoritative**
+
+The Pebble KeyIndex is explicitly a **rebuildable cache**. If corrupted or missing, it is reconstructed from `.seg` file scans — segments remain the source of truth (self-describing via `.meta` files). This follows the same design principle as the RAM index (Section 4.2): any derived data structure that can be rebuilt from segments is non-authoritative. Pebble's own WAL is disabled (`DisableWAL: true`) since there is no durability requirement.
+
+**4-Namespace Design**
+
+The KeyIndex uses a single Pebble DB with four namespaces distinguished by a one-byte prefix:
+
+| Prefix | Namespace | Key → Value | Purpose |
+|--------|-----------|-------------|---------|
+| `0x00` | hash→key | `hash(16B)` → `userKey` | Reverse lookup during eviction (SIEVE provides only the hash) |
+| `0x01` | key→hash | `userKey` → `hash(16B)` | Ordered iteration over user keys |
+| `0x02` | segment membership | `segID(4B) + hash(16B)` → `""` | Enumerate all keys in a segment (drain cleanup) |
+| `0x03` | sentinel | `segID(4B)` → `""` | Reconciliation: tracks which segments have been loaded |
+
+The hash→key namespace enables a critical operation: when SIEVE evicts an item, it only knows the 128-bit hash. The reverse lookup retrieves the original user key so both the key→hash and hash→key entries can be deleted.
+
+**Startup Reconciliation**
+
+On startup, the KeyIndex is reconciled against the RAM index:
+
+1. Snapshot all registered segment IDs from the RAM index
+2. For each segment, check for a sentinel in Pebble (`HasSentinel`)
+3. If missing: scan the `.seg` file to extract user keys, batch-insert all entries, write sentinel
+4. If present: segment is already loaded, skip
+
+This sentinel-based protocol handles three scenarios: clean restart (all sentinels present, zero rebuilds), partial Pebble corruption (missing sentinels trigger targeted rebuilds), and complete Pebble loss (full rebuild from all segments).
+
+**Integration Points**
+
+The KeyIndex is updated during:
+- **Flush:** `AddEntries` inserts key↔hash mappings and segment membership for all records in the flushed slab
+- **Delete:** `DeleteByUserKey` removes both key→hash and hash→key entries
+- **Eviction:** `DeleteByHash` performs reverse lookup then removes both entries
+- **Drain:** `DrainSegment` iterates segment membership prefix, removes all entries and the sentinel
+- **Compaction:** `RelocateSegment` moves membership records from old to new segment ID
+
+All KeyIndex operations are best-effort: failures are logged as warnings but do not block the critical path. The index can always be rebuilt.
 
 ---
 
@@ -424,8 +484,8 @@ BlobCache uses **Go 1.24's `runtime.AddCleanup`**. The buffer only returns to th
 ### 6.1 Amortizing the Syscall Tax
 In a high-traffic environment, writing 10,000 blobs as individual files requires 30,000 syscalls (`open`/`write`/`close`). This involves heavy inode allocation, kernel-level locking, and file-system journaling for every small object. By packing blobs into **Segments** (~64MB, matching `WriteBufferSize`), BlobCache converts thousands of random file-system metadata operations into a single sequential write stream. This reduces the "syscall tax" to near-zero and allows the NVMe controller to operate in its most efficient sequential mode. The MemTable-sized segments enable efficient WAL-rename (zero-copy promotion), fast crash recovery (smaller files to scan), and effective space reclamation (easier to identify sparse segments for drain).
 
-### 6.2 Segment Footers: Defense in Depth
-The **Segment Footer** is a page-aligned (4KB) block at the absolute EOF. If the primary `.meta` index file is corrupted or missing, the entire state can be reconstructed by scanning the trailing metadata of every `.seg` file.
+### 6.2 Segment Footers and `.meta` Files: Defense in Depth
+Per-segment **`.meta` files** are the **primary crash-recovery mechanism** (Section 4.2). They are read first during startup to populate the RAM index. The **Segment Footer** — a page-aligned (4KB) block at the absolute EOF of each `.seg` file — serves as a secondary recovery path: if the `.meta` file is corrupted or missing, the entire state can be reconstructed by scanning the trailing metadata of the `.seg` file. This two-layer approach ensures that no single-file corruption can prevent recovery.
 
 ```text
 SEGMENT METADATA BLOCK (N * 4KB Aligned)
@@ -656,7 +716,7 @@ When a background I/O error occurs (e.g., `Disk Full`), BlobCache enters **Degra
 BlobCache uses different space reclamation strategies depending on the operating mode:
 
 - **Cache Mode:** SIEVE eviction + Pressure-Driven Segment Drain (zero write amplification)
-- **WAL/CAS Mode:** SIEVE eviction + Tombstone Compaction (metadata-only maintenance)
+- **WAL/CAS Mode:** SIEVE eviction + Segment Rewrite Compaction + Tombstone Compaction
 
 ### 10.1 SIEVE Eviction
 
@@ -734,9 +794,68 @@ PRESSURE-DRIVEN DRAIN:
 - **Unbounded:** Drains as many segments as needed to meet the space budget. Under sustained write pressure, this may drain dozens of segments per maintenance pass.
 - **Sparsest-first:** Segments with the least live data are drained first, minimizing the number of cache misses per GB of disk reclaimed.
 - **Cooling period:** Only segments older than the Librarian cache window are eligible for drain, preventing eviction of recently-written data still serving read-after-write hits.
-- **WAL mode excluded:** WAL/CAS mode cannot tolerate data loss from drain. It uses tombstone compaction instead (see 10.5).
+- **WAL mode excluded:** WAL/CAS mode cannot tolerate data loss from drain. It uses segment rewrite compaction (Section 10.3) and tombstone compaction (Section 10.6) instead.
 
-### 10.3 Why Not Merge Compaction? (The copy_file_range False Start)
+### 10.3 Segment Rewrite Compaction (WAL/CAS Mode)
+
+In WAL mode, segment drain is not an option — deleting entire segments would lose durable data. Instead, BlobCache uses **single-segment rewrite compaction**: sparse segments are rewritten in-place, copying only live records to a new segment file via `copy_file_range`.
+
+**When it triggers:**
+- Maintenance worker calls `maybeRewriteSegments` each cycle
+- Segment must have cooled past the Librarian cache window (same cooling period as drain)
+- Waste ratio must exceed `CompactionWasteThreshold` (configurable)
+- Candidates returned by `GetRewriteCandidates`, sorted by segment ID ascending
+
+**Algorithm:**
+
+```text
+SEGMENT REWRITE COMPACTION:
+
+   [Get manifest from in-memory cache]
+        |
+        v
+   [Classify entries using RAM index]
+        |-- Live: entry exists in RAM, points to this segment, not deleted
+        |-- Tombstone: entry is deleted; keep if HasOlderShadow(), dissolve otherwise
+        |-- Stale: entry not in RAM or points elsewhere; skip
+        |
+        v
+   [Build page-aligned runs]            <-- Sort live entries by offset, merge
+        |                                    nearby records (gap ≤ 16KB absorbed),
+        |                                    align to block boundaries
+        v
+   [copy_file_range per run]            <-- Source and destination both O_DIRECT
+        |                                    Block-aligned offsets for reflink
+        |                                    eligibility on XFS
+        v
+   [fdatasync + atomic rename]          <-- tmp.compact.tmp → segID.seg
+        |
+        v
+   [Write .meta footer]                <-- New positions for live entries,
+        |                                    preserved tombstones (Pos=0)
+        v
+   [Relocate in RAM index]             <-- RelocateBatch: old (segID, offset) →
+        |                                    new (segID, offset) with CAS semantics
+        v
+   [Relocate in Pebble KeyIndex]       <-- RelocateSegment: move membership records
+        |
+        v
+   [Drop old segment]                  <-- DropSegment + delete .seg/.meta files
+```
+
+**Tombstone Dissolution:**
+
+During classification, each tombstone is checked via `HasOlderShadow(key, segID)`. This function uses `Peek()` (reads without marking visited — no SIEVE perturbation) to check whether an older version of the key exists in any segment below `segID`. If no older shadow exists, the tombstone is dissolved — it is simply omitted from the output. This is the primary mechanism for bounded tombstone accumulation.
+
+**100% Dead Optimization:**
+
+If a segment has zero live items and all its tombstones are dissolvable, the rewrite is skipped entirely. The segment is deleted directly (`DropSegment` + file removal), avoiding the overhead of creating a new segment file.
+
+**No Pre-allocation:**
+
+The output file is NOT pre-allocated with `fallocate`. On XFS, pre-allocation fills the range with zeroed extents, forcing `copy_file_range` to perform actual data copies instead of metadata-only reflinks (COW). Leaving the file sparse preserves reflink eligibility.
+
+### 10.4 Why Not Merge Compaction? (The copy_file_range False Start)
 
 BlobCache initially implemented merge compaction using Linux's `copy_file_range` syscall, which uses server-side copy (reflinks on supported filesystems) to merge sparse segments into dense output without reading data into userspace. The theory was compelling: zero-copy, kernel-optimized, O_DIRECT-compatible.
 
@@ -752,7 +871,7 @@ BlobCache initially implemented merge compaction using Linux's `copy_file_range`
 
 **The insight:** For cache workloads, the remaining ~10% of live items in a sparse segment are not worth preserving. They can be re-fetched from the origin on cache miss. Segment drain exploits this by simply deleting the entire segment, trading a small increase in miss rate for zero I/O cost and zero code complexity.
 
-### 10.4 The Deletion Model: Tombstones and Consistency
+### 10.5 The Deletion Model: Tombstones and Consistency
 
 BlobCache uses a **soft delete (tombstone)** model rather than immediate removal. When `Delete(key)` is called:
 
@@ -789,9 +908,9 @@ DELETE LIFECYCLE:
     Compaction]
 ```
 
-**Why Tombstones (in WAL mode)?** Tombstones prevent the "Leapfrog Hazard"—a subtle bug that can resurrect deleted keys if compaction ever merges non-contiguous segments. See Section 10.6.
+**Why Tombstones (in WAL mode)?** Tombstones prevent the "Leapfrog Hazard"—a subtle bug that can resurrect deleted keys if compaction ever merges non-contiguous segments. See Section 10.7.
 
-### 10.5 Tombstone Compaction (WAL/CAS Mode)
+### 10.6 Tombstone Compaction (WAL/CAS Mode)
 
 In WAL mode, tombstones accumulate as incremental appendages to `.meta` files. Over time, a segment's `.meta` file grows: `[footer block] [tombstone batch 1] [batch 2] ...`. Tombstone compaction is a metadata-only operation that collapses these appendages back into the footer entries.
 
@@ -806,7 +925,7 @@ In WAL mode, tombstones accumulate as incremental appendages to `.meta` files. O
 
 This is purely a metadata maintenance operation — no blob data is read or written.
 
-### 10.6 The Leapfrog Hazard and Strict Contiguity
+### 10.7 The Leapfrog Hazard and Strict Contiguity
 
 The Leapfrog Hazard is a correctness concern for any system that merges segments while tombstones exist. It is primarily relevant to WAL/CAS mode where data must not be lost:
 
@@ -833,47 +952,182 @@ In cache mode, the Leapfrog Hazard is irrelevant: segment drain deletes entire s
 
 ---
 
-## 11. The Read-Path Spectrum: Page Cache vs. Direct I/O
+## 11. The Read Path
 
-The optimization of the read path is a spectrum of strategies determined by the workload's access patterns. By default, BlobCache utilizes **Buffered I/O**, relying on the operating system’s decades of optimization.
+### 11.1 Read Path Architecture
 
-### 11.1 The Default: Buffered I/O and the Kernel Page Cache
-By default, any read that misses the Librarian's in-memory slab cache is satisfied via standard `pread`.
-* **Mechanism:** The kernel intercepts the request and checks its own Page Cache (Unified Buffer Cache). If the data is missing, the kernel fetches it from NVMe, stores it in its own pages, and copies it into the application buffer.
-* **Workload Implication:** This is the most efficient path for workloads with high temporal or spatial locality, as the kernel provides sophisticated read-ahead and prefetching "for free".
-* **The "Double Tax" & Tail Latency:** Under heavy memory pressure, the kernel’s background page reclamation (kswapd) can introduce unpredictable stalls. Furthermore, data exists in both Kernel RAM and application RAM, reducing total caching capacity.
-
-### 11.2 Future: Direct I/O Reads (Planned)
-For "Write-Once, Read-Once" workloads where data is unlikely to be requested again, a future `WithDirectIORead` option could use `O_DIRECT` to bypass the kernel's Page Cache entirely:
-* **High-Entropy Efficiency:** Prevents the kernel from polluting its cache with one-time-use data that would otherwise evict critical system metadata.
-* **Predictability:** Read latencies would remain bound strictly to the hardware's physical performance, avoiding the "stutter" of kernel-driven eviction.
-
-### 11.3 Future: Read Promotion Buffer (Planned)
-A future `WithCacheAfterRead` option could provide a mechanism to promote cold data into the user-space "Hot" zone:
-* **Circular Promotion Arena:** Promoted blobs written into a dedicated `MmapBuffer` managed as a circular arena, avoiding slab-sized fragmentation.
-* **Granular Packing:** Disparate blobs from different disk segments packed into a single contiguous memory region.
-* **Indexing:** The in-memory index updated to point to promoted coordinates, enabling zero-copy reads without a sharded block-caching subsystem.
+BlobCache’s read path is a three-tier hierarchy, each tier trading latency for capacity:
 
 ```text
 [ USER GET(Key) ]
-               |
-               v
-     +-------------------+       HIT        +--------------------+
-     | Librarian L1 Check| ---------------> | Return App Pointer |
-     +-------------------+                  | (Zero-Copy View)   |
-               |                            +--------------------+
-               | MISS
-               v
-     +-------------------+                  +-------------------------+
-     | KERNEL PAGE CACHE | <-- pread() ---> |   PHYSICAL NVMe I/O     |
-     | (Buffered I/O)    |                  | (Page cache miss)       |
-     +-------------------+                  +-------------------------+
-               |
-               v
-       [ Return to User ]
+        |
+        v
++-------------------+       HIT        +--------------------+
+| 1. Librarian      | ---------------> | Zero-Copy View     |
+| (Write-path slabs)|                  | (mmap pointer)     |
+| ~seconds of data  |                  | p50: ~8µs          |
++-------------------+                  +--------------------+
+        |
+        | MISS
+        v
++-------------------+       HIT        +--------------------+
+| 2. ReadCache      | ---------------> | Slab-resident copy |
+| (Dedicated arenas)|                  | (mmap arena)       |
+| configurable size |                  | p50: ~10µs         |
++-------------------+                  +--------------------+
+        |
+        | MISS
+        v
++-------------------+                  +--------------------+
+| 3. Archivist      | ---- pread ----> | NVMe segment file  |
+| (Disk I/O)        |                  | (via IOScheduler)  |
+| flight coalescing |                  | p50: ~50-100µs     |
++-------------------+                  +--------------------+
+        |
+        v (if ReadCache enabled)
+  [Populate cache inline]
 ```
 
-The current read path is straightforward: Librarian hit (zero-copy from mmap'd slab) or buffered `pread()` from segment file (leveraging kernel page cache). The planned extensions above (Direct I/O reads, promotion arena) would add branches to this path.
+**Decision flow:**
+
+1. **Librarian** (Section 5.1.1): Zero-copy access to write-path slabs still in mmap’d memory. Covers the hot write-after-read window (~seconds of writes). No additional memory cost — reuses write-path arenas.
+
+2. **ReadCache** (Section 11.2): User-space mmap-backed read cache for disk-resident blobs accessed frequently enough to justify caching. Disabled by default. Uses its own dedicated `MmapPool` (no contention with the write path).
+
+3. **Archivist** (Section 11.3): Single disk read with flight coalescing. If ReadCache is enabled, the disk read may be widened to a 64KB chunk and all valid records in the chunk are populated into the cache inline (temporal prefetch).
+
+### 11.2 ReadCache: User-Space Read Acceleration
+
+The **ReadCache** is an optional second-tier read cache for blobs that have fallen out of the Librarian window but are still accessed frequently. Typical use case: temporally distant reads-after-write, or workloads where the kernel page cache is under pressure from other processes.
+
+**Architecture:**
+
+ReadCache composes a `Librarian` for its sealed slab list, giving it the same lock-free `Acquire` and FIFO eviction. The only addition is an **active slab** for inserting records populated from disk reads.
+
+```text
++-------------------+
+| ReadCache         |
+|                   |
+|  Active Slab      | <-- Insert() copies raw records from disk
+|  (mu-protected)   |     Bloom BEFORE index (no false negatives)
+|                   |
+|  Librarian        | <-- Sealed slabs (lock-free Acquire)
+|  [Slab N-1]       |     FIFO eviction: seal → publish → acquire new
+|  [Slab N-2]       |
+|  [...]            |
+|                   |
+|  MmapPool         | <-- Dedicated arena pool (separate from write path)
++-------------------+
+```
+
+**Key Properties:**
+
+- **Admission policy:** Items exceeding `maxItemSize` or slab size are rejected (counter: `Skipped`). Large blobs bypass the cache and go direct to disk.
+- **PopulateChunk:** When the Archivist reads a 64KB chunk for a small blob, it calls `PopulateChunk` to scan the buffer for valid records (Magic + HeaderCRC verification) and insert each one. This provides **temporal prefetch** — neighboring records in the same chunk are cached for free.
+- **FIFO eviction:** When the active slab fills, it is sealed, published to the Librarian (which handles FIFO eviction of the oldest slab), and a new active slab is acquired from the pool.
+- **Separate MmapPool:** ReadCache has its own arena pool. No contention with write-path slab acquisition.
+- **Invalidation:** `Delete()` propagates to `ReadCache.Invalidate()`, removing the key from all slabs (sealed and active) to prevent serving stale data.
+
+**Configuration:**
+```go
+cache, _ := blobcache.New(path,
+    blobcache.WithReadCacheSlabs(4),          // 4 read cache slabs
+    blobcache.WithReadCacheMaxItemSize(1<<20), // Skip items > 1MB
+)
+```
+
+### 11.3 The Archivist: Single-Read Optimization
+
+The **Archivist** manages all disk reads. When a ReadCache is configured, the Archivist integrates with it to minimize I/O:
+
+**Flight Coalescing (inflightGroup):**
+
+When thousands of goroutines experience a cache miss for the same disk region simultaneously, the `inflightGroup` ensures exactly **one** goroutine performs the disk I/O. Others block on a per-shard `sync.Cond` and are woken when the fetch completes.
+
+```text
+FLIGHT COALESCING:
+
+   Goroutine A: cache miss for chunk X
+        |
+        v
+   [inflightGroup.DoOnce(chunkKey)]
+        |
+        +--> Leader: performs disk I/O, populates ReadCache
+        |
+   Goroutine B: cache miss for same chunk X
+        |
+        v
+   [inflightGroup.DoOnce(chunkKey)]
+        |
+        +--> Waiter: blocks on sync.Cond, then serves from ReadCache
+```
+
+The flight key packs `(segmentID, alignedChunkOffset)` into a `uint64`. With 64 shards and ~50–100 active flights, each shard has ~1–2 concurrent flights, so `Broadcast` wakes at most a few goroutines per shard.
+
+**Chunk Alignment for Small Blobs:**
+
+For blobs ≤ 64KB (`prefetchChunkSize`), the Archivist reads a 64KB chunk aligned to chunk boundaries. This captures neighboring records for temporal prefetch via `PopulateChunk`. For large blobs (> 64KB), the read is sized to the exact blob with page alignment (no wasted bandwidth).
+
+**Leader/Waiter Pattern:**
+
+1. First cache miss for a chunk becomes the **leader**: performs one disk read, populates ReadCache, parses the target record
+2. Concurrent misses for the same chunk become **waiters**: block until the leader finishes, then re-check ReadCache
+3. If a waiter’s record wasn’t in the populated chunk (edge cases: record at chunk boundary, parse error), it falls back to a standard disk read
+
+### 11.4 IOScheduler: Pluggable I/O Backend
+
+All disk reads flow through the `IOScheduler` interface (`internal/iosched`), which abstracts positioned reads for pluggable backends:
+
+```go
+type IOScheduler interface {
+    ReadAt(fd int, buf []byte, offset int64) (int, error)
+    Stats() Stats
+    Close() error
+}
+```
+
+**PreadScheduler (Default):**
+
+Synchronous `pread(2)`. Each `ReadAt` maps directly to one syscall. Zero overhead, zero complexity. Portable across Linux and Darwin.
+
+**URingScheduler (Linux Only, Opt-In):**
+
+Asynchronous `io_uring` with batched submission and optional `SQPOLL` kernel polling.
+
+Architecture: a single **coordinator goroutine** exclusively owns the ring. Callers append requests to a mutex-protected queue and send a notification on a buffered(1) signal channel. The coordinator uses a **sliding-window protocol**:
+
+```text
+SLIDING-WINDOW COORDINATOR:
+
+   [Collect: grab pending requests from queue]
+        |
+        v
+   [Fill: prepare SQEs for free ring slots]
+        |
+        v
+   [SubmitAndWait(1): submit to kernel, wait for ≥1 CQE]
+        |
+        v
+   [Reap: process all ready CQEs, free slots, wake callers]
+        |
+        v
+   [Loop: freed slots available for next batch]
+```
+
+The ring stays as full as possible, keeping the NVMe pipeline saturated. With `SQPOLL` enabled, the kernel spawns a polling thread that continuously checks for new submissions, eliminating the `io_uring_enter` syscall on the submission path (burns one CPU core).
+
+**Latency Histograms:**
+
+Both schedulers track per-read I/O latency via HDR histograms (1µs–10s range, 3 significant digits). The URingScheduler additionally tracks batching statistics (batch count, average batch size, max batch size).
+
+### 11.5 Buffered vs. Direct I/O Reads
+
+By default, reads use **buffered I/O** (kernel page cache). The `WithDirectIORead` option enables Direct I/O reads with aligned buffers:
+
+- **Buffered (default):** Leverages kernel read-ahead, prefetching, and LRU page replacement. Best for workloads with temporal/spatial locality. The kernel page cache is "free" infrastructure — "it’d be the height of hubris to assume we can do better."
+- **Direct I/O:** Bypasses kernel page cache. Prevents write pollution from one-time-use data. Predictable latency bound to hardware performance. Requires block-aligned buffers and offsets (`sys.AlignRange`).
+
+See Section 6.5 for empirical comparison of buffered vs. Direct I/O under write-heavy load.
 
 ---
 

@@ -156,6 +156,17 @@ func (it *Iterator) filterAndSet() bool {
 	}
 }
 
+// View provides scoped access to the current entry's blob data.
+// The data slice is valid only for the duration of fn.
+// Returns false if the blob is no longer accessible (e.g., evicted between
+// positioning and read).
+func (it *Iterator) View(fn func(data []byte)) bool {
+	if !it.valid {
+		return false
+	}
+	return it.cache.View(it.key, fn)
+}
+
 // Key returns the current user key. Only valid when Valid() returns true.
 func (it *Iterator) Key() []byte {
 	return it.key

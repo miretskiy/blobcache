@@ -18,19 +18,26 @@ const UseFadvise = false
 // Darwin's F_NOCACHE does not enforce strict alignment like Linux O_DIRECT.
 const RequiresAlignment = false
 
-// Fdatasync syncs file data to disk
+// Fdatasync syncs file data to disk.
 // Darwin doesn't have fdatasync, so we use F_FULLFSYNC which ensures
-// data reaches physical disk (not just drive cache)
+// data reaches physical disk (not just drive cache).
+// Retries on EINTR (Go runtime SIGURG preemption can interrupt syscalls).
 func Fdatasync(f *os.File) error {
-	_, _, errno := syscall.Syscall(syscall.SYS_FCNTL, f.Fd(), uintptr(syscall.F_FULLFSYNC), 0)
-	if errno != 0 {
-		return errno
+	for {
+		_, _, errno := syscall.Syscall(syscall.SYS_FCNTL, f.Fd(), uintptr(syscall.F_FULLFSYNC), 0)
+		if errno == syscall.EINTR {
+			continue
+		}
+		if errno != 0 {
+			return errno
+		}
+		return nil
 	}
-	return nil
 }
 
-// Fallocate pre-allocates disk space for a file
-// Darwin uses F_PREALLOCATE via fcntl
+// Fallocate pre-allocates disk space for a file.
+// Darwin uses F_PREALLOCATE via fcntl.
+// Retries on EINTR.
 func Fallocate(f *os.File, size int64) error {
 	// fstore_t structure for F_PREALLOCATE
 	fstore := syscall.Fstore_t{
@@ -40,23 +47,34 @@ func Fallocate(f *os.File, size int64) error {
 		Length:  size,
 	}
 
-	// Try contiguous allocation first
-	_, _, errno := syscall.Syscall(
-		syscall.SYS_FCNTL,
-		f.Fd(),
-		uintptr(syscall.F_PREALLOCATE),
-		uintptr(unsafe.Pointer(&fstore)),
-	)
-
-	// Fall back to non-contiguous allocation if contiguous failed
-	if errno != 0 {
-		fstore.Flags = syscall.F_ALLOCATEALL
+	// Try contiguous allocation first, retrying on EINTR.
+	var errno syscall.Errno
+	for {
 		_, _, errno = syscall.Syscall(
 			syscall.SYS_FCNTL,
 			f.Fd(),
 			uintptr(syscall.F_PREALLOCATE),
 			uintptr(unsafe.Pointer(&fstore)),
 		)
+		if errno != syscall.EINTR {
+			break
+		}
+	}
+
+	// Fall back to non-contiguous allocation if contiguous failed.
+	if errno != 0 {
+		fstore.Flags = syscall.F_ALLOCATEALL
+		for {
+			_, _, errno = syscall.Syscall(
+				syscall.SYS_FCNTL,
+				f.Fd(),
+				uintptr(syscall.F_PREALLOCATE),
+				uintptr(unsafe.Pointer(&fstore)),
+			)
+			if errno != syscall.EINTR {
+				break
+			}
+		}
 		if errno != 0 {
 			return errno
 		}
@@ -75,10 +93,11 @@ type fpunchhole_t struct {
 	FP_length   int64
 }
 
-// PunchHole deallocates a range within a file (creates sparse file)
-// Uses F_PUNCHHOLE to reclaim space on macOS (requires APFS)
+// PunchHole deallocates a range within a file (creates sparse file).
+// Uses F_PUNCHHOLE to reclaim space on macOS (requires APFS).
 // Aligns to filesystem block boundaries to avoid punching adjacent blobs.
-// Returns the actual number of bytes reclaimed (after alignment)
+// Returns the actual number of bytes reclaimed (after alignment).
+// Retries on EINTR.
 func PunchHole(f *os.File, offset, length int64) (int64, error) {
 	alignedOffset, alignedLength, canPunch := AlignForHolePunch(offset, length)
 	if !canPunch {
@@ -92,21 +111,26 @@ func PunchHole(f *os.File, offset, length int64) (int64, error) {
 		FP_length:   alignedLength,
 	}
 
-	_, _, errno := syscall.Syscall(
-		syscall.SYS_FCNTL,
-		f.Fd(),
-		uintptr(unix.F_PUNCHHOLE),
-		uintptr(unsafe.Pointer(&ph)),
-	)
-
-	if errno != 0 {
-		return 0, errno
+	for {
+		_, _, errno := syscall.Syscall(
+			syscall.SYS_FCNTL,
+			f.Fd(),
+			uintptr(unix.F_PUNCHHOLE),
+			uintptr(unsafe.Pointer(&ph)),
+		)
+		if errno == syscall.EINTR {
+			continue
+		}
+		if errno != 0 {
+			return 0, errno
+		}
+		return alignedLength, nil
 	}
-	return alignedLength, nil
 }
 
 // Fadvise on darwin is less flexible than linux in that it's a global, file descriptor
-// based operation.  But we keep the same signature as linux (ignoring offset and the length).
+// based operation. But we keep the same signature as linux (ignoring offset and the length).
+// Retries on EINTR.
 func Fadvise(fd uintptr, _ Offset_t, _ int64, hint FadviseHint) error {
 	var cmd, enable int
 	switch hint {
@@ -127,11 +151,16 @@ func Fadvise(fd uintptr, _ Offset_t, _ int64, hint FadviseHint) error {
 		return nil // Unsupported hints are ignored on Darwin
 	}
 
-	_, _, errno := syscall.Syscall(syscall.SYS_FCNTL, fd, uintptr(cmd), uintptr(enable))
-	if errno != 0 {
-		return errno
+	for {
+		_, _, errno := syscall.Syscall(syscall.SYS_FCNTL, fd, uintptr(cmd), uintptr(enable))
+		if errno == syscall.EINTR {
+			continue
+		}
+		if errno != 0 {
+			return errno
+		}
+		return nil
 	}
-	return nil
 }
 
 // RequiresExplicitSync indicates whether explicit sync calls are needed for durable writes.

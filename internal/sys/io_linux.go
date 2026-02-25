@@ -16,22 +16,34 @@ const UseFadvise = true
 // Linux O_DIRECT requires aligned memory, offset, and size.
 const RequiresAlignment = true
 
-// Fdatasync syncs file data to disk without syncing metadata
-// Uses fdatasync(2) on Linux for better performance than fsync
+// Fdatasync syncs file data to disk without syncing metadata.
+// Uses fdatasync(2) on Linux for better performance than fsync.
+// Retries on EINTR (Go runtime SIGURG preemption can interrupt syscalls).
 func Fdatasync(f *os.File) error {
-	return unix.Fdatasync(int(f.Fd()))
+	for {
+		err := unix.Fdatasync(int(f.Fd()))
+		if err != unix.EINTR {
+			return err
+		}
+	}
 }
 
-// Fallocate pre-allocates disk space for a file
-// Reduces fragmentation and improves write performance
+// Fallocate pre-allocates disk space for a file.
+// Reduces fragmentation and improves write performance.
+// Retries on EINTR.
 func Fallocate(f *os.File, size int64) error {
-	return unix.Fallocate(int(f.Fd()), 0, 0, size)
+	for {
+		err := unix.Fallocate(int(f.Fd()), 0, 0, size)
+		if err != unix.EINTR {
+			return err
+		}
+	}
 }
 
-// PunchHole deallocates a range within a file (creates sparse file)
-// Uses FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE to reclaim space
-// Aligns to filesystem block boundaries to avoid punching adjacent blobs
-// Returns the actual number of bytes reclaimed (after alignment)
+// PunchHole deallocates a range within a file (creates sparse file).
+// Uses FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE to reclaim space.
+// Aligns to filesystem block boundaries to avoid punching adjacent blobs.
+// Returns the actual number of bytes reclaimed (after alignment).
 func PunchHole(f *os.File, offset, length int64) (int64, error) {
 	alignedOffset, alignedLength, canPunch := AlignForHolePunch(offset, length)
 	if !canPunch {
@@ -40,12 +52,16 @@ func PunchHole(f *os.File, offset, length int64) (int64, error) {
 	// Mode must be the bitwise OR of PUNCH_HOLE and KEEP_SIZE
 	mode := uint32(unix.FALLOC_FL_PUNCH_HOLE | unix.FALLOC_FL_KEEP_SIZE)
 
-	// Fallocate(fd, mode, offset, length)
-	err := unix.Fallocate(int(f.Fd()), mode, alignedOffset, alignedLength)
-	if err != nil {
-		return 0, err
+	for {
+		err := unix.Fallocate(int(f.Fd()), mode, alignedOffset, alignedLength)
+		if err == unix.EINTR {
+			continue
+		}
+		if err != nil {
+			return 0, err
+		}
+		return alignedLength, nil
 	}
-	return alignedLength, nil
 }
 
 // Fadvise maps the internal FadviseHint to Linux-specific posix_fadvise constants.
@@ -65,8 +81,12 @@ func Fadvise(fd uintptr, offset Offset_t, length int64, hint FadviseHint) error 
 		return nil
 	}
 
-	// Signature: fd, offset, length, advice
-	return unix.Fadvise(int(fd), int64(offset), length, linuxHint)
+	for {
+		err := unix.Fadvise(int(fd), int64(offset), length, linuxHint)
+		if err != unix.EINTR {
+			return err
+		}
+	}
 }
 
 // RequiresExplicitSync indicates whether explicit sync calls are needed for durable writes.
@@ -91,9 +111,14 @@ func OpenFileForRead(path string, flags OpenFlag) (*os.File, error) {
 
 // CopyFileRange copies data between two files using the copy_file_range(2) syscall.
 // On XFS with reflinks, this is a metadata-only operation (zero I/O).
+// Retries on EINTR.
 func CopyFileRange(srcFile, dstFile *os.File, srcOff, dstOff *int64, length int) (int, error) {
-	n, err := unix.CopyFileRange(int(srcFile.Fd()), srcOff, int(dstFile.Fd()), dstOff, length, 0)
-	return n, err
+	for {
+		n, err := unix.CopyFileRange(int(srcFile.Fd()), srcOff, int(dstFile.Fd()), dstOff, length, 0)
+		if err != unix.EINTR {
+			return n, err
+		}
+	}
 }
 
 // PreadAligned reads from a file at an aligned offset into an aligned buffer.

@@ -202,6 +202,93 @@ func TestIterator_BoundsRespected(t *testing.T) {
 	require.Equal(t, []string{"bbb", "ccc"}, collected)
 }
 
+// TestIterator_ViewData verifies that View() returns correct data for
+// every key via the direct-read path (bypassing bloom + index lookup).
+func TestIterator_ViewData(t *testing.T) {
+	tmpDir := t.TempDir()
+	cache, err := New(tmpDir, WithMaxSize(100<<20), WithWriteBufferSize(1<<20))
+	require.NoError(t, err)
+	defer cache.Close()
+
+	// Write keys with recognizable values — small WriteBufferSize forces
+	// multiple segments so we test both within-segment and cross-segment reads.
+	const numKeys = 50
+	valueSize := 8 * 1024
+	expected := make(map[string][]byte, numKeys)
+	for i := range numKeys {
+		key := fmt.Appendf(nil, "key-%04d", i)
+		val := make([]byte, valueSize)
+		// Stamp key name into value for later verification.
+		copy(val, key)
+		require.NoError(t, cache.Put(key, val))
+		expected[string(key)] = val
+	}
+	cache.Drain()
+
+	iter, err := cache.NewIterator(nil, nil)
+	require.NoError(t, err)
+	defer iter.Close()
+
+	seen := 0
+	for ok := iter.First(); ok; ok = iter.Next() {
+		key := string(iter.Key())
+		got := iter.View(func(data []byte) {
+			exp, ok := expected[key]
+			require.True(t, ok, "unexpected key %q", key)
+			require.Equal(t, len(exp), len(data), "size mismatch for key %q", key)
+			// Verify the key stamp in the value.
+			require.Equal(t, key, string(data[:len(key)]),
+				"data mismatch for key %q", key)
+		})
+		require.True(t, got, "View() returned false for live key %q", key)
+		seen++
+	}
+	require.NoError(t, iter.Error())
+	require.Equal(t, numKeys, seen)
+}
+
+// TestIterator_ViewAfterReopen verifies View() works after closing and
+// reopening the cache (cold librarian, exercises the disk path).
+func TestIterator_ViewAfterReopen(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	const numKeys = 20
+	valueSize := 16 * 1024
+
+	// Phase 1: populate and close.
+	{
+		cache, err := New(tmpDir, WithMaxSize(100<<20), WithWriteBufferSize(1<<20))
+		require.NoError(t, err)
+		for i := range numKeys {
+			val := make([]byte, valueSize)
+			val[0] = byte(i)
+			require.NoError(t, cache.Put(fmt.Appendf(nil, "k-%04d", i), val))
+		}
+		cache.Drain()
+		require.NoError(t, cache.Close())
+	}
+
+	// Phase 2: reopen and iterate — librarian is empty, all reads from disk.
+	cache, err := New(tmpDir, WithMaxSize(100<<20), WithWriteBufferSize(1<<20))
+	require.NoError(t, err)
+	defer cache.Close()
+
+	iter, err := cache.NewIterator(nil, nil)
+	require.NoError(t, err)
+	defer iter.Close()
+
+	count := 0
+	for ok := iter.First(); ok; ok = iter.Next() {
+		got := iter.View(func(data []byte) {
+			require.Equal(t, valueSize, len(data))
+		})
+		require.True(t, got, "View() returned false for live key")
+		count++
+	}
+	require.NoError(t, iter.Error())
+	require.Equal(t, numKeys, count)
+}
+
 // TestIterator_Empty verifies iteration over an empty cache.
 func TestIterator_Empty(t *testing.T) {
 	tmpDir := t.TempDir()

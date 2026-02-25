@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -47,9 +48,11 @@ import (
 //
 //	go test -bench=BenchmarkIterator -benchtime=10000x -v -timeout=30m
 //
-// Run a single variant:
+// Filter variants with ITER_FILTER (substring match on variant name):
 //
-//	go test -bench='BenchmarkIterator/full/directio' -benchtime=100000x -v -timeout=60m
+//	ITER_FILTER=directio go test -bench=BenchmarkIterator -benchtime=100000x -v -timeout=60m
+//	ITER_FILTER=full/directio go test -bench=BenchmarkIterator -benchtime=100000x -v -timeout=60m
+//	ITER_FILTER=subset go test -bench=BenchmarkIterator -benchtime=100000x -v -timeout=60m
 //
 // On Linux remote:
 //
@@ -130,8 +133,12 @@ func BenchmarkIterator(b *testing.B) {
 		}
 	}
 
+	iterFilter := os.Getenv("ITER_FILTER")
 	for _, tc := range configs {
 		name := fmt.Sprintf("%s/%s/P=%d", tc.scope, tc.ioMode, tc.parallel)
+		if iterFilter != "" && !strings.Contains(name, iterFilter) {
+			continue
+		}
 		directIO := tc.ioMode == "directio"
 		fmt.Printf("\n=== ITER: %s ===\n", name)
 		runIterScan(b, dir, maxSizeBytes, numKeys, directIO, tc.scope == "subset", tc.parallel)

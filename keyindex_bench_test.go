@@ -344,10 +344,13 @@ func iterKey(buf []byte, id int) []byte {
 // benchDir returns a directory for benchmark data.
 // Uses BENCH_DIR env var if set (for /instance_storage on remote),
 // otherwise falls back to b.TempDir().
+// Any pre-existing data in the directory is removed on entry to ensure
+// a clean state (prevents stale data from crashed or previous runs).
 func benchDir(b *testing.B) string {
 	b.Helper()
 	if dir := os.Getenv("BENCH_DIR"); dir != "" {
 		path := filepath.Join(dir, b.Name())
+		os.RemoveAll(path) // Clean stale data from previous/crashed runs.
 		if err := os.MkdirAll(path, 0o755); err != nil {
 			b.Fatal(err)
 		}

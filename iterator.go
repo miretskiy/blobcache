@@ -1,7 +1,6 @@
 package blobcache
 
 import (
-	"encoding/binary"
 	"errors"
 	"fmt"
 
@@ -58,32 +57,8 @@ func (c *Cache) NewIterator(lower, upper []byte) (*Iterator, error) {
 		return nil, errors.New("key index not available")
 	}
 
-	snap := c.keyIndex.NewSnapshot()
-
-	// Build Pebble iteration bounds in the 0x01 (userKey→hash) namespace.
-	var lowerBound, upperBound []byte
-	if lower != nil {
-		lowerBound = make([]byte, 1+len(lower))
-		lowerBound[0] = nsKeyToHash
-		copy(lowerBound[1:], lower)
-	} else {
-		lowerBound = []byte{nsKeyToHash}
-	}
-	if upper != nil {
-		upperBound = make([]byte, 1+len(upper))
-		upperBound[0] = nsKeyToHash
-		copy(upperBound[1:], upper)
-	} else {
-		// Stop before the next namespace (0x02).
-		upperBound = []byte{nsKeyToHash + 1}
-	}
-
-	iter, err := snap.NewIter(&pebble.IterOptions{
-		LowerBound: lowerBound,
-		UpperBound: upperBound,
-	})
+	snap, iter, err := c.keyIndex.NewSnapshotIter(lower, upper)
 	if err != nil {
-		_ = snap.Close()
 		return nil, err
 	}
 
@@ -125,11 +100,7 @@ func (it *Iterator) SeekGE(target []byte) bool {
 	if it.err != nil {
 		return false
 	}
-	seekKey := make([]byte, 1+len(target))
-	seekKey[0] = nsKeyToHash
-	copy(seekKey[1:], target)
-
-	if !it.iter.SeekGE(seekKey) {
+	if !it.iter.SeekGE(it.cache.keyIndex.EncodeSeekKey(target)) {
 		it.valid = false
 		it.err = it.iter.Error()
 		return false
@@ -141,9 +112,14 @@ func (it *Iterator) SeekGE(target []byte) bool {
 // for liveness. Skips dead/evicted keys by advancing the iterator.
 func (it *Iterator) filterAndSet() bool {
 	for {
-		// Decode hash from the value (16 bytes: Lo(8) + Hi(8)).
-		val := it.iter.Value()
-		if len(val) < hashSize {
+		val, valErr := it.iter.ValueAndErr()
+		if valErr != nil {
+			it.valid = false
+			it.err = valErr
+			return false
+		}
+		userKey, h, ok := it.cache.keyIndex.DecodeEntry(it.iter.Key(), val)
+		if !ok {
 			// Corrupt entry — skip.
 			if !it.iter.Next() {
 				it.valid = false
@@ -152,18 +128,11 @@ func (it *Iterator) filterAndSet() bool {
 			}
 			continue
 		}
-		h := index.Key{
-			Lo: binary.LittleEndian.Uint64(val[0:8]),
-			Hi: binary.LittleEndian.Uint64(val[8:16]),
-		}
 
 		// Check RAM index for liveness.
 		item, found := it.cache.index.Get(h)
 		if found && !item.IsDeleted() {
-			// Live entry — extract user key (strip 0x01 prefix).
-			pebbleKey := it.iter.Key()
-			it.key = make([]byte, len(pebbleKey)-1)
-			copy(it.key, pebbleKey[1:])
+			it.key = userKey
 			it.hash = h
 			it.item = item
 			it.valid = true
@@ -266,13 +235,13 @@ func (it *Iterator) peekNextItem() (index.Item, bool) {
 	}
 	defer func() { it.iter.Prev() }()
 
-	val := it.iter.Value()
-	if len(val) < hashSize {
+	val, valErr := it.iter.ValueAndErr()
+	if valErr != nil {
 		return index.Item{}, false
 	}
-	h := index.Key{
-		Lo: binary.LittleEndian.Uint64(val[0:8]),
-		Hi: binary.LittleEndian.Uint64(val[8:16]),
+	_, h, ok := it.cache.keyIndex.DecodeEntry(it.iter.Key(), val)
+	if !ok {
+		return index.Item{}, false
 	}
 
 	next, found := it.cache.index.Get(h)

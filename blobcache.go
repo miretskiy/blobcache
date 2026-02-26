@@ -83,7 +83,7 @@ type Cache struct {
 	// keyIndex is the global Pebble-backed key index for ordered iteration.
 	// Rebuildable from segment files — not a durability layer.
 	// nil if not available (e.g., during recovery without path).
-	keyIndex *KeyIndex
+	keyIndex *index.KeyIndex
 
 	// ballast is a heap allocation that reduces GC frequency by keeping
 	// the heap larger. Never accessed after initialization.
@@ -291,7 +291,7 @@ func open(cfg config) (*Cache, bool, error) {
 	}
 
 	// Open global Pebble key index (rebuildable — non-fatal if it fails).
-	ki, kiErr := OpenKeyIndex(cfg.Path)
+	ki, kiErr := index.OpenKeyIndex(cfg.Path)
 	if kiErr != nil {
 		log.Warn("failed to open key index, iteration will be unavailable", "error", kiErr)
 	}

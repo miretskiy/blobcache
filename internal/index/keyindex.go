@@ -1,4 +1,4 @@
-package blobcache
+package index
 
 import (
 	"encoding/binary"
@@ -256,10 +256,58 @@ func (ki *KeyIndex) SetSentinel(segID uint32) error {
 	return ki.db.Set(encodeSegSentinelKey(segID), nil, pebble.NoSync)
 }
 
-// NewSnapshot returns a Pebble snapshot for consistent iteration.
-// The caller must close the snapshot when done.
-func (ki *KeyIndex) NewSnapshot() *pebble.Snapshot {
-	return ki.db.NewSnapshot()
+// NewSnapshotIter creates a Pebble snapshot and an iterator scoped to the
+// userKey→hash (0x01) namespace, with bounds derived from user-space [lower, upper).
+// The caller must close both the iterator and the snapshot when done.
+// On error, both are nil and all cleanup has already been performed.
+func (ki *KeyIndex) NewSnapshotIter(lower, upper []byte) (*pebble.Snapshot, *pebble.Iterator, error) {
+	snap := ki.db.NewSnapshot()
+	var lowerBound, upperBound []byte
+	if lower != nil {
+		lowerBound = make([]byte, 1+len(lower))
+		lowerBound[0] = nsKeyToHash
+		copy(lowerBound[1:], lower)
+	} else {
+		lowerBound = []byte{nsKeyToHash}
+	}
+	if upper != nil {
+		upperBound = make([]byte, 1+len(upper))
+		upperBound[0] = nsKeyToHash
+		copy(upperBound[1:], upper)
+	} else {
+		// Stop before the next namespace (0x02).
+		upperBound = []byte{nsKeyToHash + 1}
+	}
+	iter, err := snap.NewIter(&pebble.IterOptions{
+		LowerBound: lowerBound,
+		UpperBound: upperBound,
+	})
+	if err != nil {
+		_ = snap.Close()
+		return nil, nil, err
+	}
+	return snap, iter, nil
+}
+
+// EncodeSeekKey encodes a user key for use with pebble.Iterator.SeekGE.
+func (ki *KeyIndex) EncodeSeekKey(userKey []byte) []byte {
+	buf := make([]byte, 1+len(userKey))
+	buf[0] = nsKeyToHash
+	copy(buf[1:], userKey)
+	return buf
+}
+
+// DecodeEntry decodes a (pebbleKey, pebbleValue) pair from the 0x01 namespace
+// into a user key (namespace prefix stripped) and 128-bit hash.
+// Returns ok=false if the value is too short (corrupt entry).
+// The returned userKey is a fresh copy — safe to retain after iterator movement.
+func (ki *KeyIndex) DecodeEntry(pebbleKey, pebbleValue []byte) (userKey []byte, hash Key, ok bool) {
+	if len(pebbleValue) < hashSize {
+		return nil, Key{}, false
+	}
+	userKey = make([]byte, len(pebbleKey)-1)
+	copy(userKey, pebbleKey[1:])
+	return userKey, decodeHash(pebbleValue), true
 }
 
 // --- Key encoding helpers ---

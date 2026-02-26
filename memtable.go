@@ -9,6 +9,7 @@ import (
 
 	"github.com/miretskiy/blobcache/bloom"
 	"github.com/miretskiy/blobcache/compression"
+	"github.com/miretskiy/blobcache/internal/index"
 	"github.com/miretskiy/blobcache/internal/record"
 	"github.com/miretskiy/blobcache/internal/sys"
 	"github.com/miretskiy/blobcache/internal/wal"
@@ -40,7 +41,7 @@ type MemTable struct {
 	slabPool  *MmapPool
 	publisher Publisher
 	wal       *wal.WAL  // nil if WAL disabled
-	keyIndex  *KeyIndex // nil if key index disabled
+	keyIndex  *index.KeyIndex // nil if key index disabled
 
 	mu struct {
 		sync.Mutex
@@ -595,8 +596,8 @@ func collectXLWrites(as *ActiveSlab) ([]SlabEntry, map[uint64]int) {
 // them with their 128-bit hashes for insertion into the global Pebble key index.
 //
 // MUST be called while the slab buffer is still pinned (before Unpin).
-func collectKeyIndexEntries(as *ActiveSlab, entries []record.FooterEntry) []KeyIndexEntry {
-	result := make([]KeyIndexEntry, 0, len(entries))
+func collectKeyIndexEntries(as *ActiveSlab, entries []record.FooterEntry) []index.KeyIndexEntry {
+	result := make([]index.KeyIndexEntry, 0, len(entries))
 
 	// Build set of known hashes for validation.
 	known := make(map[Key]struct{}, len(entries))
@@ -623,7 +624,7 @@ func collectKeyIndexEntries(as *ActiveSlab, entries []record.FooterEntry) []KeyI
 			copy(keyBytes, as.buf.Bytes()[start:start+int(e.KeyLen)])
 		}
 
-		result = append(result, KeyIndexEntry{
+		result = append(result, index.KeyIndexEntry{
 			UserKey: keyBytes,
 			Hash:    key,
 		})
@@ -684,7 +685,7 @@ func (mt *MemTable) ioFlags() sys.OpenFlag {
 // Pebble key index (if available).
 func (mt *MemTable) finalizeFlush(
 	segmentID uint32, segmentPath string, entries []record.FooterEntry, maxSeqID uint64,
-	kiEntries []KeyIndexEntry,
+	kiEntries []index.KeyIndexEntry,
 ) error {
 	if mt.Knobs != nil && mt.Knobs.InjectIndexErr != nil {
 		if err := mt.Knobs.InjectIndexErr(); err != nil {

@@ -1,4 +1,4 @@
-package blobcache
+package index
 
 import (
 	"bytes"
@@ -42,7 +42,7 @@ func TestKeyIndex_AddAndIterate(t *testing.T) {
 	require.NoError(t, ki.AddEntries(2, seg2Entries))
 
 	// Iterate over 0x01 namespace — should yield keys in sorted order.
-	snap := ki.NewSnapshot()
+	snap := ki.db.NewSnapshot()
 	defer snap.Close()
 
 	lower := []byte{nsKeyToHash}
@@ -80,7 +80,7 @@ func TestKeyIndex_DeleteByHash(t *testing.T) {
 	require.NoError(t, ki.DeleteByHash(makeHash("beta")))
 
 	// Verify beta is gone from both namespaces.
-	snap := ki.NewSnapshot()
+	snap := ki.db.NewSnapshot()
 	defer snap.Close()
 
 	// Check 0x01 (key→hash).
@@ -124,7 +124,7 @@ func TestKeyIndex_DeleteByUserKey(t *testing.T) {
 	require.NoError(t, ki.DeleteByUserKey([]byte("foo"), makeHash("foo")))
 
 	// Verify foo is gone.
-	snap := ki.NewSnapshot()
+	snap := ki.db.NewSnapshot()
 	defer snap.Close()
 
 	lower := []byte{nsKeyToHash}
@@ -166,7 +166,7 @@ func TestKeyIndex_DrainSegment(t *testing.T) {
 	require.NoError(t, ki.DrainSegment(10))
 
 	// Only segment 20 keys should remain.
-	snap := ki.NewSnapshot()
+	snap := ki.db.NewSnapshot()
 	defer snap.Close()
 
 	lower := []byte{nsKeyToHash}
@@ -222,7 +222,7 @@ func TestKeyIndex_RelocateSegment(t *testing.T) {
 	require.True(t, has)
 
 	// User keys still iterable (0x01 namespace unchanged by relocate).
-	snap := ki.NewSnapshot()
+	snap := ki.db.NewSnapshot()
 	defer snap.Close()
 
 	lower := []byte{nsKeyToHash}
@@ -329,7 +329,7 @@ func TestKeyIndex_LargeSegment(t *testing.T) {
 	require.NoError(t, ki.AddEntries(1, entries))
 
 	// Verify ordered iteration yields all 1000 in sorted order.
-	snap := ki.NewSnapshot()
+	snap := ki.db.NewSnapshot()
 	defer snap.Close()
 
 	lower := []byte{nsKeyToHash}

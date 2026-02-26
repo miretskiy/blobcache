@@ -52,7 +52,7 @@ func RecoverIndex(path string, opts ...Option) (*Cache, error) {
 	c.Knobs = cfg.knobs
 
 	// Open and reconcile key index.
-	ki, kiErr := OpenKeyIndex(cfg.Path)
+	ki, kiErr := index.OpenKeyIndex(cfg.Path)
 	if kiErr != nil {
 		log.Warn("failed to open key index during recovery", "error", kiErr)
 	}

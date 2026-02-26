@@ -111,7 +111,7 @@ func DeleteSegmentFiles(basePath string, shards int, segmentID uint32) error {
 //
 // This reads record headers sequentially, extracting only the key bytes and hash.
 // Deleted records are skipped. Performance: ~100MB/s sequential read.
-func scanSegmentForUserKeys(segPath string) ([]KeyIndexEntry, error) {
+func scanSegmentForUserKeys(segPath string) ([]index.KeyIndexEntry, error) {
 	f, err := os.Open(segPath)
 	if err != nil {
 		return nil, fmt.Errorf("open segment for key scan: %w", err)
@@ -133,7 +133,7 @@ func scanSegmentForUserKeys(segPath string) ([]KeyIndexEntry, error) {
 	}
 
 	// Re-read key bytes from disk for each entry.
-	var entries []KeyIndexEntry
+	var entries []index.KeyIndexEntry
 	for i := range footer.Entries {
 		entry := &footer.Entries[i]
 		if entry.IsDeleted() {
@@ -150,7 +150,7 @@ func scanSegmentForUserKeys(segPath string) ([]KeyIndexEntry, error) {
 			continue // Skip unreadable entries.
 		}
 
-		entries = append(entries, KeyIndexEntry{
+		entries = append(entries, index.KeyIndexEntry{
 			UserKey: keyBuf,
 			Hash:    entry.Key,
 		})

@@ -39,6 +39,16 @@ type Iterator struct {
 	prefetchSeg uint32       // segment the buffer covers
 	prefetchOff int64        // start offset in segment
 	prefetchEnd int64        // end offset (prefetchOff + valid bytes)
+
+	// Stats for debugging and testing read-ahead effectiveness.
+	Stats IteratorStats
+}
+
+// IteratorStats tracks read-ahead effectiveness.
+type IteratorStats struct {
+	PrefetchHits   int64 // View() served from prefetch buffer
+	PrefetchMisses int64 // View() required a disk read
+	ReadAheadBytes int64 // total extra bytes read for prefetch
 }
 
 // NewIterator creates an iterator over all live keys in [lower, upper).
@@ -185,19 +195,27 @@ func (it *Iterator) View(fn func(data []byte)) bool {
 
 	// 1. Try prefetch buffer hit.
 	if it.tryPrefetchHit(fn) {
+		it.Stats.PrefetchHits++
 		return true
 	}
+	it.Stats.PrefetchMisses++
 
 	// 2. Determine read-ahead from next entry.
+	// Always read enough to fully cover the next item so that the next
+	// View() call can be served from the prefetch buffer.
 	readExtra := 0
 	if nextItem, ok := it.peekNextItem(); ok {
 		if nextItem.SegmentID == it.item.SegmentID &&
 			nextItem.Offset == it.item.Offset+it.item.PhysicalLen {
-			readExtra = readAheadFor(int(it.item.PhysicalLen))
+			// Cover the next item completely, plus adaptive read-ahead
+			// past it for the item after that.
+			nextLen := int(nextItem.PhysicalLen)
+			readExtra = nextLen + readAheadFor(nextLen)
 		}
 	}
 
 	// 3. Read from disk with optional read-ahead.
+	it.Stats.ReadAheadBytes += int64(readExtra)
 	return it.readAndServe(fn, readExtra)
 }
 

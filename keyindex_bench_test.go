@@ -229,6 +229,7 @@ func runSingleIterScan(b *testing.B, cache *Cache, lower, upper []byte) {
 	scanStart := time.Now()
 	go iterHeartbeat(ctx, scanStart, &keysScanned, &bytesScanned)
 
+	var aggStats IteratorStats
 	for scan := range b.N {
 		iter, err := cache.NewIterator(lower, upper)
 		if err != nil {
@@ -254,6 +255,9 @@ func runSingleIterScan(b *testing.B, cache *Cache, lower, upper []byte) {
 		if err := iter.Error(); err != nil {
 			b.Fatalf("scan %d: %v", scan, err)
 		}
+		aggStats.PrefetchHits += iter.Stats.PrefetchHits
+		aggStats.PrefetchMisses += iter.Stats.PrefetchMisses
+		aggStats.ReadAheadBytes += iter.Stats.ReadAheadBytes
 		if err := iter.Close(); err != nil {
 			b.Fatalf("close iter %d: %v", scan, err)
 		}
@@ -277,6 +281,13 @@ func runSingleIterScan(b *testing.B, cache *Cache, lower, upper []byte) {
 		b.N, keysPerScan, keysPerSec, mbPerSec, nsPerKey)
 	fmt.Printf("  Total: %d keys, %.1f GB in %v\n",
 		totalKeys, float64(totalBytes)/(1<<30), elapsed.Round(time.Millisecond))
+	hitRate := float64(0)
+	if total := aggStats.PrefetchHits + aggStats.PrefetchMisses; total > 0 {
+		hitRate = float64(aggStats.PrefetchHits) / float64(total) * 100
+	}
+	fmt.Printf("  Prefetch: hits=%d misses=%d readAhead=%.1f MB hitRate=%.1f%%\n",
+		aggStats.PrefetchHits, aggStats.PrefetchMisses,
+		float64(aggStats.ReadAheadBytes)/(1<<20), hitRate)
 	reportLatency(b, "ITER-VIEW", hist)
 }
 

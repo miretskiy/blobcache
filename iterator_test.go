@@ -289,6 +289,78 @@ func TestIterator_ViewAfterReopen(t *testing.T) {
 	require.Equal(t, numKeys, count)
 }
 
+// TestIterator_PrefetchHits verifies that the read-ahead prefetch buffer
+// reduces disk reads when iterating sequentially. With contiguous records,
+// a View() that reads ahead should let subsequent View() calls hit the buffer.
+// Tests both buffered and directIO read paths.
+func TestIterator_PrefetchHits(t *testing.T) {
+	for _, directIO := range []bool{false, true} {
+		name := "buffered"
+		if directIO {
+			name = "directio"
+		}
+		t.Run(name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+
+			const numKeys = 200
+			valueSize := 8 * 1024 // 8KB values — small enough to fit many per segment
+
+			// Phase 1: populate and close (ensures cold librarian on reopen).
+			{
+				cache, err := New(tmpDir, WithMaxSize(100<<20), WithWriteBufferSize(1<<20))
+				require.NoError(t, err)
+				for i := range numKeys {
+					val := make([]byte, valueSize)
+					val[0] = byte(i)
+					require.NoError(t, cache.Put(fmt.Appendf(nil, "key-%04d", i), val))
+				}
+				cache.Drain()
+				require.NoError(t, cache.Close())
+			}
+
+			// Phase 2: reopen and iterate with View() on every key.
+			cache, err := New(tmpDir,
+				WithMaxSize(100<<20),
+				WithWriteBufferSize(1<<20),
+				WithDirectIORead(directIO),
+			)
+			require.NoError(t, err)
+			defer cache.Close()
+
+			iter, err := cache.NewIterator(nil, nil)
+			require.NoError(t, err)
+			defer iter.Close()
+
+			count := 0
+			for ok := iter.First(); ok; ok = iter.Next() {
+				got := iter.View(func(data []byte) {
+					require.Equal(t, valueSize, len(data))
+				})
+				require.True(t, got, "View() returned false for live key")
+				count++
+			}
+			require.NoError(t, iter.Error())
+			require.Equal(t, numKeys, count)
+
+			// Verify read-ahead stats.
+			t.Logf("PrefetchHits=%d  PrefetchMisses=%d  ReadAheadBytes=%d",
+				iter.Stats.PrefetchHits, iter.Stats.PrefetchMisses, iter.Stats.ReadAheadBytes)
+
+			// With contiguous records in the same segment, most View() calls should
+			// be served from the prefetch buffer. We expect at least 50% hit rate
+			// (actually much higher — one miss per segment boundary + first read).
+			totalViews := iter.Stats.PrefetchHits + iter.Stats.PrefetchMisses
+			require.Equal(t, int64(numKeys), totalViews, "total views should match key count")
+			hitRate := float64(iter.Stats.PrefetchHits) / float64(totalViews)
+			t.Logf("Prefetch hit rate: %.1f%%", hitRate*100)
+			require.Greater(t, hitRate, 0.5,
+				"prefetch hit rate should be >50%% for sequential iteration, got %.1f%%", hitRate*100)
+			require.Greater(t, iter.Stats.ReadAheadBytes, int64(0),
+				"should have read ahead some bytes")
+		})
+	}
+}
+
 // TestIterator_Empty verifies iteration over an empty cache.
 func TestIterator_Empty(t *testing.T) {
 	tmpDir := t.TempDir()

@@ -48,7 +48,7 @@ pub use key::Key;
 pub use librarian::{Librarian, Publisher};
 pub use mempool::{MmapBuffer, MmapPool};
 pub use memtable::MemTable;
-pub use slab::{ActiveSlab, SharedSlab, SlabEntry};
+pub use slab::{ActiveSlab, PinnedBlob, SharedSlab, SlabEntry};
 pub use storage::{Archivist, SegmentIDProvider, SegmentWriter};
 pub use recovery::{recover_index, RecoveryResult};
 pub use wal::Wal;

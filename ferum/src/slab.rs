@@ -11,12 +11,124 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
+use std::ops::Deref;
+
 use crate::compression::{self, Codec};
 use crate::error::BlobErrno;
 use crate::key::Key;
 use crate::mempool::MmapBuffer;
 use crate::record::{Header, HEADER_SIZE};
 use crate::sys;
+
+// =============================================================================
+// PinnedBlob
+// =============================================================================
+
+/// Zero-copy handle to blob data pinned in an mmap'd buffer.
+///
+/// For uncompressed blobs: points directly into the mmap arena (no copy).
+/// For compressed blobs: owns a decompressed Vec<u8>.
+///
+/// The data is valid for as long as `PinnedBlob` is held. Drop it to release
+/// the reference to the underlying mmap buffer.
+pub struct PinnedBlob {
+    inner: PinnedInner,
+    /// The stored key bytes for collision detection (always a copy, keys are small).
+    pub stored_key: Vec<u8>,
+}
+
+enum PinnedInner {
+    /// Uncompressed: raw pointer + len pinning an Arc<MmapBuffer>.
+    Pinned {
+        ptr: *const u8,
+        len: usize,
+        /// Keeps the mmap buffer alive for the lifetime of this blob.
+        _pin: Arc<MmapBuffer>,
+    },
+    /// Compressed or decompressed copy.
+    Owned(Vec<u8>),
+}
+
+// SAFETY: The Arc<MmapBuffer> in `_pin` owns the underlying memory. The raw
+// pointer is valid for at least as long as PinnedBlob is alive. We never write
+// through the pointer, so sharing across threads is safe.
+unsafe impl Send for PinnedBlob {}
+unsafe impl Sync for PinnedBlob {}
+
+impl PinnedBlob {
+    /// Creates a zero-copy view into an mmap buffer.
+    pub(crate) fn pinned(ptr: *const u8, len: usize, pin: Arc<MmapBuffer>) -> Self {
+        PinnedBlob {
+            inner: PinnedInner::Pinned { ptr, len, _pin: pin },
+            stored_key: Vec::new(),
+        }
+    }
+
+    /// Creates an owned (decompressed) blob.
+    pub(crate) fn owned(data: Vec<u8>) -> Self {
+        PinnedBlob {
+            inner: PinnedInner::Owned(data),
+            stored_key: Vec::new(),
+        }
+    }
+
+    pub(crate) fn with_key(mut self, key: Vec<u8>) -> Self {
+        self.stored_key = key;
+        self
+    }
+
+    /// Copies the data into an owned Vec<u8>.
+    pub fn to_owned_vec(&self) -> Vec<u8> {
+        self.deref().to_vec()
+    }
+}
+
+impl Deref for PinnedBlob {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match &self.inner {
+            PinnedInner::Pinned { ptr, len, .. } => {
+                // SAFETY: _pin keeps the mmap alive, ptr is valid for `len` bytes.
+                unsafe { std::slice::from_raw_parts(*ptr, *len) }
+            }
+            PinnedInner::Owned(v) => v.as_slice(),
+        }
+    }
+}
+
+impl AsRef<[u8]> for PinnedBlob {
+    fn as_ref(&self) -> &[u8] {
+        self.deref()
+    }
+}
+
+impl PartialEq<[u8]> for PinnedBlob {
+    fn eq(&self, other: &[u8]) -> bool {
+        self.deref() == other
+    }
+}
+
+impl PartialEq<Vec<u8>> for PinnedBlob {
+    fn eq(&self, other: &Vec<u8>) -> bool {
+        self.deref() == other.as_slice()
+    }
+}
+
+impl<const N: usize> PartialEq<&[u8; N]> for PinnedBlob {
+    fn eq(&self, other: &&[u8; N]) -> bool {
+        self.deref() == *other
+    }
+}
+
+impl std::fmt::Debug for PinnedBlob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PinnedBlob")
+            .field("len", &self.deref().len())
+            .field("stored_key", &self.stored_key)
+            .finish()
+    }
+}
 
 // =============================================================================
 // SlabEntry
@@ -170,29 +282,23 @@ pub struct SharedSlab {
     pub index: Arc<SlabIndex>,
 }
 
-/// Result of acquiring data from a slab.
-pub struct AcquireResult {
-    /// The value data (possibly decompressed).
-    pub value: Vec<u8>,
-    /// The stored key bytes for collision detection.
-    pub stored_key: Vec<u8>,
-    /// Buffer to release when done.
-    pub release: Option<Arc<MmapBuffer>>,
-}
-
 impl SharedSlab {
     /// Creates a new shared slab.
     pub fn new(buf: Arc<MmapBuffer>, index: Arc<SlabIndex>) -> Self {
         SharedSlab { buf, index }
     }
 
-    /// Acquires data for a key.
+    /// Acquires data for a key, returning a zero-copy `PinnedBlob`.
+    ///
+    /// For uncompressed blobs the returned blob holds a raw pointer into the
+    /// mmap buffer (no copy). For compressed blobs the returned blob owns the
+    /// decompressed bytes.
     ///
     /// Returns:
-    /// - `Ok(Some(result))`: Found with data
-    /// - `Ok(None)`: Not found
+    /// - `Ok(Some(blob))`: Found with data
+    /// - `Ok(None)`: Not found or tombstone
     /// - `Err(errno)`: Found but has error flag set
-    pub fn acquire(&self, key: &Key) -> Result<Option<AcquireResult>, BlobErrno> {
+    pub fn acquire(&self, key: &Key) -> Result<Option<PinnedBlob>, BlobErrno> {
         // 1. Lock-free lookup
         let entry = match self.index.get(key) {
             Some(e) => e,
@@ -209,44 +315,40 @@ impl SharedSlab {
             return Err(entry.errno());
         }
 
-        // 3. Determine which buffer to read from
-        // For XL entries, xl_buf contains the full record starting at offset 0
-        // For normal entries, pos points to the record start in the slab buffer
-        // Arc::clone safely increments ref count - no try_inc needed
+        // 4. Determine which buffer to read from.
+        // For XL entries, xl_buf contains the full record starting at offset 0.
+        // For normal entries, pos points to the record start in the slab buffer.
         let (buf, offset) = if let Some(ref xl_buf) = entry.xl_buf {
             (Arc::clone(xl_buf), 0i64)
         } else {
             (Arc::clone(&self.buf), entry.pos)
         };
 
-        // 4. Extract key bytes
+        // 5. Extract key bytes (always copied — small and needed for collision detection)
         let key_start = offset as usize + HEADER_SIZE;
         let key_end = key_start + entry.key_len as usize;
         let stored_key = buf.as_slice()[key_start..key_end].to_vec();
 
-        // 6. Extract physical data
+        // 6. Build PinnedBlob — zero-copy for uncompressed, owned copy for compressed.
+        let value_start = key_end;
         let value_end = key_end + entry.physical_size as usize;
-        let physical_data = &buf.as_slice()[key_end..value_end];
 
-        // 6. Handle decompression
-        // Note: buf (Arc) is automatically dropped when we return, releasing the reference
-        let value = if entry.is_compressed() {
+        let blob = if entry.is_compressed() {
+            let physical_data = &buf.as_slice()[value_start..value_end];
             let mut decompressed = vec![0u8; entry.logical_size as usize];
             match compression::decompress(entry.compression(), &mut decompressed, physical_data) {
-                Ok(()) => decompressed,
-                Err(_) => {
-                    return Err(BlobErrno::Decompression);
-                }
+                Ok(()) => PinnedBlob::owned(decompressed).with_key(stored_key),
+                Err(_) => return Err(BlobErrno::Decompression),
             }
         } else {
-            physical_data.to_vec()
+            // Zero-copy: pin a raw pointer into the mmap arena.
+            let slice = &buf.as_slice()[value_start..value_end];
+            let ptr = slice.as_ptr();
+            let len = slice.len();
+            PinnedBlob::pinned(ptr, len, buf).with_key(stored_key)
         };
 
-        Ok(Some(AcquireResult {
-            value,
-            stored_key,
-            release: Some(buf),
-        }))
+        Ok(Some(blob))
     }
 
     /// Invalidates a key from the index.

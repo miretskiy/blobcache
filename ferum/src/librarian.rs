@@ -19,7 +19,7 @@ use arc_swap::ArcSwap;
 
 use crate::error::BlobErrno;
 use crate::key::Key;
-use crate::slab::SharedSlab;
+use crate::slab::{PinnedBlob, SharedSlab};
 
 // =============================================================================
 // Publisher trait
@@ -29,28 +29,6 @@ use crate::slab::SharedSlab;
 pub trait Publisher {
     /// Publishes a slab to the cache.
     fn publish(&self, slab: SharedSlab);
-}
-
-// =============================================================================
-// AcquireResult
-// =============================================================================
-
-/// Result of acquiring data from the Librarian.
-pub struct AcquireResult {
-    /// The value data (possibly decompressed).
-    pub value: Vec<u8>,
-    /// The stored key bytes for collision detection.
-    pub stored_key: Vec<u8>,
-    /// The slab containing the data (keeps buffer pinned).
-    slab: SharedSlab,
-}
-
-impl AcquireResult {
-    /// Releases the acquired data.
-    pub fn release(self) {
-        // Slab is dropped here, which will call unpin on the buffer
-        drop(self.slab);
-    }
 }
 
 // =============================================================================
@@ -138,35 +116,32 @@ impl Librarian {
         }
     }
 
-    /// Searches the catalog for the key.
+    /// Searches the catalog for the key, returning a zero-copy `PinnedBlob`.
     ///
     /// WAIT-FREE: No mutexes, just an atomic pointer load.
     ///
-    /// Returns the value and stored key if found. The stored key should be
-    /// verified against the expected key to detect 128-bit hash collisions.
-    pub fn acquire(&self, hash_key: Key) -> Result<Option<AcquireResult>, BlobErrno> {
+    /// For uncompressed blobs the returned `PinnedBlob` holds a raw pointer into
+    /// the mmap buffer (no copy). For compressed blobs the data is decompressed
+    /// into an owned Vec<u8>.
+    ///
+    /// The `stored_key` field of the returned blob should be verified against the
+    /// expected key to detect 128-bit hash collisions.
+    pub fn acquire(&self, hash_key: Key) -> Result<Option<PinnedBlob>, BlobErrno> {
         // 1. Load the immutable snapshot (wait-free)
         let list = self.view.load();
 
-        // 2. Iterate through slabs
+        // 2. Iterate through slabs (newest first)
         for slab in list.iter() {
-            // 3. Attempt to acquire from this slab.
             // Arc-based reference counting ensures the slab buffer remains valid
             // even if 'Publish' evicts this slab while we are iterating.
             match slab.acquire(&hash_key) {
-                Ok(Some(result)) => {
-                    return Ok(Some(AcquireResult {
-                        value: result.value,
-                        stored_key: result.stored_key,
-                        slab: slab.clone(),
-                    }));
-                }
-                Ok(None) => continue, // Not found in this slab
-                Err(errno) => return Err(errno), // Error (e.g., decompression failure)
+                Ok(Some(blob)) => return Ok(Some(blob)),
+                Ok(None) => continue,
+                Err(errno) => return Err(errno),
             }
         }
 
-        Ok(None) // Not found in any slab
+        Ok(None)
     }
 
     /// Protected view that handles lifecycle automatically via a closure.
@@ -178,9 +153,8 @@ impl Librarian {
         F: FnMut(&[u8], &[u8]),
     {
         match self.acquire(hash_key)? {
-            Some(result) => {
-                callback(&result.stored_key, &result.value);
-                result.release();
+            Some(blob) => {
+                callback(&blob.stored_key, &blob);
                 Ok(true)
             }
             None => Ok(false),
@@ -341,10 +315,10 @@ mod tests {
         let result = librarian.acquire(key).unwrap();
         assert!(result.is_some());
 
-        let data = result.unwrap();
-        assert_eq!(data.stored_key, b"testkey");
-        assert_eq!(data.value, b"testvalue");
-        data.release();
+        let blob = result.unwrap();
+        assert_eq!(blob.stored_key, b"testkey");
+        assert_eq!(&*blob, b"testvalue");
+        // blob is dropped here, releasing the mmap reference
     }
 
     #[test]
@@ -371,7 +345,7 @@ mod tests {
         let key = Key::from_bytes(b"key1");
         let result = librarian.acquire(key).unwrap();
         assert!(result.is_some());
-        result.unwrap().release();
+        drop(result.unwrap());
 
         // Invalidate
         librarian.invalidate(&key);

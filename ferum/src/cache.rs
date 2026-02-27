@@ -527,10 +527,14 @@ impl Cache {
         }
     }
 
-    /// Retrieves a blob from the cache.
+    /// Retrieves a blob from the cache as a zero-copy `PinnedBlob`.
     ///
-    /// Returns None if the key is not found.
-    pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+    /// For uncompressed blobs found in the Librarian (RAM cache), returns a
+    /// direct pointer into the mmap arena — no allocation, no copy.
+    /// For compressed blobs or disk reads, returns an owned decompressed copy.
+    ///
+    /// Returns `None` if the key is not found.
+    pub fn get_pinned(&self, key: &[u8]) -> Option<crate::slab::PinnedBlob> {
         if key.is_empty() {
             return None;
         }
@@ -538,30 +542,25 @@ impl Cache {
         let hash_key = Key::from_bytes(key);
 
         // 1. Bloom filter gate
-        #[cfg(test)]
-        let bloom_result = self.bloom.test(hash_key);
-        #[cfg(not(test))]
         let bloom_result = self.bloom.test(hash_key);
 
         #[cfg(test)]
         {
             eprintln!("get: hash_key={:?}, bloom_result={}", hash_key, bloom_result);
-        }
-
-        #[cfg(test)]
-        if !bloom_result {
-            eprintln!("get: bloom filter rejected key {:?}", std::str::from_utf8(key));
+            if !bloom_result {
+                eprintln!("get: bloom filter rejected key {:?}", std::str::from_utf8(key));
+            }
         }
 
         if !bloom_result {
             return None;
         }
 
-        // 2. Check librarian (RAM cache)
-        if let Ok(Some(result)) = self.librarian.acquire(hash_key) {
+        // 2. Check librarian (RAM cache) — zero-copy for uncompressed blobs
+        if let Ok(Some(blob)) = self.librarian.acquire(hash_key) {
             // Verify key to detect hash collision
-            if result.stored_key == key {
-                return Some(result.value);
+            if blob.stored_key == key {
+                return Some(blob);
             }
             // Hash collision - not our key
             return None;
@@ -576,12 +575,16 @@ impl Cache {
             }
 
             match self.archivist.read_blob(&item, key) {
-                Ok(result) => return Some(result.value),
+                Ok(result) => {
+                    return Some(
+                        crate::slab::PinnedBlob::owned(result.value)
+                            .with_key(result.stored_key),
+                    );
+                }
                 Err(e) => {
-                    // Log error but don't fail - return None
                     #[cfg(test)]
                     eprintln!("read error for key {:?}: {}", hash_key, e);
-                    let _ = e; // Suppress unused warning in release
+                    let _ = e;
                     return None;
                 }
             }
@@ -590,71 +593,50 @@ impl Cache {
         None
     }
 
-    /// Provides scoped access to a value via a closure.
+    /// Retrieves a blob from the cache, returning an owned `Vec<u8>`.
     ///
-    /// Returns true if the key was found and the closure was called.
+    /// This is a convenience wrapper around `get_pinned()` for callers that need
+    /// owned data. For zero-copy access use `get_pinned()` or `view()`.
+    ///
+    /// Returns None if the key is not found.
+    pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.get_pinned(key).map(|b| b.to_owned_vec())
+    }
+
+    /// Alias for `get()` — returns an owned copy of the blob data.
+    pub fn get_bytes(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.get(key)
+    }
+
+    /// Provides scoped zero-copy access to a value via a closure.
+    ///
+    /// For uncompressed Librarian hits the closure receives a direct pointer into
+    /// the mmap arena — no allocation. Returns true if the key was found.
     pub fn view<F>(&self, key: &[u8], mut f: F) -> bool
     where
         F: FnMut(&[u8]),
     {
-        if let Some(data) = self.get(key) {
-            f(&data);
+        if let Some(blob) = self.get_pinned(key) {
+            f(&blob);
             true
         } else {
             false
         }
     }
 
-    /// Retrieves a blob into a pre-allocated buffer (zero allocation).
+    /// Retrieves a blob into a pre-allocated buffer (zero allocation on the path,
+    /// one copy from pinned memory into `buf`).
     ///
     /// The buffer is cleared and filled with the blob data if found.
     /// Returns true if the key was found and data was written to buf.
-    ///
-    /// This is more efficient than `get()` for repeated reads as it
-    /// avoids allocation per call.
     pub fn get_into(&self, key: &[u8], buf: &mut Vec<u8>) -> bool {
         buf.clear();
-
-        if key.is_empty() {
-            return false;
+        if let Some(blob) = self.get_pinned(key) {
+            buf.extend_from_slice(&blob);
+            true
+        } else {
+            false
         }
-
-        let hash_key = Key::from_bytes(key);
-
-        // 1. Bloom filter gate
-        if !self.bloom.test(hash_key) {
-            return false;
-        }
-
-        // 2. Check librarian (RAM cache)
-        if let Ok(Some(result)) = self.librarian.acquire(hash_key) {
-            // Verify key to detect hash collision
-            if result.stored_key == key {
-                buf.extend_from_slice(&result.value);
-                return true;
-            }
-            // Hash collision - not our key
-            return false;
-        }
-
-        // 3. Check disk via archivist
-        if let Some(item) = self.index.get(&hash_key) {
-            if item.is_deleted() {
-                return false;
-            }
-
-            match self.archivist.read_blob(&item, key) {
-                Ok(result) => {
-                    buf.extend_from_slice(&result.value);
-                    return true;
-                }
-                Err(_) => {
-                    return false;
-                }
-            }
-        }
-
-        false
     }
 
     /// Deletes a blob from the cache.

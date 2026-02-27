@@ -233,6 +233,43 @@ impl DurableIndex {
         Ok(())
     }
 
+    /// Drains all items belonging to `seg_id` from the in-memory index and
+    /// persistence, then removes segment metadata.
+    ///
+    /// Returns `(total_physical_bytes_freed, item_count_removed)`.
+    ///
+    /// Used by cache-mode drain: after calling this, delete the segment files.
+    pub fn drain_segment(&self, seg_id: u32) -> (u64, i64) {
+        let mut total_bytes = 0u64;
+        let mut count = 0i64;
+
+        // Collect all items belonging to this segment
+        let mut to_delete = Vec::new();
+        self.blobs.for_each(|item| {
+            if item.segment_id == seg_id {
+                to_delete.push(*item);
+            }
+        });
+
+        // Remove each item from the in-memory index
+        for item in &to_delete {
+            if self.blobs.delete(&item.key) {
+                total_bytes += item.physical_len as u64;
+                count += 1;
+            }
+        }
+
+        // Drop from persistence (removes all items + tombstones for this segment)
+        if let Some(ref pers) = self.persistence {
+            let _ = pers.drop_segment(seg_id);
+        }
+
+        // Remove segment metadata
+        self.segment_meta.remove(seg_id);
+
+        (total_bytes, count)
+    }
+
     /// Returns the maximum sequence ID from persistence.
     pub fn max_seq_id(&self) -> Result<u64> {
         if let Some(ref pers) = self.persistence {

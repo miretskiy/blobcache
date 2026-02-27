@@ -414,6 +414,44 @@ impl Compactor {
 
         Ok((to_relocate, tombstones, max_seq_id))
     }
+
+    /// Returns the number of segments tracked in the index.
+    pub fn segment_count(&self) -> usize {
+        self.index.segment_metadata_snapshot().len()
+    }
+
+    /// Returns drain candidates: segments with `id < max_eligible_id`, sorted
+    /// ascending by live bytes (delete least-populated first).
+    ///
+    /// Used by cache-mode drain to reclaim space by deleting sparse segments.
+    pub fn get_drain_candidates(&self, max_eligible_id: u32) -> Vec<SparseSegment> {
+        let snapshot = self.index.segment_metadata_snapshot();
+        let mut candidates: Vec<SparseSegment> = snapshot
+            .into_iter()
+            .filter(|(seg_id, _)| *seg_id < max_eligible_id)
+            .map(|(seg_id, meta)| SparseSegment {
+                id: seg_id,
+                live_bytes: meta.logical_bytes.max(0) as u64,
+            })
+            .collect();
+
+        // Sort ascending by live_bytes (delete least-populated first)
+        candidates.sort_by_key(|s| s.live_bytes);
+        candidates
+    }
+}
+
+// =============================================================================
+// SparseSegment
+// =============================================================================
+
+/// A segment candidate for drain-based eviction in cache mode.
+#[derive(Debug, Clone)]
+pub struct SparseSegment {
+    /// Segment ID.
+    pub id: u32,
+    /// Approximate live data bytes (from index metadata).
+    pub live_bytes: u64,
 }
 
 // =============================================================================

@@ -41,7 +41,7 @@ pub mod wal;
 // Re-export main types for convenient access
 pub use bloom::Filter as BloomFilter;
 pub use cache::{cache, cas, Cache, CacheBuilder, CacheStats};
-pub use compaction::{CompactResult, Compactor, SegmentStats};
+pub use compaction::{CompactResult, Compactor, SegmentStats, SparseSegment};
 pub use compression::Codec;
 pub use config::Config;
 pub use error::{Error, Result};

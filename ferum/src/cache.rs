@@ -23,7 +23,7 @@ use crate::key::Key;
 use crate::librarian::Librarian;
 use crate::memtable::MemTable;
 use crate::record::Record;
-use crate::storage::{recover_index_from_footers, Archivist, SegmentIDProvider};
+use crate::storage::{delete_segment_files, recover_index_from_footers, Archivist, SegmentIDProvider};
 use crate::wal::{Replayer, Wal, WalConfig};
 
 // =============================================================================
@@ -820,6 +820,11 @@ impl Cache {
                     if let Err(e) = cache.maybe_compact_segments() {
                         eprintln!("compaction failed: {}", e);
                     }
+
+                    // Cache mode only: drain sparse segments to reclaim disk space
+                    if !cache.config.wal_enabled && cache.config.max_size > 0 {
+                        cache.maybe_drain_segments();
+                    }
                 }
             }
         })
@@ -899,6 +904,64 @@ impl Cache {
         }
 
         Ok(())
+    }
+
+    /// Drains sparse segments to reclaim disk space (cache mode only).
+    ///
+    /// When the estimated total disk usage exceeds `max_size * DRAIN_HIGH_WATERMARK`,
+    /// deletes the sparsest segments (by live bytes) until usage drops below
+    /// `max_size * DRAIN_LOW_WATERMARK`.
+    ///
+    /// Only operates in cache mode (no WAL). Respects the cooling period so
+    /// recently-written segments are never drained.
+    fn maybe_drain_segments(&self) {
+        const DRAIN_HIGH_WATERMARK_RATIO: f64 = 0.5;
+        const DRAIN_LOW_WATERMARK_RATIO: f64 = 0.25;
+
+        let max_size = self.config.max_size;
+        if max_size == 0 {
+            return; // Unlimited — nothing to drain
+        }
+
+        let seg_count = self.compactor.segment_count() as u64;
+        let estimated_disk = seg_count * self.config.write_buffer_size as u64;
+        let live_bytes = self.approx_size.load(Ordering::Relaxed);
+        let waste = estimated_disk.saturating_sub(live_bytes);
+
+        let high = (max_size as f64 * DRAIN_HIGH_WATERMARK_RATIO) as u64;
+        if waste <= high {
+            return;
+        }
+
+        let low = (max_size as f64 * DRAIN_LOW_WATERMARK_RATIO) as u64;
+        let mut drain_target = waste.saturating_sub(low) as i64;
+
+        // Cooling gap: skip recently-written segments (still warm in librarian)
+        let cooling_gap = (self.config.max_cached_slabs + 2) as u32;
+        let max_eligible_id = self.segment_ids.current().saturating_sub(cooling_gap);
+
+        let candidates = self.compactor.get_drain_candidates(max_eligible_id);
+
+        for seg in candidates {
+            if drain_target <= 0 {
+                break;
+            }
+
+            // Take exclusive lock on this segment during deletion
+            let _guard = self.index.lock_segment_exclusive(seg.id);
+            let (drained_bytes, _count) = self.index.drain_segment(seg.id);
+            self.archivist.drop_segment_cache(seg.id);
+            let _ = delete_segment_files(&self.config.path, self.config.shards, seg.id);
+
+            self.sub_approx_size(drained_bytes);
+            drain_target -= self.config.write_buffer_size as i64;
+
+            info!(
+                "drain: deleted segment {} ({:.2} MB live bytes freed)",
+                seg.id,
+                drained_bytes as f64 / (1024.0 * 1024.0),
+            );
+        }
     }
 
     /// Closes the cache gracefully.

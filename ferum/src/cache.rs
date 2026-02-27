@@ -511,6 +511,41 @@ impl Cache {
         self.global_seq.fetch_add(1, Ordering::AcqRel)
     }
 
+    /// Stores a blob in the cache with a caller-supplied CRC32 checksum.
+    ///
+    /// Skips CRC32 computation (the caller already computed it). Useful when the
+    /// checksum is known from a prior validation step (e.g., network transfer).
+    pub fn put_checksummed(&self, key: &[u8], value: &[u8], checksum: u32) -> Result<()> {
+        if key.is_empty() {
+            return Err(Error::InvalidConfig {
+                message: "empty key not allowed".to_string(),
+            });
+        }
+
+        let hash_key = Key::from_bytes(key);
+        self.bloom.add(hash_key);
+
+        let mut seq_id = self.next_seq();
+        loop {
+            match self.memtable.put_checksummed(seq_id, hash_key, key, value, checksum) {
+                Ok(()) => {
+                    self.add_approx_size((key.len() + value.len()) as u64);
+                    if seq_id & 0x3FF == 0 {
+                        self.maybe_evict();
+                    }
+                    return Ok(());
+                }
+                Err(Error::InvalidConfig { message }) if message.contains("too old") => {
+                    if self.index.get(&hash_key).is_some() {
+                        return Ok(());
+                    }
+                    seq_id = self.next_seq();
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// Stores a blob in the cache.
     ///
     /// Returns an error if the key is empty.
@@ -1152,6 +1187,7 @@ impl Cache {
     /// Returns cache statistics.
     pub fn stats(&self) -> CacheStats {
         let index_stats = self.index.stats();
+        let io_stats = self.archivist.io_stats();
         CacheStats {
             items: index_stats.items,
             arena_nodes: index_stats.arena_nodes,
@@ -1159,6 +1195,13 @@ impl Cache {
             memory_est: index_stats.memory_est,
             approx_size: self.approx_size(),
             librarian_cached_slabs: self.librarian.len(),
+            librarian_evictions: self.librarian.eviction_count(),
+            bloom_hits: self.bloom_stats.hits.load(Ordering::Relaxed),
+            bloom_ghosts: self.bloom_stats.ghosts.load(Ordering::Relaxed),
+            bloom_deletions: self.bloom_stats.deletions.load(Ordering::Relaxed),
+            iosched_requests: io_stats.requests,
+            iosched_batches: io_stats.batches,
+            degraded: self.is_degraded(),
         }
     }
 }
@@ -1186,8 +1229,22 @@ pub struct CacheStats {
     pub memory_est: i64,
     /// Approximate size of stored data.
     pub approx_size: u64,
-    /// Number of slabs cached in librarian.
+    /// Number of slabs currently cached in librarian.
     pub librarian_cached_slabs: usize,
+    /// Total number of slabs evicted from librarian catalog.
+    pub librarian_evictions: i64,
+    /// Sampled bloom filter positive lookups (1/128 sampling).
+    pub bloom_hits: u64,
+    /// Sampled bloom filter false positives (bloom yes, index no).
+    pub bloom_ghosts: u64,
+    /// Cumulative deletes since last bloom rebuild.
+    pub bloom_deletions: i64,
+    /// Total I/O read requests issued by Archivist.
+    pub iosched_requests: u64,
+    /// Total I/O submission batches.
+    pub iosched_batches: u64,
+    /// Whether the cache is in degraded mode.
+    pub degraded: bool,
 }
 
 // =============================================================================

@@ -238,6 +238,25 @@ impl MemTable {
         self.write_to_slab(seq_id, key, rec)
     }
 
+    /// Puts a value with a caller-supplied CRC32 checksum (bypasses computation).
+    pub fn put_checksummed(
+        &self,
+        seq_id: u64,
+        key: Key,
+        key_bytes: &[u8],
+        value: &[u8],
+        checksum: u32,
+    ) -> Result<()> {
+        let (compressed, codec) = self.maybe_compress(value);
+        let value_bytes = compressed.as_deref().unwrap_or(value);
+
+        let mut rec = Record::new(seq_id, key_bytes.to_vec(), value_bytes.to_vec(), value.len() as i64);
+        rec.header.set_compression(codec);
+        rec.header.set_crc(checksum);
+
+        self.write_to_slab(seq_id, key, rec)
+    }
+
     /// Deletes a key by writing a tombstone record.
     ///
     /// A tombstone is a record with FLAG_DELETED set and empty value.

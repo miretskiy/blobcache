@@ -12,7 +12,7 @@
 //! - **Bounded memory**: Configurable max cached slabs with automatic eviction
 //! - **Zero-copy**: Direct access to mmap'd slab buffers
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -47,6 +47,8 @@ pub struct Librarian {
     closed: AtomicBool,
     /// Maximum number of slabs to cache.
     max_cached: usize,
+    /// Number of slabs evicted from the catalog due to capacity limits.
+    pub evictions: AtomicI64,
 }
 
 impl Librarian {
@@ -58,7 +60,13 @@ impl Librarian {
             view: ArcSwap::from_pointee(Vec::new()),
             closed: AtomicBool::new(false),
             max_cached,
+            evictions: AtomicI64::new(0),
         }
+    }
+
+    /// Returns the total number of slabs evicted from the catalog.
+    pub fn eviction_count(&self) -> i64 {
+        self.evictions.load(Ordering::Relaxed)
     }
 
     /// Returns true if the librarian is disabled (max_cached = 0).
@@ -95,7 +103,11 @@ impl Librarian {
 
             // Evict oldest if over limit
             let victim = if new_list.len() > self.max_cached {
-                new_list.pop()
+                let v = new_list.pop();
+                if v.is_some() {
+                    self.evictions.fetch_add(1, Ordering::Relaxed);
+                }
+                v
             } else {
                 None
             };

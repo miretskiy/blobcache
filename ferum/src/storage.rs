@@ -7,15 +7,18 @@
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::Write;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 use parking_lot::RwLock;
 
 use crate::compression;
 use crate::error::{Error, Result};
 use crate::index::Item;
+use crate::iosched::{IOScheduler, PreadScheduler};
 use crate::record::{self, FooterEntry, Header, HEADER_SIZE};
 use crate::sys::{self, OpenFlags};
 
@@ -469,10 +472,12 @@ pub struct Archivist {
     use_fadvise: bool,
     /// Whether to verify checksums on read.
     verify_checksum: bool,
+    /// I/O scheduler for segment reads.
+    sched: Arc<dyn IOScheduler>,
 }
 
 impl Archivist {
-    /// Creates a new Archivist.
+    /// Creates a new Archivist with the default PreadScheduler.
     pub fn new(base_path: &Path, shards: u32) -> Self {
         Archivist {
             base_path: base_path.to_path_buf(),
@@ -480,6 +485,19 @@ impl Archivist {
             cache: RwLock::new(HashMap::new()),
             use_fadvise: true,
             verify_checksum: false,
+            sched: Arc::new(PreadScheduler::new()),
+        }
+    }
+
+    /// Creates an Archivist with a custom I/O scheduler.
+    pub fn with_scheduler(base_path: &Path, shards: u32, sched: Arc<dyn IOScheduler>) -> Self {
+        Archivist {
+            base_path: base_path.to_path_buf(),
+            shards,
+            cache: RwLock::new(HashMap::new()),
+            use_fadvise: true,
+            verify_checksum: false,
+            sched,
         }
     }
 
@@ -493,14 +511,21 @@ impl Archivist {
         self.verify_checksum = enabled;
     }
 
-    /// Reads a blob from a segment.
+    /// Returns I/O scheduler statistics.
+    pub fn io_stats(&self) -> crate::iosched::IOStats {
+        self.sched.stats()
+    }
+
+    /// Reads a blob from a segment using the configured I/O scheduler.
     ///
+    /// Uses `pread(2)` (or io_uring on Linux) with an aligned read buffer.
     /// The `expected_key` is used to verify the stored key matches
     /// (detects 128-bit hash collisions).
     pub fn read_blob(&self, item: &Item, expected_key: &[u8]) -> Result<ReadResult> {
         let file = self.get_segment_file(item.segment_id)?;
+        let fd = file.as_raw_fd();
 
-        // Advisory hint to kernel (errors logged but not fatal)
+        // Advisory hint to kernel before reading (errors logged but not fatal)
         if self.use_fadvise {
             if let Err(e) = sys::fadvise(&file, item.offset as i64, item.physical_len as i64) {
                 eprintln!(
@@ -510,15 +535,32 @@ impl Archivist {
             }
         }
 
-        // Read entire record
-        let mut buf = vec![0u8; item.physical_len as usize];
-        {
-            let mut file_ref = &file;
-            file_ref.seek(SeekFrom::Start(item.offset as u64))
-                .map_err(|e| Error::io("seek in segment", e))?;
-            file_ref.read_exact(&mut buf)
-                .map_err(|e| Error::io("read from segment", e))?;
+        // Align the read for Direct I/O compatibility and better kernel prefetch.
+        let (aligned_off, aligned_len) = sys::align_range(item.offset as u64, item.physical_len as usize);
+
+        // Allocate aligned buffer and issue the read via the scheduler.
+        let mut aligned_buf = sys::alloc_aligned(aligned_len)
+            .map_err(|e| Error::io("allocate aligned read buffer", std::io::Error::other(e.to_string())))?;
+        aligned_buf.set_len(aligned_len);
+
+        let n = self.sched.read_at(fd, aligned_buf.as_mut_slice(), aligned_off)
+            .map_err(|e| Error::io("pread segment", e))?;
+
+        // The actual record starts at lead bytes into the aligned buffer.
+        let lead = (item.offset as u64 - aligned_off) as usize;
+        let rec_end = lead + item.physical_len as usize;
+
+        if n < rec_end {
+            return Err(Error::io(
+                "read segment",
+                std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!("read {} bytes, needed {}", n, rec_end),
+                ),
+            ));
         }
+
+        let buf = &aligned_buf.as_slice()[lead..rec_end];
 
         // Parse header
         let header = Header::decode(&buf[..HEADER_SIZE])?;
@@ -544,7 +586,6 @@ impl Archivist {
         };
 
         // Optional integrity verification
-        // CRC covers key + value (see record::compute_crc)
         if self.verify_checksum && header.has_valid_crc() {
             let stored_crc = header.crc();
             let computed_crc = record::compute_crc(&stored_key, &value);
@@ -564,17 +605,26 @@ impl Archivist {
     /// Used by compaction for copying blobs without parsing.
     pub fn read_blob_raw(&self, item: &Item) -> Result<Vec<u8>> {
         let file = self.get_segment_file(item.segment_id)?;
+        let fd = file.as_raw_fd();
 
-        let mut buf = vec![0u8; item.physical_len as usize];
-        {
-            let mut file_ref = &file;
-            file_ref.seek(SeekFrom::Start(item.offset as u64))
-                .map_err(|e| Error::io("seek in segment", e))?;
-            file_ref.read_exact(&mut buf)
-                .map_err(|e| Error::io("read from segment", e))?;
+        let (aligned_off, aligned_len) = sys::align_range(item.offset as u64, item.physical_len as usize);
+        let mut aligned_buf = sys::alloc_aligned(aligned_len)
+            .map_err(|e| Error::io("allocate aligned buffer", std::io::Error::other(e.to_string())))?;
+        aligned_buf.set_len(aligned_len);
+
+        let n = self.sched.read_at(fd, aligned_buf.as_mut_slice(), aligned_off)
+            .map_err(|e| Error::io("pread segment raw", e))?;
+
+        let lead = (item.offset as u64 - aligned_off) as usize;
+        let rec_end = lead + item.physical_len as usize;
+        if n < rec_end {
+            return Err(Error::io(
+                "read segment raw",
+                std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "short read"),
+            ));
         }
 
-        Ok(buf)
+        Ok(aligned_buf.as_slice()[lead..rec_end].to_vec())
     }
 
     /// Releases disk space for an evicted blob via hole punching.

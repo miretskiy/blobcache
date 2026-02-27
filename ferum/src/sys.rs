@@ -107,6 +107,19 @@ pub fn page_align(size: usize) -> usize {
     (size + BLOCK_MASK) & !BLOCK_MASK
 }
 
+/// Aligns a (offset, length) pair for Direct I/O or efficient pread.
+///
+/// Rounds `offset` DOWN to the nearest block boundary and `offset + length`
+/// UP to the nearest block boundary. Returns `(aligned_offset, aligned_len)`.
+/// The actual data starts at `(original_offset - aligned_offset)` within the
+/// returned buffer.
+#[inline]
+pub fn align_range(offset: u64, length: usize) -> (u64, usize) {
+    let aligned_offset = offset & !(BLOCK_SIZE as u64 - 1);
+    let end = page_align((offset + length as u64) as usize) as u64;
+    (aligned_offset, (end - aligned_offset) as usize)
+}
+
 /// Checks if a buffer is aligned for Direct I/O.
 #[inline]
 pub fn is_aligned(buf: &[u8]) -> bool {

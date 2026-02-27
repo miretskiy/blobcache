@@ -24,6 +24,7 @@ pub mod config;
 pub mod durable_index;
 pub mod error;
 pub mod index;
+pub mod iosched;
 pub mod key;
 pub mod librarian;
 pub mod mempool;

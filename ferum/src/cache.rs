@@ -11,6 +11,8 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::config::DegradedMode;
+
 use log::info;
 use parking_lot::Mutex;
 
@@ -558,15 +560,23 @@ impl Cache {
 
         // 2. Check librarian (RAM cache) — zero-copy for uncompressed blobs
         if let Ok(Some(blob)) = self.librarian.acquire(hash_key) {
-            // Verify key to detect hash collision
-            if blob.stored_key == key {
+            // In trust_hash mode (cache mode), skip key comparison.
+            // In non-trust_hash mode (CAS/WAL), verify to detect 128-bit collisions.
+            if self.config.trust_hash || blob.stored_key == key {
                 return Some(blob);
             }
-            // Hash collision - not our key
+            // Hash collision — not our key
             return None;
         }
 
-        // 3. Check disk via archivist
+        // 3. In MemoryOnly degraded mode, skip disk entirely
+        if self.degraded.load(Ordering::Acquire)
+            && self.config.degraded_mode == DegradedMode::MemoryOnly
+        {
+            return None;
+        }
+
+        // 4. Check disk via archivist
         if let Some(item) = self.index.get(&hash_key) {
             #[cfg(test)]
             eprintln!("get: found item for {:?}, is_deleted={}", hash_key, item.is_deleted());
@@ -584,13 +594,36 @@ impl Cache {
                 Err(e) => {
                     #[cfg(test)]
                     eprintln!("read error for key {:?}: {}", hash_key, e);
-                    let _ = e;
+                    // Report the error — may trigger degraded mode
+                    self.report_bg_error(e);
                     return None;
                 }
             }
         }
 
         None
+    }
+
+    /// Reports a background (non-fatal) I/O error.
+    ///
+    /// - `DegradedMode::Panic`: panics immediately
+    /// - `DegradedMode::MemoryOnly`: sets degraded flag on first error
+    /// - `DegradedMode::Log` / `DegradedMode::Return`: logs only
+    fn report_bg_error(&self, err: Error) {
+        match self.config.degraded_mode {
+            DegradedMode::Panic => {
+                panic!("blobcache I/O error (DegradedMode::Panic): {}", err);
+            }
+            DegradedMode::MemoryOnly => {
+                // First error wins — only log once
+                if !self.degraded.swap(true, Ordering::AcqRel) {
+                    eprintln!("blobcache entering degraded (memory-only) mode: {}", err);
+                }
+            }
+            DegradedMode::Log | DegradedMode::Return => {
+                eprintln!("blobcache I/O error: {}", err);
+            }
+        }
     }
 
     /// Retrieves a blob from the cache, returning an owned `Vec<u8>`.

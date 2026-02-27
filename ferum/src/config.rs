@@ -96,6 +96,11 @@ pub struct Config {
 
     /// Behavior when entering degraded mode due to I/O errors.
     pub degraded_mode: DegradedMode,
+
+    /// When true, skip key comparison on Librarian hits (trust hash == key).
+    /// Default: true for cache mode, false for CAS/WAL mode (where collisions
+    /// would corrupt durable state).
+    pub trust_hash: bool,
 }
 
 impl Config {
@@ -123,6 +128,7 @@ impl Config {
             compression_level: Level::Default,
             compression_min_size: DEFAULT_COMPRESSION_MIN_SIZE,
             degraded_mode: DegradedMode::Log,
+            trust_hash: true,   // Cache mode default: trust hash
         }
     }
 
@@ -172,8 +178,10 @@ impl Config {
     }
 
     /// Enables the Write-Ahead Log for durability (CAS mode).
+    /// Also disables hash trust (key verification required for correctness).
     pub fn with_wal(mut self) -> Self {
         self.wal_enabled = true;
+        self.trust_hash = false;
         self
     }
 
@@ -249,6 +257,18 @@ impl Config {
         self
     }
 
+    /// Enables or disables hash trust for Librarian hits.
+    ///
+    /// When `true`, the stored key is not verified against the expected key
+    /// on Librarian hits (saves one comparison). Safe for cache mode where
+    /// a hash collision just returns wrong data (eviction will fix it).
+    ///
+    /// Set to `false` in CAS/WAL mode where correctness is critical.
+    pub fn with_trust_hash(mut self, trusted: bool) -> Self {
+        self.trust_hash = trusted;
+        self
+    }
+
     /// Validates the configuration.
     pub fn validate(&self) -> crate::Result<()> {
         use crate::error::Error;
@@ -285,6 +305,8 @@ impl Config {
 /// Behavior when the cache enters degraded mode due to I/O errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DegradedMode {
+    /// Serve RAM (Librarian) hits only; skip index + archivist after first error.
+    MemoryOnly,
     /// Log the error and continue (best effort).
     #[default]
     Log,

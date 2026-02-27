@@ -305,7 +305,7 @@ impl MemTable {
                         reason: "previous I/O error caused degraded mode".to_string(),
                     });
                 }
-                crate::config::DegradedMode::Log => {
+                crate::config::DegradedMode::Log | crate::config::DegradedMode::MemoryOnly => {
                     // Continue with best-effort (RAM only)
                 }
             }
@@ -607,9 +607,10 @@ impl MemTable {
                                 eprintln!("flush error (degraded mode): {}", e);
                                 self.degraded.store(true, Ordering::Release);
                             }
-                            crate::config::DegradedMode::Log => {
-                                // Log and enter degraded mode (best-effort)
-                                eprintln!("flush error (continuing): {}", e);
+                            crate::config::DegradedMode::Log
+                            | crate::config::DegradedMode::MemoryOnly => {
+                                // Enter degraded mode (MemoryOnly: reads fall back to RAM only)
+                                eprintln!("flush error (degraded mode): {}", e);
                                 self.degraded.store(true, Ordering::Release);
                             }
                         }

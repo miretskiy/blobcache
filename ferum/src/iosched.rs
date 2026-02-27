@@ -145,7 +145,7 @@ pub use uring::URingScheduler;
 #[cfg(target_os = "linux")]
 mod uring {
     use super::*;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Mutex;
 
     /// io_uring-based I/O scheduler.
     ///

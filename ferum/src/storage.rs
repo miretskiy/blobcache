@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
+use crate::buffer_pool::BufferPool;
 use crate::compression;
 use crate::error::{Error, Result};
 use crate::index::Item;
@@ -474,6 +475,8 @@ pub struct Archivist {
     verify_checksum: bool,
     /// I/O scheduler for segment reads.
     sched: Arc<dyn IOScheduler>,
+    /// Aligned buffer pool (avoids per-read mmap under concurrent load).
+    pool: Arc<BufferPool>,
 }
 
 impl Archivist {
@@ -486,6 +489,7 @@ impl Archivist {
             use_fadvise: true,
             verify_checksum: false,
             sched: Arc::new(PreadScheduler::new()),
+            pool: BufferPool::new(),
         }
     }
 
@@ -498,6 +502,7 @@ impl Archivist {
             use_fadvise: true,
             verify_checksum: false,
             sched,
+            pool: BufferPool::new(),
         }
     }
 
@@ -538,12 +543,10 @@ impl Archivist {
         // Align the read for Direct I/O compatibility and better kernel prefetch.
         let (aligned_off, aligned_len) = sys::align_range(item.offset as u64, item.physical_len as usize);
 
-        // Allocate aligned buffer and issue the read via the scheduler.
-        let mut aligned_buf = sys::alloc_aligned(aligned_len)
-            .map_err(|e| Error::io("allocate aligned read buffer", std::io::Error::other(e.to_string())))?;
-        aligned_buf.set_len(aligned_len);
+        // Acquire a pooled aligned buffer (avoids per-read mmap under load).
+        let mut pooled = self.pool.acquire(aligned_len);
 
-        let n = self.sched.read_at(fd, aligned_buf.as_mut_slice(), aligned_off)
+        let n = self.sched.read_at(fd, &mut pooled, aligned_off)
             .map_err(|e| Error::io("pread segment", e))?;
 
         // The actual record starts at lead bytes into the aligned buffer.
@@ -560,7 +563,7 @@ impl Archivist {
             ));
         }
 
-        let buf = &aligned_buf.as_slice()[lead..rec_end];
+        let buf = &pooled[lead..rec_end];
 
         // Parse header
         let header = Header::decode(&buf[..HEADER_SIZE])?;
@@ -608,11 +611,9 @@ impl Archivist {
         let fd = file.as_raw_fd();
 
         let (aligned_off, aligned_len) = sys::align_range(item.offset as u64, item.physical_len as usize);
-        let mut aligned_buf = sys::alloc_aligned(aligned_len)
-            .map_err(|e| Error::io("allocate aligned buffer", std::io::Error::other(e.to_string())))?;
-        aligned_buf.set_len(aligned_len);
+        let mut pooled = self.pool.acquire(aligned_len);
 
-        let n = self.sched.read_at(fd, aligned_buf.as_mut_slice(), aligned_off)
+        let n = self.sched.read_at(fd, &mut pooled, aligned_off)
             .map_err(|e| Error::io("pread segment raw", e))?;
 
         let lead = (item.offset as u64 - aligned_off) as usize;
@@ -624,7 +625,7 @@ impl Archivist {
             ));
         }
 
-        Ok(aligned_buf.as_slice()[lead..rec_end].to_vec())
+        Ok(pooled[lead..rec_end].to_vec())
     }
 
     /// Releases disk space for an evicted blob via hole punching.

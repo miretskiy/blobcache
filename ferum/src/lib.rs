@@ -17,6 +17,7 @@
 //! - Lock-free hot paths
 
 pub mod bloom;
+pub mod buffer_pool;
 pub mod cache;
 pub mod compaction;
 pub mod compression;

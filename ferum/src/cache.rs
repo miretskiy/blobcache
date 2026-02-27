@@ -6,7 +6,7 @@
 //! - **CAS Mode**: Durable Content Addressable Storage via Write-Ahead Log
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -41,6 +41,21 @@ const EVICTION_HYSTERESIS: f64 = 0.93;
 /// to allow quicker shutdown response.
 #[allow(dead_code)]
 const COMPACTION_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
+// =============================================================================
+// BloomStats
+// =============================================================================
+
+/// Tracks bloom filter hit/ghost/deletion counters for FPR-reactive rebuild.
+#[derive(Default)]
+struct BloomStats {
+    /// Sampled positive lookups (bloom said "maybe yes").
+    hits: AtomicU64,
+    /// Bloom said yes but index said no (false positive / ghost).
+    ghosts: AtomicU64,
+    /// Cumulative deletes since last rebuild.
+    deletions: AtomicI64,
+}
 
 // =============================================================================
 // RecoveryReplayer - implements Replayer trait for WAL recovery
@@ -154,6 +169,9 @@ pub struct Cache {
 
     /// Handle for the background compaction worker thread.
     compaction_worker: Mutex<Option<JoinHandle<()>>>,
+
+    /// Bloom filter statistics for FPR-reactive rebuild.
+    bloom_stats: BloomStats,
 }
 
 impl Cache {
@@ -461,6 +479,7 @@ impl Cache {
             closed: AtomicBool::new(false),
             compactor,
             compaction_worker: Mutex::new(None),
+            bloom_stats: BloomStats::default(),
         });
 
         // Start background compaction worker
@@ -558,6 +577,11 @@ impl Cache {
             return None;
         }
 
+        // Sample bloom hits at 1/128 rate (cheap amortized counter)
+        if hash_key.lo() & 0x7F == 0 {
+            self.bloom_stats.hits.fetch_add(1, Ordering::Relaxed);
+        }
+
         // 2. Check librarian (RAM cache) — zero-copy for uncompressed blobs
         if let Ok(Some(blob)) = self.librarian.acquire(hash_key) {
             // In trust_hash mode (cache mode), skip key comparison.
@@ -581,6 +605,10 @@ impl Cache {
             #[cfg(test)]
             eprintln!("get: found item for {:?}, is_deleted={}", hash_key, item.is_deleted());
             if item.is_deleted() {
+                // Bloom said yes, index says deleted — count as ghost
+                if hash_key.lo() & 0x7F == 0 {
+                    self.bloom_stats.ghosts.fetch_add(1, Ordering::Relaxed);
+                }
                 return None;
             }
 
@@ -598,6 +626,11 @@ impl Cache {
                     self.report_bg_error(e);
                     return None;
                 }
+            }
+        } else {
+            // Bloom said yes, index has no entry — ghost entry
+            if hash_key.lo() & 0x7F == 0 {
+                self.bloom_stats.ghosts.fetch_add(1, Ordering::Relaxed);
             }
         }
 
@@ -684,6 +717,9 @@ impl Cache {
                 message: "empty key not allowed".to_string(),
             });
         }
+
+        // Track deletion for bloom rebuild heuristics
+        self.bloom_stats.deletions.fetch_add(1, Ordering::Relaxed);
 
         let hash_key = Key::from_bytes(key);
 
@@ -858,6 +894,9 @@ impl Cache {
                     if !cache.config.wal_enabled && cache.config.max_size > 0 {
                         cache.maybe_drain_segments();
                     }
+
+                    // Bloom filter FPR-reactive rebuild
+                    cache.maybe_trigger_bloom_rebuild();
                 }
             }
         })
@@ -937,6 +976,41 @@ impl Cache {
         }
 
         Ok(())
+    }
+
+    /// Checks if the bloom filter should be rebuilt and triggers a rebuild if so.
+    ///
+    /// Rebuild is triggered when:
+    /// - Cumulative deletes exceed 10% of estimated keys (stale ghost entries)
+    /// - FPR has spiked: ghost rate > 5× configured FPR (with ≥2000 sample hits)
+    fn maybe_trigger_bloom_rebuild(&self) {
+        let deletions = self.bloom_stats.deletions.load(Ordering::Relaxed);
+        let stale_threshold = (self.config.bloom_estimated_keys as f64 * 0.10) as i64;
+
+        let hits = self.bloom_stats.hits.load(Ordering::Relaxed);
+        let ghosts = self.bloom_stats.ghosts.load(Ordering::Relaxed);
+
+        let should_rebuild = deletions > stale_threshold
+            || (hits > 2000 && (ghosts as f64 / hits as f64) > self.config.bloom_fp_rate * 5.0);
+
+        if should_rebuild {
+            self.rebuild_bloom();
+        }
+    }
+
+    /// Rebuilds the bloom filter from the current in-memory index.
+    ///
+    /// Clears all bits, re-adds every live item, and resets stats counters.
+    /// Called from the maintenance worker (not on the hot path).
+    fn rebuild_bloom(&self) {
+        self.bloom.rebuild(self.index.blobs());
+
+        // Reset stats
+        self.bloom_stats.deletions.store(0, Ordering::Relaxed);
+        self.bloom_stats.ghosts.store(0, Ordering::Relaxed);
+        self.bloom_stats.hits.store(0, Ordering::Relaxed);
+
+        info!("bloom filter rebuilt");
     }
 
     /// Drains sparse segments to reclaim disk space (cache mode only).

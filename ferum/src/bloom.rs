@@ -233,6 +233,21 @@ impl Filter {
             atom.store(0, Ordering::Release);
         }
     }
+
+    /// Rebuilds the filter in place from a `BlobIndex`.
+    ///
+    /// Clears all bits, then re-adds every live item in the index.
+    /// This is a stop-the-world operation (no lock held during clear/add,
+    /// but the filter is temporarily inconsistent — false negatives possible
+    /// for a brief window). Only call from the maintenance worker.
+    pub fn rebuild(&self, index: &crate::index::BlobIndex) {
+        self.clear();
+        index.for_each(|item| {
+            if !item.is_deleted() {
+                self.add_hash(item.key);
+            }
+        });
+    }
 }
 
 impl Drop for Filter {

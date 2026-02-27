@@ -101,6 +101,10 @@ pub struct Config {
     /// Default: true for cache mode, false for CAS/WAL mode (where collisions
     /// would corrupt durable state).
     pub trust_hash: bool,
+
+    /// Enable the redb KeyIndex for ordered iteration and key-by-name lookup.
+    /// Default: false (KeyIndex adds per-write overhead).
+    pub enable_keyindex: bool,
 }
 
 impl Config {
@@ -129,6 +133,7 @@ impl Config {
             compression_min_size: DEFAULT_COMPRESSION_MIN_SIZE,
             degraded_mode: DegradedMode::Log,
             trust_hash: true,   // Cache mode default: trust hash
+            enable_keyindex: false,
         }
     }
 
@@ -254,6 +259,12 @@ impl Config {
     /// Sets the degraded mode behavior.
     pub fn degraded_mode(mut self, mode: DegradedMode) -> Self {
         self.degraded_mode = mode;
+        self
+    }
+
+    /// Enables the redb KeyIndex for ordered iteration.
+    pub fn with_keyindex(mut self) -> Self {
+        self.enable_keyindex = true;
         self
     }
 

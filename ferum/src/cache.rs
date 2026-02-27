@@ -19,12 +19,14 @@ use parking_lot::Mutex;
 use crate::bloom::Filter as BloomFilter;
 use crate::compaction::Compactor;
 use crate::config::Config;
+use crate::iterator::Iterator as BlobIterator;
 use crate::durable_index::DurableIndex;
 use crate::error::{Error, Result};
 use crate::key::Key;
 use crate::librarian::Librarian;
 use crate::memtable::MemTable;
 use crate::record::Record;
+use crate::keyindex::KeyIndex;
 use crate::storage::{delete_segment_files, recover_index_from_footers, Archivist, SegmentIDProvider};
 use crate::wal::{Replayer, Wal, WalConfig};
 
@@ -172,6 +174,9 @@ pub struct Cache {
 
     /// Bloom filter statistics for FPR-reactive rebuild.
     bloom_stats: BloomStats,
+
+    /// Optional redb KeyIndex for ordered iteration.
+    key_index: Option<Arc<KeyIndex>>,
 }
 
 impl Cache {
@@ -252,6 +257,7 @@ impl Cache {
             Arc::clone(&librarian),
             None,  // <-- No WAL during recovery (avoid double-writing)
             None,  // on_flush callback
+            None,  // no KeyIndex during WAL recovery
         )?;
 
         // Open WAL for recovery (read-only mode conceptually)
@@ -414,6 +420,14 @@ impl Cache {
             }
         }
 
+        // Initialize KeyIndex if configured
+        let key_index: Option<Arc<KeyIndex>> = if config.enable_keyindex {
+            let ki_path = config.path.join("keyindex.redb");
+            Some(Arc::new(KeyIndex::open(&ki_path)?))
+        } else {
+            None
+        };
+
         // Initialize WAL if enabled
         let wal = if config.wal_enabled {
             let wal_config = WalConfig {
@@ -433,7 +447,8 @@ impl Cache {
             Arc::clone(&index),
             Arc::clone(&librarian),
             wal.clone(),
-            None, // on_flush callback - eviction handled via periodic checks
+            None,               // on_flush callback - eviction handled via periodic checks
+            key_index.clone(),  // KeyIndex for ordered iteration (None if not configured)
         )?;
 
         // Initialize compactor for segment merge operations
@@ -480,6 +495,7 @@ impl Cache {
             compactor,
             compaction_worker: Mutex::new(None),
             bloom_stats: BloomStats::default(),
+            key_index,
         });
 
         // Start background compaction worker
@@ -635,6 +651,35 @@ impl Cache {
         }
 
         None
+    }
+
+    /// Creates a new ordered iterator over all live keys.
+    ///
+    /// Requires the KeyIndex to be enabled (`Config::with_keyindex()`).
+    /// The iterator holds a snapshot of the KeyIndex at construction time.
+    ///
+    /// `lower` and `upper` are optional inclusive/exclusive byte-key bounds.
+    pub fn new_iterator(
+        self: &Arc<Self>,
+        lower: Option<&[u8]>,
+        upper: Option<&[u8]>,
+    ) -> Result<BlobIterator> {
+        let ki = self.key_index.as_ref().ok_or_else(|| Error::InvalidConfig {
+            message: "KeyIndex not enabled; use Config::with_keyindex()".into(),
+        })?;
+
+        BlobIterator::new(
+            Arc::clone(&self.index),
+            Arc::clone(&self.archivist),
+            ki,
+            lower,
+            upper,
+        )
+    }
+
+    /// Returns a reference to the KeyIndex, if enabled.
+    pub fn key_index(&self) -> Option<&Arc<KeyIndex>> {
+        self.key_index.as_ref()
     }
 
     /// Reports a background (non-fatal) I/O error.
@@ -1059,6 +1104,9 @@ impl Cache {
             let (drained_bytes, _count) = self.index.drain_segment(seg.id);
             self.archivist.drop_segment_cache(seg.id);
             let _ = delete_segment_files(&self.config.path, self.config.shards, seg.id);
+            if let Some(ref ki) = self.key_index {
+                let _ = ki.drain_segment(seg.id);
+            }
 
             self.sub_approx_size(drained_bytes);
             drain_target -= self.config.write_buffer_size as i64;

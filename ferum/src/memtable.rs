@@ -23,7 +23,8 @@ use crate::error::{Error, Result};
 use crate::key::Key;
 use crate::librarian::Librarian;
 use crate::mempool::{MmapBuffer, MmapPool};
-use crate::record::{self, FooterEntry, Record};
+use crate::keyindex::KeyIndexEntry;
+use crate::record::{self, FooterEntry, Record, HEADER_SIZE};
 use crate::slab::{ActiveSlab, SlabEntry};
 use crate::storage::{
     footer_entries_to_items, get_footer_path, get_segment_path, SegmentIDProvider, SegmentWriter,
@@ -136,6 +137,9 @@ pub struct MemTable {
 
     // Callback for flush completion (size tracking, eviction)
     on_flush: Option<OnFlushCallback>,
+
+    // Optional KeyIndex for ordered iteration support
+    key_index: Option<Arc<crate::keyindex::KeyIndex>>,
 }
 
 struct MemTableState {
@@ -155,6 +159,7 @@ impl MemTable {
         librarian: Arc<Librarian>,
         wal: Option<Arc<Wal>>,
         on_flush: Option<OnFlushCallback>,
+        key_index: Option<Arc<crate::keyindex::KeyIndex>>,
     ) -> Result<Arc<Self>> {
         let pool_capacity = config.max_cached_slabs + config.max_inflight_slabs + 2;
 
@@ -195,6 +200,7 @@ impl MemTable {
             flush_done_lock: Mutex::new(()),
             degraded: AtomicBool::new(false),
             on_flush,
+            key_index,
         });
 
         // Initialize active slab
@@ -718,6 +724,16 @@ impl MemTable {
         #[cfg(test)]
         eprintln!("flush_via_rename: updated index with {} items", items.len());
 
+        // Populate KeyIndex (for ordered iteration)
+        if let Some(ref ki) = self.key_index {
+            let ki_entries = Self::build_keyindex_entries_inner(&entries, slab);
+            if !ki_entries.is_empty() && !ki.has_sentinel(segment_id) {
+                if let Err(e) = ki.add_entries(segment_id, &ki_entries) {
+                    eprintln!("keyindex add_entries failed for segment {}: {}", segment_id, e);
+                }
+            }
+        }
+
         // Invoke callback
         let bytes_flushed: u64 = entries
             .iter()
@@ -855,6 +871,16 @@ impl MemTable {
         #[cfg(test)]
         eprintln!("flush_via_copy: updated index with {} items", items.len());
 
+        // Populate KeyIndex (for ordered iteration)
+        if let Some(ref ki) = self.key_index {
+            let ki_entries = Self::build_keyindex_entries_inner(&entries, slab);
+            if !ki_entries.is_empty() && !ki.has_sentinel(segment_id) {
+                if let Err(e) = ki.add_entries(segment_id, &ki_entries) {
+                    eprintln!("keyindex add_entries failed for segment {}: {}", segment_id, e);
+                }
+            }
+        }
+
         // Calculate bytes flushed and invoke callback
         let bytes_flushed: u64 = entries
             .iter()
@@ -959,6 +985,44 @@ impl MemTable {
         });
 
         (entries, max_seq_id)
+    }
+
+    /// Builds KeyIndexEntry list from footer entries + slab.
+    ///
+    /// Reads user keys from the slab buffer or XL buffer to populate the
+    /// KeyIndex with hash → user_key mappings.
+    fn build_keyindex_entries_inner(
+        entries: &[FooterEntry],
+        slab: &ActiveSlab,
+    ) -> Vec<KeyIndexEntry> {
+        let mut ki_entries = Vec::with_capacity(entries.len());
+
+        slab.index.for_each(|hash, slab_entry| {
+            // Skip tombstones
+            if slab_entry.is_deleted() {
+                return;
+            }
+            // Skip entries not in the footer list (shouldn't happen but be safe)
+            if !entries.iter().any(|fe| fe.key == hash) {
+                return;
+            }
+
+            // Read key from the appropriate buffer
+            let (buf, offset) = if let Some(ref xl_buf) = slab_entry.xl_buf {
+                (xl_buf.as_slice(), 0usize)
+            } else {
+                (slab.buf.as_slice(), slab_entry.pos as usize)
+            };
+
+            let key_start = offset + HEADER_SIZE;
+            let key_end = key_start + slab_entry.key_len as usize;
+            if key_end <= buf.len() {
+                let user_key = buf[key_start..key_end].to_vec();
+                ki_entries.push(KeyIndexEntry { hash, user_key });
+            }
+        });
+
+        ki_entries
     }
 
     /// Triggers a flush of the current slab.
@@ -1107,7 +1171,7 @@ mod tests {
         let index = Arc::new(DurableIndex::open(None, 1 << 20).unwrap());
         let librarian = Arc::new(Librarian::new(4));
 
-        MemTable::new(config, dir.path().to_path_buf(), index, librarian, None, None).unwrap()
+        MemTable::new(config, dir.path().to_path_buf(), index, librarian, None, None, None).unwrap()
     }
 
     #[test]
@@ -1151,7 +1215,7 @@ mod tests {
         let index = Arc::new(DurableIndex::open(None, 1 << 20).unwrap());
         let librarian = Arc::new(Librarian::new(4));
 
-        let mt = MemTable::new(config, dir.path().to_path_buf(), index, librarian, None, None).unwrap();
+        let mt = MemTable::new(config, dir.path().to_path_buf(), index, librarian, None, None, None).unwrap();
 
         // Write enough to fill buffer and trigger multiple rotations
         let value = vec![0xAB; 100_000]; // 100KB per write
@@ -1198,7 +1262,7 @@ mod tests {
         let index = Arc::new(DurableIndex::open(None, 1 << 20).unwrap());
         let librarian = Arc::new(Librarian::new(4));
 
-        let mt = MemTable::new(config, dir.path().to_path_buf(), index, librarian, None, None).unwrap();
+        let mt = MemTable::new(config, dir.path().to_path_buf(), index, librarian, None, None, None).unwrap();
 
         // Write enough to create multiple pending slabs
         let value = vec![0xAB; 200_000]; // 200KB per write

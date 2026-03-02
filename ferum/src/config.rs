@@ -119,6 +119,16 @@ pub struct Config {
     /// Enable the redb KeyIndex for ordered iteration and key-by-name lookup.
     /// Default: false (KeyIndex adds per-write overhead).
     pub enable_keyindex: bool,
+
+    /// Maximum number of threads that can simultaneously block in pread.
+    ///
+    /// None (default) = unlimited. When set, excess callers block on a
+    /// Condvar in userspace rather than in a kernel syscall, preventing OS
+    /// thread explosion under high cold-read concurrency. See DESIGN.md §11.6.
+    ///
+    /// Recommended: 2 × num_cpus when using PreadScheduler. Not needed with
+    /// URingScheduler (the coordinator already bounds OS threads to 1).
+    pub max_read_concurrency: Option<usize>,
 }
 
 impl Config {
@@ -150,6 +160,7 @@ impl Config {
             degraded_mode: DegradedMode::Log,
             trust_hash: true,   // Cache mode default: trust hash
             enable_keyindex: false,
+            max_read_concurrency: None, // unlimited by default
         }
     }
 
@@ -296,6 +307,16 @@ impl Config {
     /// Enables the redb KeyIndex for ordered iteration.
     pub fn with_keyindex(mut self) -> Self {
         self.enable_keyindex = true;
+        self
+    }
+
+    /// Limits the number of threads that can simultaneously block in pread.
+    ///
+    /// Prevents OS thread explosion under high cold-read concurrency.
+    /// Recommended: `2 * num_cpus` when using PreadScheduler.
+    /// Not needed with URingScheduler (coordinator bounds threads to 1).
+    pub fn max_read_concurrency(mut self, n: usize) -> Self {
+        self.max_read_concurrency = Some(n);
         self
     }
 

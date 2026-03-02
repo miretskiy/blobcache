@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-use parking_lot::RwLock;
+use parking_lot::{Condvar, Mutex, RwLock};
 
 use crate::buffer_pool::BufferPool;
 use crate::compression;
@@ -22,6 +22,52 @@ use crate::index::Item;
 use crate::iosched::{IOScheduler, PreadScheduler};
 use crate::record::{self, FooterEntry, Header, HEADER_SIZE};
 use crate::sys::{self, OpenFlags};
+
+// =============================================================================
+// ReadSemaphore
+// =============================================================================
+
+/// Counting semaphore that limits concurrent pread syscalls.
+///
+/// Without a limit, each goroutine/thread blocked in pread holds one OS
+/// thread.  Under high cold-read concurrency this causes thread explosion
+/// (see DESIGN.md §11.6).  Excess callers block on the Condvar (userspace
+/// only, no OS thread consumed) until a permit is released.
+pub struct ReadSemaphore {
+    available: Mutex<usize>,
+    cvar:      Condvar,
+}
+
+impl ReadSemaphore {
+    pub fn new(permits: usize) -> Self {
+        ReadSemaphore {
+            available: Mutex::new(permits),
+            cvar:      Condvar::new(),
+        }
+    }
+
+    /// Acquires one permit, blocking until one is available.
+    /// Returns a guard that releases the permit on drop.
+    pub fn acquire(&self) -> SemaphoreGuard<'_> {
+        let mut count = self.available.lock();
+        while *count == 0 {
+            self.cvar.wait(&mut count);
+        }
+        *count -= 1;
+        SemaphoreGuard(self)
+    }
+}
+
+/// RAII guard: releases one permit back to the semaphore on drop.
+pub struct SemaphoreGuard<'a>(&'a ReadSemaphore);
+
+impl Drop for SemaphoreGuard<'_> {
+    fn drop(&mut self) {
+        let mut count = self.0.available.lock();
+        *count += 1;
+        self.0.cvar.notify_one();
+    }
+}
 
 /// Segment file extension.
 pub const SEGMENT_EXTENSION: &str = ".seg";
@@ -479,6 +525,8 @@ pub struct Archivist {
     sched: Arc<dyn IOScheduler>,
     /// Aligned buffer pool (avoids per-read mmap under concurrent load).
     pool: Arc<BufferPool>,
+    /// Optional semaphore bounding concurrent pread syscalls (see DESIGN.md §11.6).
+    read_sem: Option<Arc<ReadSemaphore>>,
 }
 
 impl Archivist {
@@ -493,6 +541,7 @@ impl Archivist {
             direct_io_read: false,
             sched: Arc::new(PreadScheduler::new()),
             pool: BufferPool::new(),
+            read_sem: None,
         }
     }
 
@@ -507,6 +556,7 @@ impl Archivist {
             direct_io_read: false,
             sched,
             pool: BufferPool::new(),
+            read_sem: None,
         }
     }
 
@@ -531,6 +581,16 @@ impl Archivist {
         }
     }
 
+    /// Sets the maximum number of concurrent pread syscalls.
+    ///
+    /// When Some(n), at most n goroutines can simultaneously block in pread.
+    /// Excess callers block on a Condvar (userspace) rather than in a syscall,
+    /// preventing thread explosion under high cold-read concurrency.
+    /// See DESIGN.md §11.6.
+    pub fn set_read_concurrency(&mut self, max: Option<usize>) {
+        self.read_sem = max.map(|n| Arc::new(ReadSemaphore::new(n)));
+    }
+
     /// Returns I/O scheduler statistics.
     pub fn io_stats(&self) -> crate::iosched::IOStats {
         self.sched.stats()
@@ -542,6 +602,10 @@ impl Archivist {
     /// The `expected_key` is used to verify the stored key matches
     /// (detects 128-bit hash collisions).
     pub fn read_blob(&self, item: &Item, expected_key: &[u8]) -> Result<ReadResult> {
+        // Acquire read semaphore if configured (prevents thread explosion under
+        // high cold-read concurrency; released when _permit drops).
+        let _permit = self.read_sem.as_ref().map(|s| s.acquire());
+
         let file = self.get_segment_file(item.segment_id)?;
         let fd = file.as_raw_fd();
 
@@ -622,6 +686,8 @@ impl Archivist {
     ///
     /// Used by compaction for copying blobs without parsing.
     pub fn read_blob_raw(&self, item: &Item) -> Result<Vec<u8>> {
+        let _permit = self.read_sem.as_ref().map(|s| s.acquire());
+
         let file = self.get_segment_file(item.segment_id)?;
         let fd = file.as_raw_fd();
 

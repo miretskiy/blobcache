@@ -378,6 +378,7 @@ impl Cache {
         if !config.direct_io_read {
             archivist.set_fadvise(config.fadvise);
         }
+        archivist.set_read_concurrency(config.max_read_concurrency);
         let archivist = Arc::new(archivist);
         let librarian = Arc::new(Librarian::new(config.max_cached_slabs));
 

@@ -28,18 +28,26 @@ type Archivist struct {
 	cache     sync.Map   // segmentID (uint32) -> *os.File
 	readCache *ReadCache // nil if disabled
 	flights   *inflightGroup
+	// readSem limits concurrent pread syscalls (nil = unlimited).
+	// Each slot is a struct{} in the channel; acquire = send, release = receive.
+	// See DESIGN.md §11.6.
+	readSem chan struct{}
 }
 
 func NewArchivist(cfg config, idx *index.DurableIndex, sched iosched.IOScheduler) *Archivist {
 	if sched == nil {
 		sched = &iosched.PreadScheduler{}
 	}
-	return &Archivist{
+	a := &Archivist{
 		config:  cfg,
 		index:   idx,
 		sched:   sched,
 		flights: newInflightGroup(),
 	}
+	if cfg.MaxReadConcurrency > 0 {
+		a.readSem = make(chan struct{}, cfg.MaxReadConcurrency)
+	}
+	return a
 }
 
 // Close closes the read cache (if any), all cached segment file handles,
@@ -92,12 +100,31 @@ func (a *Archivist) ReadBlob(e index.Item, expectedKey []byte) ([]byte, Releaser
 
 		// Cache miss — if admissible, do a single widened read and populate.
 		if a.readCache.Admissible(int64(e.PhysicalLen)) {
+			a.acquireReadSem()
+			defer a.releaseReadSem()
 			return a.readBlobWithPrefetch(e, expectedKey)
 		}
 	}
 
 	// No cache or blob not admissible — standard disk read.
+	a.acquireReadSem()
+	defer a.releaseReadSem()
 	return a.readBlobFromDisk(e, expectedKey)
+}
+
+// acquireReadSem acquires one pread concurrency permit (no-op if unlimited).
+// Callers block on the Go channel scheduler — no OS thread consumed.
+func (a *Archivist) acquireReadSem() {
+	if a.readSem != nil {
+		a.readSem <- struct{}{}
+	}
+}
+
+// releaseReadSem returns one permit to the semaphore.
+func (a *Archivist) releaseReadSem() {
+	if a.readSem != nil {
+		<-a.readSem
+	}
 }
 
 // readBlobWithPrefetch coalesces concurrent cache misses for the same disk

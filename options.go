@@ -75,6 +75,14 @@ type config struct {
 
 	IOScheduler iosched.IOScheduler // Pluggable I/O backend for reads (default: pread)
 
+	// MaxReadConcurrency limits how many goroutines can simultaneously block
+	// in pread.  0 = unlimited (default).  When set, excess readers block on
+	// a channel (Go scheduler, no OS thread consumed) rather than in a
+	// syscall, preventing thread explosion.  See DESIGN.md §11.6.
+	// Recommended: runtime.GOMAXPROCS(0)*2 when using PreadScheduler.
+	// Not needed with URingScheduler (coordinator bounds threads to 1).
+	MaxReadConcurrency int
+
 	// --- Read Cache Configuration ---
 	ReadCacheSlabs       int   // Number of read cache slabs (0 = disabled)
 	ReadCacheSlabSize    int64 // Size of each read cache slab (default: WriteBufferSize)
@@ -165,6 +173,17 @@ func WithDirectIOWrite(enabled bool) Option {
 // Default: false (leverage kernel page cache for reads).
 func WithDirectIORead(enabled bool) Option {
 	return funcOpt(func(c *config) { c.IO.DirectIORead = enabled })
+}
+
+// WithReadConcurrency limits the number of goroutines that can simultaneously
+// block in pread.  Excess callers block on a Go channel (no OS thread consumed)
+// rather than in a syscall, preventing thread explosion under high cold-read
+// concurrency.  See DESIGN.md §11.6.
+//
+// Recommended: runtime.GOMAXPROCS(0)*2 when using PreadScheduler.
+// Not needed with URingScheduler (its coordinator already bounds OS threads to 1).
+func WithReadConcurrency(n int) Option {
+	return funcOpt(func(c *config) { c.MaxReadConcurrency = n })
 }
 
 // WithCompression enables compression with the specified codec.

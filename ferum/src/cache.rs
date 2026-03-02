@@ -687,6 +687,11 @@ impl Cache {
                             .with_key(result.stored_key),
                     );
                 }
+                Err(Error::NotFound) => {
+                    // Segment was drained between index lookup and file open — treat as
+                    // cache miss. This is expected under concurrent drain and not a bug.
+                    return None;
+                }
                 Err(e) => {
                     #[cfg(test)]
                     eprintln!("read error for key {:?}: {}", hash_key, e);

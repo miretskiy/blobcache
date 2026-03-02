@@ -673,7 +673,17 @@ impl Archivist {
             dsync: false,
             sync: false,
         };
-        let file = sys::open_file_for_read(&path, flags)?;
+        let file = sys::open_file_for_read(&path, flags).map_err(|e| {
+            // A missing segment file means it was drained between index lookup and read.
+            // Map ENOENT to NotFound so the caller treats this as a cache miss, not a
+            // fatal I/O error (which would trigger DegradedMode::Panic unnecessarily).
+            if let Error::Io { source, .. } = &e {
+                if source.kind() == std::io::ErrorKind::NotFound {
+                    return Error::NotFound;
+                }
+            }
+            e
+        })?;
 
         // Cache the handle (write lock)
         {

@@ -149,7 +149,7 @@ mod uring {
     use std::sync::{Arc, Condvar, Mutex};
     use std::thread;
 
-    use crossbeam_channel::{Receiver, Sender};
+    use crossbeam::channel::{self, Receiver, Sender};
 
     // -------------------------------------------------------------------------
     // ReadRequest: a single positioned read submitted to the coordinator.
@@ -201,7 +201,7 @@ mod uring {
     impl URingScheduler {
         pub fn new(ring_depth: u32) -> io::Result<Self> {
             let ring = io_uring::IoUring::new(ring_depth)?;
-            let (tx, rx) = crossbeam_channel::unbounded::<CoordMsg>();
+            let (tx, rx) = channel::unbounded::<CoordMsg>();
 
             let requests = Arc::new(AtomicU64::new(0));
             let batches  = Arc::new(AtomicU64::new(0));

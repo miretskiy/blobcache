@@ -649,10 +649,19 @@ fn bench_parallel_blobcache(c: &mut Criterion) {
 
     // Debug: print cache stats to check for unflushed data
     let stats = cache.stats();
+    let avg_batch = if stats.iosched_batches > 0 {
+        stats.iosched_requests as f64 / stats.iosched_batches as f64
+    } else {
+        0.0
+    };
     println!(">>> Cache stats: items={}, approx_size={:.2} GB, librarian_slabs={}",
         stats.items,
         stats.approx_size as f64 / (1024.0 * 1024.0 * 1024.0),
         stats.librarian_cached_slabs);
+    println!(">>> IOSched stats: requests={}, batches={}, avg_batch_size={:.2}",
+        stats.iosched_requests,
+        stats.iosched_batches,
+        avg_batch);
 
     let bench_elapsed = bench_start.elapsed();
 

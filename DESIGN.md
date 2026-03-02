@@ -1169,6 +1169,141 @@ The iterator’s read-ahead prefetch (Section 4.8) works correctly with Direct I
 
 See Section 6.5 for empirical comparison of buffered vs. Direct I/O under write-heavy load.
 
+### 11.6 Blocking I/O, Go's Threading Model, and Read Path Concurrency Protection
+
+This section explains a non-obvious hazard in any system that issues blocking file I/O from goroutines, and how BlobCache is (and is not) protected against it.
+
+#### Go's M:N Threading Model and Blocking Syscalls
+
+Go runs goroutines on an M:N scheduler with three entities:
+
+- **G** — goroutine (2KB initial stack, scheduled by the runtime)
+- **M** — OS thread (kernel-managed, ~1MB including kernel structures)
+- **P** — logical processor (`GOMAXPROCS` of these; the "permission to run")
+
+At most `GOMAXPROCS` goroutines execute simultaneously. Each executing goroutine occupies a G→P→M chain. The P is the scarce resource.
+
+When a goroutine issues a **blocking syscall** (any file I/O — `pread`, `write`, `fallocate`), the Go runtime executes the following before the thread enters the kernel:
+
+```text
+goroutine calls pread()
+      │
+      ▼
+runtime.entersyscall()
+  ├── sets g.status = _Gsyscall
+  └── DETACHES the P from this M     ← P is now free
+            │
+            ▼
+      P acquired by another M        ← other goroutines keep running
+            │
+            ▼
+OS thread blocks in kernel           (pread executing, NVMe spinning)
+            │
+            ▼
+      NVMe responds (~50–500µs)
+            │
+            ▼
+runtime.exitsyscall()
+  ├── tries to re-acquire a P
+  ├── if P available: goroutine resumes immediately on same M
+  └── if no P available: goroutine queued, M parks (sleeps)
+```
+
+The P is released *before* the thread enters the kernel, so other goroutines continue unimpeded. However, the **OS thread itself remains blocked** — it cannot be reused for other goroutines during the syscall.
+
+#### The Thread Explosion Problem
+
+If N goroutines concurrently enter `pread`, N OS threads are simultaneously blocked in the kernel. Go creates new OS threads to ensure `GOMAXPROCS` goroutines can always run, so total thread count grows to:
+
+```
+OS threads = N (blocked in pread) + GOMAXPROCS (running other work)
+```
+
+Each additional OS thread costs roughly 1MB of kernel-side memory (task struct, kernel stack, signal tables, mm mappings) plus scheduler bookkeeping. Beyond memory, the real hazard is **thundering herd at completion**: when the NVMe services a batch of I/Os, potentially hundreds of threads all become runnable within microseconds. The Linux CFS scheduler processes all N wakeup events simultaneously — spiking CPU and degrading latency for everything else on the machine.
+
+The hard ceiling is `runtime/debug.SetMaxThreads` (default: 10,000). Exceeding it produces:
+```
+runtime: program exceeds 10000-thread limit
+fatal error: thread exhaustion
+```
+
+**Important: this ceiling is not hypothetical.** Any service that lets unbounded goroutine concurrency flow through to blocking file I/O syscalls can hit it under sustained load.
+
+#### Why Throughput Doesn't Scale With Concurrency
+
+Little's Law bounds the useful concurrency for NVMe reads:
+
+```
+Concurrency = Throughput × Latency
+= 1,200 reads/sec × 0.0005 sec   (1MB blobs, 500µs NVMe latency)
+≈ 0.6 concurrent I/Os
+```
+
+Even at the device's full bandwidth, fewer than one concurrent read is needed to saturate it. Modern NVMe drives internally exploit parallelism across their queues; the application does not need to provide this concurrency explicitly. Beyond ~4–8 outstanding I/Os, additional concurrent reads increase queue depth and latency with zero throughput gain. **Thread explosion costs are paid with no throughput return.**
+
+#### The Write Path Is Naturally Protected
+
+BlobCache's write path is bounded by design. No matter how many goroutines call `Put()` concurrently:
+
+1. `Put()` writes to the MemTable — a lock-free memory copy, no syscall, no OS thread consumed
+2. Slab rotation hands off to a flush worker — there are at most `FlushConcurrency` flush workers (default: 6)
+3. Only those `FlushConcurrency` goroutines ever block in write syscalls simultaneously
+
+`MaxInflightSlabs` provides backpressure: when the flush workers can't keep up, `Put()` callers block in Go's scheduler (no OS thread held) waiting for a slab to become available. The write path has **explicit, configurable concurrency control** at the syscall layer.
+
+#### The Read Path Currently Has No Equivalent Protection
+
+Any goroutine that calls `Get()` and misses both the Librarian and ReadCache proceeds directly to `pread`. There is no bound on how many goroutines can simultaneously be in `pread`. With 10,000 concurrent readers all cold-missing, 10,000 OS threads block simultaneously.
+
+The Librarian and ReadCache **reduce the probability** that a given `Get()` reaches `pread` — they do not **bound the concurrency** when reads do reach it. Under adversarial access patterns (uniform random keys, wide iterator scans, cache cold-start) these tiers provide little protection and the full read concurrency is exposed.
+
+#### Buffered I/O Does Not Eliminate the Risk
+
+With buffered I/O, many `pread` calls are served from the kernel page cache (pure RAM, no blocking, no OS thread consumed beyond the cost of the syscall overhead itself). This raises the threshold at which thread explosion occurs — a workload that triggers 10,000 concurrent blocking reads with Direct I/O might only trigger 100 with buffered I/O if the hot set fits in the page cache.
+
+However, under memory pressure (page cache eviction from iterator thrashing, competing processes, or simply insufficient RAM for the working set), buffered reads converge to the same blocking behavior. The thread explosion risk is present; the workload required to trigger it is just more extreme.
+
+#### What Should Be Done: io_uring as the Principled Fix
+
+The `URingScheduler` (Section 11.4) addresses this correctly. With the sliding-window coordinator pattern:
+
+```text
+pread model (N=1000 concurrent readers):
+  → 1000 OS threads blocked in kernel
+  → +GOMAXPROCS threads running other work
+  → Thundering herd at completion
+
+URingScheduler model (N=1000 concurrent readers):
+  → 1000 goroutines parked in Go scheduler (zero OS threads consumed)
+  → 1 coordinator OS thread blocked in io_uring_enter
+  → Completions reaped one at a time, goroutines woken individually
+```
+
+With a proper coordinator, OS thread count is O(1) regardless of read concurrency. This is the principled solution.
+
+#### Defensive Backstop: Read Concurrency Limiter
+
+Even with `URingScheduler` enabled, a semaphore limiting concurrent preads (used when `URingScheduler` is not in use, or as defense-in-depth) provides the same backpressure semantics as `MaxInflightSlabs`:
+
+```go
+// Goroutines that exceed the limit block in Go's scheduler (no OS thread held),
+// not in a syscall. Equivalent to how Put() blocks on MmapPool when full.
+sem.Acquire(ctx, 1)
+defer sem.Release(1)
+pread(fd, buf, offset)
+```
+
+This makes the read path's syscall concurrency **explicit and configurable**, matching the write path's design. A reasonable default is `2 × GOMAXPROCS` — enough to keep the NVMe pipeline full without allowing unbounded thread growth. This is particularly valuable on Darwin where io_uring is unavailable and `PreadScheduler` is the only option.
+
+#### Summary
+
+| Path | Concurrency Control | Mechanism | Thread Explosion Risk |
+|------|--------------------|-----------|-----------------------|
+| Write | ✅ Explicit | `FlushConcurrency` + `MaxInflightSlabs` backpressure | None — bounded by design |
+| Read (URingScheduler) | ✅ Implicit | Coordinator goroutine; readers park in scheduler | None — O(1) threads |
+| Read (PreadScheduler) | ❌ None | Unbounded goroutines → unbounded OS threads | Present under high cold-read concurrency |
+| Read (Buffered I/O) | ❌ None | Page cache reduces frequency; same risk under pressure | Present but requires more extreme workload |
+
 ---
 
 ## 12. Write-Ahead Log (WAL)

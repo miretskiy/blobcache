@@ -185,6 +185,9 @@ fn bench_blobcache(c: &mut Criterion) {
     config.max_cached_slabs = 64;          // 64 (increased for Librarian hits)
     config.flush_concurrency = 6;          // 6 (matches Go)
     config.direct_io_write = true;         // Direct I/O for writes
+    config.direct_io_read = true;          // Direct I/O for reads (prevent page cache thrash)
+    #[cfg(target_os = "linux")]
+    { config.iosched_kind = ferum::iosched::IOSchedulerKind::URing { ring_depth: 64 }; }
     config.fdatasync = true;               // fdatasync enabled
     config.wal_enabled = false;            // Cache mode (no WAL) for foyer comparison
     config.degraded_mode = DegradedMode::Panic; // Crash on errors
@@ -359,6 +362,9 @@ fn bench_parallel_blobcache(c: &mut Criterion) {
     config.max_cached_slabs = 64;          // 64 (increased for Librarian hits)
     config.flush_concurrency = 6;          // 6
     config.direct_io_write = true;
+    config.direct_io_read = true;          // Direct I/O for reads (prevent page cache thrash)
+    #[cfg(target_os = "linux")]
+    { config.iosched_kind = ferum::iosched::IOSchedulerKind::URing { ring_depth: 64 }; }
     config.fdatasync = true;
     config.wal_enabled = false;  // Cache mode (no WAL) for foyer comparison
     config.degraded_mode = DegradedMode::Panic;

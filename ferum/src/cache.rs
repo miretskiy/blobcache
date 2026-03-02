@@ -27,6 +27,7 @@ use crate::librarian::Librarian;
 use crate::memtable::MemTable;
 use crate::record::Record;
 use crate::keyindex::KeyIndex;
+use crate::iosched::IOSchedulerKind;
 use crate::storage::{delete_segment_files, recover_index_from_footers, Archivist, SegmentIDProvider};
 use crate::wal::{Replayer, Wal, WalConfig};
 
@@ -358,9 +359,25 @@ impl Cache {
     fn open_internal(config: Config) -> Result<Arc<Self>> {
         // Initialize components
         let segment_ids = Arc::new(SegmentIDProvider::new(&config.path, config.shards));
-        let mut archivist = Archivist::new(&config.path, config.shards);
+
+        // Build I/O scheduler from config
+        let sched: Arc<dyn crate::iosched::IOScheduler> = match config.iosched_kind {
+            IOSchedulerKind::Pread => Arc::new(crate::iosched::PreadScheduler::new()),
+            #[cfg(target_os = "linux")]
+            IOSchedulerKind::URing { ring_depth } => {
+                let s = crate::iosched::URingScheduler::new(ring_depth)
+                    .map_err(|e| Error::io("build URingScheduler", e))?;
+                Arc::new(s)
+            }
+        };
+
+        let mut archivist = Archivist::with_scheduler(&config.path, config.shards, sched);
         archivist.set_verify_checksum(config.verify_on_read);
-        archivist.set_fadvise(config.fadvise);
+        archivist.set_direct_io_read(config.direct_io_read);
+        // set_fadvise after set_direct_io_read (direct_io_read suppresses fadvise automatically)
+        if !config.direct_io_read {
+            archivist.set_fadvise(config.fadvise);
+        }
         let archivist = Arc::new(archivist);
         let librarian = Arc::new(Librarian::new(config.max_cached_slabs));
 
@@ -893,28 +910,15 @@ impl Cache {
         let victims = self.index.evict_batch(to_evict as i64);
         let num_victims = victims.len();
 
-        // Hole-punch each victim to reclaim disk space
+        // Accumulate freed bytes from evicted items.
+        // Note: we do NOT hole-punch here. Physical space is reclaimed by pressure-driven
+        // segment drain (compaction.rs), which deletes entire sparse segment files.
+        // Hole-punching individual records during eviction adds unnecessary fallocate
+        // syscalls on the hot path without providing meaningful space reclamation
+        // (segments remain on disk until drain deletes them wholesale).
         let mut freed_bytes: u64 = 0;
-        for victim in victims {
-            // Skip tombstones - they don't take much space
-            if victim.is_deleted() {
-                continue;
-            }
-
-            match self.archivist.hole_punch(
-                victim.segment_id,
-                victim.offset,
-                victim.physical_len,
-            ) {
-                Ok(punched) => {
-                    freed_bytes += punched as u64;
-                }
-                Err(_e) => {
-                    // Hole punch can fail (e.g., not supported) - continue anyway
-                    // The item is already removed from the index
-                    freed_bytes += victim.physical_len as u64;
-                }
-            }
+        for victim in &victims {
+            freed_bytes += victim.physical_len as u64;
         }
 
         // Update size counter

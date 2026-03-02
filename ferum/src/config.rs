@@ -5,6 +5,7 @@
 use std::path::PathBuf;
 
 use crate::compression::{Codec, Level};
+use crate::iosched::IOSchedulerKind;
 use crate::sys::OpenFlags;
 
 /// Default write buffer size (128 MB).
@@ -73,6 +74,19 @@ pub struct Config {
     /// Use Direct I/O for segment writes (O_DIRECT on Linux, F_NOCACHE on Darwin).
     pub direct_io_write: bool,
 
+    /// Use Direct I/O for segment reads (O_DIRECT on Linux, F_NOCACHE on Darwin).
+    ///
+    /// Default: false (buffered reads leverage kernel page cache).
+    /// Enable for iterator-heavy workloads to prevent page cache thrashing from
+    /// non-sequential access patterns. See DESIGN.md §11.5.
+    pub direct_io_read: bool,
+
+    /// I/O scheduler for segment reads.
+    ///
+    /// Default: PreadScheduler (synchronous pread(2), portable).
+    /// Use URing on Linux for lower latency at high I/O concurrency.
+    pub iosched_kind: IOSchedulerKind,
+
     /// Use fdatasync for durability.
     pub fdatasync: bool,
 
@@ -124,6 +138,8 @@ impl Config {
             checksum_enabled: false,
             verify_on_read: false,
             direct_io_write: true,  // Default: Direct I/O for writes (matches Go)
+            direct_io_read: false,  // Default: buffered reads (leverage page cache)
+            iosched_kind: IOSchedulerKind::Pread, // Default: synchronous pread(2)
             fdatasync: false,       // Default: false (matches Go)
             fadvise: crate::sys::USE_FADVISE, // Platform-dependent
             bloom_fp_rate: DEFAULT_BLOOM_FP_RATE,
@@ -211,6 +227,21 @@ impl Config {
     /// Enables or disables Direct I/O for segment writes.
     pub fn direct_io_write(mut self, enabled: bool) -> Self {
         self.direct_io_write = enabled;
+        self
+    }
+
+    /// Enables or disables Direct I/O for segment reads.
+    ///
+    /// When enabled, fadvise is automatically suppressed. Recommended for
+    /// iterator-heavy workloads to prevent page cache thrashing.
+    pub fn direct_io_read(mut self, enabled: bool) -> Self {
+        self.direct_io_read = enabled;
+        self
+    }
+
+    /// Sets the I/O scheduler for segment reads.
+    pub fn io_scheduler(mut self, kind: IOSchedulerKind) -> Self {
+        self.iosched_kind = kind;
         self
     }
 

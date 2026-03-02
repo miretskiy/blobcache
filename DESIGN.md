@@ -1122,10 +1122,50 @@ Both schedulers track per-read I/O latency via HDR histograms (1µs–10s range,
 
 ### 11.5 Buffered vs. Direct I/O Reads
 
-By default, reads use **buffered I/O** (kernel page cache). The `WithDirectIORead` option enables Direct I/O reads with aligned buffers:
+Reads default to **buffered I/O** (kernel page cache). The `WithDirectIORead` option enables Direct I/O reads with block-aligned buffers. The right choice depends heavily on the access pattern.
 
-- **Buffered (default):** Leverages kernel read-ahead, prefetching, and LRU page replacement. Best for workloads with temporal/spatial locality. The kernel page cache is "free" infrastructure — "it’d be the height of hubris to assume we can do better."
-- **Direct I/O:** Bypasses kernel page cache. Prevents write pollution from one-time-use data. Predictable latency bound to hardware performance. Requires block-aligned buffers and offsets (`sys.AlignRange`).
+#### When Buffered Reads Win
+
+For pure point-lookup workloads with strong temporal locality — `Get(key)` calls that repeatedly access the same hot subset of keys — buffered I/O is an asset. The kernel page cache learns which 4KB pages are hot, keeps them in RAM, and serves repeat accesses from DRAM without a disk round-trip. Workloads where the Librarian and ReadCache miss rates are high but the hot set fits in the kernel page cache benefit from this behavior.
+
+#### Why BlobCache Data Does Not Benefit From Kernel Read-Ahead
+
+BlobCache’s log-structured layout means that **blobs for adjacent keys are physically non-contiguous on disk**. Data is written in arrival order, not key order. Blob A at key `"user:1001"` may land in segment 42 at offset 0x4000, while blob B at key `"user:1002"` lands in segment 7 at offset 0x1F8000. Kernel read-ahead assumes sequential access patterns and pre-fetches pages beyond the current read position — an assumption that is fundamentally wrong for random-key blob workloads.
+
+#### The Iterator Problem: Page Cache Thrashing
+
+Iterator workloads expose the worst-case failure mode of buffered reads in BlobCache. An iterator must visit keys in sorted order, but the underlying blobs are stored in write-arrival order across many segments. Each `View()` call in an iterator issues a read to a **random segment, at a random offset** — there is no spatial locality between successive keys.
+
+With buffered I/O, each random read:
+1. Fetches one or more 4KB kernel pages from the disk (even if the blob is 100 bytes)
+2. Populates the page cache with pages that will **never be reused** (the next key is elsewhere)
+3. Evicts hot pages that were genuinely useful (recently written blobs, index metadata)
+
+For a **wide iterator** — one that scans thousands of keys — this becomes a self-inflicted page cache DoS. Thousands of 4KB pages are loaded, consume RAM, evict hot data, and are immediately thrown away when the next key arrives at a completely different location. The page cache thrashes, and all concurrent readers suffer elevated miss rates. On a 128GB machine with a 120GB page cache, a wide iterator can corrupt the entire working set in minutes.
+
+**Write pressure compounds the problem:** as analyzed in Section 6.5, BlobCache’s write path floods the page cache with recently-written blob data. With Direct I/O writes disabled, the page cache is already under pressure from the write side. Adding random iterator reads turns a manageable situation into a cliff.
+
+#### Direct I/O Reads: Predictable IOPS, No Cache Pollution
+
+`WithDirectIORead(true)` opens segment files with `O_DIRECT` (Linux) or `F_NOCACHE` (Darwin). Each read:
+- Issues exactly one aligned `pread` for the blob’s physical extent
+- Bypasses the page cache entirely — no pollution, no eviction side effects
+- Provides predictable, hardware-bound latency (no wait for page cache to warm up)
+- Allows the Librarian and ReadCache to remain effective (they serve hot data without kernel interference)
+
+The iterator’s read-ahead prefetch (Section 4.8) works correctly with Direct I/O: it explicitly fetches contiguous records using a user-space buffer, controlled by the iterator itself rather than the kernel’s heuristics.
+
+#### Decision Guide
+
+| Workload | Recommended Read Mode |
+|----------|----------------------|
+| Pure point lookups, strong temporal locality | Buffered (default) |
+| Mixed point lookups + occasional iteration | Buffered (default); monitor page cache hit rate |
+| Heavy iterator workloads, wide scans | **Direct I/O** (`WithDirectIORead(true)`) |
+| High write pressure + any reads | **Direct I/O** (prevents write pollution cascading into read path) |
+| Write-only or Librarian-dominated reads | Either; page cache not a factor |
+
+**Implementation:** The Archivist routes between `readBlobBuffered()` (standard aligned `pread`) and `readBlobDirect()` (4KB-aligned buffer, `O_DIRECT` file handle) based on `IO.DirectIORead`. Fadvise hints are suppressed in Direct I/O mode (pointless without page cache). The IOScheduler (Section 11.4) is shared between both paths.
 
 See Section 6.5 for empirical comparison of buffered vs. Direct I/O under write-heavy load.
 

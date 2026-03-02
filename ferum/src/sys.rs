@@ -451,6 +451,52 @@ pub fn open_file(path: &Path) -> Result<File> {
     File::open(path).map_err(|e| Error::io("open file", e))
 }
 
+/// Opens an existing segment file for reading (and hole-punching) with optional Direct I/O.
+///
+/// On Linux, applies O_DIRECT via custom_flags when `flags.direct_io` is set.
+/// On Darwin, applies F_NOCACHE via fcntl after opening.
+/// Always opens with both read and write access (write is needed for hole punching).
+pub fn open_file_for_read(path: &Path, flags: OpenFlags) -> Result<File> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(flags.to_os_flags())
+            .open(path)
+            .map_err(|e| Error::io("open segment file for read", e))
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::io::AsRawFd;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|e| Error::io("open segment file for read", e))?;
+
+        if flags.direct_io {
+            let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) };
+            if result == -1 {
+                return Err(Error::io("set F_NOCACHE for read", io::Error::last_os_error()));
+            }
+        }
+        Ok(file)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = flags;
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|e| Error::io("open segment file for read", e))
+    }
+}
+
 /// Pre-allocates disk space for a file.
 #[cfg(target_os = "linux")]
 pub fn fallocate(file: &File, size: i64) -> Result<()> {

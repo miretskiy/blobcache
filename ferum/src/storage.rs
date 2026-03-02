@@ -6,7 +6,7 @@
 //! - `Archivist`: Read-only access to persisted segments
 
 use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -469,10 +469,12 @@ pub struct Archivist {
     shards: u32,
     /// Cached file handles: segmentID -> File
     cache: RwLock<HashMap<u32, File>>,
-    /// Whether to use fadvise hints.
+    /// Whether to use fadvise hints (suppressed when direct_io_read is true).
     use_fadvise: bool,
     /// Whether to verify checksums on read.
     verify_checksum: bool,
+    /// Whether to open segment files with O_DIRECT (Linux) / F_NOCACHE (Darwin) for reads.
+    direct_io_read: bool,
     /// I/O scheduler for segment reads.
     sched: Arc<dyn IOScheduler>,
     /// Aligned buffer pool (avoids per-read mmap under concurrent load).
@@ -488,6 +490,7 @@ impl Archivist {
             cache: RwLock::new(HashMap::new()),
             use_fadvise: true,
             verify_checksum: false,
+            direct_io_read: false,
             sched: Arc::new(PreadScheduler::new()),
             pool: BufferPool::new(),
         }
@@ -501,6 +504,7 @@ impl Archivist {
             cache: RwLock::new(HashMap::new()),
             use_fadvise: true,
             verify_checksum: false,
+            direct_io_read: false,
             sched,
             pool: BufferPool::new(),
         }
@@ -514,6 +518,17 @@ impl Archivist {
     /// Enables or disables checksum verification on read.
     pub fn set_verify_checksum(&mut self, enabled: bool) {
         self.verify_checksum = enabled;
+    }
+
+    /// Enables or disables Direct I/O for segment reads (O_DIRECT on Linux, F_NOCACHE on Darwin).
+    ///
+    /// When enabled, fadvise is automatically suppressed (pointless without page cache).
+    /// Use for iterator-heavy workloads to prevent page cache thrashing from non-sequential access.
+    pub fn set_direct_io_read(&mut self, enabled: bool) {
+        self.direct_io_read = enabled;
+        if enabled {
+            self.use_fadvise = false; // fadvise is meaningless with Direct I/O
+        }
     }
 
     /// Returns I/O scheduler statistics.
@@ -651,13 +666,14 @@ impl Archivist {
             }
         }
 
-        // Open the file
+        // Open the file with appropriate flags
         let path = get_segment_path(&self.base_path, self.shards, segment_id);
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .map_err(|e| Error::io("open segment file", e))?;
+        let flags = sys::OpenFlags {
+            direct_io: self.direct_io_read,
+            dsync: false,
+            sync: false,
+        };
+        let file = sys::open_file_for_read(&path, flags)?;
 
         // Cache the handle (write lock)
         {

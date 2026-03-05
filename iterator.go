@@ -6,7 +6,7 @@ import (
 
 	"github.com/cockroachdb/pebble"
 	"github.com/miretskiy/blobcache/internal/index"
-	"github.com/miretskiy/blobcache/internal/sys"
+	"github.com/miretskiy/dio/align"
 )
 
 // Iterator provides ordered iteration over cache entries using the global
@@ -274,7 +274,7 @@ func (it *Iterator) readAndServe(fn func(data []byte), readExtra int) bool {
 
 	var readOff int64
 	if a.IO.DirectIORead {
-		alignedOff, alignedLen := sys.AlignRange(blobOff, readLen)
+		alignedOff, alignedLen := align.AlignRange(blobOff, readLen)
 		it.releasePrefetch()
 		it.prefetch = AcquireAlignedBuffer(int(alignedLen), int(alignedLen))
 		readOff = alignedOff

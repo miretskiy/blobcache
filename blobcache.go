@@ -17,8 +17,8 @@ import (
 	"github.com/miretskiy/blobcache/bloom"
 	"github.com/miretskiy/blobcache/internal/index"
 	"github.com/miretskiy/blobcache/internal/record"
-	"github.com/miretskiy/blobcache/internal/sys"
 	"github.com/miretskiy/blobcache/internal/wal"
+	"github.com/miretskiy/dio/sys"
 	"github.com/zeebo/xxh3"
 )
 

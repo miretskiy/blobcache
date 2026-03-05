@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"github.com/miretskiy/blobcache/internal/index"
-	"github.com/miretskiy/blobcache/internal/sys"
+	"github.com/miretskiy/dio/align"
 	"github.com/stretchr/testify/require"
 	"github.com/zeebo/xxh3"
 )
@@ -265,7 +265,7 @@ func TestRewriteSegment_BlockAlignment(t *testing.T) {
 		item, found := cache.index.Get(h)
 		require.True(t, found)
 		require.Equal(t, result.NewSegID, item.SegmentID)
-		require.EqualValues(t, 0, int64(item.Offset)%sys.BlockSize,
+		require.EqualValues(t, 0, int64(item.Offset)%align.BlockSize,
 			"item %d offset %d should be block-aligned", i, item.Offset)
 	}
 }

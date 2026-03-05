@@ -5,7 +5,7 @@ import (
 	"time"
 
 	"github.com/miretskiy/blobcache/internal/record"
-	"github.com/miretskiy/blobcache/internal/sys"
+	"github.com/miretskiy/dio/sys"
 )
 
 // IndexSegmentExtension is the file extension for segment metadata files.

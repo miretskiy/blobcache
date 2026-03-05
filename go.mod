@@ -6,8 +6,11 @@ require (
 	github.com/DataDog/zstd v1.5.7
 	github.com/HdrHistogram/hdrhistogram-go v1.2.0
 	github.com/klauspost/compress v1.18.2
+	github.com/miretskiy/dio v0.0.0
 	github.com/pawelgaczynski/giouring v0.0.0-20230826085535-69588b89acb9
 )
+
+replace github.com/miretskiy/dio => ../dio
 
 replace github.com/pawelgaczynski/giouring => ../giouring
 

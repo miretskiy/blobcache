@@ -3,7 +3,7 @@ package blobcache
 import (
 	"testing"
 
-	"github.com/miretskiy/blobcache/internal/sys"
+	"github.com/miretskiy/dio/align"
 	"github.com/stretchr/testify/require"
 )
 
@@ -13,7 +13,7 @@ func TestAcquireAlignedBuffer_Alignment(t *testing.T) {
 		h := AcquireAlignedBuffer(size, size)
 		buf := h.Bytes()
 		require.Equal(t, size, len(buf), "length mismatch for size %d", size)
-		require.True(t, sys.IsAligned(buf), "AcquireAlignedBuffer(%d) not aligned", size)
+		require.True(t, align.IsAligned(buf), "AcquireAlignedBuffer(%d) not aligned", size)
 		h.Release()
 	}
 }
@@ -23,7 +23,7 @@ func TestAcquireAlignedBuffer_ReuseAfterRelease(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		h := AcquireAlignedBuffer(8192, 8192)
 		buf := h.Bytes()
-		require.True(t, sys.IsAligned(buf), "iteration %d: not aligned", i)
+		require.True(t, align.IsAligned(buf), "iteration %d: not aligned", i)
 		// Write a pattern to exercise the buffer.
 		for j := range buf {
 			buf[j] = byte(j)
@@ -51,6 +51,6 @@ func TestAcquireAlignedBuffer_JumboSize(t *testing.T) {
 	h := AcquireAlignedBuffer(size, size)
 	buf := h.Bytes()
 	require.Equal(t, size, len(buf))
-	require.True(t, sys.IsAligned(buf), "jumbo aligned buffer not aligned")
+	require.True(t, align.IsAligned(buf), "jumbo aligned buffer not aligned")
 	h.Release()
 }

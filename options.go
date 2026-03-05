@@ -5,9 +5,9 @@ import (
 	"hash/crc32"
 
 	"github.com/miretskiy/blobcache/compression"
-	"github.com/miretskiy/blobcache/internal/iosched"
-	"github.com/miretskiy/blobcache/internal/sys"
 	"github.com/miretskiy/blobcache/internal/wal"
+	"github.com/miretskiy/dio/iosched"
+	"github.com/miretskiy/dio/sys"
 )
 
 // DegradedMode controls how the cache behaves when entering degraded mode.

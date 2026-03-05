@@ -11,9 +11,10 @@ import (
 
 	"github.com/miretskiy/blobcache/compression"
 	"github.com/miretskiy/blobcache/internal/index"
-	"github.com/miretskiy/blobcache/internal/iosched"
 	"github.com/miretskiy/blobcache/internal/record"
-	"github.com/miretskiy/blobcache/internal/sys"
+	"github.com/miretskiy/dio/align"
+	"github.com/miretskiy/dio/iosched"
+	"github.com/miretskiy/dio/sys"
 )
 
 // Archivist manages read-only access to persisted segments.
@@ -36,7 +37,7 @@ type Archivist struct {
 
 func NewArchivist(cfg config, idx *index.DurableIndex, sched iosched.IOScheduler) *Archivist {
 	if sched == nil {
-		sched = &iosched.PreadScheduler{}
+		sched, _ = iosched.NewPwriteScheduler()
 	}
 	a := &Archivist{
 		config:  cfg,
@@ -202,9 +203,9 @@ func (a *Archivist) prefetchAndParse(e index.Item, expectedKey []byte) ([]byte, 
 		if neededLen < prefetchChunkSize {
 			neededLen = prefetchChunkSize
 		}
-		readOff, readLen = sys.AlignRange(chunkOff, neededLen)
+		readOff, readLen = align.AlignRange(chunkOff, neededLen)
 	} else {
-		readOff, readLen = sys.AlignRange(blobOff, blobLen)
+		readOff, readLen = align.AlignRange(blobOff, blobLen)
 	}
 
 	handle := AcquireAlignedBuffer(int(readLen), int(readLen))
@@ -278,7 +279,7 @@ func (a *Archivist) readBlobBuffered(
 func (a *Archivist) readBlobDirect(
 	sf *os.File, e index.Item, expectedKey []byte,
 ) ([]byte, Releaser, error) {
-	alignedOff, alignedLen := sys.AlignRange(int64(e.Offset), int(e.PhysicalLen))
+	alignedOff, alignedLen := align.AlignRange(int64(e.Offset), int(e.PhysicalLen))
 	handle := AcquireAlignedBuffer(int(alignedLen), int(alignedLen))
 	buf := handle.Bytes()
 
@@ -376,14 +377,14 @@ func (a *Archivist) getSegmentFile(segmentID uint32) (*os.File, error) {
 	if a.IO.DirectIORead {
 		flags |= sys.FlDirectIO
 	}
-	f, err := sys.OpenFileForRead(path, flags)
+	f, err := sys.OpenDirect(path, flags)
 	if err != nil {
 		return nil, err
 	}
 
 	// fadvise is meaningless with Direct I/O (no page cache).
 	if a.IO.Fadvise && !a.IO.DirectIORead {
-		if err := sys.Fadvise(f.Fd(), 0, 0, sys.FadvRandom); err != nil {
+		if err := sys.Fadvise(f, 0, 0, sys.FadvRandom); err != nil {
 			log.Warn("fadvise failed", "segID", segmentID, "err", err)
 		}
 	}

@@ -16,7 +16,8 @@ import (
 
 	"github.com/miretskiy/blobcache/bloom"
 	"github.com/miretskiy/blobcache/internal/record"
-	"github.com/miretskiy/blobcache/internal/sys"
+	"github.com/miretskiy/dio/align"
+	"github.com/miretskiy/dio/sys"
 )
 
 // Persistence format constants for the unified .meta file.
@@ -231,7 +232,7 @@ func findFooterBlockSize(path string) (int64, error) {
 		if _, err := f.ReadAt(tailBuf, fileSize-record.TailSize); err == nil {
 			if tail, err := record.DecodeSegmentTail(tailBuf); err == nil {
 				// Valid tail at end - footer block is the entire file
-				return sys.PageAlign(tail.DataLen + record.TailSize), nil
+				return align.PageAlign(tail.DataLen + record.TailSize), nil
 			}
 		}
 	}
@@ -262,7 +263,7 @@ func findFooterBlockSize(path string) (int64, error) {
 				// Found tail magic - verify by reading the full tail
 				tailOffset := offset + int64(i)
 				possibleBlockEnd := tailOffset + record.TailSize
-				roundedEnd := sys.PageAlign(possibleBlockEnd)
+				roundedEnd := align.PageAlign(possibleBlockEnd)
 
 				// The footer block should end at a page boundary
 				if roundedEnd <= fileSize {
@@ -272,7 +273,7 @@ func findFooterBlockSize(path string) (int64, error) {
 							// Verify: data length should match position
 							expectedStart := tailOffset - tail.DataLen
 							if expectedStart >= 0 {
-								return sys.PageAlign(tail.DataLen + record.TailSize), nil
+								return align.PageAlign(tail.DataLen + record.TailSize), nil
 							}
 						}
 					}

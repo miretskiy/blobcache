@@ -8,7 +8,8 @@ import (
 	"testing"
 
 	"github.com/miretskiy/blobcache/internal/record"
-	"github.com/miretskiy/blobcache/internal/sys"
+	"github.com/miretskiy/dio/align"
+	"github.com/miretskiy/dio/sys"
 	"github.com/stretchr/testify/require"
 )
 
@@ -102,7 +103,7 @@ func TestWAL_WriteAndRecover(t *testing.T) {
 	}
 
 	// First record starts after file header; sequential writes each become their own batch
-	expectedOffset := sys.PageAlign(int64(FileHeaderSize))
+	expectedOffset := align.PageAlign(int64(FileHeaderSize))
 	for i, rec := range records {
 		result := writeAndVerify(t, w, rec, expectedOffset)
 		if i == 0 {
@@ -146,13 +147,13 @@ func TestWAL_RecoverSkipsCommittedFiles(t *testing.T) {
 	require.NoError(t, err)
 
 	rec := record.NewRecord(100, []byte("key1"), []byte("value1"), 6)
-	writeAndVerify(t, w, rec, sys.PageAlign(int64(FileHeaderSize)))
+	writeAndVerify(t, w, rec, align.PageAlign(int64(FileHeaderSize)))
 	_, err = w.EnqueueRotation()
 	require.NoError(t, err)
 
 	// Write records with SeqID 200 to second file (new file, so offset resets to FileHeaderSize)
 	rec = record.NewRecord(200, []byte("key2"), []byte("value2"), 6)
-	writeAndVerify(t, w, rec, sys.PageAlign(int64(FileHeaderSize)))
+	writeAndVerify(t, w, rec, align.PageAlign(int64(FileHeaderSize)))
 	require.NoError(t, w.Close())
 
 	// Reopen and recover - mark first file as committed
@@ -184,7 +185,7 @@ func TestWAL_Rotate(t *testing.T) {
 
 	// Write record with SeqID 100 (becomes first WAL file name)
 	rec1 := record.NewRecord(100, []byte("key1"), []byte("value1"), 6)
-	writeAndVerify(t, w, rec1, sys.PageAlign(int64(FileHeaderSize)))
+	writeAndVerify(t, w, rec1, align.PageAlign(int64(FileHeaderSize)))
 	require.Equal(t, uint64(100), w.CurrentFirstID())
 
 	// Rotate (closes current file)
@@ -194,7 +195,7 @@ func TestWAL_Rotate(t *testing.T) {
 
 	// Write to new slab with SeqID 200 (new file, offset resets)
 	rec2 := record.NewRecord(200, []byte("key2"), []byte("value2"), 6)
-	writeAndVerify(t, w, rec2, sys.PageAlign(int64(FileHeaderSize)))
+	writeAndVerify(t, w, rec2, align.PageAlign(int64(FileHeaderSize)))
 	require.Equal(t, uint64(200), w.CurrentFirstID())
 
 	// Rotate again
@@ -203,7 +204,7 @@ func TestWAL_Rotate(t *testing.T) {
 
 	// Write to new slab with SeqID 300 (new file, offset resets)
 	rec3 := record.NewRecord(300, []byte("key3"), []byte("value3"), 6)
-	writeAndVerify(t, w, rec3, sys.PageAlign(int64(FileHeaderSize)))
+	writeAndVerify(t, w, rec3, align.PageAlign(int64(FileHeaderSize)))
 
 	// Check multiple files were created
 	files, err := w.listWALFiles()
@@ -262,7 +263,7 @@ func TestWAL_DeleteFile(t *testing.T) {
 
 	// Write with SeqID 100 (file named wal-0000000000000100.log)
 	rec := record.NewRecord(100, []byte("key"), []byte("value"), 5)
-	writeAndVerify(t, w, rec, sys.PageAlign(int64(FileHeaderSize)))
+	writeAndVerify(t, w, rec, align.PageAlign(int64(FileHeaderSize)))
 
 	// Rotate
 	_, err = w.EnqueueRotation()
@@ -270,7 +271,7 @@ func TestWAL_DeleteFile(t *testing.T) {
 
 	// Write with SeqID 200 (file named wal-0000000000000200.log)
 	rec2 := record.NewRecord(200, []byte("key2"), []byte("value2"), 6)
-	writeAndVerify(t, w, rec2, sys.PageAlign(int64(FileHeaderSize)))
+	writeAndVerify(t, w, rec2, align.PageAlign(int64(FileHeaderSize)))
 
 	require.NoError(t, w.Close())
 
@@ -316,7 +317,7 @@ func TestWAL_DeleteRecord(t *testing.T) {
 	}
 	rec.SetCRC(record.ComputeCRC(rec.Key, nil))
 
-	writeAndVerify(t, w, rec, sys.PageAlign(int64(FileHeaderSize)))
+	writeAndVerify(t, w, rec, align.PageAlign(int64(FileHeaderSize)))
 	require.NoError(t, w.Close())
 
 	// Recover and verify tombstone
@@ -346,7 +347,7 @@ func TestWAL_RecoverCorruptedRecord(t *testing.T) {
 	rec3 := record.NewRecord(3, []byte("key3"), []byte("value3"), 6)
 
 	// Sequential writes: each becomes its own batch
-	r1 := writeAndVerify(t, w, rec1, sys.PageAlign(int64(FileHeaderSize)))
+	r1 := writeAndVerify(t, w, rec1, align.PageAlign(int64(FileHeaderSize)))
 	r2 := writeAndVerify(t, w, rec2, r1.BytesAligned)
 	writeAndVerify(t, w, rec3, r1.BytesAligned+r2.BytesAligned)
 	require.NoError(t, w.Close())
@@ -391,7 +392,7 @@ func TestWAL_RecoverTruncatedFile(t *testing.T) {
 	rec2 := record.NewRecord(2, []byte("key2"), []byte("value2"), 6)
 
 	// Sequential writes: each becomes its own batch
-	r1 := writeAndVerify(t, w, rec1, sys.PageAlign(int64(FileHeaderSize)))
+	r1 := writeAndVerify(t, w, rec1, align.PageAlign(int64(FileHeaderSize)))
 	writeAndVerify(t, w, rec2, r1.BytesAligned)
 	require.NoError(t, w.Close())
 
@@ -431,7 +432,7 @@ func TestWAL_RecoverEmptyFile(t *testing.T) {
 	require.NoError(t, err)
 
 	rec := record.NewRecord(1, []byte("key"), []byte("value"), 5)
-	writeAndVerify(t, w, rec, sys.PageAlign(int64(FileHeaderSize)))
+	writeAndVerify(t, w, rec, align.PageAlign(int64(FileHeaderSize)))
 	require.NoError(t, w.Close())
 
 	// Truncate to just header (no records)
@@ -460,12 +461,12 @@ func TestWAL_RecoverMultipleFiles(t *testing.T) {
 	require.NoError(t, err)
 
 	rec1 := record.NewRecord(100, []byte("key1"), []byte("value1"), 6)
-	writeAndVerify(t, w, rec1, sys.PageAlign(int64(FileHeaderSize)))
+	writeAndVerify(t, w, rec1, align.PageAlign(int64(FileHeaderSize)))
 	_, err = w.EnqueueRotation()
 	require.NoError(t, err)
 
 	rec2 := record.NewRecord(200, []byte("key2"), []byte("value2"), 6)
-	writeAndVerify(t, w, rec2, sys.PageAlign(int64(FileHeaderSize))) // New file, offset resets
+	writeAndVerify(t, w, rec2, align.PageAlign(int64(FileHeaderSize))) // New file, offset resets
 	require.NoError(t, w.Close())
 
 	// Verify 2 files exist
@@ -537,7 +538,7 @@ func TestScanMaxSeqID(t *testing.T) {
 	require.NoError(t, err)
 
 	// Write records with various SeqIDs - sequential writes, each is its own batch
-	expectedOffset := sys.PageAlign(int64(FileHeaderSize))
+	expectedOffset := align.PageAlign(int64(FileHeaderSize))
 	seqIDs := []uint64{10, 50, 30, 100, 75}
 	for i, seq := range seqIDs {
 		rec := record.NewRecord(seq, []byte("key"), []byte("value"), 5)
@@ -626,7 +627,7 @@ func TestWAL_ListWALFiles(t *testing.T) {
 	seqIDs := []uint64{100, 200, 300, 400}
 	for i, seqID := range seqIDs {
 		rec := record.NewRecord(seqID, []byte("key"), []byte("value"), 5)
-		writeAndVerify(t, w, rec, sys.PageAlign(int64(FileHeaderSize))) // Each file starts fresh
+		writeAndVerify(t, w, rec, align.PageAlign(int64(FileHeaderSize))) // Each file starts fresh
 		if i < len(seqIDs)-1 {
 			_, err = w.EnqueueRotation()
 			require.NoError(t, err)
@@ -671,7 +672,7 @@ func TestWAL_BatchSplitting(t *testing.T) {
 	}
 
 	// Write all records (batch splitting doesn't allow precise offset tracking)
-	offset := sys.PageAlign(int64(FileHeaderSize))
+	offset := align.PageAlign(int64(FileHeaderSize))
 	for _, rec := range records {
 		result, err := w.Write(rec)
 		require.NoError(t, err)
@@ -719,7 +720,7 @@ func TestWAL_OversizedRecord(t *testing.T) {
 	largeRec := record.NewRecord(1, []byte("bigkey"), largeValue, 6)
 
 	// Write should succeed via slow path
-	writeAndVerify(t, w, largeRec, sys.PageAlign(int64(FileHeaderSize)))
+	writeAndVerify(t, w, largeRec, align.PageAlign(int64(FileHeaderSize)))
 	require.NoError(t, w.Close())
 
 	// Recover and verify
@@ -858,7 +859,7 @@ func TestWAL_Guard_PreventsTimeTravel(t *testing.T) {
 
 	// 1. Write SeqID 100
 	rec100 := record.NewRecord(100, []byte("k"), []byte("v"), 0)
-	writeAndVerify(t, w, rec100, sys.PageAlign(int64(FileHeaderSize)))
+	writeAndVerify(t, w, rec100, align.PageAlign(int64(FileHeaderSize)))
 
 	// 2. Rotate. This sets w.lastRotatedSeq = 100
 	_, err = w.EnqueueRotation()
@@ -866,7 +867,7 @@ func TestWAL_Guard_PreventsTimeTravel(t *testing.T) {
 
 	// 3. Write SeqID 200 (Valid: > 100) - new file, offset resets
 	rec200 := record.NewRecord(200, []byte("k"), []byte("v"), 0)
-	writeAndVerify(t, w, rec200, sys.PageAlign(int64(FileHeaderSize)))
+	writeAndVerify(t, w, rec200, align.PageAlign(int64(FileHeaderSize)))
 
 	// 4. ATTACK: Attempt to write SeqID 99 (Time Travel)
 	// This should be rejected because 99 <= lastRotatedSeq (100)
@@ -891,8 +892,8 @@ func TestWAL_Write_LargeAlignedValue(t *testing.T) {
 
 	// Allocate aligned buffer (must be page-sized)
 	valueSize := 4096 * 2 // 8KB - two pages
-	value := sys.AllocAligned(valueSize)
-	defer sys.FreeAligned(value)
+	value := align.AllocAligned(valueSize)
+	defer align.FreeAligned(value)
 
 	// Fill with pattern
 	for i := range value {
@@ -900,7 +901,7 @@ func TestWAL_Write_LargeAlignedValue(t *testing.T) {
 	}
 
 	rec := record.NewRecord(1, []byte("big-key"), value, 6)
-	result := writeAndVerify(t, w, rec, sys.PageAlign(int64(FileHeaderSize)))
+	result := writeAndVerify(t, w, rec, align.PageAlign(int64(FileHeaderSize)))
 
 	// Write another normal record - next offset is at BytesAligned (not BytesWritten)
 	rec2 := record.NewRecord(2, []byte("small-key"), []byte("small-value"), 6)
@@ -943,8 +944,8 @@ func TestWAL_Write_1MB_Record(t *testing.T) {
 
 	// Allocate a 1MB aligned buffer (256 pages)
 	valueSize := 1 << 20 // 1MB
-	value := sys.AllocAligned(valueSize)
-	defer sys.FreeAligned(value)
+	value := align.AllocAligned(valueSize)
+	defer align.FreeAligned(value)
 
 	// Fill with deterministic pattern for verification
 	for i := range value {
@@ -952,7 +953,7 @@ func TestWAL_Write_1MB_Record(t *testing.T) {
 	}
 
 	rec := record.NewRecord(1, []byte("megabyte-key"), value, 6)
-	writeAndVerify(t, w, rec, sys.PageAlign(int64(FileHeaderSize)))
+	writeAndVerify(t, w, rec, align.PageAlign(int64(FileHeaderSize)))
 
 	require.NoError(t, w.Close())
 
@@ -997,7 +998,7 @@ func TestWAL_RecordBlockAlignment(t *testing.T) {
 		rec := record.NewRecord(uint64(i+1), []byte("key"), value, 3)
 		result, err := w.Write(rec)
 		require.NoError(t, err)
-		require.Zero(t, result.Offset%sys.BlockSize,
+		require.Zero(t, result.Offset%align.BlockSize,
 			"record %d (size=%d) has unaligned offset %d", i, size, result.Offset)
 	}
 
@@ -1030,12 +1031,12 @@ func TestWAL_Write_MixedSizes(t *testing.T) {
 
 	// Normal write 1
 	rec1 := record.NewRecord(1, []byte("k1"), []byte("normal1"), 6)
-	r1 := writeAndVerify(t, w, rec1, sys.PageAlign(int64(FileHeaderSize)))
+	r1 := writeAndVerify(t, w, rec1, align.PageAlign(int64(FileHeaderSize)))
 	nextOffset := r1.BytesAligned // First batch includes header
 
 	// Direct write 1
-	val2 := sys.AllocAligned(4096)
-	defer sys.FreeAligned(val2)
+	val2 := align.AllocAligned(4096)
+	defer align.FreeAligned(val2)
 	for i := range val2 {
 		val2[i] = 0xAA
 	}
@@ -1049,8 +1050,8 @@ func TestWAL_Write_MixedSizes(t *testing.T) {
 	nextOffset += r3.BytesAligned
 
 	// Direct write 2
-	val4 := sys.AllocAligned(8192)
-	defer sys.FreeAligned(val4)
+	val4 := align.AllocAligned(8192)
+	defer align.FreeAligned(val4)
 	for i := range val4 {
 		val4[i] = 0xBB
 	}

@@ -8,8 +8,8 @@ import (
 	"github.com/miretskiy/blobcache/bloom"
 	"github.com/miretskiy/blobcache/compression"
 	"github.com/miretskiy/blobcache/internal/record"
-	"github.com/miretskiy/blobcache/internal/sys"
 	"github.com/miretskiy/blobcache/internal/xmap"
+	"github.com/miretskiy/dio/align"
 )
 
 // SlabEntry is stored in the slab's in-memory index.
@@ -95,10 +95,10 @@ func (s *SharedSlab) Acquire(key Key) ([]byte, []byte, Releaser, bool, base.Blob
 	// 4. Extract key bytes (zero-copy slice for collision detection)
 	keyStart := offset + int64(record.HeaderSize)
 	keyEnd := keyStart + int64(rec.KeyLen)
-	keyBytes := buf.raw[keyStart:keyEnd]
+	keyBytes := buf.Bytes()[keyStart:keyEnd]
 
 	// 5. Get Physical Data (skip past header and key to value bytes)
-	physicalData := buf.raw[keyEnd : keyEnd+rec.PhysicalSize]
+	physicalData := buf.Bytes()[keyEnd : keyEnd+rec.PhysicalSize]
 	releaser := Releaser{slab: buf}
 
 	// 6. Handle Decompression
@@ -180,11 +180,11 @@ func (as *ActiveSlab) Alloc(n int) (buf []byte, offset int64) {
 		return nil, 0
 	}
 	as.wPos = end
-	return as.buf.raw[offset:end], offset
+	return as.buf.Bytes()[offset:end], offset
 }
 
 func (as *ActiveSlab) AlignPosToPageBoundary() int64 {
-	as.wPos = sys.PageAlign(as.wPos)
+	as.wPos = align.PageAlign(as.wPos)
 	return as.wPos
 }
 

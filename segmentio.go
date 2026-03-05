@@ -11,7 +11,8 @@ import (
 
 	"github.com/miretskiy/blobcache/internal/index"
 	"github.com/miretskiy/blobcache/internal/record"
-	"github.com/miretskiy/blobcache/internal/sys"
+	"github.com/miretskiy/dio/align"
+	"github.com/miretskiy/dio/sys"
 )
 
 // segmentIDProvider allocates unique segment IDs.
@@ -215,7 +216,7 @@ func CreateSegmentWriter(
 	size int64,
 ) (*segmentWriter, error) {
 	path := getSegmentPath(basePath, shards, segmentID)
-	f, err := sys.CreateAndAllocateFile(path, ioFlags, size)
+	f, err := sys.CreateAndAllocate(path, ioFlags, size)
 	if err != nil {
 		return nil, err
 	}
@@ -249,14 +250,14 @@ func (w *segmentWriter) File() *os.File {
 // We write a full page (4KB) with the 8-byte header at the start.
 func (w *segmentWriter) WriteHeader() error {
 	// Acquire page-aligned buffer (minimum 4KB for O_DIRECT write size alignment)
-	buf := w.footerPool.AcquireAligned(sys.BlockSize)
+	buf := w.footerPool.AcquireAligned(align.BlockSize)
 	defer buf.Unpin()
 
 	// Copy header bytes into aligned buffer (rest is zero-padded)
 	copy(buf.Bytes(), record.FileHeaderBytes[:])
 
 	// Write full page - O_DIRECT requires aligned write size
-	_, err := sys.WriteAligned(buf.Bytes()[:sys.BlockSize], w.file, w.ioFlags)
+	_, err := w.file.Write(buf.Bytes()[:align.BlockSize])
 	return err
 }
 

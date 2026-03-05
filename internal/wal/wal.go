@@ -23,7 +23,8 @@ import (
 	"time"
 
 	"github.com/miretskiy/blobcache/internal/record"
-	"github.com/miretskiy/blobcache/internal/sys"
+	"github.com/miretskiy/dio/align"
+	"github.com/miretskiy/dio/sys"
 )
 
 // ErrSequenceRegression is returned when a write's SeqID is older than the
@@ -114,7 +115,7 @@ type WAL struct {
 	flushing []*request
 
 	// Reusable encode buffer for "Flatten and Flush" pattern.
-	// 4KB-aligned memory from sys.AllocAligned for O_DIRECT.
+	// 4KB-aligned memory from align.AllocAligned for O_DIRECT.
 	// Sizing policy: grows to max batch size, never shrinks (avoids allocation churn).
 	encodeBuf []byte
 
@@ -149,8 +150,8 @@ func Open(cfg Config) (*WAL, error) {
 	if bufSize <= 0 {
 		bufSize = DefaultMaxBatchSize
 	}
-	alignedSize := int(sys.PageAlign(int64(bufSize + FileHeaderSize)))
-	w.encodeBuf = sys.AllocAligned(alignedSize)
+	alignedSize := int(align.PageAlign(int64(bufSize + FileHeaderSize)))
+	w.encodeBuf = align.AllocAligned(alignedSize)
 
 	return w, nil
 }
@@ -363,7 +364,7 @@ func (w *WAL) flushRecords(batch []*request) error {
 		needHeader := w.fileOffset == 0
 		overhead := 0
 		if needHeader {
-			overhead = int(sys.PageAlign(int64(FileHeaderSize)))
+			overhead = int(align.PageAlign(int64(FileHeaderSize)))
 		}
 
 		chunkStart := idx
@@ -371,7 +372,7 @@ func (w *WAL) flushRecords(batch []*request) error {
 
 		for idx < len(batch) {
 			recSize := batch[idx].rec.EncodedSize()
-			paddedRecSize := int(sys.PageAlign(int64(recSize)))
+			paddedRecSize := int(align.PageAlign(int64(recSize)))
 
 			if chunkSize+paddedRecSize <= bufCap {
 				// Record fits in current chunk (padded to block boundary)
@@ -427,14 +428,14 @@ func (w *WAL) writeChunk(chunk []*request, includeHeader bool) error {
 	// present) is padded to a full block so the first record starts at offset 4096.
 	payloadSize := 0
 	for _, req := range chunk {
-		payloadSize = int(sys.PageAlign(int64(payloadSize + req.rec.EncodedSize())))
+		payloadSize = int(align.PageAlign(int64(payloadSize + req.rec.EncodedSize())))
 	}
 
 	totalPayload := payloadSize
 	if includeHeader {
-		totalPayload += int(sys.PageAlign(int64(FileHeaderSize)))
+		totalPayload += int(align.PageAlign(int64(FileHeaderSize)))
 	}
-	writeSize := int(sys.PageAlign(int64(totalPayload)))
+	writeSize := int(align.PageAlign(int64(totalPayload)))
 
 	buf := w.encodeBuf[:writeSize]
 	clear(buf) // Zero entire buffer: inter-record padding, header padding, tail
@@ -448,13 +449,13 @@ func (w *WAL) writeChunk(chunk []*request, includeHeader bool) error {
 			CreatedAt: time.Now().UnixNano(),
 		}
 		hdr.EncodeTo(buf)
-		bufOffset = int(sys.PageAlign(int64(FileHeaderSize)))
+		bufOffset = int(align.PageAlign(int64(FileHeaderSize)))
 	}
 
 	// Track file offset for WriteResult (before writing)
 	baseFileOffset := w.fileOffset
 	if includeHeader {
-		baseFileOffset += sys.PageAlign(int64(FileHeaderSize))
+		baseFileOffset += align.PageAlign(int64(FileHeaderSize))
 	}
 
 	// Serialize records with per-record block padding
@@ -468,8 +469,8 @@ func (w *WAL) writeChunk(chunk []*request, includeHeader bool) error {
 			BytesAligned: int64(writeSize), // Shared across batch (total aligned write)
 		}
 
-		bufOffset = int(sys.PageAlign(int64(bufOffset + recSize)))
-		baseFileOffset = sys.PageAlign(baseFileOffset + int64(recSize))
+		bufOffset = int(align.PageAlign(int64(bufOffset + recSize)))
+		baseFileOffset = align.PageAlign(baseFileOffset + int64(recSize))
 	}
 
 	// Write and sync
@@ -490,15 +491,15 @@ func (w *WAL) writeLargeRecord(req *request) error {
 	totalPayload := recSize
 	recordOffset := w.fileOffset
 	if includeHeader {
-		paddedHeader := int(sys.PageAlign(int64(FileHeaderSize)))
+		paddedHeader := int(align.PageAlign(int64(FileHeaderSize)))
 		totalPayload = paddedHeader + recSize
 		recordOffset += int64(paddedHeader)
 	}
-	writeSize := int(sys.PageAlign(int64(totalPayload)))
+	writeSize := int(align.PageAlign(int64(totalPayload)))
 
 	// Allocate temporary aligned buffer
-	buf := sys.AllocAligned(writeSize)
-	defer sys.FreeAligned(buf)
+	buf := align.AllocAligned(writeSize)
+	defer align.FreeAligned(buf)
 	clear(buf) // Zero entire buffer (header padding + tail)
 
 	// Write header if needed, padded to block boundary
@@ -510,7 +511,7 @@ func (w *WAL) writeLargeRecord(req *request) error {
 			CreatedAt: time.Now().UnixNano(),
 		}
 		hdr.EncodeTo(buf)
-		bufOffset = int(sys.PageAlign(int64(FileHeaderSize)))
+		bufOffset = int(align.PageAlign(int64(FileHeaderSize)))
 	}
 
 	// Serialize record
@@ -591,7 +592,7 @@ func (w *WAL) ensureFile(firstSeqID uint64) error {
 	w.currentFirstID = firstSeqID
 	path := w.walPath(firstSeqID)
 
-	f, err := sys.CreateFile(path, w.cfg.Flags)
+	f, err := sys.CreateDirect(path, w.cfg.Flags)
 	if err != nil {
 		return fmt.Errorf("wal: create file: %w", err)
 	}

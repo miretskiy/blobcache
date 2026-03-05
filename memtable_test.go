@@ -32,7 +32,7 @@ func NewTrackedPool(capacity int, slabSize int64) *TrackedPool {
 func (tp *TrackedPool) AcquireAligned(size int64) *MmapBuffer {
 	buf := tp.MmapPool.AcquireAligned(size)
 	// If buf.pool is nil, it's a one-off unpooled allocation that needs tracking.
-	if buf.pool == nil {
+	if !buf.IsPooled() {
 		tp.mu.Lock()
 		tp.extraRegions = append(tp.extraRegions, buf.Bytes())
 		tp.mu.Unlock()

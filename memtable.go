@@ -11,9 +11,10 @@ import (
 	"github.com/miretskiy/blobcache/compression"
 	"github.com/miretskiy/blobcache/internal/index"
 	"github.com/miretskiy/blobcache/internal/record"
-	"github.com/miretskiy/blobcache/internal/sys"
 	"github.com/miretskiy/blobcache/internal/wal"
 	"github.com/miretskiy/blobcache/internal/xmap"
+	"github.com/miretskiy/dio/align"
+	"github.com/miretskiy/dio/sys"
 )
 
 const (
@@ -40,7 +41,7 @@ type MemTable struct {
 	segIDs    SegmentIDProvider
 	slabPool  *MmapPool
 	publisher Publisher
-	wal       *wal.WAL  // nil if WAL disabled
+	wal       *wal.WAL        // nil if WAL disabled
 	keyIndex  *index.KeyIndex // nil if key index disabled
 
 	mu struct {
@@ -72,7 +73,7 @@ func NewMemTable(
 ) *MemTable {
 	// Clamp WriteBufferSize: block-aligned records start at offset BlockSize (4096),
 	// so the slab (WriteBufferSize + BlockSize) must have room for at least one record.
-	cfg.WriteBufferSize = max(cfg.WriteBufferSize, 2*sys.BlockSize)
+	cfg.WriteBufferSize = max(cfg.WriteBufferSize, 2*align.BlockSize)
 
 	poolCapacity := cfg.MaxCachedSlabs + cfg.MaxInflightSlabs + 2
 
@@ -83,7 +84,7 @@ func NewMemTable(
 		publisher:     pub,
 		wal:           w, // nil if WAL disabled
 		segIDs:        segIDs,
-		slabPool:      NewMmapPool("slab", cfg.WriteBufferSize+sys.BlockSize, poolCapacity),
+		slabPool:      NewMmapPool("slab", cfg.WriteBufferSize+align.BlockSize, poolCapacity),
 		flushCh:       make(chan FlushTicket, cfg.MaxInflightSlabs),
 		stopCh:        make(chan struct{}),
 	}
@@ -109,7 +110,7 @@ func (mt *MemTable) newActiveSlab(size int) *ActiveSlab {
 		if mt.IsDegraded() {
 			// If degraded, just safer to use unpooled.  Readers/Writers might
 			// not have released their resources due to an error.
-			return NewMmapBuffer(mt.WriteBufferSize + sys.BlockSize)
+			return NewMmapBuffer(mt.WriteBufferSize + align.BlockSize)
 		}
 		return mt.slabPool.Acquire()
 	}()
@@ -245,7 +246,7 @@ func (mt *MemTable) writeToSlab(seqID uint64, hash Key, rec record.Record) error
 			// Reserve position and increment xlSize under lock.
 			// Actual buffer allocation happens after unlock to avoid mmap syscall under lock.
 			wPos = active.AlignPosToPageBoundary()
-			active.xlSize += sys.PageAlign(record.FileHeaderSize + int64(writeSize))
+			active.xlSize += align.PageAlign(record.FileHeaderSize + int64(writeSize))
 		} else {
 			needRotation = true
 		}
@@ -278,7 +279,7 @@ func (mt *MemTable) writeToSlab(seqID uint64, hash Key, rec record.Record) error
 	var xlBuf *MmapBuffer
 	if xlWrite {
 		xlBuf = NewMmapBuffer(record.FileHeaderSize + int64(rec.EncodedSize()))
-		buf = xlBuf.raw[record.FileHeaderSize:]
+		buf = xlBuf.Bytes()[record.FileHeaderSize:]
 	}
 
 	// 5. WAL Write (AFTER reservation, BEFORE fill - Reserve-First pattern)
@@ -730,7 +731,7 @@ func writeSegmentWithXLPayloads(
 	for _, w := range xlWrites {
 		xlSize += int64(len(w.XLBuf.Bytes()))
 	}
-	f, err := sys.CreateAndAllocateFile(segmentPath, flags, int64(len(alignedData))+xlSize)
+	f, err := sys.CreateAndAllocate(segmentPath, flags, int64(len(alignedData))+xlSize)
 	if err != nil {
 		return err
 	}
@@ -745,20 +746,19 @@ func writeSegmentWithXLPayloads(
 		}
 		// Write alignedData from current pos up to XL insertion point
 		if int(e.Pos) > pos {
-			buf := alignedData[pos:e.Pos]
-			if _, err := sys.WriteAligned(buf, f, flags); err != nil {
+			if _, err := f.Write(alignedData[pos:e.Pos]); err != nil {
 				return fmt.Errorf("write: %w", err)
 			}
 		}
 		// Write full XL buffer (including reserved FileHeaderSize bytes for alignment)
-		if _, err := sys.WriteAligned(e.XLBuf.Bytes(), f, flags); err != nil {
+		if _, err := f.Write(e.XLBuf.Bytes()); err != nil {
 			return fmt.Errorf("xlwrite: %w", err)
 		}
 		pos = int(e.Pos)
 	}
 	// Write any remaining alignedData after last XL
 	if len(alignedData[pos:]) > 0 {
-		if _, err := sys.WriteAligned(alignedData[pos:], f, flags); err != nil {
+		if _, err := f.Write(alignedData[pos:]); err != nil {
 			return fmt.Errorf("trailer write: %w", err)
 		}
 	}

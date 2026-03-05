@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/miretskiy/blobcache/internal/sys"
+	"github.com/miretskiy/dio/sys"
 	"github.com/stretchr/testify/require"
 )
 

@@ -8,7 +8,8 @@ import (
 
 	"github.com/miretskiy/blobcache/internal/index"
 	"github.com/miretskiy/blobcache/internal/record"
-	"github.com/miretskiy/blobcache/internal/sys"
+	"github.com/miretskiy/dio/align"
+	"github.com/miretskiy/dio/sys"
 )
 
 // compactionRun is a page-aligned range of data in the source segment that
@@ -51,7 +52,7 @@ func copyFileRangeFull(src, dst *os.File, srcOff, dstOff *int64, length int) err
 // maxRunGapBytes is the maximum gap between live records that will be absorbed
 // into a single run. Small gaps (from deleted records or padding) are cheaper to
 // copy as invisible garbage than to split into separate copy_file_range calls.
-const maxRunGapBytes = 4 * sys.BlockSize // 16KB — up to 4 pages of dead data
+const maxRunGapBytes = 4 * align.BlockSize // 16KB — up to 4 pages of dead data
 
 // buildCompactionRuns sorts live entries by source offset, merges nearby records
 // (absorbing small gaps of dead data), and aligns each run to page boundaries.
@@ -113,8 +114,8 @@ func buildCompactionRuns(entries []record.FooterEntry) []compactionRun {
 	// Start rounds DOWN, end rounds UP. Extra bytes are invisible garbage.
 	runs := make([]compactionRun, len(rawRuns))
 	for i, raw := range rawRuns {
-		alignedStart := raw.start &^ sys.BlockMask // Round DOWN
-		alignedEnd := sys.PageAlign(raw.end)       // Round UP
+		alignedStart := raw.start &^ align.BlockMask // Round DOWN
+		alignedEnd := align.PageAlign(raw.end)       // Round UP
 		runs[i] = compactionRun{
 			srcOffset: alignedStart,
 			length:    alignedEnd - alignedStart,
@@ -189,7 +190,7 @@ func (c *Cache) rewriteSegment(segID uint32) (result RewriteResult, retErr error
 
 	// 5. Open source .seg file with O_DIRECT.
 	srcPath := getSegmentPath(c.Path, c.Shards, segID)
-	srcFile, err := sys.OpenFileForRead(srcPath, sys.FlDirectIO)
+	srcFile, err := sys.OpenDirect(srcPath, sys.FlDirectIO)
 	if err != nil {
 		return result, fmt.Errorf("open source segment %d: %w", segID, err)
 	}
@@ -210,7 +211,7 @@ func (c *Cache) rewriteSegment(segID uint32) (result RewriteResult, retErr error
 	// actual data copies instead of reflinks.
 	dstPath := getSegmentPath(c.Path, c.Shards, newSegID)
 	tmpPath := dstPath + ".compact.tmp"
-	dstFile, err := sys.CreateFile(tmpPath, sys.FlDirectIO)
+	dstFile, err := sys.CreateDirect(tmpPath, sys.FlDirectIO)
 	if err != nil {
 		return result, fmt.Errorf("create compaction output: %w", err)
 	}
@@ -227,7 +228,7 @@ func (c *Cache) rewriteSegment(segID uint32) (result RewriteResult, retErr error
 	}()
 
 	// 9. Write file header (padded to 4KB block).
-	headerBuf := make([]byte, sys.BlockSize)
+	headerBuf := make([]byte, align.BlockSize)
 	copy(headerBuf, record.FileHeaderBytes[:])
 	if _, err := dstFile.WriteAt(headerBuf, 0); err != nil {
 		return result, fmt.Errorf("write compaction header: %w", err)
@@ -241,7 +242,7 @@ func (c *Cache) rewriteSegment(segID uint32) (result RewriteResult, retErr error
 		entry     record.FooterEntry // Entry with NEW position
 		oldOffset int64              // Original position in source segment
 	}
-	dstOff := int64(sys.BlockSize)
+	dstOff := int64(align.BlockSize)
 	var outputMappings []entryMapping
 
 	for _, run := range runs {

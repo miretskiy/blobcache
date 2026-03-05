@@ -6,7 +6,7 @@ import (
 	"sync/atomic"
 	"unsafe"
 
-	"github.com/miretskiy/blobcache/internal/sys"
+	"github.com/miretskiy/dio/align"
 )
 
 // handle is the internal pooled buffer structure.
@@ -105,10 +105,10 @@ func AcquireBuffer(length, capacity int) BufferHandle {
 // for O_DIRECT I/O. Requests one extra page from the pool to guarantee alignment,
 // then shifts the slice to the first page-aligned address.
 func AcquireAlignedBuffer(length, capacity int) BufferHandle {
-	h := acquireHandle(capacity + sys.BlockSize)
+	h := acquireHandle(capacity + align.BlockSize)
 	full := h.buf[:cap(h.buf)]
 	addr := uintptr(unsafe.Pointer(&full[0]))
-	shift := int((sys.BlockSize - (addr & uintptr(sys.BlockMask))) & uintptr(sys.BlockMask))
+	shift := int((align.BlockSize - (addr & uintptr(align.BlockMask))) & uintptr(align.BlockMask))
 	h.raw = full
 	h.buf = full[shift : shift+length]
 	return BufferHandle{h: h}

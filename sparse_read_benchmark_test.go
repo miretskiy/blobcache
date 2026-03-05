@@ -8,7 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/miretskiy/blobcache/internal/sys"
+	"github.com/miretskiy/dio/align"
+	"github.com/miretskiy/dio/sys"
 )
 
 // BenchmarkSparseFileReadLatency measures read throughput and latency from
@@ -78,15 +79,15 @@ func BenchmarkSparseFileReadLatency(b *testing.B) {
 			}
 
 			// Open with O_DIRECT to bypass page cache entirely.
-			f, err := sys.OpenFileForRead(path, sys.FlDirectIO)
+			f, err := sys.OpenDirect(path, sys.FlDirectIO)
 			if err != nil {
 				b.Fatal(err)
 			}
 			defer f.Close()
 
 			// Aligned buffer for O_DIRECT reads.
-			buf := sys.AllocAligned(blobSize)
-			defer sys.FreeAligned(buf)
+			buf := align.AllocAligned(blobSize)
+			defer align.FreeAligned(buf)
 
 			b.SetBytes(blobSize)
 			b.ResetTimer()
@@ -210,14 +211,14 @@ func BenchmarkDirectIOReadSize(b *testing.B) {
 
 	for _, sz := range sizes {
 		b.Run(sz.name, func(b *testing.B) {
-			f, err := sys.OpenFileForRead(srcPath, sys.FlDirectIO)
+			f, err := sys.OpenDirect(srcPath, sys.FlDirectIO)
 			if err != nil {
 				b.Fatal(err)
 			}
 			defer f.Close()
 
-			buf := sys.AllocAligned(sz.size)
-			defer sys.FreeAligned(buf)
+			buf := align.AllocAligned(sz.size)
+			defer align.FreeAligned(buf)
 
 			// Pre-compute page-aligned offsets that fit the read size.
 			var offsets []int64

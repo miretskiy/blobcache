@@ -19,7 +19,7 @@ import (
 
 	"github.com/HdrHistogram/hdrhistogram-go"
 	"github.com/miretskiy/blobcache/internal/index"
-	"github.com/miretskiy/blobcache/internal/iosched"
+	"github.com/miretskiy/dio/iosched"
 	"github.com/shirou/gopsutil/v3/disk"
 	"github.com/shirou/gopsutil/v3/process"
 )
@@ -571,7 +571,7 @@ func newBenchScheduler() (iosched.IOScheduler, error) {
 	if sched, err := iosched.NewURingScheduler(iosched.URingConfig{}); err == nil {
 		return sched, nil
 	}
-	return iosched.NewPreadScheduler()
+	return iosched.NewPwriteScheduler()
 }
 
 func reportLatency(b *testing.B, name string, h *hdrhistogram.Histogram) {

@@ -73,7 +73,7 @@ type config struct {
 	BallastSize              int          // Heap ballast size in bytes (default: 1GB, 0 = disabled)
 	CompactionWasteThreshold float64      // Waste ratio to trigger segment rewrite (WAL mode, default: 0.25)
 
-	IOScheduler iosched.IOScheduler // Pluggable I/O backend for reads (default: pread)
+	IOScheduler *iosched.BlockingIO // Pluggable I/O backend for reads (default: direct POSIX)
 
 	// MaxReadConcurrency limits how many goroutines can simultaneously block
 	// in pread.  0 = unlimited (default).  When set, excess readers block on
@@ -261,10 +261,11 @@ func WithCompactionWasteThreshold(ratio float64) Option {
 	return funcOpt(func(c *config) { c.CompactionWasteThreshold = ratio })
 }
 
-// WithIOScheduler sets the I/O scheduler used for segment reads.
-// Default: PreadScheduler (synchronous pread). Use [iosched.NewURingScheduler]
-// for async io_uring on Linux.
-func WithIOScheduler(sched iosched.IOScheduler) Option {
+// WithIOScheduler sets the I/O backend used for segment reads.
+// Default: direct POSIX pread. Use [iosched.NewDefaultIO] to get
+// io_uring on Linux or [iosched.NewBlockingIO]([iosched.NewURingScheduler])
+// for explicit control.
+func WithIOScheduler(sched *iosched.BlockingIO) Option {
 	return funcOpt(func(c *config) { c.IOScheduler = sched })
 }
 

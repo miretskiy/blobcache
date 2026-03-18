@@ -25,7 +25,7 @@ import (
 type Archivist struct {
 	config
 	index     *index.DurableIndex
-	sched     iosched.IOScheduler
+	sched     *iosched.BlockingIO
 	cache     sync.Map   // segmentID (uint32) -> *os.File
 	readCache *ReadCache // nil if disabled
 	flights   *inflightGroup
@@ -35,9 +35,9 @@ type Archivist struct {
 	readSem chan struct{}
 }
 
-func NewArchivist(cfg config, idx *index.DurableIndex, sched iosched.IOScheduler) *Archivist {
+func NewArchivist(cfg config, idx *index.DurableIndex, sched *iosched.BlockingIO) *Archivist {
 	if sched == nil {
-		sched, _ = iosched.NewPwriteScheduler()
+		sched = iosched.NewBlockingIO(nil)
 	}
 	a := &Archivist{
 		config:  cfg,
@@ -211,7 +211,7 @@ func (a *Archivist) prefetchAndParse(e index.Item, expectedKey []byte) ([]byte, 
 	handle := AcquireAlignedBuffer(int(readLen), int(readLen))
 	buf := handle.Bytes()
 
-	n, err := a.sched.ReadAt(int(sf.Fd()), buf, readOff)
+	n, err := a.sched.ReadAt(sf, buf, readOff)
 	if err != nil {
 		handle.Release()
 		return nil, Releaser{}, fmt.Errorf("storage: prefetch read failed: %w", err)
@@ -262,7 +262,7 @@ func (a *Archivist) readBlobBuffered(
 ) ([]byte, Releaser, error) {
 	handle := AcquireBuffer(int(e.PhysicalLen), int(e.PhysicalLen))
 	buf := handle.Bytes()
-	n, err := a.sched.ReadAt(int(sf.Fd()), buf, int64(e.Offset))
+	n, err := a.sched.ReadAt(sf, buf, int64(e.Offset))
 	if err != nil {
 		handle.Release()
 		return nil, Releaser{}, fmt.Errorf("storage: read failed: %w", err)
@@ -283,7 +283,7 @@ func (a *Archivist) readBlobDirect(
 	handle := AcquireAlignedBuffer(int(alignedLen), int(alignedLen))
 	buf := handle.Bytes()
 
-	n, err := a.sched.ReadAt(int(sf.Fd()), buf, alignedOff)
+	n, err := a.sched.ReadAt(sf, buf, alignedOff)
 	if err != nil {
 		handle.Release()
 		return nil, Releaser{}, fmt.Errorf("storage: direct read failed: %w", err)

@@ -76,10 +76,11 @@ func BenchmarkBlobCache(b *testing.B) {
 	// Toggle DirectIO via environment variable for A/B testing
 	directIO := os.Getenv("BLOBCACHE_BUFFERED_IO") != "1"
 
-	sched, err := iosched.NewURingScheduler(iosched.URingConfig{})
+	s, err := iosched.NewURingScheduler(iosched.URingConfig{})
 	if err != nil {
 		b.Fatal(err)
 	}
+	sched := iosched.NewBlockingIO(s)
 	cache, err := New(tmpDir,
 		WithMaxSize(400<<30),
 		WithWriteBufferSize(64<<20),
@@ -132,7 +133,7 @@ func BenchmarkBlobCache(b *testing.B) {
 
 	// --- SYSTEM MONITOR (Background Heartbeat) ---
 	ctx, cancel := context.WithCancel(context.Background())
-	metricsChan := startSystemMonitor(ctx, &totalWriteBytes, &totalReadBytes, &cache.approxSize, &numReads, &numFound, tmpDir, sched, cache.readCache)
+	metricsChan := startSystemMonitor(ctx, &totalWriteBytes, &totalReadBytes, &cache.approxSize, &numReads, &numFound, tmpDir, cache.readCache)
 
 	// Reinterpret b.N: each iteration = one write
 	// e.g., -benchtime=1000000x means 1M writes (~1TB at 1MB/write)
@@ -236,11 +237,6 @@ func BenchmarkBlobCache(b *testing.B) {
 	fmt.Printf("\n--- FINAL LATENCY (clat) REPORT (ns) ---\n")
 	reportLatency(b, "GET", globalGet)
 	reportLatency(b, "PUT", globalPut)
-
-	// Disk read latency from the I/O scheduler.
-	if h := sched.Stats().ReadLatency; h != nil {
-		reportLatency(b, "DISK", h)
-	}
 
 	// Read cache final summary.
 	if cache.readCache != nil {
@@ -390,7 +386,7 @@ func BenchmarkBlobCache_SmallBlobs(b *testing.B) {
 		)
 
 		ctx, cancel := context.WithCancel(context.Background())
-		metricsChan := startSystemMonitor(ctx, &zeroBytes, &totalReadBytes, &cache.approxSize, &numReads, &numFound, tmpDir, sched, cache.readCache)
+		metricsChan := startSystemMonitor(ctx, &zeroBytes, &totalReadBytes, &cache.approxSize, &numReads, &numFound, tmpDir, cache.readCache)
 
 		b.ResetTimer()
 		b.RunParallel(func(pb *testing.PB) {
@@ -436,10 +432,6 @@ func BenchmarkBlobCache_SmallBlobs(b *testing.B) {
 		finalMetrics := <-metricsChan
 		fmt.Printf("\n--- %s: LATENCY (ns) ---\n", name)
 		reportLatency(b, "GET", globalGet)
-		if h := sched.Stats().ReadLatency; h != nil {
-			reportLatency(b, "DISK", h)
-		}
-
 		if cache.readCache != nil {
 			rcs := cache.readCache.Stats()
 			total := rcs.Hits + rcs.Misses
@@ -567,11 +559,11 @@ func BenchmarkBlobCacheLookupMemory(b *testing.B) {
 }
 
 // newBenchScheduler creates an IOScheduler, preferring io_uring on Linux.
-func newBenchScheduler() (iosched.IOScheduler, error) {
-	if sched, err := iosched.NewURingScheduler(iosched.URingConfig{}); err == nil {
-		return sched, nil
+func newBenchScheduler() (*iosched.BlockingIO, error) {
+	if s, err := iosched.NewURingScheduler(iosched.URingConfig{}); err == nil {
+		return iosched.NewBlockingIO(s), nil
 	}
-	return iosched.NewPwriteScheduler()
+	return iosched.NewBlockingIO(nil), nil
 }
 
 func reportLatency(b *testing.B, name string, h *hdrhistogram.Histogram) {
@@ -588,7 +580,6 @@ func startSystemMonitor(
 	ctx context.Context,
 	logicalWriteBytes, logicalReadBytes, liveSizeBytes, readCount, hitCount *atomic.Int64,
 	cachePath string,
-	ioSched iosched.IOScheduler,
 	readCache *ReadCache,
 ) <-chan SystemMetrics {
 	out := make(chan SystemMetrics, 1)
@@ -705,15 +696,7 @@ func startSystemMonitor(
 				hitsPerSec := float64(intervalHits) / interval.Seconds()
 				missesPerSec := float64(intervalMisses) / interval.Seconds()
 
-				// 8. I/O Scheduler stats
-				st := ioSched.Stats()
-				uringLine := ""
-				if st.Batches > 0 {
-					uringLine = fmt.Sprintf("  URING: Batches: %d | Reqs: %d | MaxBatch: %d | AvgBatch: %.1f\n",
-						st.Batches, st.Requests, st.MaxBatch, st.AvgBatch)
-				}
-
-				// 9. Read cache stats
+				// 8. Read cache stats
 				rcLine := ""
 				if readCache != nil {
 					rcs := readCache.Stats()
@@ -737,13 +720,13 @@ func startSystemMonitor(
 					"  CACHE: OnDisk: %.2fGB | Live: %.2fGB | Waste: %.2fGB (%.1f%%)\n"+
 					"  TPUT:  Log-Write: %.2f GB/s | Log-Read: %.2f GB/s\n"+
 					"  READS: %.0f/s total | %.0f/s hits | %.0f/s misses | HitRate: %.1f%%\n"+
-					"%s%s",
+					"%s",
 					time.Now().Format("15:04:05"), rss,
 					maxUtil, currentQD, physReadTP, physWriteTP, freeGB,
 					onDiskGB, liveGB, wasteGB, wastePct,
 					logWriteTP, logReadTP,
 					readsPerSec, hitsPerSec, missesPerSec, hitRate,
-					rcLine, uringLine)
+					rcLine)
 
 				// Update states
 				totalQD += currentQD

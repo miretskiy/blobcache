@@ -285,7 +285,7 @@ func (it *Iterator) readAndServe(fn func(data []byte), readExtra int) bool {
 	}
 	buf := it.prefetch.Bytes()
 
-	n, err := a.sched.ReadAt(int(sf.Fd()), buf, readOff)
+	n, err := a.sched.ReadAt(sf, buf, readOff)
 	shard.RUnlock()
 
 	// Verify we read enough for the current record.

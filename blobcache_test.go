@@ -2,988 +2,612 @@ package blobcache
 
 import (
 	"bytes"
-	crand "crypto/rand"
+	"encoding/binary"
+	"errors"
 	"fmt"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
-	"syscall"
+	"runtime"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/miretskiy/blobcache/base"
-	"github.com/miretskiy/blobcache/compression"
-	"github.com/miretskiy/blobcache/internal/index"
-	"github.com/miretskiy/blobcache/internal/record"
+	"github.com/miretskiy/blobcache/blobstore"
+	"github.com/miretskiy/blobcache/internal/xmap"
+	"github.com/miretskiy/dio/v2/align"
+	"github.com/miretskiy/dio/v2/iosched"
 	"github.com/stretchr/testify/require"
-	"github.com/zeebo/xxh3"
 )
 
-func TestCache_PutGet_Basic(t *testing.T) {
-	tmpDir := t.TempDir()
-	cache, err := New(tmpDir)
-	require.NoError(t, err)
-	defer cache.Close()
-
-	key := []byte("test-key")
-	value := []byte("test-value")
-
-	// Standard Put
-	require.NoError(t, cache.Put(key, value))
-
-	// Flush memtable to disk to test the full IO path (Index + Storage)
-	cache.Drain()
-
-	retrieved, found := cache.Get(key)
-	require.True(t, found)
-	require.Equal(t, value, retrieved)
-}
-
-func TestCache_Put_EmptyKeyRejected(t *testing.T) {
-	tmpDir := t.TempDir()
-	cache, err := New(tmpDir)
-	require.NoError(t, err)
-	defer cache.Close()
-
-	// Empty key should return error
-	err = cache.Put([]byte{}, []byte("value"))
-	require.ErrorIs(t, err, ErrEmptyKey)
-
-	// Nil key should also return error
-	err = cache.Put(nil, []byte("value"))
-	require.ErrorIs(t, err, ErrEmptyKey)
-
-	// PutChecksummed should also reject empty keys
-	err = cache.PutChecksummed([]byte{}, []byte("value"), 0)
-	require.ErrorIs(t, err, ErrEmptyKey)
-}
-
-func TestCache_Put_EmptyValueAllowed(t *testing.T) {
-	tmpDir := t.TempDir()
-	cache, err := New(tmpDir, WithMaxCachedSlabs(0)) // Force disk path
-	require.NoError(t, err)
-	defer cache.Close()
-
-	// Empty slice value is allowed
-	err = cache.Put([]byte("key-empty-slice"), []byte{})
-	require.NoError(t, err)
-
-	// Nil value is allowed
-	err = cache.Put([]byte("key-nil-value"), nil)
-	require.NoError(t, err)
-
-	// Flush to disk and verify round-trip
-	cache.Drain()
-
-	// Empty slice should read back as empty
-	retrieved, found := cache.Get([]byte("key-empty-slice"))
-	require.True(t, found)
-	require.Empty(t, retrieved)
-
-	// Nil value should read back as empty
-	retrieved, found = cache.Get([]byte("key-nil-value"))
-	require.True(t, found)
-	require.Empty(t, retrieved)
-}
-
-func TestCache_Delete_Basic(t *testing.T) {
-	tmpDir := t.TempDir()
-	cache, err := New(tmpDir, WithMaxCachedSlabs(0)) // Force disk path
-	require.NoError(t, err)
-	defer cache.Close()
-
-	key := []byte("delete-me")
-	value := []byte("some-value")
-
-	// Put and verify
-	require.NoError(t, cache.Put(key, value))
-	cache.Drain()
-	_, found := cache.Get(key)
-	require.True(t, found, "key should exist before delete")
-
-	// Delete
-	require.NoError(t, cache.Delete(key))
-
-	// Should not be found after delete
-	_, found = cache.Get(key)
-	require.False(t, found, "key should not be found after delete")
-
-	// Delete again should be idempotent (no error)
-	require.NoError(t, cache.Delete(key))
-}
-
-func TestCache_Delete_NonExistent(t *testing.T) {
-	tmpDir := t.TempDir()
-	cache, err := New(tmpDir)
-	require.NoError(t, err)
-	defer cache.Close()
-
-	// Deleting non-existent key should succeed (idempotent)
-	err = cache.Delete([]byte("never-existed"))
-	require.NoError(t, err)
-}
-
-func TestCache_Delete_EmptyKeyRejected(t *testing.T) {
-	tmpDir := t.TempDir()
-	cache, err := New(tmpDir)
-	require.NoError(t, err)
-	defer cache.Close()
-
-	err = cache.Delete([]byte{})
-	require.ErrorIs(t, err, ErrEmptyKey)
-
-	err = cache.Delete(nil)
-	require.ErrorIs(t, err, ErrEmptyKey)
-}
-
-func TestCache_Delete_Persistence(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	// Create cache and add data
-	cache, err := New(tmpDir, WithMaxCachedSlabs(0))
-	require.NoError(t, err)
-
-	key := []byte("persistent-delete")
-	require.NoError(t, cache.Put(key, []byte("value")))
-	cache.Drain()
-
-	// Delete and close
-	require.NoError(t, cache.Delete(key))
-	require.NoError(t, cache.Close())
-
-	// Reopen - deleted item should still be gone
-	cache2, err := New(tmpDir)
-	require.NoError(t, err)
-	defer cache2.Close()
-
-	_, found := cache2.Get(key)
-	require.False(t, found, "deleted key should not be found after reopen")
-}
-
-func TestCache_Delete_WAL_NoHolePunch(t *testing.T) {
-	// Validates that in CAS mode (WAL enabled), Delete() does NOT hole-punch.
-	// Space reclamation is deferred to compaction for durability guarantees.
-	tmpDir := t.TempDir()
-
-	cache, err := New(tmpDir,
-		WithWAL(),
-		WithMaxCachedSlabs(0), // Force disk path
-	)
-	require.NoError(t, err)
-	cache.Start()
-	defer cache.Close()
-
-	key := []byte("wal-delete-key")
-	value := make([]byte, 100_000) // 100KB
-	require.NoError(t, cache.Put(key, value))
-	cache.Drain()
-
-	// Get segment stats before delete
-	h := xxh3.Hash128(key)
-	item, found := cache.index.Get(h)
-	require.True(t, found)
-	segID := item.SegmentID
-
-	// Get physical size before delete
-	segPath := getSegmentPath(cache.Path, cache.Shards, segID)
-	beforeStat, err := os.Stat(segPath)
-	require.NoError(t, err)
-	beforeBlocks := beforeStat.Sys().(*syscall.Stat_t).Blocks
-
-	// Delete
-	require.NoError(t, cache.Delete(key))
-
-	// Verify tombstone in index
-	item, found = cache.index.Get(h)
-	require.True(t, found, "item should still exist as tombstone")
-	require.True(t, item.IsDeleted(), "item should be marked deleted")
-
-	// Verify NO hole punch happened (physical size unchanged)
-	afterStat, err := os.Stat(segPath)
-	require.NoError(t, err)
-	afterBlocks := afterStat.Sys().(*syscall.Stat_t).Blocks
-	require.Equal(t, beforeBlocks, afterBlocks,
-		"WAL mode should NOT hole-punch (space reclaimed during compaction)")
-}
-
-func TestCache_Delete_Cache_LogicalTombstone(t *testing.T) {
-	// Validates that in Cache mode (no WAL), Delete() creates a logical tombstone
-	// without hole-punching. Physical space is reclaimed later by merge compaction.
-	tmpDir := t.TempDir()
-
-	cache, err := New(tmpDir,
-		// No WAL = Cache mode
-		WithMaxCachedSlabs(0), // Force disk path
-	)
-	require.NoError(t, err)
-	cache.Start()
-	defer cache.Close()
-
-	key := []byte("cache-delete-key")
-	value := make([]byte, 100_000) // 100KB
-	require.NoError(t, cache.Put(key, value))
-	cache.Drain()
-
-	// Get segment info before delete
-	h := xxh3.Hash128(key)
-	item, found := cache.index.Get(h)
-	require.True(t, found)
-	segID := item.SegmentID
-
-	// Get physical size before delete (should NOT change)
-	segPath := getSegmentPath(cache.Path, cache.Shards, segID)
-	beforeStat, err := os.Stat(segPath)
-	require.NoError(t, err)
-	beforeBlocks := beforeStat.Sys().(*syscall.Stat_t).Blocks
-
-	// Delete
-	require.NoError(t, cache.Delete(key))
-
-	// Verify tombstone in index
-	item, found = cache.index.Get(h)
-	require.True(t, found, "item should still exist as tombstone")
-	require.True(t, item.IsDeleted(), "item should be marked deleted")
-
-	// Verify physical size unchanged (no hole punching)
-	afterStat, err := os.Stat(segPath)
-	require.NoError(t, err)
-	afterBlocks := afterStat.Sys().(*syscall.Stat_t).Blocks
-	require.Equal(t, beforeBlocks, afterBlocks,
-		"Delete should not hole-punch; physical space reclaimed by merge compaction")
-
-	_ = segID // Used above
-}
-
-func TestCache_Put_LargeBlob(t *testing.T) {
-	// Tests the XL (extra large) write code path.
-	// XL writes are triggered when record size exceeds WriteBufferSize.
-	tmpDir := t.TempDir()
-	bufferSize := int64(16 * 1024) // 16KB buffer
-	cache, err := New(tmpDir,
-		WithWriteBufferSize(bufferSize),
-		WithMaxCachedSlabs(0),                  // Force disk path
-		WithCompression(compression.CodexNone), // No compression for predictable size
-	)
-	require.NoError(t, err)
-	defer cache.Close()
-
-	key := []byte("large-key")
-	// Value must be larger than WriteBufferSize to trigger XL write path
-	value := make([]byte, int(bufferSize)+1024) // Exceeds buffer size
-	// Use identifiable pattern for debugging
-	copy(value, "XLBLOB_START_")
-	for i := 13; i < len(value)-11; i++ {
-		value[i] = byte(i % 256)
-	}
-	copy(value[len(value)-11:], "_END_XLBLOB")
-
-	require.NoError(t, cache.Put(key, value))
-
-	// Flush to disk and verify round-trip
-	cache.Drain()
-
-	retrieved, found := cache.Get(key)
-	require.True(t, found, "key not found after drain")
-	require.Equal(t, len(value), len(retrieved), "length mismatch")
-	require.Equal(t, value, retrieved, "data mismatch")
-}
-
-// TestCache_LargeWrites_Comprehensive tests various combinations of normal and XL (extra large) writes.
-// XL writes are triggered when record size exceeds WriteBufferSize.
-// Tests verify correct round-trip for each pattern, both with and without WAL.
-func TestCache_LargeWrites_Comprehensive(t *testing.T) {
-	// Test patterns: 'N' = normal write, 'L' = large (XL) write
-	patterns := []struct {
-		name   string
-		writes string // 'N' for normal, 'L' for large
-		desc   string
-	}{
-		{"SimpleXL", "L", "single large write"},
-		{"XLThenNormal", "LN", "large followed by normal"},
-		{"XLThenMultiNormal", "LNNN", "large followed by multiple normals"},
-		{"NormalThenXL", "NL", "normal followed by large"},
-		{"MultiNormalThenXL", "NNNL", "multiple normals followed by large"},
-		{"Alternating", "NLNLNL", "alternating normal and large"},
-		{"Complex", "NLNLLLNN", "mixed: normal, large, normal, large, large, large, normal, normal"},
-		{"AllXL", "LLL", "multiple large writes"},
-		{"BookendXL", "LNNNL", "large at start and end"},
-	}
-
-	for _, walEnabled := range []bool{false, true} {
-		walName := "NoWAL"
-		if walEnabled {
-			walName = "WithWAL"
-		}
-
-		for _, p := range patterns {
-			t.Run(fmt.Sprintf("%s/%s", walName, p.name), func(t *testing.T) {
-				testLargeWritePattern(t, p.writes, walEnabled)
-			})
-		}
-	}
-}
-
-func testLargeWritePattern(t *testing.T, pattern string, walEnabled bool) {
-	tmpDir := t.TempDir()
-	bufferSize := int64(16 * 1024) // 16KB buffer
-
-	opts := []Option{
-		WithWriteBufferSize(bufferSize),
-		WithMaxCachedSlabs(0),                  // Force disk path
-		WithCompression(compression.CodexNone), // No compression for predictable size
-	}
-	if walEnabled {
-		opts = append(opts, WithWAL())
-	}
-
-	cache, err := New(tmpDir, opts...)
-	require.NoError(t, err)
-	defer cache.Close()
-
-	// Track what we write for verification
-	type writeRecord struct {
-		key   []byte
-		value []byte
-		isXL  bool
-	}
-	var writes []writeRecord
-
-	// Generate writes based on pattern
-	for i, ch := range pattern {
-		isXL := ch == 'L'
-		key := []byte(fmt.Sprintf("key-%d-%c", i, ch))
-
-		var value []byte
-		if isXL {
-			// Value larger than buffer to trigger XL path
-			value = make([]byte, int(bufferSize)+1024)
-		} else {
-			// Normal small value
-			value = make([]byte, 512)
-		}
-
-		// Fill with identifiable pattern
-		fillPattern(value, i, isXL)
-
-		writes = append(writes, writeRecord{key: key, value: value, isXL: isXL})
-		require.NoError(t, cache.Put(key, value), "Put failed for key %s", key)
-	}
-
-	// Flush to disk
-	cache.Drain()
-
-	// Verify all writes can be read back correctly
-	for _, w := range writes {
-		retrieved, found := cache.Get(w.key)
-		require.True(t, found, "key %s not found after drain (isXL=%v)", w.key, w.isXL)
-		require.Equal(t, len(w.value), len(retrieved),
-			"length mismatch for key %s (isXL=%v)", w.key, w.isXL)
-		require.Equal(t, w.value, retrieved,
-			"data mismatch for key %s (isXL=%v)", w.key, w.isXL)
-	}
-
-	// Verify segment file exists and has valid structure
-	verifySegmentFiles(t, tmpDir, cache.Shards)
-}
-
-// TestCache_XLRotation verifies that slab rotation occurs when XL writes
-// accumulate past the threshold (2x WriteBufferSize), preventing unbounded
-// memory usage in workloads with only large writes.
-func TestCache_XLRotation(t *testing.T) {
-	tmpDir := t.TempDir()
-	bufferSize := int64(16 * 1024) // 16KB buffer
-
-	cache, err := New(tmpDir,
-		WithWriteBufferSize(bufferSize),
-		WithMaxCachedSlabs(0),                  // Force disk path
-		WithCompression(compression.CodexNone), // No compression
-	)
-	require.NoError(t, err)
-	defer cache.Close()
-
-	// Each XL write is ~17KB (just over buffer size).
-	// Threshold is 2x buffer = 32KB.
-	// So 2 XL writes should trigger rotation before the 3rd.
-	xlSize := int(bufferSize) + 1024 // ~17KB
-
-	var keys [][]byte
-	for i := 0; i < 5; i++ {
-		key := []byte(fmt.Sprintf("xl-rotation-key-%d", i))
-		value := make([]byte, xlSize)
-		fillPattern(value, i, true)
-
-		keys = append(keys, key)
-		require.NoError(t, cache.Put(key, value))
-	}
-
-	cache.Drain()
-
-	// Verify all keys are readable
-	for i, key := range keys {
-		retrieved, found := cache.Get(key)
-		require.True(t, found, "key %d not found after rotation", i)
-		require.Equal(t, xlSize, len(retrieved), "key %d length mismatch", i)
-	}
-
-	// Count unique segment IDs from index - should be >1 due to rotation
-	segmentIDs := make(map[uint32]struct{})
-	for _, key := range keys {
-		h := xxh3.Hash128(key)
-		entry, ok := cache.index.Get(index.Key(h))
-		require.True(t, ok, "key should be in index")
-		segmentIDs[entry.SegmentID] = struct{}{}
-	}
-	require.Greater(t, len(segmentIDs), 1,
-		"should have multiple segments due to XL rotation (got %d)", len(segmentIDs))
-	t.Logf("XL rotation created %d segments for 5 XL writes", len(segmentIDs))
-
-	// Verify .meta (footer) files exist for each segment.
-	for segID := range segmentIDs {
-		metaPath := SegmentMetaPath(getSegmentPath(tmpDir, cache.Shards, segID))
-		_, err := os.Stat(metaPath)
-		require.NoError(t, err, "meta file should exist: %s", metaPath)
-	}
-}
-
-// fillPattern fills a buffer with an identifiable pattern for debugging
-func fillPattern(buf []byte, index int, isXL bool) {
-	prefix := "NORM_"
-	if isXL {
-		prefix = "XLBL_"
-	}
-	marker := fmt.Sprintf("%s%03d_START_", prefix, index)
-	copy(buf, marker)
-
-	// Fill middle with index-based pattern
-	for i := len(marker); i < len(buf)-12; i++ {
-		buf[i] = byte((i + index) % 256)
-	}
-
-	// End marker
-	endMarker := fmt.Sprintf("_END_%03d", index)
-	copy(buf[len(buf)-len(endMarker):], endMarker)
-}
-
-// verifySegmentFiles checks that segment files exist and have valid footer structure
-func verifySegmentFiles(t *testing.T, dir string, shards int) {
+const (
+	testSegment = 256 << 10
+	testMemory  = 16 << 20
+)
+
+func openCache(t *testing.T, dir string, opts ...Option) *Cache {
 	t.Helper()
+	c, err := New(dir, append([]Option{WithSegmentSize(testSegment), WithMemory(testMemory)}, opts...)...)
+	require.NoError(t, err)
+	return c
+}
 
-	// Find all .iseg files
-	segDir := fmt.Sprintf("%s/segments", dir)
-	for shard := 0; shard < shards; shard++ {
-		shardDir := fmt.Sprintf("%s/%04d", segDir, shard)
-		entries, err := os.ReadDir(shardDir)
-		if os.IsNotExist(err) {
-			continue // Shard may not have data
+func closeCache(t *testing.T, c *Cache) {
+	t.Helper()
+	require.NoError(t, c.Close())
+}
+
+// alloc lends cache memory holding value, as a download would fill it,
+// retrying ErrBusy: with tiny test segments, rotation can briefly outrun
+// seals, and the oldest memory may be briefly in use.
+func alloc(t *testing.T, c *Cache, key string, value []byte) []byte {
+	t.Helper()
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(time.Millisecond) {
+		buf, err := c.Alloc(c.RecordSize(len(key), len(value)))
+		if errors.Is(err, ErrBusy) && time.Now().Before(deadline) {
+			continue
 		}
 		require.NoError(t, err)
+		copy(buf, value)
+		return buf
+	}
+}
 
-		for _, entry := range entries {
-			if !entry.IsDir() && len(entry.Name()) > 5 {
-				ext := entry.Name()[len(entry.Name())-5:]
-				if ext == ".iseg" {
-					path := fmt.Sprintf("%s/%s", shardDir, entry.Name())
-					verifySegmentFile(t, path)
-				}
-			}
+// put stores value, waits for the write, and waits for the completer to
+// record where it landed.
+func put(t *testing.T, c *Cache, key string, value []byte) {
+	t.Helper()
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(time.Millisecond) {
+		ticket, err := c.Put([]byte(key), alloc(t, c, key, value), len(value))
+		if errors.Is(err, ErrBusy) && time.Now().Before(deadline) {
+			continue
+		}
+		require.NoError(t, err)
+		err = ticket.Wait()
+		require.NoError(t, err)
+		c.Drain()
+		return
+	}
+}
+
+// lookup returns a copy of key's value and whether it came from memory.
+func lookup(t *testing.T, c *Cache, key string) (value []byte, fromMemory, ok bool) {
+	t.Helper()
+	fromMemory, err := c.get([]byte(key), func(v []byte) error {
+		value = bytes.Clone(v)
+		return nil
+	})
+	if errors.Is(err, ErrNotFound) {
+		return nil, false, false
+	}
+	require.NoError(t, err)
+	return value, fromMemory, true
+}
+
+func requireValue(t *testing.T, c *Cache, key string, want []byte) (fromMemory bool) {
+	t.Helper()
+	got, fromMemory, ok := lookup(t, c, key)
+	require.True(t, ok, "key %q missing", key)
+	require.Equal(t, want, got, "key %q", key)
+	return fromMemory
+}
+
+func requireMissing(t *testing.T, c *Cache, key string) {
+	t.Helper()
+	_, _, ok := lookup(t, c, key)
+	require.False(t, ok, "key %q unexpectedly present", key)
+}
+
+func randomBytes(seed uint64, n int) []byte {
+	rng := rand.New(rand.NewPCG(seed, seed^0x9e3779b97f4a7c15))
+	b := make([]byte, n)
+	for i := 0; i < n; i += 8 {
+		var w [8]byte
+		binary.LittleEndian.PutUint64(w[:], rng.Uint64())
+		copy(b[i:], w[:])
+	}
+	return b
+}
+
+func segmentFiles(t *testing.T, dir string) []string {
+	t.Helper()
+	files, err := filepath.Glob(filepath.Join(dir, "*", "*.seg"))
+	require.NoError(t, err)
+	return files
+}
+
+// findRecord returns the segment file holding key's record, written with a
+// value of valueLen bytes with direct I/O, and the record's bounds in it. The
+// key is stored just before the record's trailer, which ends the record.
+func findRecord(t *testing.T, dir, key string, valueLen int) (path string, start, end int64) {
+	t.Helper()
+	for _, path := range segmentFiles(t, dir) {
+		data, err := os.ReadFile(path)
+		require.NoError(t, err)
+		if i := bytes.Index(data, []byte(key)); i >= 0 {
+			end := int64(i + len(key) + trailerSize)
+			return path, end - align.PageAlign(int64(valueLen+len(key)+trailerSize)), end
 		}
 	}
+	t.Fatalf("no record of %q", key)
+	return "", 0, 0
 }
 
-// verifySegmentFile validates a single segment file structure
-func verifySegmentFile(t *testing.T, path string) {
+// trailerSize is the record trailer's size (see blobstore's format).
+const trailerSize = 20
+
+// locations writes n records to a store of its own and returns their
+// Locations, in write order.
+func locations(t *testing.T, n int) []blobstore.Location {
 	t.Helper()
-
-	fi, err := os.Stat(path)
-	require.NoError(t, err, "segment file should exist: %s", path)
-	require.Greater(t, fi.Size(), int64(0), "segment file should not be empty: %s", path)
-
-	// Read file header
-	f, err := os.Open(path)
+	st, err := blobstore.Open(t.TempDir())
 	require.NoError(t, err)
-	defer f.Close()
-
-	// Verify file header magic
-	header := make([]byte, record.FileHeaderSize)
-	_, err = f.Read(header)
-	require.NoError(t, err, "should read file header")
-
-	magic := uint32(header[0]) | uint32(header[1])<<8 | uint32(header[2])<<16 | uint32(header[3])<<24
-	require.Equal(t, record.FileMagic, magic, "segment file should have correct magic: %s", path)
-
-	t.Logf("Verified segment file: %s (size=%d)", path, fi.Size())
-}
-
-func TestCache_PutChecksummed_CorrectChecksum(t *testing.T) {
-	tmpDir := t.TempDir()
-	cache, err := New(tmpDir,
-		WithMaxCachedSlabs(0), // Force disk path
-		WithChecksum(),        // Enable checksum hasher
-		WithVerifyOnRead(true),
-	)
-	require.NoError(t, err)
-	defer cache.Close()
-
-	key := []byte("checksum-key")
-	value := []byte("checksum-value")
-	// Note: checksumVerifyingReader verifies just the value stream,
-	// so the CRC should be computed over value only (not key+value).
-	correctCRC := record.ComputeCRC(nil, value)
-
-	err = cache.PutChecksummed(key, value, correctCRC)
-	require.NoError(t, err)
-
-	cache.Drain()
-
-	// Should read back successfully with correct checksum
-	retrieved, found := cache.Get(key)
-	require.True(t, found)
-	require.Equal(t, value, retrieved)
-}
-
-func TestCache_PutChecksummed_IncorrectChecksum(t *testing.T) {
-	tmpDir := t.TempDir()
-	cache, err := New(tmpDir,
-		WithMaxCachedSlabs(0), // Force disk path
-		WithChecksum(),        // Enable checksum hasher
-		WithVerifyOnRead(true),
-	)
-	require.NoError(t, err)
-	defer cache.Close()
-
-	key := []byte("bad-checksum-key")
-	value := []byte("bad-checksum-value")
-	incorrectCRC := uint32(0xDEADBEEF) // Wrong checksum
-
-	err = cache.PutChecksummed(key, value, incorrectCRC)
-	require.NoError(t, err) // Put succeeds (checksum stored as-is)
-
-	cache.Drain()
-
-	// Read should fail - data appears missing due to CRC mismatch
-	_, found := cache.Get(key)
-	require.False(t, found, "should not find blob with incorrect checksum")
-}
-
-func TestCache_KeyCollisionDetection(t *testing.T) {
-	tmpDir := t.TempDir()
-	// TrustHash=false enables collision detection (default is true in cache mode)
-	cache, err := New(tmpDir, WithMaxCachedSlabs(0), WithTrustHash(false)) // Force disk path
-	require.NoError(t, err)
-	defer cache.Close()
-
-	key := []byte("collision-key")
-	value := []byte("collision-value")
-	h := xxh3.Hash128(key)
-
-	err = cache.Put(key, value)
-	require.NoError(t, err)
-	cache.Drain()
-
-	// Find the entry in the index to get the segment file and offset
-	entry, found := cache.index.Get(index.Key(h))
-	require.True(t, found, "entry should exist in index")
-
-	// Close cache to release file handles
-	require.NoError(t, cache.Close())
-
-	// Corrupt the key bytes in the segment file.
-	// Record layout: [Header:35B][Key][Value]
-	// Key starts at offset + HeaderSize
-	segPath := fmt.Sprintf("%s/segments/0000/%d.seg", tmpDir, entry.SegmentID)
-	segFile, err := os.OpenFile(segPath, os.O_RDWR, 0644)
-	require.NoError(t, err)
-
-	keyOffset := int64(entry.Offset) + int64(record.HeaderSize)
-	// Write different key bytes (same length to keep record valid)
-	corruptedKey := []byte("CORRUPTED-KEY") // Different key that would "collide"
-	_, err = segFile.WriteAt(corruptedKey[:len(key)], keyOffset)
-	require.NoError(t, err)
-	require.NoError(t, segFile.Close())
-
-	// Reopen cache and try to read - should fail with key mismatch
-	cache2, err := New(tmpDir, WithMaxCachedSlabs(0), WithTrustHash(false))
-	require.NoError(t, err)
-	defer cache2.Close()
-
-	// Get should fail because stored key doesn't match requested key
-	_, found = cache2.Get(key)
-	require.False(t, found, "should not find blob with mismatched key (simulated collision)")
-}
-
-func TestCache_SelfHealing_OnCorruption(t *testing.T) {
-	tmpDir := t.TempDir()
-	// Disable in-memory slab caching so Get() must go to disk.
-	cache, err := New(tmpDir, WithMaxCachedSlabs(0))
-	require.NoError(t, err)
-	defer cache.Close()
-
-	key := []byte("healing-key")
-	value := []byte("precious-data")
-	h := xxh3.Hash128(key)
-
-	require.NoError(t, cache.Put(key, value))
-	cache.Drain()
-
-	// 1. Manually corrupt the storage by deleting the segment file
-	entry, ok := cache.index.Get(index.Key(h))
-	require.True(t, ok)
-
-	// Use shard-aware path helper
-	segmentPath := getSegmentPath(tmpDir, cache.Shards, entry.SegmentID)
-	err = os.Remove(segmentPath)
-	require.NoError(t, err)
-
-	// 2. Attempt Get.
-	// The Index has the entry, but Storage will return a failure.
-	// This triggers corruption marking via ReportBlobError.
-	_, found := cache.Get(key)
-	require.False(t, found, "Get should return false after storage failure")
-
-	// 3. Verify blob is marked as corrupt but still in index
-	entry, inIndex := cache.index.Get(index.Key(h))
-	require.True(t, inIndex, "Index entry should still exist")
-	require.True(t, entry.HasError(), "Blob should be marked as corrupt")
-	require.NotEqual(t, base.ErrNone, entry.Errno(), "Errno should be set")
-
-	// 4. Subsequent reads should fail fast (corruption check)
-	_, found = cache.Get(key)
-	require.False(t, found, "Subsequent reads should fail")
-}
-
-func TestCache_Eviction_Headroom(t *testing.T) {
-	tmpDir := t.TempDir()
-	// Small cache with eviction enabled
-	cache, err := New(tmpDir,
-		WithMaxSize(20*1024),        // 20KB limit
-		WithWriteBufferSize(2*1024)) // Small buffer to ensure flush (clamped to 8KB min)
-	require.NoError(t, err)
-	defer cache.Close()
-	cache.Start() // Start eviction worker
-
-	// Put enough data to trigger eviction (30KB > 20KB limit)
-	for i := 0; i < 30; i++ {
-		key := fmt.Appendf(nil, "key-%d", i)
-		require.NoError(t, cache.Put(key, make([]byte, 1024)))
+	defer func() { require.NoError(t, st.Close()) }()
+	locs := make([]blobstore.Location, n)
+	for i := range locs {
+		ticket, err := st.Write([]byte(fmt.Sprint(i)), make([]byte, 100), 10)
+		require.NoError(t, err)
+		locs[i], err = ticket.Wait()
+		require.NoError(t, err)
 	}
-	cache.Drain()
+	return locs
+}
 
-	// Poll for eviction completion with timeout
-	deadline := time.Now().Add(5 * time.Second)
-	var finalSize int64
-	var deletions int64
-	for time.Now().Before(deadline) {
-		finalSize = cache.approxSize.Load()
-		deletions = cache.bloomStats.deletions.Load()
-		if finalSize < 20*1024 && deletions > 0 {
+func TestIndexShardAlignment(t *testing.T) {
+	require.NoError(t, xmap.VerifyAlignment[item, xmap.Pad32]())
+}
+
+// TestPutGetRoundTrip checks values of many sizes: served from memory once
+// Put returns, from disk after a restart, and from memory again after that
+// read.
+func TestPutGetRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	c := openCache(t, dir, WithSegmentSize(4<<20))
+	sizes := []int{0, 1, 100, 4048, 4049, 4096, 4097, 64<<10 - 48 - 3, 64 << 10, 3*64<<10 + 17, 1 << 20}
+	values := map[string][]byte{}
+	for i, size := range sizes {
+		key := fmt.Sprintf("key-%d", i)
+		values[key] = randomBytes(uint64(i), size)
+		buf := alloc(t, c, key, values[key])
+		ticket, err := c.Put([]byte(key), buf, size)
+		require.NoError(t, err)
+		require.True(t, requireValue(t, c, key, values[key]), "served from Put's memory")
+		err = ticket.Wait()
+		require.NoError(t, err)
+	}
+	requireMissing(t, c, "absent")
+	require.Equal(t, len(sizes), c.Stats().Items)
+	closeCache(t, c)
+
+	c = openCache(t, dir, WithSegmentSize(4<<20))
+	defer closeCache(t, c)
+	for key, value := range values {
+		require.False(t, requireValue(t, c, key, value), "first read after restart is from disk")
+		require.True(t, requireValue(t, c, key, value), "a read from disk stays in memory")
+	}
+}
+
+func TestOverwrite(t *testing.T) {
+	dir := t.TempDir()
+	c := openCache(t, dir)
+	put(t, c, "k", []byte("one"))
+	put(t, c, "k", []byte("two"))
+	requireValue(t, c, "k", []byte("two"))
+	closeCache(t, c)
+
+	c = openCache(t, dir)
+	defer closeCache(t, c)
+	requireValue(t, c, "k", []byte("two"))
+}
+
+func TestReopenAcrossSegments(t *testing.T) {
+	dir := t.TempDir()
+	c := openCache(t, dir)
+	values := map[string][]byte{}
+	for i := range 40 {
+		key := fmt.Sprintf("key-%d", i)
+		values[key] = randomBytes(uint64(i), 20<<10+i*997)
+		put(t, c, key, values[key])
+	}
+	closeCache(t, c)
+	require.Greater(t, len(segmentFiles(t, dir)), 2, "test must span several segments")
+
+	c = openCache(t, dir)
+	defer closeCache(t, c)
+	for key, value := range values {
+		requireValue(t, c, key, value)
+	}
+	require.Equal(t, len(values), c.Stats().Items)
+}
+
+// TestMemoryReclaimedOldestFirst writes more than the cache's memory: the
+// newest values stay in memory, the oldest are read back from disk.
+func TestMemoryReclaimedOldestFirst(t *testing.T) {
+	const memory = 1 << 20
+	c := openCache(t, t.TempDir(), WithMemory(memory))
+	defer closeCache(t, c)
+	value := func(i int) []byte { return randomBytes(uint64(i), 100<<10) }
+	const n = 30 // about 3 MB
+	for i := range n {
+		put(t, c, fmt.Sprintf("key-%d", i), value(i))
+	}
+	require.LessOrEqual(t, c.Stats().MemoryUsed, int64(memory))
+	require.True(t, requireValue(t, c, fmt.Sprintf("key-%d", n-1), value(n-1)), "newest in memory")
+	require.False(t, requireValue(t, c, "key-0", value(0)), "oldest reclaimed, read from disk")
+}
+
+// TestBusyWhenMemoryInUse checks that memory in use is never reclaimed:
+// Alloc and reads from disk return ErrBusy, without waiting, until it is
+// given back.
+func TestBusyWhenMemoryInUse(t *testing.T) {
+	const memory = 1 << 20
+	c := openCache(t, t.TempDir(), WithMemory(memory))
+	defer closeCache(t, c)
+	put(t, c, "on-disk", randomBytes(1, 100<<10))
+	// Hold all the memory: large buffers, then pages until none is left.
+	var held [][]byte
+	for _, size := range []int{200 << 10, 4096} {
+		for {
+			buf, err := c.Alloc(size)
+			if errors.Is(err, ErrBusy) {
+				break
+			}
+			require.NoError(t, err)
+			held = append(held, buf)
+		}
+	}
+	// "on-disk" was reclaimed to make room; reading it back needs memory.
+	err := c.Get([]byte("on-disk"), func([]byte) error { return nil })
+	require.ErrorIs(t, err, ErrBusy)
+
+	for _, buf := range held {
+		require.NoError(t, c.Free(buf))
+	}
+	requireValue(t, c, "on-disk", randomBytes(1, 100<<10))
+}
+
+// TestMemoryRules covers handing memory back: Put and Free each take memory
+// from Alloc exactly once, whatever the outcome, and refuse other memory.
+func TestMemoryRules(t *testing.T) {
+	c := openCache(t, t.TempDir())
+	defer closeCache(t, c)
+
+	foreign := align.AllocAligned(64 << 10)
+	defer align.FreeAligned(foreign)
+	_, err := c.Put([]byte("k"), foreign, 10)
+	require.ErrorIs(t, err, ErrForeignMemory)
+	require.ErrorIs(t, c.Free(foreign), ErrForeignMemory)
+
+	buf, err := c.Alloc(c.RecordSize(1, 10000))
+	require.NoError(t, err)
+	_, err = c.Put([]byte("k"), buf[4096:], 10)
+	require.ErrorIs(t, err, ErrForeignMemory, "only the memory Alloc returned")
+	_, err = c.Put(nil, buf, 10)
+	require.ErrorIs(t, err, ErrEmptyKey)
+	require.ErrorIs(t, c.Free(buf), ErrForeignMemory, "a failed Put still took the memory")
+
+	buf, err = c.Alloc(c.RecordSize(1, 10))
+	require.NoError(t, err)
+	require.NoError(t, c.Free(buf))
+	require.ErrorIs(t, c.Free(buf), ErrForeignMemory, "freed twice")
+
+	buf = alloc(t, c, "k", []byte("value"))
+	_, err = c.Put([]byte("k"), buf, 5)
+	require.NoError(t, err)
+	_, err = c.Put([]byte("k"), buf, 5)
+	require.ErrorIs(t, err, ErrForeignMemory, "Put twice")
+	c.Drain()
+
+	_, err = c.Alloc(testMemory + 1)
+	require.ErrorIs(t, err, ErrValueTooLarge)
+
+	// fn's error is Get's.
+	refused := errors.New("refused")
+	require.ErrorIs(t, c.Get([]byte("k"), func([]byte) error { return refused }), refused)
+}
+
+// TestCloseReportsHeldMemory checks that Close refuses to unmap memory a
+// caller still holds from Alloc.
+func TestCloseReportsHeldMemory(t *testing.T) {
+	c := openCache(t, t.TempDir())
+	_, err := c.Alloc(4096)
+	require.NoError(t, err)
+	require.ErrorContains(t, c.Close(), "still held")
+}
+
+// gate holds the store's next submission while armed, before it reaches the
+// scheduler.
+type gate struct {
+	armed   atomic.Bool
+	blocked chan struct{}
+	release chan struct{}
+}
+
+func newGate() *gate {
+	return &gate{blocked: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (g *gate) hook(op iosched.Op) iosched.Op {
+	if g.armed.CompareAndSwap(true, false) {
+		g.blocked <- struct{}{}
+		<-g.release
+	}
+	return op
+}
+
+// putHeld starts a Put that the gate holds before submission, and returns a
+// channel that delivers Put's error when it returns; its write may still be
+// in flight then.
+func putHeld(t *testing.T, c *Cache, gate *gate, key string, value []byte) <-chan error {
+	t.Helper()
+	buf := alloc(t, c, key, value)
+	gate.armed.Store(true)
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.Put([]byte(key), buf, len(value))
+		done <- err
+	}()
+	<-gate.blocked
+	return done
+}
+
+// TestPutVisibleOnReturn checks that a key is absent until Put returns, and is
+// served from Put's memory from then on, before and after its write lands.
+func TestPutVisibleOnReturn(t *testing.T) {
+	gate := newGate()
+	c := openCache(t, t.TempDir(), withPreSubmit(gate.hook))
+	defer closeCache(t, c)
+
+	value := randomBytes(1, 100<<10)
+	done := putHeld(t, c, gate, "k", value) // inside Put, not yet submitted
+	requireMissing(t, c, "k")
+
+	close(gate.release)
+	require.NoError(t, <-done)
+	require.True(t, requireValue(t, c, "k", value))
+	c.Drain()
+	require.True(t, requireValue(t, c, "k", value))
+}
+
+// TestOverwriteVisibleOnReturn checks that an overwrite replaces the value
+// for Get when Put returns.
+func TestOverwriteVisibleOnReturn(t *testing.T) {
+	gate := newGate()
+	c := openCache(t, t.TempDir(), withPreSubmit(gate.hook))
+	defer closeCache(t, c)
+
+	put(t, c, "k", []byte("old"))
+	done := putHeld(t, c, gate, "k", []byte("new"))
+	requireValue(t, c, "k", []byte("old"))
+	close(gate.release)
+	require.NoError(t, <-done)
+	requireValue(t, c, "k", []byte("new"))
+}
+
+// TestWithoutMemoryHits checks the disk-only mode used to compare the memory
+// tier with a disk-only cache: every hit is a read from disk.
+func TestWithoutMemoryHits(t *testing.T) {
+	c := openCache(t, t.TempDir(), withoutMemoryHits())
+	defer closeCache(t, c)
+	put(t, c, "k", []byte("value"))
+	require.False(t, requireValue(t, c, "k", []byte("value")))
+	require.False(t, requireValue(t, c, "k", []byte("value")))
+	require.Zero(t, c.Stats().MemoryHits)
+}
+
+func flipByte(t *testing.T, path string, off int64) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	require.NoError(t, err)
+	var b [1]byte
+	_, err = f.ReadAt(b[:], off)
+	require.NoError(t, err)
+	b[0] ^= 0xff
+	_, err = f.WriteAt(b[:], off)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+}
+
+func TestCorruptionIsDetected(t *testing.T) {
+	dir := t.TempDir()
+	c := openCache(t, dir, WithChecksum())
+	put(t, c, "value-corrupt", randomBytes(1, 10000))
+	put(t, c, "trailer-corrupt", randomBytes(2, 10000))
+	closeCache(t, c)
+
+	path, start, _ := findRecord(t, dir, "value-corrupt", 10000)
+	flipByte(t, path, start+100)
+	path, _, end := findRecord(t, dir, "trailer-corrupt", 10000)
+	flipByte(t, path, end-10)
+
+	c = openCache(t, dir, WithChecksum())
+	defer closeCache(t, c)
+	err := c.Get([]byte("value-corrupt"), func([]byte) error { return nil })
+	var ce *base.ChecksumError
+	require.ErrorAs(t, err, &ce)
+	requireMissing(t, c, "value-corrupt") // the entry was dropped
+
+	err = c.Get([]byte("trailer-corrupt"), func([]byte) error { return nil })
+	require.ErrorIs(t, err, ErrNotFound)
+	require.Equal(t, uint64(2), c.Stats().Corrupt)
+}
+
+func TestBufferedReads(t *testing.T) {
+	dir := t.TempDir()
+	c := openCache(t, dir, WithDirectReads(false))
+	value := randomBytes(1, 10000)
+	put(t, c, "k", value)
+	closeCache(t, c)
+	c = openCache(t, dir, WithDirectReads(false))
+	defer closeCache(t, c)
+	require.False(t, requireValue(t, c, "k", value))
+}
+
+func TestPutRejects(t *testing.T) {
+	c := openCache(t, t.TempDir())
+	for _, key := range [][]byte{nil, make([]byte, MaxKeyLen+1)} {
+		buf, err := c.Alloc(4096)
+		require.NoError(t, err)
+		_, err = c.Put(key, buf, 1)
+		require.Error(t, err)
+	}
+	buf, err := c.Alloc(testSegment)
+	require.NoError(t, err)
+	_, err = c.Put([]byte("huge"), buf, testSegment-4096)
+	require.ErrorIs(t, err, ErrValueTooLarge)
+	require.Equal(t, 0, c.Stats().Items)
+
+	closeCache(t, c)
+	require.NoError(t, c.Close(), "a second Close is a no-op")
+	_, err = c.Alloc(4096)
+	require.ErrorIs(t, err, ErrClosed)
+	require.ErrorIs(t, c.Get([]byte("k"), func([]byte) error { return nil }), ErrClosed)
+}
+
+// TestDrain checks that Drain waits for every write accepted before it.
+func TestDrain(t *testing.T) {
+	c := openCache(t, t.TempDir())
+	defer closeCache(t, c)
+	var tickets []Ticket
+	for i := range 50 {
+		key := fmt.Sprint(i)
+		value := randomBytes(uint64(i), 30<<10)
+		for {
+			ticket, err := c.Put([]byte(key), alloc(t, c, key, value), len(value))
+			if errors.Is(err, ErrBusy) {
+				runtime.Gosched()
+				continue
+			}
+			require.NoError(t, err)
+			tickets = append(tickets, ticket)
 			break
 		}
-		time.Sleep(50 * time.Millisecond)
+	}
+	c.Drain()
+	require.Zero(t, c.Stats().WritesInFlight)
+	for i := range 50 {
+		it, ok := c.index.get(blobstore.HashKey([]byte(fmt.Sprint(i))))
+		require.True(t, ok)
+		require.True(t, it.onDisk(), "Drain returned before the completer recorded every write")
+	}
+	for _, ticket := range tickets {
+		err := ticket.Wait()
+		require.NoError(t, err)
+	}
+	c.Drain() // nothing in flight: returns at once
+}
+
+// TestConcurrentStress mixes writes, overwrites and reads across rotating
+// segments and memory reclaimed under pressure. Every value names
+// its key, so any hit can be checked: a read must never return another key's
+// data.
+func TestConcurrentStress(t *testing.T) {
+	dir := t.TempDir()
+	opts := []Option{WithChecksum(), WithMemory(2 << 20)}
+	c := openCache(t, dir, opts...)
+	const keys = 200
+	value := func(key string, version uint64, size int) []byte {
+		return append([]byte(key+"|"), randomBytes(version, size)...)
+	}
+	var wg sync.WaitGroup
+	var hits atomic.Int64
+	for g := range 8 {
+		wg.Add(1)
+		go func(seed uint64) {
+			defer wg.Done()
+			rng := rand.New(rand.NewPCG(seed, seed))
+			for range 400 {
+				key := fmt.Sprintf("key-%d", rng.IntN(keys))
+				switch op := rng.IntN(10); {
+				case op < 5:
+					v := value(key, rng.Uint64(), rng.IntN(40<<10))
+					buf, err := c.Alloc(c.RecordSize(len(key), len(v)))
+					if errors.Is(err, ErrBusy) {
+						continue // a caller skips caching
+					}
+					require.NoError(t, err)
+					copy(buf, v)
+					ticket, err := c.Put([]byte(key), buf, len(v))
+					if errors.Is(err, ErrBusy) {
+						continue
+					}
+					require.NoError(t, err)
+					if rng.IntN(2) == 0 {
+						err = ticket.Wait()
+						require.NoError(t, err)
+					}
+				default:
+					err := c.Get([]byte(key), func(got []byte) error {
+						if !bytes.HasPrefix(got, []byte(key+"|")) {
+							return fmt.Errorf("read of %s returned another key's data", key)
+						}
+						hits.Add(1)
+						return nil
+					})
+					if !errors.Is(err, ErrNotFound) && !errors.Is(err, ErrBusy) {
+						require.NoError(t, err)
+					}
+				}
+			}
+		}(uint64(g))
+	}
+	wg.Wait()
+	require.Greater(t, c.Stats().Segments, 3, "stress must span several segments")
+	require.Positive(t, hits.Load())
+	closeCache(t, c)
+
+	c = openCache(t, dir, opts...)
+	defer closeCache(t, c)
+	for i := range keys {
+		key := fmt.Sprintf("key-%d", i)
+		if got, _, ok := lookup(t, c, key); ok {
+			require.True(t, bytes.HasPrefix(got, []byte(key+"|")))
+		}
+	}
+}
+
+// TestIndexPutLifecycle covers a Put's entry: in memory until its write
+// lands, superseded by a later Put, removed if its write fails.
+func TestIndexPutLifecycle(t *testing.T) {
+	locs := locations(t, 3)
+	x := newIndex(0)
+	h := blobstore.HashKey([]byte("k"))
+	loc := locs[0]
+	values := make([]memoryValue, 12)
+	for i := range values {
+		values[i] = memoryValue{block: &memoryBlock{keys: []Key{h}}}
 	}
 
-	t.Logf("FinalSize: %d bytes (limit: 20KB)", finalSize)
-	t.Logf("Deletions: %d", deletions)
+	x.put(h, values[7])
+	it, _ := x.get(h)
+	require.Equal(t, item{mem: values[7]}, it)
+	x.landed(h, values[7], loc)
+	it, _ = x.get(h)
+	require.Equal(t, item{mem: values[7], loc: loc}, it)
 
-	require.Less(t, finalSize, int64(20*1024), "Should have evicted to stay under limit")
-	require.Greater(t, deletions, int64(0), "Deletions should be tracked after eviction")
-}
+	x.put(h, values[8]) // overwrite
+	x.put(h, values[9]) // and another, installed later
+	x.landed(h, values[8], locs[1])
+	x.evictMemory([]*memoryBlock{values[8].block})
+	it, _ = x.get(h)
+	require.Equal(t, item{mem: values[9]}, it, "a superseded write changes nothing")
+	x.evictMemory([]*memoryBlock{values[9].block})
+	_, ok := x.get(h)
+	require.False(t, ok, "expired memory without a disk copy leaves nothing")
 
-func TestCache_Restart_Persistence(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	// Phase 1: Write and Close
-	cache1, err := New(tmpDir)
-	require.NoError(t, err)
-	cache1.Put([]byte("k1"), []byte("v1"))
-	cache1.Drain()
-	cache1.Close()
-
-	// Phase 2: OpenIndex and Verify
-	cache2, err := New(tmpDir)
-	require.NoError(t, err)
-	defer cache2.Close()
-
-	val, found := cache2.Get([]byte("k1"))
-	require.True(t, found)
-	require.Equal(t, []byte("v1"), val)
-}
-
-// Benchmarks
-
-func BenchmarkCache_Get_WithBloom(b *testing.B) {
-	tmpDir := b.TempDir()
-	cache, _ := New(tmpDir)
-	defer cache.Close()
-
-	key := []byte("bench-key")
-	if err := cache.Put(key, make([]byte, 1024)); err != nil {
-		b.Fatal(err)
-	}
-	cache.Drain()
-
-	b.ResetTimer()
-	for b.Loop() {
-		_, _ = cache.Get(key)
-	}
-}
-
-// --- Compression Tests ---
-
-func TestCache_Compression_Zstd(t *testing.T) {
-	tmpDir := t.TempDir()
-	cache, err := New(tmpDir,
-		WithCompression(compression.CodexZstd),
-		WithCompressionMinSize(100), // Compress blobs >= 100 bytes
-		WithMaxCachedSlabs(0),       // Force disk reads
-	)
-	require.NoError(t, err)
-	defer cache.Close()
-
-	// Create highly compressible data (repeated pattern)
-	original := bytes.Repeat([]byte("COMPRESS_ME_"), 1000) // ~12KB of repeated text
-	key := []byte("compressed-key")
-
-	// Write compressed
-	require.NoError(t, cache.Put(key, original))
-	cache.Drain()
-
-	// Read back and verify
-	result, found := cache.Get(key)
-	require.True(t, found, "compressed blob should be readable")
-	require.Equal(t, original, result, "decompressed data should match original")
-
-	// Verify compression metadata is correct
-	h := xxh3.Hash128(key)
-	entry, ok := cache.index.Get(index.Key(h))
-	require.True(t, ok)
-
-	// PhysicalLen is total record size (header + key + value)
-	// For compressed data, this should be much smaller than original data size
-	t.Logf("Original size: %d, PhysicalLen (total record): %d", len(original), entry.PhysicalLen)
-
-	// Verify compression metadata is set correctly
-	require.True(t, entry.IsCompressed(), "record should be marked as compressed")
-	require.Equal(t, compression.CodexZstd, entry.Compression())
-}
-
-func TestCache_Compression_IncompressibleData(t *testing.T) {
-	tmpDir := t.TempDir()
-	cache, err := New(tmpDir,
-		WithCompression(compression.CodexZstd),
-		WithCompressionMinSize(100),
-		WithMaxCachedSlabs(0),
-	)
-	require.NoError(t, err)
-	defer cache.Close()
-
-	// Create truly incompressible data (crypto random)
-	// The 1/8th heuristic should detect this and store raw
-	original := make([]byte, 1000)
-	_, err = crand.Read(original)
-	require.NoError(t, err, "failed to generate random data")
-
-	key := []byte("incompressible-key")
-
-	require.NoError(t, cache.Put(key, original))
-	cache.Drain()
-
-	// Read back and verify
-	result, found := cache.Get(key)
-	require.True(t, found, "incompressible blob should be readable")
-	require.Equal(t, original, result, "data should match original")
-
-	// Check entry exists and verify compression flag
-	h := xxh3.Hash128(key)
-	entry, ok := cache.index.Get(index.Key(h))
-	require.True(t, ok)
-
-	t.Logf("PhysicalLen: %d, IsCompressed: %v", entry.PhysicalLen, entry.IsCompressed())
-
-	// For truly random data, compression shouldn't help much
-	// The entry exists and read/write cycle works - that's the main test
-}
-
-func TestCache_Compression_SmallBlob_NoCompress(t *testing.T) {
-	tmpDir := t.TempDir()
-	cache, err := New(tmpDir,
-		WithCompression(compression.CodexZstd),
-		WithCompressionMinSize(1000), // Only compress >= 1KB
-		WithMaxCachedSlabs(0),
-	)
-	require.NoError(t, err)
-	defer cache.Close()
-
-	// Small blob below threshold
-	original := []byte("small data under threshold")
-	key := []byte("small-key")
-
-	require.NoError(t, cache.Put(key, original))
-	cache.Drain()
-
-	// Read back and verify
-	result, found := cache.Get(key)
-	require.True(t, found)
-	require.Equal(t, original, result)
-
-	// Verify it was NOT compressed due to size threshold
-	h := xxh3.Hash128(key)
-	entry, ok := cache.index.Get(index.Key(h))
-	require.True(t, ok)
-
-	require.False(t, entry.IsCompressed(), "small blob should not be compressed")
-}
-
-func TestCache_Compression_MinSizeZero_NoRestriction(t *testing.T) {
-	tmpDir := t.TempDir()
-	cache, err := New(tmpDir,
-		WithCompression(compression.CodexZstd),
-		WithCompressionMinSize(0), // MinSize=0 means no minimum, compress everything
-		WithMaxCachedSlabs(0),
-	)
-	require.NoError(t, err)
-	defer cache.Close()
-
-	// Small but compressible data (repeated pattern)
-	original := bytes.Repeat([]byte("x"), 50) // Only 50 bytes
-	key := []byte("tiny-key")
-
-	require.NoError(t, cache.Put(key, original))
-	cache.Drain()
-
-	// Read back and verify
-	result, found := cache.Get(key)
-	require.True(t, found)
-	require.Equal(t, original, result)
-
-	// Verify it WAS compressed despite being small (MinSize=0 disables restriction)
-	h := xxh3.Hash128(key)
-	entry, ok := cache.index.Get(index.Key(h))
-	require.True(t, ok)
-
-	t.Logf("PhysicalLen: %d, IsCompressed: %v", entry.PhysicalLen, entry.IsCompressed())
-
-	// With MinSize=0, compression should be attempted regardless of size
-	// For this highly compressible pattern, it should succeed
-	require.True(t, entry.IsCompressed(), "MinSize=0 should allow compression of any size blob")
-}
-
-func TestCache_Compression_ReadFromLibrarian(t *testing.T) {
-	tmpDir := t.TempDir()
-	cache, err := New(tmpDir,
-		WithCompression(compression.CodexZstd),
-		WithCompressionMinSize(100),
-		WithMaxCachedSlabs(4), // Enable Librarian cache
-	)
-	require.NoError(t, err)
-	defer cache.Close()
-
-	// Compressible data
-	original := bytes.Repeat([]byte("librarian_test_"), 500)
-	key := []byte("librarian-key")
-
-	require.NoError(t, cache.Put(key, original))
-	// DON'T drain - read from Librarian (RAM)
-
-	result, found := cache.Get(key)
-	require.True(t, found, "should find in Librarian before flush")
-	require.Equal(t, original, result, "decompressed data from Librarian should match")
-}
-
-func TestCache_Compression_LZ4(t *testing.T) {
-	tmpDir := t.TempDir()
-	cache, err := New(tmpDir,
-		WithCompression(compression.CodexLZ4),
-		WithCompressionMinSize(100),
-		WithMaxCachedSlabs(0),
-	)
-	require.NoError(t, err)
-	defer cache.Close()
-
-	// LZ4 optimizes for speed over ratio, so use larger data for better compression
-	original := bytes.Repeat([]byte("LZ4_TEST_DATA_"), 5000) // 70KB of repeated text
-	key := []byte("lz4-key")
-
-	require.NoError(t, cache.Put(key, original))
-	cache.Drain()
-
-	result, found := cache.Get(key)
-	require.True(t, found)
-	require.Equal(t, original, result)
-
-	h := xxh3.Hash128(key)
-	entry, ok := cache.index.Get(index.Key(h))
-	require.True(t, ok)
-
-	t.Logf("PhysicalLen: %d, IsCompressed: %v", entry.PhysicalLen, entry.IsCompressed())
-
-	require.True(t, entry.IsCompressed(), "blob should be compressed with LZ4")
-	require.Equal(t, compression.CodexLZ4, entry.Compression())
-}
-
-// TestArchivist_PrefetchStraddlesChunkBoundary exercises readBlobWithPrefetch
-// when a blob starts near the end of a 64KB chunk and extends into the next.
-// This is the exact condition that caused "short prefetch read" errors.
-func TestArchivist_PrefetchStraddlesChunkBoundary(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	// Create a real DurableIndex (Archivist needs SegmentLockShard).
-	idx, err := index.OpenIndex(tmpDir, 1, 1024)
-	require.NoError(t, err)
-	defer idx.Close()
-
-	// Build a record: 42-byte header + key + 20KB value = ~20KB total.
-	key := []byte("straddle-key")
-	value := make([]byte, 20_000)
-	crand.Read(value)
-	rec := record.NewRecord(1, key, value, int64(len(value)))
-	recBytes := make([]byte, rec.EncodedSize())
-	rec.EncodeTo(recBytes)
-
-	// Place the record at offset 60000 in the segment file.
-	// This is inside the first 64KB chunk (0–65535) but the record extends
-	// to 60000 + ~20054 = ~80054, straddling into the second chunk.
-	const blobOffset = 60_000
-	const segID = 1
-	segFile := getSegmentPath(tmpDir, 1, segID)
-	require.NoError(t, os.MkdirAll(filepath.Dir(segFile), 0o755))
-	fileSize := blobOffset + len(recBytes)
-	segData := make([]byte, fileSize)
-	copy(segData[blobOffset:], recBytes)
-	require.NoError(t, os.WriteFile(segFile, segData, 0o644))
-
-	// Register the segment in the index so SegmentLockShard works.
-	h := xxh3.Hash128(key)
-	entries := []record.FooterEntry{{
-		Key:          h,
-		Pos:          blobOffset,
-		PhysicalSize: int64(len(value)),
-		LogicalSize:  int64(len(value)),
-		SeqID:        1,
-		KeyLen:       uint16(len(key)),
-	}}
-	idx.AddSegmentFromEntries(segID, entries)
-
-	item, found := idx.Get(h)
-	require.True(t, found)
-	require.Equal(t, uint32(blobOffset), item.Offset)
-
-	// Set up Archivist with ReadCache enabled.
-	cfg := defaultConfig(tmpDir)
-	cfg.Shards = 1
-	archivist := NewArchivist(cfg, idx, nil)
-	defer archivist.Close()
-
-	rc := NewReadCache(1<<20, 4, 0, noopReporter{})
-	defer rc.Close()
-	archivist.readCache = rc
-
-	// ReadBlob should succeed — the prefetch read must cover the full blob.
-	data, rel, err := archivist.ReadBlob(item, key)
-	require.NoError(t, err, "prefetch should handle blob straddling 64KB chunk boundary")
-	defer rel.Release()
-	require.Equal(t, value, data)
-
-	// Verify it went through the ReadCache path (miss → populate → parse).
-	stats := rc.Stats()
-	require.Equal(t, int64(1), stats.Misses, "should have 1 cache miss")
-	require.Greater(t, stats.Inserts, int64(0), "should have populated cache")
+	x.loaded(h, loc)
+	x.cache(h, loc, values[10])
+	it, _ = x.get(h)
+	require.Equal(t, values[10], it.mem, "a read from disk is kept in memory")
+	x.cache(h, locs[2], values[11])
+	it, _ = x.get(h)
+	require.Equal(t, values[10], it.mem, "only for the record the index names")
+	x.deleteIfAt(h, locs[2])
+	_, ok = x.get(h)
+	require.True(t, ok, "only the record the index names is removed")
+	x.deleteIfAt(h, loc)
+	_, ok = x.get(h)
+	require.False(t, ok)
 }

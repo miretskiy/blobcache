@@ -1,328 +1,83 @@
 package blobcache
 
 import (
-	"hash"
-	"hash/crc32"
-
-	"github.com/miretskiy/blobcache/compression"
-	"github.com/miretskiy/blobcache/internal/wal"
-	"github.com/miretskiy/dio/iosched"
-	"github.com/miretskiy/dio/sys"
+	"github.com/miretskiy/blobcache/blobstore"
+	"github.com/miretskiy/dio/v2/iosched"
 )
 
-// DegradedMode controls how the cache behaves when entering degraded mode.
-type DegradedMode int
-
-const (
-	// DegradedMemoryOnly continues operating as a memory-only cache (default).
-	// This is the resilient option for production caches.
-	DegradedMemoryOnly DegradedMode = iota
-
-	// DegradedPanic panics with a stack trace when degraded mode is triggered.
-	// Use this for debugging and benchmarking to catch issues immediately.
-	DegradedPanic
-)
-
-// IOConfig holds I/O strategy settings
-type IOConfig struct {
-	FDataSync     bool // Use fdatasync for durability
-	Fadvise       bool // Use fadvise to provide data access hints to the kernel.
-	DirectIOWrite bool // Use O_DIRECT (Linux) or F_NOCACHE (Darwin) for segment writes
-	DirectIORead  bool // Use O_DIRECT (Linux) or F_NOCACHE (Darwin) for segment reads
-}
-
-// ResilienceConfig holds data integrity settings
-type ResilienceConfig struct {
-	ChecksumHasher Hasher // Hash factory for checksums (nil = disabled)
-	VerifyOnRead   bool   // Verify checksums on reads
-}
-
-// CompressionConfig holds compression strategy settings
-type CompressionConfig struct {
-	Codec   compression.Codex // Compression algorithm (None, Zstd, LZ4, S2)
-	Level   compression.Level // Compression level (Default, Speed, Best)
-	MinSize int64             // Don't compress blobs smaller than this (default: 512)
-}
-
-// WALConfig holds write-ahead log settings
-type WALConfig struct {
-	Enabled bool // Enable WAL for durability (default: false)
-	wal.Config
-}
-
-// config holds internal configuration
 type config struct {
-	Path    string
-	MaxSize int64
-	Shards  int
-
-	// --- Slab Configuration ---
-	WriteBufferSize  int64 // Size of one memory slab
-	MaxInflightSlabs int   // Max slabs queueing for flush
-	MaxCachedSlabs   int   // Max slabs kept in memory for reading
-
-	FlushConcurrency         int
-	BloomFPRate              float64
-	BloomEstimatedKeys       int
-	IO                       IOConfig
-	Resilience               ResilienceConfig
-	Compression              CompressionConfig
-	WAL                      WALConfig
-	DegradedMode             DegradedMode // How to handle degraded mode (default: memory-only)
-	TrustHash                bool         // Skip key verification on reads (cache mode optimization)
-	BallastSize              int          // Heap ballast size in bytes (default: 1GB, 0 = disabled)
-	CompactionWasteThreshold float64      // Waste ratio to trigger segment rewrite (WAL mode, default: 0.25)
-
-	IOScheduler *iosched.BlockingIO // Pluggable I/O backend for reads (default: direct POSIX)
-
-	// MaxReadConcurrency limits how many goroutines can simultaneously block
-	// in pread.  0 = unlimited (default).  When set, excess readers block on
-	// a channel (Go scheduler, no OS thread consumed) rather than in a
-	// syscall, preventing thread explosion.  See DESIGN.md §11.6.
-	// Recommended: runtime.GOMAXPROCS(0)*2 when using PreadScheduler.
-	// Not needed with URingScheduler (coordinator bounds threads to 1).
-	MaxReadConcurrency int
-
-	// --- Read Cache Configuration ---
-	ReadCacheSlabs       int   // Number of read cache slabs (0 = disabled)
-	ReadCacheSlabSize    int64 // Size of each read cache slab (default: WriteBufferSize)
-	ReadCacheMaxItemSize int64 // Max item size to cache (0 = slabSize/64, -1 = no limit)
-
-	knobs *TestingKnobs
+	store      []blobstore.Option
+	memory     int64
+	memoryHits bool
 }
 
-// Option configures BlobCache
+func defaultConfig() config {
+	return config{memory: 1 << 30, memoryHits: true}
+}
+
+// Option configures a Cache.
 type Option interface {
 	apply(*config)
 }
 
 type funcOpt func(*config)
 
-func (f funcOpt) apply(c *config) {
-	f(c)
+func (f funcOpt) apply(c *config) { f(c) }
+
+func storeOpt(o blobstore.Option) Option {
+	return funcOpt(func(c *config) { c.store = append(c.store, o) })
 }
 
-func WithMaxSize(size int64) Option {
-	return funcOpt(func(c *config) { c.MaxSize = size })
+// WithSegmentSize sets the size of each segment file. Default: 256 MiB.
+func WithSegmentSize(bytes int64) Option { return storeOpt(blobstore.WithSegmentSize(bytes)) }
+
+// WithRingDepth sets the io_uring submission queue depth. Default: 256.
+func WithRingDepth(n uint32) Option { return storeOpt(blobstore.WithRingDepth(n)) }
+
+// WithDirectReads chooses between O_DIRECT reads (the default) and reads
+// through the kernel page cache. Direct reads copy nothing; buffered reads
+// copy each read out of the page cache, which may serve repeated reads of
+// older values. With direct writes (the default) recently written values are
+// not in the page cache.
+func WithDirectReads(enabled bool) Option { return storeOpt(blobstore.WithDirectReads(enabled)) }
+
+// WithDirectWrites chooses between O_DIRECT writes (the default) and writes
+// through the kernel page cache. Direct writes go from the cache's memory to
+// the device with no copy; buffered writes are copied into the page cache and
+// written back by the kernel, and need WithDirectReads(false). See
+// blobstore.WithDirectWrites.
+func WithDirectWrites(enabled bool) Option { return storeOpt(blobstore.WithDirectWrites(enabled)) }
+
+// WithChecksum is retained for compatibility; value checksums are always enabled.
+func WithChecksum() Option { return storeOpt(blobstore.WithChecksum()) }
+
+// WithMemory bounds mapped value memory in bytes, a page multiple of at least
+// 128 KiB. Memory grows on demand: normally 16 MiB chunks split into 4 MiB
+// blocks, scaled down for small budgets. Larger records use dedicated mappings
+// under the same limit. Full blocks are reclaimed oldest first, skipping those
+// held by downloads, writes, or readers. Alloc and Get return ErrBusy when no
+// suitable memory can be reclaimed. Default: 1 GiB. Metadata is additional.
+func WithMemory(bytes int64) Option {
+	return funcOpt(func(c *config) { c.memory = bytes })
 }
 
-func WithShards(n int) Option {
-	return funcOpt(func(c *config) { c.Shards = n })
+// withoutMemoryHits makes Get ignore values in memory and read everything
+// from disk, for comparing the memory tier with a disk-only cache. Tests and
+// benchmarks only.
+func withoutMemoryHits() Option {
+	return funcOpt(func(c *config) { c.memoryHits = false })
 }
 
-// WithWriteBufferSize sets the size of the memory chunks used for buffering.
-// Default: 128MB.
-func WithWriteBufferSize(bytes int64) Option {
-	return funcOpt(func(c *config) { c.WriteBufferSize = bytes })
+// withPreSubmit passes every operation the store submits through fn (see
+// blobstore.TestingWithPreSubmit). Tests only.
+func withPreSubmit(fn func(iosched.Op) iosched.Op) Option {
+	return storeOpt(blobstore.TestingWithPreSubmit(fn))
 }
 
-// WithMaxInflightSlabs sets how many slabs can be queued for flushing
-// before backpressure (blocking writes) kicks in.
-func WithMaxInflightSlabs(n int) Option {
-	return funcOpt(func(c *config) { c.MaxInflightSlabs = n })
-}
+// WithMaxSize targets disk usage for retained segments and reservations. Zero
+// disables eviction. The limit must fit two segments. Pending or failed best
+// effort unlinks can leave more bytes on disk than this target.
+func WithMaxSize(bytes int64) Option { return storeOpt(blobstore.WithMaxSize(bytes)) }
 
-// WithMaxCachedSlabs sets how many sealed slabs are kept in memory for reading.
-// Increasing this improves read performance for recently written data at the cost of RAM.
-// Set to 0 to disable the in-memory read cache (all reads go to disk).
-// Default: 4.
-func WithMaxCachedSlabs(n int) Option {
-	return funcOpt(func(c *config) { c.MaxCachedSlabs = n })
-}
-
-func WithBloomFPRate(rate float64) Option {
-	return funcOpt(func(c *config) { c.BloomFPRate = rate })
-}
-
-func WithBloomEstimatedKeys(n int) Option {
-	return funcOpt(func(c *config) { c.BloomEstimatedKeys = n })
-}
-
-func WithChecksum() Option {
-	return funcOpt(func(c *config) {
-		c.Resilience.ChecksumHasher = func() hash.Hash32 { return crc32.NewIEEE() }
-	})
-}
-
-func WithChecksumHash(factory Hasher) Option {
-	return funcOpt(func(c *config) { c.Resilience.ChecksumHasher = factory })
-}
-
-func WithFDataSync(enabled bool) Option {
-	return funcOpt(func(c *config) { c.IO.FDataSync = enabled })
-}
-
-func WithVerifyOnRead(enabled bool) Option {
-	return funcOpt(func(c *config) { c.Resilience.VerifyOnRead = enabled })
-}
-
-func WithFlushConcurrency(n int) Option {
-	return funcOpt(func(c *config) { c.FlushConcurrency = n })
-}
-
-func WithFadvise(enabled bool) Option {
-	return funcOpt(func(c *config) { c.IO.Fadvise = enabled })
-}
-
-func WithDirectIOWrite(enabled bool) Option {
-	return funcOpt(func(c *config) { c.IO.DirectIOWrite = enabled })
-}
-
-// WithDirectIORead enables O_DIRECT (Linux) or F_NOCACHE (Darwin) for segment reads.
-// Bypasses kernel page cache, which can reduce tail latency under heavy write I/O pressure.
-// Default: false (leverage kernel page cache for reads).
-func WithDirectIORead(enabled bool) Option {
-	return funcOpt(func(c *config) { c.IO.DirectIORead = enabled })
-}
-
-// WithReadConcurrency limits the number of goroutines that can simultaneously
-// block in pread.  Excess callers block on a Go channel (no OS thread consumed)
-// rather than in a syscall, preventing thread explosion under high cold-read
-// concurrency.  See DESIGN.md §11.6.
-//
-// Recommended: runtime.GOMAXPROCS(0)*2 when using PreadScheduler.
-// Not needed with URingScheduler (its coordinator already bounds OS threads to 1).
-func WithReadConcurrency(n int) Option {
-	return funcOpt(func(c *config) { c.MaxReadConcurrency = n })
-}
-
-// WithCompression enables compression with the specified codec.
-// Compression is performed in the calling goroutine during Put() to distribute
-// CPU load and prevent flush workers from becoming bottlenecks.
-func WithCompression(codec compression.Codex) Option {
-	return funcOpt(func(c *config) { c.Compression.Codec = codec })
-}
-
-// WithCompressionLevel sets the compression level.
-func WithCompressionLevel(level compression.Level) Option {
-	return funcOpt(func(c *config) { c.Compression.Level = level })
-}
-
-// WithCompressionMinSize sets the minimum blob size for compression.
-// Blobs smaller than this are stored uncompressed.
-func WithCompressionMinSize(size int64) Option {
-	return funcOpt(func(c *config) { c.Compression.MinSize = size })
-}
-
-// WithTestingKnobs configures testing hooks for error injection and behavior overrides.
-func WithTestingKnobs(knobs *TestingKnobs) Option {
-	return funcOpt(func(c *config) { c.knobs = knobs })
-}
-
-// WithWAL enables the write-ahead log for durability.
-// When enabled, all writes are logged to WAL before being acknowledged.
-// This transforms blobcache from an ephemeral cache into durable storage.
-func WithWAL() Option {
-	return funcOpt(func(c *config) {
-		c.WAL.Enabled = true
-		c.IO.FDataSync = true // If using wal, not using data sync is lying to yourself.
-		c.TrustHash = false   // CAS mode: verify keys to detect hash collisions.
-	})
-}
-
-// WithWALFlags sets the file flags for WAL writes.
-// FlDirectIO: bypass OS page cache (default: enabled)
-// FlDSync: fdatasync after writes (default: enabled)
-// FlSync: full fsync after writes
-// Use sys.SyncNone (0) for testing only.
-func WithWALFlags(flags sys.OpenFlag) Option {
-	return funcOpt(func(c *config) { c.WAL.Flags = flags })
-}
-
-// WithDegradedMode controls how the cache handles degraded mode.
-// DegradedMemoryOnly (default): continues operating as memory-only cache
-// DegradedPanic: panics with stack trace (use for debugging/benchmarking)
-func WithDegradedMode(mode DegradedMode) Option {
-	return funcOpt(func(c *config) { c.DegradedMode = mode })
-}
-
-// WithTrustHash controls whether to skip key verification on reads.
-// When true, the cache trusts hash collisions are rare enough that verifying
-// the stored key matches the requested key is unnecessary.
-// Default: true for cache mode, false for CAS mode (WAL enabled).
-// Cache mode: hash collision = wrong data served (acceptable for cache)
-// CAS mode: hash collision = data corruption (must verify)
-func WithTrustHash(enabled bool) Option {
-	return funcOpt(func(c *config) { c.TrustHash = enabled })
-}
-
-// WithBallast sets the heap ballast size in bytes.
-// By default, the cache allocates a 1GB ballast at startup.
-// This keeps the heap larger so GC triggers less frequently, reducing GC overhead.
-// Use WithBallast(0) to disable, or WithBallast(10<<30) for 10GB, etc.
-func WithBallast(size int) Option {
-	return funcOpt(func(c *config) { c.BallastSize = max(0, size) })
-}
-
-// WithCompactionWasteThreshold sets the waste ratio that triggers segment rewrite
-// in WAL mode. When a segment's tombstone ratio exceeds this threshold, it becomes
-// a candidate for compaction. Default: 0.25 (25%).
-func WithCompactionWasteThreshold(ratio float64) Option {
-	return funcOpt(func(c *config) { c.CompactionWasteThreshold = ratio })
-}
-
-// WithIOScheduler sets the I/O backend used for segment reads.
-// Default: direct POSIX pread. Use [iosched.NewDefaultIO] to get
-// io_uring on Linux or [iosched.NewBlockingIO]([iosched.NewURingScheduler])
-// for explicit control.
-func WithIOScheduler(sched *iosched.BlockingIO) Option {
-	return funcOpt(func(c *config) { c.IOScheduler = sched })
-}
-
-// WithReadCacheSlabs enables the optional second-tier read cache for disk-resident
-// blobs. The primary read path (Librarian) handles recently written data with
-// zero-copy sub-microsecond latency; this cache is only useful for temporally
-// distant reads or when the kernel page cache is under external pressure.
-// Each arena is ReadCacheSlabSize bytes. Total memory = n * slabSize.
-// Default: 0 (disabled — Librarian + kernel page cache is sufficient for most workloads).
-func WithReadCacheSlabs(n int) Option {
-	return funcOpt(func(c *config) { c.ReadCacheSlabs = n })
-}
-
-// WithReadCacheSlabSize sets the size of each read cache slab.
-// Default: same as WriteBufferSize.
-func WithReadCacheSlabSize(size int64) Option {
-	return funcOpt(func(c *config) { c.ReadCacheSlabSize = size })
-}
-
-// WithReadCacheMaxItemSize sets the maximum item size eligible for caching.
-// Items larger than this bypass the read cache and are served directly from disk.
-// This prevents large items from rapidly filling slabs and evicting many smaller items.
-// Default: slabSize/64 (ensuring at least 64 items per slab).
-// Use -1 to disable the limit (cache all items regardless of size).
-func WithReadCacheMaxItemSize(size int64) Option {
-	return funcOpt(func(c *config) { c.ReadCacheMaxItemSize = size })
-}
-
-func defaultConfig(path string) config {
-	return config{
-		Path:                     path,
-		MaxSize:                  0,
-		Shards:                   0,        // 0 = auto-computed from MaxSize/WriteBufferSize
-		WriteBufferSize:          64 << 20, // 64MB
-		MaxInflightSlabs:         6,
-		MaxCachedSlabs:           8, // Keep ~1GB of recently written data in RAM
-		FlushConcurrency:         2,
-		BloomFPRate:              0.01,
-		BloomEstimatedKeys:       1_000_000,
-		DegradedMode:             DegradedMemoryOnly,
-		TrustHash:                true,    // Cache mode: trust hash, skip key verification
-		BallastSize:              1 << 30, // 1GB heap ballast to reduce GC frequency
-		CompactionWasteThreshold: 0.25,    // 25% waste triggers segment rewrite
-		IO: IOConfig{
-			FDataSync:     false,
-			Fadvise:       sys.UseFadvise,
-			DirectIOWrite: true,
-		},
-
-		Compression: CompressionConfig{
-			Codec:   compression.CodexNone, // Disabled by default
-			Level:   compression.CompressionDefault,
-			MinSize: 512, // Don't compress small blobs
-		},
-		WAL: WALConfig{
-			Enabled: false,
-			Config:  wal.Config{Flags: sys.FlDirectIO | sys.SyncData},
-		},
-	}
-}
+// WithMaxReadHandles bounds cached segment descriptors. Default: 4096.
+func WithMaxReadHandles(n int) Option { return storeOpt(blobstore.WithMaxReadHandles(n)) }

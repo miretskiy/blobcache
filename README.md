@@ -80,8 +80,9 @@ Delete API.
   capacity cannot currently accommodate the request. Calls do not wait for
   those resources. A caller may retry or treat the cache as unavailable.
 - `ErrNotFound` covers absent keys, evicted files, and records rejected by read
-  verification. Value checksum failures also carry a checksum error. Failed
-  writes are logged and counted; valid memory values remain usable while cached.
+  verification. Value checksum failures also carry a `*blobstore.ChecksumError`
+  with the expected and actual CRC. Failed writes are logged and counted; valid
+  memory values remain usable while cached.
 - `Ticket.Wait` reports write completion. `Drain` waits for writes accepted before
   its barrier; neither promises crash durability for a still-open segment.
 - `Close` waits for accepted writes and seals partial segments. It must not race

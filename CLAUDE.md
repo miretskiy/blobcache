@@ -302,8 +302,7 @@ blobcache/
 │   ├── scheduler_*.go #  io_uring on Linux, POSIX elsewhere
 │   ├── format.go    #   Record framing and trailer, RecordSize, segment footer
 │   └── options.go   #   Configuration
-├── internal/xmap/   # Sharded map used by the index
-├── base/            # Error types
+└── internal/xmap/   # Sharded map used by the index
 ```
 
 ## Common Gotchas and Best Practices

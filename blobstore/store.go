@@ -54,7 +54,7 @@ var (
 	ErrNotFound = errors.New("blobstore: no such record")
 	// ErrCorrupt is returned by Read for a record that fails verification: its
 	// trailer, its key, or its value, in which case the
-	// error is also a *base.ChecksumError.
+	// error is also a *ChecksumError.
 	ErrCorrupt = errors.New("blobstore: corrupt record")
 )
 

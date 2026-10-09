@@ -8,13 +8,23 @@ import (
 	"math"
 	"os"
 
-	"github.com/miretskiy/blobcache/base"
 	"github.com/miretskiy/dio/v2/align"
 )
 
 // MaxKeyLen is the longest key Write accepts: the record trailer stores the
 // key length in 16 bits.
 const MaxKeyLen = math.MaxUint16
+
+// ChecksumError reports a value CRC mismatch. Read also returns ErrCorrupt
+// through the same error chain.
+type ChecksumError struct {
+	Expected uint32
+	Got      uint32
+}
+
+func (e *ChecksumError) Error() string {
+	return fmt.Sprintf("checksum mismatch: expected %08x, got %08x", e.Expected, e.Got)
+}
 
 // --- Record ---
 //
@@ -79,7 +89,7 @@ func frameRecord(rec, key []byte, t recordTrailer) {
 
 // verifyRecord checks that rec, one whole record, is intact and belongs to
 // key, and returns its value, a prefix of rec. A record that fails any check
-// is ErrCorrupt; a value CRC mismatch is also a *base.ChecksumError.
+// is ErrCorrupt; a value CRC mismatch is also a *ChecksumError.
 func verifyRecord(rec, key []byte) ([]byte, error) {
 	size := len(rec)
 	if size < trailerSize {
@@ -106,7 +116,7 @@ func verifyRecord(rec, key []byte) ([]byte, error) {
 	}
 	want := binary.LittleEndian.Uint32(raw[4:])
 	if got := valueCRC(value); got != want {
-		return nil, errors.Join(ErrCorrupt, &base.ChecksumError{Expected: want, Got: got})
+		return nil, errors.Join(ErrCorrupt, &ChecksumError{Expected: want, Got: got})
 	}
 	return value, nil
 }

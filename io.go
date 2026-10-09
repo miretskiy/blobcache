@@ -105,8 +105,9 @@ func (t Ticket) Wait() error {
 //
 // Get returns ErrNotFound for a key that is absent, whose segment file is
 // gone, or whose record fails verification on disk (dropped from the
-// index; a value checksum failure also carries a *base.ChecksumError). It returns ErrBusy, without waiting, if the value
-// must be read from disk and no memory can be reclaimed for it. It waits for
+// index; a value checksum failure also carries a *blobstore.ChecksumError).
+// It returns ErrBusy, without waiting, if the value must be read from disk
+// and no memory can be reclaimed for it. It waits for
 // the shared read for that blob, without holding an index or allocator lock.
 func (c *Cache) Get(key []byte, fn func(value []byte) error) error {
 	_, err := c.get(key, fn)

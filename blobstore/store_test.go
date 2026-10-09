@@ -13,7 +13,6 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/miretskiy/blobcache/base"
 	"github.com/miretskiy/dio/v2/align"
 	"github.com/miretskiy/dio/v2/iosched"
 	"github.com/stretchr/testify/assert"
@@ -331,7 +330,7 @@ func TestCorruptionIsDetected(t *testing.T) {
 	defer func() { require.NoError(t, st.Close()) }()
 	_, err := read(t, st, valueLoc, "value-corrupt")
 	require.ErrorIs(t, err, ErrCorrupt)
-	var ce *base.ChecksumError
+	var ce *ChecksumError
 	require.ErrorAs(t, err, &ce)
 	_, err = read(t, st, trailerLoc, "trailer-corrupt")
 	require.ErrorIs(t, err, ErrCorrupt)

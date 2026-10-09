@@ -14,7 +14,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/miretskiy/blobcache/base"
 	"github.com/miretskiy/blobcache/blobstore"
 	"github.com/miretskiy/blobcache/internal/xmap"
 	"github.com/miretskiy/dio/v2/align"
@@ -426,7 +425,7 @@ func TestCorruptionIsDetected(t *testing.T) {
 	c = openCache(t, dir)
 	defer closeCache(t, c)
 	err := c.Get([]byte("value-corrupt"), func([]byte) error { return nil })
-	var ce *base.ChecksumError
+	var ce *blobstore.ChecksumError
 	require.ErrorAs(t, err, &ce)
 	requireMissing(t, c, "value-corrupt") // the entry was dropped
 

@@ -46,6 +46,15 @@ class. WithIOBudget sets the per-class modeled device-time allowance (default
 1.5 ms); zero disables budgets without changing ring capacity or file ordering.
 The read-handle limit is total, not per ring.
 
+Keep one shared ring as the default for the mixed blob-cache workload. The
+measured read/write ring split did not improve throughput and fragmented read
+admission, worsening tails; one read plus one write ring matched the shared
+ring's read latency. Preserve DIO affinity and independent schedulers for
+isolation between distinct workloads, rather than treating read/write splitting
+as a demonstrated optimization. See docs/io-rings.md for measurements and
+unresolved attribution. Scheduler wait, kernel handoff-to-CQE latency, and
+end-to-end latency are distinct; do not label Get latency as io_uring clat.
+
 Each producer's active mutex orders reserve, rotation and Submit. The last write
 **decides and submits its seal under that mutex**: last write, immutable footer,
 fdatasync, slot close, directory fsync. Hard links attempt every seal/cleanup

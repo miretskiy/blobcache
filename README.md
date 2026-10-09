@@ -175,6 +175,19 @@ and file ordering still apply. This is not an application latency guarantee;
 an idle class can admit one oversized operation. Shares are static, so skew and
 large requests can make multi-ring behavior differ from one shared budget.
 
+Use one shared ring for the mixed blob-cache workload. On the m7gd instance
+store, splitting reads and writes across more rings did not improve throughput
+and usually worsened read tails. One read ring plus one write ring matched the
+single ring's read latency; additional read rings fragmented admission capacity.
+See the [ring, budget, and affinity measurements](docs/io-rings.md) for results,
+separate scheduler-wait and completion timings, and the limits of that conclusion.
+
+Keep multiple schedulers and CPU affinity available for workload isolation.
+Routing distinct workloads to their own schedulers is a different use case from
+splitting one workload's reads and writes. It can separate admission queues and
+coordinator work, but shared device bandwidth still needs to be accounted for.
+The current `Store` routes by key and segment; it has no workload-routing API.
+
 ## Configuration
 
 | Option | Default | Meaning |

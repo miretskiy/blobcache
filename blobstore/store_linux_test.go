@@ -17,7 +17,7 @@ import (
 func TestUsesIOUring(t *testing.T) {
 	st := openStore(t, t.TempDir(), recorder{})
 	defer func() { require.NoError(t, st.Close()) }()
-	require.IsType(t, &iosched.URingScheduler{}, st.sched)
+	require.IsType(t, &iosched.URingScheduler{}, st.queues[0].sched)
 }
 
 // A pending replacement already queued the old descriptor's close. Eviction
@@ -44,9 +44,9 @@ func TestRetirementDoesNotWaitForPendingReplacement(t *testing.T) {
 	readDone := make(chan error, 1)
 	go func() { _, err := read(t, st, next, "next"); readDone <- err }()
 	require.Eventually(t, func() bool {
-		st.reads.mu.Lock()
-		defer st.reads.mu.Unlock()
-		return st.reads.byID[next.segment] != nil
+		st.readers[0].reads.mu.Lock()
+		defer st.readers[0].reads.mu.Unlock()
+		return st.readers[0].reads.byID[next.segment] != nil
 	}, 5*time.Second, time.Millisecond)
 	retired := make(chan struct{})
 	go func() { st.retireReads(old.segment + 1); close(retired) }()
@@ -80,9 +80,9 @@ func TestRetirementClosesPendingOpenWithoutWaiting(t *testing.T) {
 	readDone := make(chan error, 1)
 	go func() { _, err := read(t, st, loc, "key"); readDone <- err }()
 	require.Eventually(t, func() bool {
-		st.reads.mu.Lock()
-		defer st.reads.mu.Unlock()
-		return st.reads.byID[loc.segment] != nil
+		st.readers[0].reads.mu.Lock()
+		defer st.readers[0].reads.mu.Unlock()
+		return st.readers[0].reads.byID[loc.segment] != nil
 	}, 5*time.Second, time.Millisecond)
 	retired := make(chan struct{})
 	go func() { st.retireReads(loc.segment + 1); close(retired) }()
@@ -93,16 +93,16 @@ func TestRetirementClosesPendingOpenWithoutWaiting(t *testing.T) {
 	}
 	release()
 	require.NoError(t, <-readDone)
-	st.reads.mu.Lock()
-	slot := st.reads.slots[0]
-	_, mapped := st.reads.byID[loc.segment]
-	st.reads.mu.Unlock()
+	st.readers[0].reads.mu.Lock()
+	slot := st.readers[0].reads.slots[0]
+	_, mapped := st.readers[0].reads.byID[loc.segment]
+	st.readers[0].reads.mu.Unlock()
 	require.True(t, slot.closing)
 	require.False(t, mapped)
 	_, err := slot.opening.Wait()
 	require.NoError(t, err)
 	// The initial reader submitted a close; no descriptor is retained forever.
-	ticket, err := st.sched.Submit(iosched.VReadOp(slot.vfd, make([]byte, 4096), 0))
+	ticket, err := st.queues[0].sched.Submit(iosched.VReadOp(slot.vfd, make([]byte, 4096), 0))
 	require.NoError(t, err)
 	_, err = ticket.Wait()
 	require.ErrorIs(t, err, unix.EBADF)

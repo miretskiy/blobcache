@@ -13,11 +13,12 @@ type Key = blobstore.KeyHash
 // item locates a value on disk, in a pinned memory block, or both. The slice
 // may only be used after pinning its block; eviction clears it before reuse.
 type item struct {
-	mem memoryValue
-	loc blobstore.Location
+	mem     memoryValue
+	loc     blobstore.Location
+	pending bool // disk I/O is still using the write buffer
 }
 
-func (it item) onDisk() bool { return it.loc != blobstore.Location{} }
+func (it item) onDisk() bool { return !it.pending && it.loc != (blobstore.Location{}) }
 
 // index maps key hashes to items: a 256-way sharded hash table.
 type index struct {
@@ -53,32 +54,31 @@ func (x *index) loaded(h Key, loc blobstore.Location) {
 	s.Unlock()
 }
 
-// put installs a value written by Put, in memory at mem and not yet on disk.
-// It supersedes whatever the index held for h. Of two concurrent Puts of one
-// key the later to install wins in memory; after a restart the later Location
-// wins. Keys name immutable content, so both hold the same value.
-func (x *index) put(h Key, mem memoryValue) {
+// put publishes the reserved disk location immediately. It is a candidate
+// for verified reads after completion. Eviction can clear memory immediately;
+// until the write completes such an entry is a miss, not readable disk data.
+func (x *index) put(h Key, mem memoryValue, loc blobstore.Location) {
 	s := x.m.Shard(h)
 	s.Lock()
-	s.Items[h] = item{mem: mem}
+	if loc.Segment() >= s.Extra.before {
+		if mem.block.refs.Load() < 0 {
+			mem = memoryValue{}
+		}
+		s.Items[h] = item{mem: mem, loc: loc, pending: true}
+	}
 	s.Unlock()
 }
 
-// landed adds loc to the value Put installed at mem, unless a later Put has
-// superseded it.
-func (x *index) landed(h Key, mem memoryValue, loc blobstore.Location) bool {
+// completed makes the disk candidate readable, conditionally on location.
+// Eviction and newer writes cannot be undone by a delayed completion.
+func (x *index) completed(h Key, loc blobstore.Location) {
 	s := x.m.Shard(h)
 	s.Lock()
-	defer s.Unlock()
-	if loc.Segment() < s.Extra.before {
-		return false
-	}
-	if it, ok := s.Items[h]; ok && it.mem.same(mem) && !it.onDisk() {
-		it.loc = loc
+	if it, ok := s.Items[h]; ok && it.loc == loc {
+		it.pending = false
 		s.Items[h] = it
-		return true
 	}
-	return false
+	s.Unlock()
 }
 
 // evictMemory clears references to an entire batch of retired memory blocks.
@@ -107,12 +107,8 @@ func (x *index) evictMemory(blocks []*memoryBlock) {
 			if !ok || it.mem.block != entry.block {
 				continue
 			}
-			if it.onDisk() {
-				it.mem = memoryValue{}
-				shard.Items[entry.key] = it
-			} else {
-				delete(shard.Items, entry.key)
-			}
+			it.mem = memoryValue{}
+			shard.Items[entry.key] = it
 		}
 		shard.Unlock()
 	}
@@ -123,7 +119,7 @@ func (x *index) evictMemory(blocks []*memoryBlock) {
 func (x *index) cache(h Key, loc blobstore.Location, mem memoryValue) {
 	s := x.m.Shard(h)
 	s.Lock()
-	if it, ok := s.Items[h]; ok && it.loc == loc {
+	if it, ok := s.Items[h]; ok && it.loc == loc && mem.block.refs.Load() > 0 {
 		it.mem = mem
 		s.Items[h] = it
 	}
@@ -162,7 +158,7 @@ func (x *index) evicted(segments blobstore.Eviction) {
 			}
 			shard.Extra.before = before
 			for h, it := range shard.Items {
-				if it.onDisk() && it.loc.Segment() < before {
+				if it.loc.Segment() < before {
 					delete(shard.Items, h)
 				}
 			}

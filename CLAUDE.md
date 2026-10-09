@@ -13,9 +13,11 @@ never unverified data. The two layers have distinct ownership:
 - `blobcache`: a sharded key index and lazy, bounded mmap chunks divided into
   memory blocks. Alloc bumps contiguous page-aligned records into an active
   block; Put transfers its pin to the write, and Get pins a block during its
-  immutable-value callback. Full blocks are reclaimed oldest first, skipping
-  pinned blocks. One atomic reference count per block includes the cache's
-  reference; eviction CASes 1 to 0. Descriptors are never reused. Per-block key
+  immutable-value callback. Full blocks are evicted oldest first regardless of
+  pins. One atomic reference count per block includes the cache's reference;
+  eviction sets its sign bit to refuse new pins. Index cleanup drops the cache
+  reference; the last outstanding pin releases storage synchronously. No
+  repeated search for unpinned victims. Descriptors are never reused. Per-block key
   lists drive conditional index cleanup, grouped by shard outside allocator
   locks, before storage reuse. No payload copies or memory eviction worker.
   Oversized records use dedicated mappings under the same budget. Empty backing
@@ -31,7 +33,20 @@ metadata CRC32C and a mandatory value CRC32C. The initial format uses uint64 seg
 32-byte footer tails. This system has not shipped; do not maintain compatibility
 with discarded development layouts.
 
-The activeSegment mutex orders reserve, rotation and Submit. The last write
+Store owns routing and one global segment registry. Each ioQueue owns one
+scheduler, local virtual slots, an append stream and/or read-handle cache.
+WithRings defaults to 1; WithDedicatedWriteRings reserves write queues, leaving
+the rest for reads. Keys route to writers; segment IDs route to readers. Queue
+roles are fixed while open and are not persisted. Linux coordinators use dedicated
+OS threads and request affinity to distinct allowed CPUs; failures are logged
+and DIO continues without the requested affinity. DIO remains one ring per scheduler. No global
+dispatcher, fd hashing, descriptor migration or cross-ring chain execution.
+Read/write budget shares are static, split by the number of queues serving each
+class. WithIOBudget sets the per-class modeled device-time allowance (default
+1.5 ms); zero disables budgets without changing ring capacity or file ordering.
+The read-handle limit is total, not per ring.
+
+Each producer's active mutex orders reserve, rotation and Submit. The last write
 **decides and submits its seal under that mutex**: last write, immutable footer,
 fdatasync, slot close, directory fsync. Hard links attempt every seal/cleanup
 operation even after errors. The next segment opens independently in another
@@ -44,11 +59,16 @@ before releasing its slot. Close owns cleanup if the scheduler rejects that too.
 The seal completion callback records an error metric, marks completion and
 releases the slot. It takes no locks and performs
 no filesystem work. Value write tickets are consumed by blobcache's completer.
-A failed write leaves its valid memory value usable. Block eviction deletes
-memory-only entries and clears memory slices of entries that also have a disk
-location, conditionally on the index still referring to that block.
+A failed write leaves its valid memory value usable. Put publishes the reserved
+Location immediately, with a pending bit until I/O completes. Memory eviction
+clears slices immediately; pending records become misses until the completer
+marks their locations readable. Failed records still require read verification.
+Block eviction clears memory slices conditionally on block identity. Late
+publications cannot restore retired memory or an evicted disk location. The
+completer records errors, clears pending only for the same location, and releases
+write pins. Put retains caller ownership on ErrBusy, so retries reuse the buffer.
 
-The read handle cache has exactly WithMaxReadHandles slots, a map and CLOCK.
+Read queues divide exactly WithMaxReadHandles slots; each has a map and CLOCK.
 Lookup, open-with-initial-read, subsequent reads and replacement submissions
 all occur under its mutex. dio orders execution after earlier opens and before
 replacement closes. Waiting and verification occur outside the mutex. No spare
@@ -60,10 +80,13 @@ waiting. A pending initial open is closed by its reader; a pending replacement
 already queued its old descriptor's close. CLOCK reuses closing slots after
 their tickets complete.
 
-WithMaxSize enables FIFO batch eviction; zero keeps disk usage unbounded.
-Rotation/allocation selects oldest completed segments under activeSegment's
-mutex and immediately removes them from the retained-segment budget. After
-releasing that mutex, the caller submits best-effort unlinks through dio and
+WithMaxSegments or WithMaxSize enables FIFO batch eviction; choose one.
+The global registry receives producer creation/growth under its mutex and seal
+completion through an atomic flag. No lifecycle channel or worker. Its mutex
+protects IDs and disk reservations, and ordinary appends do not take it.
+Creation/growth selects completed prefixes and immediately releases their
+logical reservations. After releasing store locks, the caller retires read
+handles, submits best-effort unlinks through write-capable queues, and
 notifies the index without waiting for I/O. No eviction goroutine, evicting
 flag, retry queue, worker loop, ticker or lifecycle channels. The open WaitGroup joins writes only.
 Compact the segment slice in place with slices.Delete, preserving capacity and clearing retired pointers.
@@ -71,14 +94,19 @@ Compact the segment slice in place with slices.Delete, preserving capacity and c
 Keep one segment of headroom; eviction targets 80% usage or two segments of
 headroom, whichever leaves more room. Normally remove at least two segments;
 a single completed victim may be necessary to admit a blocked reservation.
-Never skip a segment still being written. DiskBytes counts retained segments
+Never skip a segment still being written. If a failed reservation is blocked
+by a quiet producer's active segment, release all locks and ask that producer
+to seal it; return ErrBusy while I/O finishes. Acquire at most one producer
+lock at a time, and never acquire one under the registry lock. Two segment
+allocations per producer are the minimum bounded budget.
+DiskBytes counts retained segments
 and reservations; pending/failed unlinks can make physical usage larger.
 
 Eviction is a slice of segment IDs. The callback owns it and is invoked on the
 caller's goroutine outside store locks; callers may schedule work elsewhere.
 Concurrent notifications may arrive out of order. The index callback starts
 its own goroutine and sweeps each shard once, deleting the retired prefix.
-The existing shard lock protects a monotonic boundary that rejects delayed write completions. Blobstore does
+The existing shard lock protects a monotonic boundary that rejects delayed write publications. Blobstore does
 not reread footers or know the index's shard layout. Its read cache protects
 its boundary under its existing mutex to prevent reopening retired handles.
 Recovery runs before writes; Close must not race public calls. Eviction
@@ -156,7 +184,7 @@ This is the **most critical benchmark** for validating system behavior under rea
 **What it does:**
 - Each benchmark iteration (`-benchtime=XXXx`) represents **one write** of 100 KB–2 MB (~1 MB average)
 - Interspersed with each write are reads: 30% writes, 30% hot reads (Zipfian, s=1.1, over the newest keys), 30% cold reads (4 consecutive keys), 10% misses; `BLOBCACHE_WRITE_PERCENT=w` changes the write share
-- Writes download into cache memory like a caller would: `Alloc`, copy test data in (standing in for the download), `Put`; on `ErrBusy` writers back off briefly and retry (reported as busy writes). Reads lend the value to a callback that only measures it. `Drain` runs inside the timed region
+- Writes download into cache memory like a caller would: `Alloc`, copy test data in (standing in for the download), `Put`; on `ErrBusy` writers keep the buffer, wait for that worker's previous write ticket, and retry (allocation and Put busy counts are separate). Reads lend the value to a callback that only measures it. `Drain` runs inside the timed region
 - Every read's latency is recorded by where it was served: memory (`GET-memory`), disk (`GET-disk`), or a miss (`GET-miss`)
 - `BLOBCACHE_CACHE_MEMORY_MB=m` sets the cache memory (default 1024); `BLOBCACHE_NO_MEMORY_HITS=1` serves every read from disk with the same code (the disk-only comparison)
 - Reads use O_DIRECT; `BLOBCACHE_BUFFERED_READS=1` switches them to the page cache; `BLOBCACHE_PARALLELISM=p` runs p workers per CPU (Get is synchronous, so workers bound the reads in flight)
@@ -195,18 +223,18 @@ iostat -x 5
 vmstat 5
 ```
 
-**iostat expectations:**
-- `%util` column: Should be consistently 95-100% (saturated NVMe)
+**iostat observations:**
+- `%util` column: Time with outstanding work; interpret alongside throughput and queue depth, not as proof of an NVMe device's bandwidth ceiling.
 - `r/s` + `w/s`: Total IOPS (operations per second)
 - `rkB/s` + `wkB/s`: Actual hardware throughput
 - `await`: Average I/O wait time (should be consistent, not spiking)
 
-**vmstat expectations (Direct I/O writes, buffered reads):**
-- `b` column (blocked processes): **Should be 0** - no kernel blocking with Direct I/O writes
-  - If `b > 0` (e.g., 7-22): System hitting dirty page limits, thrashing
-- `cs` column (context switches): 7k-15k/sec is normal, 40k+ indicates thrashing
-- `free` column: Memory may decrease as kernel builds page cache for reads (this is expected and beneficial)
-- `si`/`so` columns (swap): Should be 0 (no swap activity)
+**vmstat and thread observations:**
+- `b` can include kernel I/O workers even with O_DIRECT; it does not by itself identify dirty-page throttling.
+- Compare context switches with throughput and CPU cost; no fixed count diagnoses thrashing.
+- Check RSS against the configured memory budget plus metadata; buffered reads also consume page cache.
+- Check `si`/`so` for swapping.
+- Use Go schedtrace for runtime thread counts and `/proc/PID/task` to identify kernel `iou-*` workers separately. Pinned coordinators own threads, not entire CPU cores.
 
 **Benchmark heartbeat output:**
 - `MEM`: RSS and writes in flight (RSS should stay near the workers' buffers + index)
@@ -245,7 +273,7 @@ reopen. Corruption tests flip bytes in segment files.
 2. **Round trips and persistence**: sizes across page boundaries, reopen across segments, overwrite
 3. **Eviction**: byte bounds, FIFO callbacks, retired descriptors, corrupt footers, unlink failures and delayed index publication
 4. **Crash and failure**: an unsealed segment is discarded on reload, sealed ones survive; a segment's file is created by its first write, so a store closed unwritten leaves none; a failed record does not poison successful peers; missing/corrupt records are rejected on read
-5. **Memory**: a value is served from memory once Put returns; reads from disk are kept; memory is reclaimed oldest first and never while pinned (`ErrBusy`); Alloc/Put/Free each hand memory back once and refuse foreign memory; Close reports memory still held
+5. **Memory**: a value is served from memory once Put returns; reads from disk are kept; memory is evicted oldest first, immediately refusing new pins; physical reuse waits for existing pins (`ErrBusy` when capacity remains held); Alloc/Put/Free each hand memory back once and refuse foreign memory; Close reports memory still held
 6. **Corruption**: value checksum and trailer failures become misses
 7. **Concurrency**: mixed workload with rotation under `-race`
 
@@ -266,7 +294,8 @@ blobcache/
 ├── index.go         # Sharded index (key hash → memory and/or Location)
 ├── options.go       # Configuration (store options pass through)
 ├── blobstore/       # Pure I/O layer
-│   ├── store.go     #   Store, Open (marker)/ReadIndex/Close, Write, Location, activeSegment, rotation and sealing
+│   ├── store.go     #   Common Store, Open/ReadIndex/Close, routing and Location
+│   ├── io.go        #   Per-ring scheduler, append stream, rotation and sealing
 │   ├── segment.go   #   Segment paths and lifecycle metadata
 │   ├── read.go      #   Fixed-slot descriptor cache and ordered read submissions
 │   ├── eviction.go  #   FIFO disk budget and segment-level callbacks
@@ -280,10 +309,11 @@ blobcache/
 ## Common Gotchas and Best Practices
 
 1. **Memory has one owner at a time.** Memory from Alloc is the caller's
-   until Put or Free takes it back; after that the caller must not touch it.
+   until Put or Free takes it back; Put returning ErrBusy leaves it with the caller.
+   After a transfer the caller must not touch it.
    A value lent by Get is valid only inside the callback. Every pin taken
    (Alloc, a write in flight, a Get) must be released, or its block cannot be
-   reclaimed. Other unpinned blocks remain eligible. Put rejects insufficient
+   physically reclaimed. Retired blocks cannot acquire new pins. Put rejects insufficient
    framing space rather than copying into blobstore-owned memory.
 2. **Never block while holding the active segment's lock** (reservation and submission) or in a
    completion function (they run on the io_uring coordinator), and never make

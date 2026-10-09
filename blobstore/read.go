@@ -33,10 +33,10 @@ type readSlot struct {
 	opening    iosched.Ticket // zero for an empty slot; otherwise its last open chain
 }
 
-func newReadSlots(n int) *readSlots {
+func newReadSlots(n int, first uint32) *readSlots {
 	r := &readSlots{byID: make(map[uint64]*readSlot), slots: make([]readSlot, n)}
 	for i := range r.slots {
-		r.slots[i].vfd = writeSlots + uint32(i)
+		r.slots[i].vfd = first + uint32(i)
 	}
 	return r
 }
@@ -94,7 +94,8 @@ func (st *Store) Read(loc Location, key, buf []byte) ([]byte, error) {
 	// Erasing the trailer ensures a short read cannot validate stale buffer
 	// contents, even when the buffer previously held this same record.
 	clear(rec[size-trailerSize:])
-	r := st.reads
+	q := st.readers[loc.segment%uint64(len(st.readers))]
+	r := q.reads
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()
@@ -125,7 +126,7 @@ func (st *Store) Read(loc Location, key, buf []byte) ([]byte, error) {
 	} else {
 		op = iosched.VReadOp(slot.vfd, rec, int64(loc.offset))
 	}
-	ticket, err := st.submit(op, nil)
+	ticket, err := q.submit(op, nil)
 	if err != nil {
 		r.mu.Unlock()
 		return nil, err
@@ -148,7 +149,7 @@ func (st *Store) Read(loc Location, key, buf []byte) ([]byte, error) {
 			}
 			// Retirement may have skipped this unfinished opening chain.
 			if slot.id < r.before {
-				st.closeReadSlot(slot)
+				q.closeReadSlot(slot)
 			}
 		}
 		r.mu.Unlock()
@@ -166,34 +167,36 @@ func (st *Store) Read(loc Location, key, buf []byte) ([]byte, error) {
 // waiting. An unfinished open is closed by its reader after the initial chain
 // completes. A pending replacement already has its old descriptor's close queued.
 func (st *Store) retireReads(before uint64) {
-	r := st.reads
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.before = max(r.before, before)
-	for i := range r.slots {
-		s := &r.slots[i]
-		if s.id < before && ticketReady(s.opening) {
-			st.closeReadSlot(s)
+	for _, q := range st.readers {
+		r := q.reads
+		r.mu.Lock()
+		r.before = max(r.before, before)
+		for i := range r.slots {
+			s := &r.slots[i]
+			if s.id < r.before && ticketReady(s.opening) {
+				q.closeReadSlot(s)
+			}
 		}
+		r.mu.Unlock()
 	}
 }
 
 // closeReadSlot is called under the read mutex, after the opening chain finishes.
 // dio's close barrier drains already-submitted reads. CLOCK reuses the slot once
 // the close ticket completes, so no callback or waiter is needed to clear it.
-func (st *Store) closeReadSlot(s *readSlot) {
+func (q *ioQueue) closeReadSlot(s *readSlot) {
 	if s.opening == (iosched.Ticket{}) || s.closing {
 		return
 	}
-	st.reads.unmap(s)
-	ticket, err := st.submit(iosched.VCloseOp(s.vfd), func(n int, err error) {
+	q.reads.unmap(s)
+	ticket, err := q.submit(iosched.VCloseOp(s.vfd), func(n int, err error) {
 		// Failed opens leave empty slots; closing one is harmless.
 		if !errors.Is(err, syscall.EBADF) {
-			st.evictionResult(n, err)
+			q.store.evictionResult(n, err)
 		}
 	})
 	if err != nil {
-		st.evictionResult(0, err)
+		q.store.evictionResult(0, err)
 		return
 	}
 	s.opening, s.closing, s.referenced = ticket, true, false

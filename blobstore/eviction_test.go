@@ -37,7 +37,7 @@ func writeRetry(t *testing.T, st *Store, key string, value []byte) Location {
 func TestSegmentIDsAboveUint32(t *testing.T) {
 	dir := t.TempDir()
 	st := openStore(t, dir, recorder{})
-	st.activeSegment.nextID = 1<<32 + 7
+	st.segments.nextID = 1<<32 + 7
 	loc := write(t, st, "large-id", []byte("value"))
 	require.Equal(t, uint64(1<<32+7), loc.Segment())
 	require.NoError(t, st.Close())
@@ -57,16 +57,16 @@ func TestFIFOEvictionCallbackAndReadHandles(t *testing.T) {
 	callback := func(e Eviction) {
 		// Calling Stats and taking both mutexes here must be safe.
 		_ = st.Stats()
-		st.activeSegment.Lock()
-		if st.activeSegment.nextID <= slices.Max(e) {
+		st.segments.Lock()
+		if st.segments.nextID <= slices.Max(e) {
 			t.Error("retired an unallocated segment")
 		}
-		st.activeSegment.Unlock()
-		st.reads.mu.Lock()
-		if len(st.reads.byID) > 2 {
+		st.segments.Unlock()
+		st.readers[0].reads.mu.Lock()
+		if len(st.readers[0].reads.byID) > 2 {
 			t.Error("handle limit exceeded")
 		}
-		st.reads.mu.Unlock()
+		st.readers[0].reads.mu.Unlock()
 		events <- e
 	}
 	st = openStore(t, t.TempDir(), recorder{}, WithMaxSize(limit), WithMaxReadHandles(2), WithEvictionCallback(callback))
@@ -84,9 +84,9 @@ func TestFIFOEvictionCallbackAndReadHandles(t *testing.T) {
 	require.NoFileExists(t, segmentPath(st.root, old.Segment()))
 	_, err = read(t, st, old, "old")
 	require.ErrorIs(t, err, ErrNotFound)
-	st.reads.mu.Lock()
-	require.NotContains(t, st.reads.byID, old.Segment())
-	st.reads.mu.Unlock()
+	st.readers[0].reads.mu.Lock()
+	require.NotContains(t, st.readers[0].reads.byID, old.Segment())
+	st.readers[0].reads.mu.Unlock()
 }
 
 func TestEvictionUnreadableFooter(t *testing.T) {
@@ -173,11 +173,11 @@ func TestConcurrentHandleLimit(t *testing.T) {
 				if err != nil && !errors.Is(err, ErrBusy) {
 					t.Error(err)
 				}
-				st.reads.mu.Lock()
-				if len(st.reads.byID) > 1 {
+				st.readers[0].reads.mu.Lock()
+				if len(st.readers[0].reads.byID) > 1 {
 					t.Error("handle limit exceeded")
 				}
-				st.reads.mu.Unlock()
+				st.readers[0].reads.mu.Unlock()
 			}
 		})
 	}
@@ -226,7 +226,7 @@ func TestLastWriteFailureStillWritesFooterAndCloses(t *testing.T) {
 	st := openStore(t, dir, recorder{})
 	first := write(t, st, "first", randomBytes(1, 100<<10))
 	second := write(t, st, "second", randomBytes(2, 100<<10))
-	s := st.activeSegment.seg
+	s := st.writers[0].active.seg
 	off := s.pos
 	size := st.RecordSize(4, 100<<10)
 	entries := append(slices.Clone(s.entries), footerEntry{hash: HashKey([]byte("last")), off: uint32(off), size: uint32(size)})

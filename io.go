@@ -34,7 +34,8 @@ func (c *Cache) Free(buf []byte) error {
 }
 
 // Put stores buf[:n] as the value of key. buf is memory from Alloc, and Put
-// takes it back unless it returns ErrClosed or ErrForeignMemory. After the
+// takes it back unless it returns ErrBusy, ErrClosed or ErrForeignMemory.
+// On ErrBusy the caller may retry with the same buffer, or Free it. After the
 // transfer, the caller must not touch it again.
 // The value stays where it is: Get serves it from that memory at once, while
 // it is written to disk with one O_DIRECT write and for as long as memory
@@ -48,14 +49,14 @@ func (c *Cache) Put(key, buf []byte, n int) (Ticket, error) {
 	if c.closed.Load() {
 		return Ticket{}, ErrClosed
 	}
+	if !c.inflight.reserve() {
+		return Ticket{}, ErrBusy
+	}
 	h := blobstore.HashKey(key)
 	mem, err := c.mem.take(buf, &h) // the caller's pin is now the write's
 	if err != nil {
+		c.inflight.unreserve()
 		return Ticket{}, err
-	}
-	if !c.inflight.reserve() {
-		mem.unpin()
-		return Ticket{}, ErrBusy
 	}
 	// Reject insufficient framing space rather than trigger blobstore's
 	// allocation-and-copy fallback. The cache always writes its own buffer.
@@ -66,14 +67,18 @@ func (c *Cache) Put(key, buf []byte, n int) (Ticket, error) {
 	}
 	ticket, err := c.store.Write(key, buf, n)
 	if err != nil {
-		mem.unpin()
+		if errors.Is(err, ErrBusy) {
+			c.mem.restore(buf, mem)
+		} else {
+			mem.unpin()
+		}
 		c.inflight.unreserve()
 		return Ticket{}, err
 	}
 	mem.data = mem.data[:n:n]
-	c.index.put(h, mem)
-	// The completer adds the Location once the write lands, and then releases
-	// the write's pin.
+	c.index.put(h, mem, ticket.Location())
+	// The completer enables disk reads and releases the I/O pin. Memory
+	// eviction may happen earlier; a pending disk write is then a cache miss.
 	c.inflight.push(pendingWrite{hash: h, mem: mem, ticket: ticket})
 	c.stats.puts.Add(1)
 	return Ticket{ticket}, nil
@@ -154,6 +159,17 @@ func (c *Cache) readDisk(h Key, key []byte, loc blobstore.Location, fn func([]by
 	k := readKey{h, loc}
 	c.reads.Lock()
 	f := c.reads.pending[k]
+	if f != nil {
+		select {
+		case <-f.done:
+			// An old callback may still hold a completed read. Once its block
+			// is retired, new callers must start a fresh disk read.
+			if f.mem.block != nil && f.mem.block.refs.Load() < 0 {
+				f = nil
+			}
+		default: // share the disk I/O that is still in progress
+		}
+	}
 	leader := f == nil
 	if leader {
 		if c.reads.pending == nil {
@@ -167,13 +183,14 @@ func (c *Cache) readDisk(h Key, key []byte, loc blobstore.Location, fn func([]by
 	defer func() {
 		c.reads.Lock()
 		f.users--
-		if f.users == 0 {
+		last := f.users == 0
+		if last && c.reads.pending[k] == f {
 			delete(c.reads.pending, k)
-			if f.mem.block != nil {
-				f.mem.unpin()
-			}
 		}
 		c.reads.Unlock()
+		if last && f.mem.block != nil {
+			f.mem.unpin()
+		}
 	}()
 	if leader {
 		f.mem, f.err = c.load(h, key, loc)

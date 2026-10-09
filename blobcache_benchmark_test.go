@@ -40,10 +40,10 @@ import (
 // prints system and cache metrics every 30 seconds.
 //
 //	go test -bench=BenchmarkBlobCache -benchtime=10000x   # ~10 GB
-//	go test -bench=BenchmarkBlobCache -benchtime=1000000x # ~1 TB (no eviction yet: needs the disk)
+//	go test -bench=BenchmarkBlobCache -benchtime=1000000x # ~1 TB written; use BLOBCACHE_MAX_SEGMENTS
 //
-// Puts are never waited on; the benchmark drains the cache inside the timed
-// region, so the result includes landing every write. Environment:
+// Backpressured writers may wait on a previous ticket. The final drain is
+// timed, so the result includes landing every write. Environment:
 //
 //	BLOBCACHE_BUFFERED_READS=1   read through the page cache instead of O_DIRECT
 //	BLOBCACHE_PARALLELISM=p      run p workers per CPU (default 1). Get is
@@ -52,6 +52,10 @@ import (
 //	                             30); misses stay 10%, hot and cold reads split
 //	                             the rest evenly
 //	BLOBCACHE_CACHE_MEMORY_MB=m  cache memory (default 1024)
+//	BLOBCACHE_RINGS=n            I/O rings (default 1)
+//	BLOBCACHE_WRITE_RINGS=n      dedicated write rings (default 0: shared)
+//	BLOBCACHE_IO_BUDGET=d        per-class budget (default 1.5ms; off disables)
+//	BLOBCACHE_MAX_SEGMENTS=n     retained segment limit (default 0: unlimited)
 //	BLOBCACHE_NO_MEMORY_HITS=1   serve every read from disk, for comparing the
 //	                             memory tier with a disk-only cache
 func BenchmarkBlobCache(b *testing.B) {
@@ -95,11 +99,25 @@ func BenchmarkBlobCache(b *testing.B) {
 	coldReadBound := 100 - missPercent
 	hotReadBound := writeBound + (coldReadBound-writeBound)/2
 	opts := []Option{
+		WithRings(envInt("BLOBCACHE_RINGS", 1)),
+		WithDedicatedWriteRings(envInt("BLOBCACHE_WRITE_RINGS", 0)),
+		WithMaxSegments(envInt("BLOBCACHE_MAX_SEGMENTS", 0)),
 		WithDirectReads(os.Getenv("BLOBCACHE_BUFFERED_READS") != "1"),
 		WithMemory(int64(envInt("BLOBCACHE_CACHE_MEMORY_MB", 1024)) << 20),
 	}
 	if os.Getenv("BLOBCACHE_NO_MEMORY_HITS") == "1" {
 		opts = append(opts, withoutMemoryHits())
+	}
+	if budget := os.Getenv("BLOBCACHE_IO_BUDGET"); budget != "" {
+		var goal time.Duration
+		if budget != "off" {
+			var err error
+			goal, err = time.ParseDuration(budget)
+			if err != nil {
+				b.Fatalf("BLOBCACHE_IO_BUDGET=%q: %v", budget, err)
+			}
+		}
+		opts = append(opts, WithIOBudget(goal))
 	}
 	cache, err := New(dir, opts...)
 	if err != nil {
@@ -115,22 +133,40 @@ func BenchmarkBlobCache(b *testing.B) {
 	if _, err := crand.Read(entropy); err != nil {
 		b.Fatal(err)
 	}
-	var busyWrites, busyReads atomic.Int64
-	// write stores value: Alloc, fill, Put, retrying ErrBusy.
-	write := func(key []byte, value []byte) {
+	var busyAlloc, busyPut, busyReads atomic.Int64
+	// Download once. Busy admission retains this buffer. Wait on this worker's
+	// previous write instead of copying again or serializing all workers on Drain.
+	write := func(key []byte, value []byte, previous Ticket) Ticket {
+		var buf []byte
 		for {
-			buf, err := cache.Alloc(cache.RecordSize(len(key), len(value)))
+			var err error
+			if buf == nil {
+				buf, err = cache.Alloc(cache.RecordSize(len(key), len(value)))
+				if errors.Is(err, ErrBusy) {
+					busyAlloc.Add(1)
+				} else if err == nil {
+					copy(buf, value)
+				}
+			}
 			if err == nil {
-				copy(buf, value)
-				if _, err = cache.Put(key, buf, len(value)); err == nil {
-					return
+				var ticket Ticket
+				ticket, err = cache.Put(key, buf, len(value))
+				if err == nil {
+					return ticket
+				}
+				if errors.Is(err, ErrBusy) {
+					busyPut.Add(1)
 				}
 			}
 			if !errors.Is(err, ErrBusy) {
 				b.Fatal(err)
 			}
-			busyWrites.Add(1)
-			time.Sleep(50 * time.Microsecond)
+			if previous.t.Location().Size() != 0 {
+				if err := previous.Wait(); err != nil {
+					b.Fatal(err)
+				}
+			}
+			time.Sleep(50 * time.Microsecond) // yield for the completer and segment seals
 		}
 	}
 	// readLatency holds one worker's read latencies: every read is recorded,
@@ -179,11 +215,12 @@ func BenchmarkBlobCache(b *testing.B) {
 		getLat                             = newReadLatency()
 	)
 
-	fmt.Printf(">>> Warmup: writing %d 1 MB keys...\n", warmupKeys)
+	fmt.Printf(">>> Warmup %s: writing %d 1 MB keys (N=%d)...\n", time.Now().Format(time.RFC3339Nano), warmupKeys, b.N)
 	warmupStart := time.Now()
 	keyBuf := make([]byte, 0, 32)
+	var previous Ticket
 	for i := range warmupKeys {
-		write(formatKey(keyBuf, "key-", uint64(i)), entropy[:1<<20])
+		previous = write(formatKey(keyBuf, "key-", uint64(i)), entropy[:1<<20], previous)
 	}
 	cache.Drain()
 	warmup := float64(warmupKeys) / (1 << 10) / time.Since(warmupStart).Seconds()
@@ -192,7 +229,7 @@ func BenchmarkBlobCache(b *testing.B) {
 	monitorCtx, stopMonitor := context.WithCancel(context.Background())
 	metrics := startMonitor(monitorCtx, cache, dir, &writeBytes, &readBytes, &reads, &hits)
 
-	fmt.Printf(">>> %d workers\n", parallelism*runtime.GOMAXPROCS(0))
+	fmt.Printf(">>> Measured %s: %d workers, N=%d\n", time.Now().Format(time.RFC3339Nano), parallelism*runtime.GOMAXPROCS(0), b.N)
 	b.SetParallelism(parallelism)
 	b.ResetTimer()
 	start := time.Now()
@@ -201,6 +238,7 @@ func BenchmarkBlobCache(b *testing.B) {
 		rng := rand.New(rand.NewPCG(uint64(time.Now().UnixNano()), uint64(wid)))
 		zipf := rand.NewZipf(rng, 1.1, 1.0, 1<<25)
 		keyBuf := make([]byte, 0, 64)
+		var previous Ticket
 		localPut := hdrhistogram.New(10, 10_000_000_000, 3)
 		localGet := newReadLatency()
 
@@ -214,7 +252,7 @@ func BenchmarkBlobCache(b *testing.B) {
 					key := formatKey(keyBuf, "key-", writeHead.Add(1))
 					size := blobSizeLo + rng.IntN(blobSizeRange)
 					off := rng.IntN(len(entropy) - size)
-					write(key, entropy[off:off+size])
+					previous = write(key, entropy[off:off+size], previous)
 					writeBytes.Add(int64(size))
 					if err := localPut.RecordValue(time.Since(start).Nanoseconds()); err != nil {
 						b.Error(err)
@@ -260,8 +298,13 @@ func BenchmarkBlobCache(b *testing.B) {
 	reportLatency(b, "GET-miss", getLat.miss)
 	reportLatency(b, "PUT", putHist)
 	s := cache.Stats()
-	fmt.Printf("\n--- CACHE ---\n  items: %d | segments: %d | failed: %d | hits: %d | memory hits: %d | misses: %d | corrupt: %d | put errors: %d | busy writes: %d | busy reads: %d\n",
-		s.Items, s.Segments, s.FailedSegments, s.Hits, s.MemoryHits, s.Misses, s.Corrupt, s.PutErrors, busyWrites.Load(), busyReads.Load())
+	fmt.Printf("\n--- CACHE ---\n  items: %d | segments: %d | evicted: %d | eviction errors: %d | retained bytes: %d | failed: %d | hits: %d | memory hits: %d | misses: %d | corrupt: %d | put errors: %d | busy alloc: %d | busy put: %d | busy reads: %d\n",
+		s.Items, s.Segments, s.EvictedSegments, s.EvictionErrors, s.DiskBytes, s.FailedSegments, s.Hits, s.MemoryHits, s.Misses, s.Corrupt, s.PutErrors, busyAlloc.Load(), busyPut.Load(), busyReads.Load())
+	b.ReportMetric(float64(busyAlloc.Load()), "busy-alloc")
+	b.ReportMetric(float64(busyPut.Load()), "busy-put")
+	b.ReportMetric(float64(s.EvictedSegments), "evicted-segments")
+	b.ReportMetric(float64(s.EvictionErrors), "eviction-errors")
+	b.ReportMetric(float64(s.DiskBytes)/(1<<30), "retained-GiB")
 	b.ReportMetric(float64(writeBytes.Load())/(1<<30)/elapsed, "write-GB/s")
 	b.ReportMetric(float64(readBytes.Load())/(1<<30)/elapsed, "read-GB/s")
 	b.ReportMetric(final.physWrite, "phys-write-GB/s")
@@ -319,7 +362,7 @@ func BenchmarkPutGet(b *testing.B) {
 						b.Fatal(err)
 					}
 					if from == "disk" {
-						cache.Drain() // the completer records where the write landed
+						cache.Drain() // release the completed write pin
 					}
 					if err := cache.Get(key, measure); err != nil {
 						b.Fatal(err)
@@ -421,12 +464,12 @@ func startMonitor(
 				"  DISK:  Util: %.1f%% | Phys-Read: %.2f GB/s | Phys-Write: %.2f GB/s | Free: %.1fGB\n"+
 				"  TPUT:  Log-Write: %.2f GB/s | Log-Read: %.2f GB/s\n"+
 				"  READS: %.0f/s | HitRate: %.1f%% | hits: %d | misses: %d\n"+
-				"  CACHE: items: %d | segments: %d | failed: %d\n",
+				"  CACHE: items: %d | segments: %d | evicted: %d | eviction errors: %d | retained: %.2f GiB | failed: %d\n",
 				time.Now().Format("15:04:05"), rss, s.WritesInFlight,
 				util, gb(physRead), gb(physWrite), freeGB,
 				gb(float64(curWrite-prevWrite)), gb(float64(curRead-prevRead)),
 				float64(curReads-prevReads)/interval.Seconds(), hitRate, s.Hits, s.Misses,
-				s.Items, s.Segments, s.FailedSegments)
+				s.Items, s.Segments, s.EvictedSegments, s.EvictionErrors, float64(s.DiskBytes)/(1<<30), s.FailedSegments)
 			prevWrite, prevRead, prevReads, prevHits = curWrite, curRead, curReads, curHits
 		}
 	}()

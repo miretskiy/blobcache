@@ -11,6 +11,9 @@
 /tmp/
 .claude/
 .idea/
+.claude.json
+.codegraph/
+/local/
 librocksdb.a
 
 # Rust build artifacts

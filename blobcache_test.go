@@ -56,11 +56,12 @@ func alloc(t *testing.T, c *Cache, key string, value []byte) []byte {
 }
 
 // put stores value, waits for the write, and waits for the completer to
-// record where it landed.
+// release its memory pin.
 func put(t *testing.T, c *Cache, key string, value []byte) {
 	t.Helper()
+	buf := alloc(t, c, key, value)
 	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(time.Millisecond) {
-		ticket, err := c.Put([]byte(key), alloc(t, c, key, value), len(value))
+		ticket, err := c.Put([]byte(key), buf, len(value))
 		if errors.Is(err, ErrBusy) && time.Now().Before(deadline) {
 			continue
 		}
@@ -412,7 +413,7 @@ func flipByte(t *testing.T, path string, off int64) {
 
 func TestCorruptionIsDetected(t *testing.T) {
 	dir := t.TempDir()
-	c := openCache(t, dir, WithChecksum())
+	c := openCache(t, dir)
 	put(t, c, "value-corrupt", randomBytes(1, 10000))
 	put(t, c, "trailer-corrupt", randomBytes(2, 10000))
 	closeCache(t, c)
@@ -422,7 +423,7 @@ func TestCorruptionIsDetected(t *testing.T) {
 	path, _, end := findRecord(t, dir, "trailer-corrupt", 10000)
 	flipByte(t, path, end-10)
 
-	c = openCache(t, dir, WithChecksum())
+	c = openCache(t, dir)
 	defer closeCache(t, c)
 	err := c.Get([]byte("value-corrupt"), func([]byte) error { return nil })
 	var ce *base.ChecksumError
@@ -474,8 +475,9 @@ func TestDrain(t *testing.T) {
 	for i := range 50 {
 		key := fmt.Sprint(i)
 		value := randomBytes(uint64(i), 30<<10)
+		buf := alloc(t, c, key, value)
 		for {
-			ticket, err := c.Put([]byte(key), alloc(t, c, key, value), len(value))
+			ticket, err := c.Put([]byte(key), buf, len(value))
 			if errors.Is(err, ErrBusy) {
 				runtime.Gosched()
 				continue
@@ -505,7 +507,7 @@ func TestDrain(t *testing.T) {
 // data.
 func TestConcurrentStress(t *testing.T) {
 	dir := t.TempDir()
-	opts := []Option{WithChecksum(), WithMemory(2 << 20)}
+	opts := []Option{WithMemory(2 << 20)}
 	c := openCache(t, dir, opts...)
 	const keys = 200
 	value := func(key string, version uint64, size int) []byte {
@@ -531,6 +533,7 @@ func TestConcurrentStress(t *testing.T) {
 					copy(buf, v)
 					ticket, err := c.Put([]byte(key), buf, len(v))
 					if errors.Is(err, ErrBusy) {
+						require.NoError(t, c.Free(buf))
 						continue
 					}
 					require.NoError(t, err)
@@ -568,8 +571,8 @@ func TestConcurrentStress(t *testing.T) {
 	}
 }
 
-// TestIndexPutLifecycle covers a Put's entry: in memory until its write
-// lands, superseded by a later Put, removed if its write fails.
+// TestIndexPutLifecycle covers immediate publication, conditional memory
+// eviction, and replacement by a later record.
 func TestIndexPutLifecycle(t *testing.T) {
 	locs := locations(t, 3)
 	x := newIndex(0)
@@ -578,24 +581,29 @@ func TestIndexPutLifecycle(t *testing.T) {
 	values := make([]memoryValue, 12)
 	for i := range values {
 		values[i] = memoryValue{block: &memoryBlock{keys: []Key{h}}}
+		values[i].block.refs.Store(1)
 	}
 
-	x.put(h, values[7])
+	x.put(h, values[7], loc)
 	it, _ := x.get(h)
-	require.Equal(t, item{mem: values[7]}, it)
-	x.landed(h, values[7], loc)
-	it, _ = x.get(h)
-	require.Equal(t, item{mem: values[7], loc: loc}, it)
+	require.Equal(t, item{mem: values[7], loc: loc, pending: true}, it)
 
-	x.put(h, values[8]) // overwrite
-	x.put(h, values[9]) // and another, installed later
-	x.landed(h, values[8], locs[1])
+	x.put(h, values[8], locs[1]) // overwrite
+	x.put(h, values[9], locs[2]) // and another, installed later
+	x.completed(h, locs[1])      // an older completion must not finish the new write
 	x.evictMemory([]*memoryBlock{values[8].block})
 	it, _ = x.get(h)
-	require.Equal(t, item{mem: values[9]}, it, "a superseded write changes nothing")
+	require.Equal(t, item{mem: values[9], loc: locs[2], pending: true}, it, "a superseded write changes nothing")
 	x.evictMemory([]*memoryBlock{values[9].block})
-	_, ok := x.get(h)
-	require.False(t, ok, "expired memory without a disk copy leaves nothing")
+	it, ok := x.get(h)
+	require.True(t, ok)
+	require.Equal(t, item{loc: locs[2], pending: true}, it, "memory eviction preserves the disk candidate")
+
+	require.False(t, it.onDisk(), "memory eviction must not expose a pending disk write")
+	x.completed(h, locs[2])
+	it, _ = x.get(h)
+	require.True(t, it.onDisk())
+	require.Nil(t, it.mem.block)
 
 	x.loaded(h, loc)
 	x.cache(h, loc, values[10])
@@ -610,4 +618,31 @@ func TestIndexPutLifecycle(t *testing.T) {
 	x.deleteIfAt(h, loc)
 	_, ok = x.get(h)
 	require.False(t, ok)
+}
+
+// The cache keeps one memory/index layer while the store routes independent
+// write and read streams. Segment retirement must still clear its shared index.
+func TestMultiRingCacheEviction(t *testing.T) {
+	if runtime.NumCPU() < 2 {
+		t.Skip("need two coordinator CPUs")
+	}
+	dir := t.TempDir()
+	c := openCache(t, dir, WithRings(2), WithDedicatedWriteRings(1),
+		WithMaxSegments(3), WithSegmentSize(64<<10), withoutMemoryHits())
+	defer func() { closeCache(t, c) }()
+	value := randomBytes(42, 20<<10)
+	put(t, c, "old", value)
+	for i := 0; i < 30; i++ {
+		key := fmt.Sprintf("key-%d", i)
+		put(t, c, key, value)
+		require.False(t, requireValue(t, c, key, value), "reads must use the dedicated read ring")
+	}
+	require.Eventually(t, func() bool {
+		_, ok := c.index.get(blobstore.HashKey([]byte("old")))
+		return !ok
+	}, 5*time.Second, time.Millisecond)
+	require.Positive(t, c.Stats().EvictedSegments)
+	closeCache(t, c)
+	c = openCache(t, dir, WithMaxSegments(3), WithSegmentSize(64<<10))
+	requireValue(t, c, "key-29", value)
 }

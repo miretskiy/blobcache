@@ -15,8 +15,9 @@ import (
 // memory owns lazily mapped chunks, divided into reusable blocks. Records are
 // bumped into an active block and never moved. Full blocks stay cached until
 // pressure reclaims them. The allocator lock protects reservations and lists;
-// readers only pin their block. Index cleanup, mmap growth, and dedicated
-// buffer unmapping run outside it.
+// readers only pin their block. Eviction stops new pins immediately;
+// existing borrowers delay storage reuse, not logical eviction. Index cleanup,
+// mmap growth, and dedicated buffer unmapping run outside it.
 type memory struct {
 	mu                   sync.Mutex
 	limit, mapped        int64
@@ -24,6 +25,7 @@ type memory struct {
 	pool                 *mempool.MmapPool
 	chunks               []*memoryChunk
 	blocks               []*memoryBlock // allocation order; includes the active block
+	retired              int            // evicted blocks still held by borrowers or I/O
 	active               *memoryBlock
 	borrowed             map[*byte]memoryValue // only allocations still owned by callers
 	onEvict              func([]*memoryBlock)
@@ -36,9 +38,13 @@ type memoryChunk struct {
 }
 
 // A fresh descriptor is created every time storage is reused. refs includes
-// one cache reference. Reclamation CASes 1 to 0; pinning never resurrects 0.
-// Thus a reader holding an old index entry cannot pin a replacement block.
+// one cache reference. A negative count marks eviction and refuses new pins.
+// The last existing pin releases storage, after index cleanup drops the cache
+// reference. Old descriptors can never pin a replacement block.
+const retiredRefs int64 = -1 << 63
+
 type memoryBlock struct {
+	owner  *memory
 	refs   atomic.Int64
 	data   []byte
 	next   int
@@ -53,17 +59,13 @@ type memoryValue struct {
 	data  []byte
 }
 
-func (v memoryValue) same(other memoryValue) bool {
-	return v.block == other.block && unsafe.SliceData(v.data) == unsafe.SliceData(other.data)
-}
-
 func (v memoryValue) pin() bool {
 	if v.block == nil {
 		return false
 	}
 	for {
 		n := v.block.refs.Load()
-		if n == 0 {
+		if n <= 0 {
 			return false
 		}
 		if v.block.refs.CompareAndSwap(n, n+1) {
@@ -72,7 +74,16 @@ func (v memoryValue) pin() bool {
 	}
 }
 
-func (v memoryValue) unpin() { v.block.refs.Add(-1) }
+func (v memoryValue) unpin() {
+	b := v.block
+	if b.refs.Add(-1) == retiredRefs {
+		m := b.owner
+		m.mu.Lock()
+		m.release(b)
+		m.retired--
+		m.mu.Unlock()
+	}
+}
 
 // ErrForeignMemory means a buffer is not currently held from Alloc.
 var ErrForeignMemory = errors.New("blobcache: memory not held from Alloc")
@@ -120,10 +131,10 @@ func (m *memory) alloc(size int, owned bool, key *Key) (memoryValue, []byte, err
 				if m.onEvict != nil {
 					m.onEvict(victims)
 				}
-				m.mu.Lock()
 				for _, victim := range victims {
-					m.release(victim)
+					(memoryValue{block: victim}).unpin() // release the cache reference
 				}
+				m.mu.Lock()
 				continue
 			}
 			if size <= m.blockSize {
@@ -231,26 +242,27 @@ func (m *memory) mapBuffer(size int, pooled bool) (buffer *mempool.MmapBuffer, e
 }
 
 func (m *memory) addBlock(b *memoryBlock) *memoryBlock {
+	b.owner = m
 	b.refs.Store(1)
 	m.blocks = append(m.blocks, b)
 	return b
 }
 
-// retire selects a batch of oldest unpinned blocks under mu. Pinned blocks
-// are skipped. Zero is permanent for these descriptors, even after slot reuse.
+// retire evicts an oldest prefix, regardless of outstanding pins. Marking a
+// block retired makes its key list immutable and prevents new memory readers.
+// Borrowers keep storage alive until they finish; no scan for unpinned victims.
 func (m *memory) retire(target int) []*memoryBlock {
 	var victims []*memoryBlock
-	kept := m.blocks[:0]
 	for _, b := range m.blocks {
-		if target > 0 && b != m.active && b.refs.CompareAndSwap(1, 0) {
-			victims = append(victims, b)
-			target -= len(b.data)
-		} else {
-			kept = append(kept, b)
+		if target <= 0 || b == m.active {
+			break
 		}
+		b.refs.Add(retiredRefs)
+		victims = append(victims, b)
+		target -= len(b.data)
 	}
-	clear(m.blocks[len(kept):])
-	m.blocks = kept
+	m.blocks = slices.Delete(m.blocks, 0, len(victims))
+	m.retired += len(victims)
 	return victims
 }
 
@@ -278,10 +290,18 @@ func (m *memory) take(buf []byte, key *Key) (memoryValue, error) {
 		return memoryValue{}, ErrForeignMemory
 	}
 	delete(m.borrowed, ptr)
-	if key != nil {
+	if key != nil && v.block.refs.Load() > 0 {
 		v.block.keys = append(v.block.keys, *key)
 	}
 	return v, nil
+}
+
+// restore returns a rejected write's existing pin to its caller. The caller
+// retains ownership on ErrBusy, so a retry needs no new allocation or copy.
+func (m *memory) restore(buf []byte, v memoryValue) {
+	m.mu.Lock()
+	m.borrowed[unsafe.SliceData(buf)] = v
+	m.mu.Unlock()
 }
 
 // used includes free slots in mapped backing chunks and dedicated allocations.
@@ -294,6 +314,9 @@ func (m *memory) used() int64 {
 func (m *memory) close() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.retired != 0 {
+		return fmt.Errorf("blobcache: evicted buffers are still held; their memory stays mapped")
+	}
 	for _, b := range m.blocks {
 		if b.refs.Load() != 1 {
 			return fmt.Errorf("blobcache: buffers are still held; their memory stays mapped")

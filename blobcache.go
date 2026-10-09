@@ -3,13 +3,14 @@
 //
 // A Cache is an index and a memory tier over a blobstore.Store, which does
 // the I/O. Value memory grows on demand up to WithMemory bytes, in blocks
-// shared by contiguous records. Values are never moved. A caller downloads into memory lent by
-// Alloc and hands it back with Put; that memory is the cached value. The store
+// shared by contiguous records. Values are never moved. A caller downloads into
+// memory lent by Alloc and hands it back with Put; that memory is the cached value. The store
 // frames the record in place and writes it with one O_DIRECT write through an
 // io_uring scheduler. Put does not wait for disk I/O. Get lends
 // a value in memory to a callback where it lies, or reads it from disk into
 // cache memory with one I/O, lends it, and keeps it. Memory is reclaimed
-// from the oldest unpinned blocks. Nothing waits for borrowers: when no memory can be reclaimed,
+// from the oldest blocks; retirement prevents new readers immediately, while
+// existing users delay storage reuse. When no memory can be reclaimed,
 // Alloc and Get return ErrBusy.
 //
 // Records are appended to preallocated segment files. When a segment fills,
@@ -198,7 +199,7 @@ func (c *Cache) Stats() Stats {
 // --- Completer ---
 
 // complete is the completer goroutine. It finishes writes in submission
-// order: it waits for each, records where it landed, and releases the
+// order: it waits for each, records errors, and releases the
 // write's pin on the value's memory, which becomes reclaimable.
 func (c *Cache) complete() {
 	for w := range c.inflight.queue {
@@ -206,13 +207,12 @@ func (c *Cache) complete() {
 			close(w.drained)
 			continue
 		}
-		loc, err := w.ticket.Wait()
+		_, err := w.ticket.Wait()
 		if err != nil {
 			c.stats.putErrors.Add(1)
 			log().Error("blob write failed", "error", err)
-		} else {
-			c.index.landed(w.hash, w.mem, loc)
 		}
+		c.index.completed(w.hash, w.ticket.Location())
 		w.mem.unpin()
 		c.inflight.unreserve()
 	}

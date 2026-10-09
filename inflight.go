@@ -10,9 +10,8 @@ import (
 // inflight hands writes from Put to the completer, in submission order. The
 // queue is a buffered channel; Put reserves room in it before submitting, so
 // that once the store has accepted a write, queueing it never blocks. When
-// there is no room, Put returns ErrBusy. Memory bounds the writes in flight
-// in practice (each holds its value's memory); the queue only needs to be
-// larger than any realistic count.
+// there is no room, Put returns ErrBusy without taking the caller's buffer.
+// Each accepted write also keeps its memory pinned until completion.
 //
 // Drain queues a marker behind the writes before it and waits for the
 // completer to reach it. Drains are serialized, and the queue has one place

@@ -4,11 +4,15 @@ package blobstore
 
 import "github.com/miretskiy/dio/v2/iosched"
 
-// newScheduler returns the POSIX scheduler, the only one off Linux, for
-// development and tests; it emulates virtual descriptor slots with ordinary
-// files. It runs each operation inside Submit, so Write waits for the disk,
-// and completions run inside Submit too; correctness does not depend on
-// either.
-func newScheduler(config, int) (iosched.Scheduler, error) {
+// Development fallback: each queue gets its own emulated virtual-file table.
+func newScheduler(...iosched.Option) (iosched.Scheduler, error) {
 	return iosched.NewPOSIXScheduler(), nil
+}
+
+func queueCPUs(cfg config) ([]int, error) {
+	cpus := make([]int, cfg.rings)
+	for i := range cpus {
+		cpus[i] = -1
+	}
+	return cpus, nil
 }

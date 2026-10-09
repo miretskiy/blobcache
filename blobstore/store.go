@@ -11,7 +11,8 @@
 // fallback to synchronous I/O, which would put disk waits inside Write.
 // Elsewhere it uses dio's POSIX scheduler, for development.
 //
-// WithMaxSize enables whole-segment FIFO eviction. Notifications describe a batch of retired segments, with no knowledge of the caller's index organization.
+// WithMaxSize or WithMaxSegments enables whole-segment FIFO eviction.
+// Notifications list retired IDs, without knowing the caller's index organization.
 package blobstore
 
 import (
@@ -84,9 +85,10 @@ func (l Location) Segment() uint64 { return l.segment }
 // Segment files are opened only in io_uring virtual descriptor slots (the
 // ring's registered-file table), so creating, writing, sealing and opening
 // them for reads are asynchronous. Write does not wait for disk I/O;
-// capacity eviction submits unlinks through dio outside the write lock. The first writeSlots slots hold the segments being written
-// (the active one and those being sealed); the rest cache segments open for
-// reads (see readSlots).
+// capacity eviction submits unlinks through dio outside store locks. Each
+// queue owns one scheduler and local descriptor table. Write-capable queues
+// have an append stream; read-capable queues have a read-handle cache.
+// Keys select writers, while segment IDs select readers.
 //
 //   - A segment's first write is chained after the open of its file into a
 //     free write slot and its preallocation. The scheduler holds writes to
@@ -108,23 +110,22 @@ func (l Location) Segment() uint64 { return l.segment }
 // Footers list reservations, not successful writes. A damaged or unwritten
 // record is a miss after checksum verification, without poisoning its peers.
 type Store struct {
-	cfg        config
-	root       string
-	dirs       [shardCount]*os.File // segment directories, held open: segments are opened relative to them
-	sched      iosched.Scheduler
-	writeSlots chan uint32    // free write slots
-	reads      *readSlots     // read slots
-	open       sync.WaitGroup // segments holding write slots; Close waits for them
-	known      uint64         // segments with ids below it were on disk at Open
+	cfg     config
+	root    string
+	dirs    [shardCount]*os.File // held until every scheduler closes
+	queues  []*ioQueue           // one scheduler and local virtual table each
+	writers []*ioQueue           // key hash selects an append stream
+	readers []*ioQueue           // segment ID selects a read-handle cache
+	open    sync.WaitGroup       // write segments whose seal has not completed
+	known   uint64               // segments below this ID existed at Open
 
-	// activeSegment is the segment being written. Its lock is held to reserve
-	// room in it, rotate it, and submit its operations (see append).
-	activeSegment struct {
+	// The common registry receives segment creation, growth and completion
+	// from all producers. Ordinary record appends do not acquire its mutex.
+	segments struct {
 		sync.Mutex
-		seg      *segment // nil before the first write, after a rotation that found no free slot, and after Close
-		nextID   uint64
-		closed   bool
-		segments []*segment // FIFO lifecycle metadata; no record index
+		nextID uint64
+		closed bool
+		fifo   []*segment
 	}
 
 	stats struct {
@@ -136,11 +137,9 @@ type Store struct {
 	}
 }
 
-// writeSlots is the number of write slots, and so of segments being written
-// at once: the active one and those whose seal chain has not completed. A
-// sealed segment holds its slot only until its writes land and the chain
-// runs, milliseconds against the hundreds a segment takes to fill at device
-// speed, so a few suffice; with none free, Write returns ErrBusy.
+// writeSlots bounds segment files being written or sealed by each producer.
+// A slot returns after its seal chain completes; with none free, Write returns
+// ErrBusy. Queued writes retain their slots until they actually reach the disk.
 const writeSlots = 16
 
 // Stats is a point-in-time snapshot of a Store's counters.
@@ -171,6 +170,10 @@ func Open(path string, opts ...Option) (*Store, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
+	cpus, err := queueCPUs(cfg)
+	if err != nil {
+		return nil, err
+	}
 	if info, err := os.Stat(path); err != nil {
 		return nil, fmt.Errorf("blobstore: %w", err)
 	} else if !info.IsDir() {
@@ -179,12 +182,7 @@ func Open(path string, opts ...Option) (*Store, error) {
 	if err := initialize(path); err != nil {
 		return nil, err
 	}
-	st := &Store{
-		cfg:        cfg,
-		root:       path,
-		writeSlots: make(chan uint32, writeSlots),
-		reads:      newReadSlots(cfg.readHandles),
-	}
+	st := &Store{cfg: cfg, root: path}
 	for shard := range shardCount {
 		d, err := os.Open(filepath.Join(path, shardName(shard)))
 		if err != nil {
@@ -209,16 +207,13 @@ func Open(path string, opts ...Option) (*Store, error) {
 		}
 		seg := &segment{id: id, size: info.Size()}
 		seg.done.Store(true)
-		st.activeSegment.segments = append(st.activeSegment.segments, seg)
+		st.segments.fifo = append(st.segments.fifo, seg)
 		st.stats.diskBytes.Add(info.Size())
 	}
-	st.activeSegment.nextID = st.known
+	st.segments.nextID = st.known
 	st.stats.segments.Store(int64(len(ids)))
-	if st.sched, err = newScheduler(cfg, writeSlots+cfg.readHandles); err != nil {
-		return nil, errors.Join(fmt.Errorf("blobstore: %w", err), st.closeDirs())
-	}
-	for slot := range uint32(writeSlots) {
-		st.writeSlots <- slot
+	if err := st.startQueues(cpus); err != nil {
+		return nil, errors.Join(fmt.Errorf("blobstore: %w", err), st.closeQueues(), st.closeDirs())
 	}
 	return st, nil
 }
@@ -298,7 +293,7 @@ func (st *Store) listSegments() ([]uint64, error) {
 }
 
 // ReadIndex reads the footer of every segment that was on disk at Open and
-// reports each record to fn in write order (segment id, then offset, so a
+// reports records to fn in segment/offset order (for any particular key, a
 // later record of a key comes after an earlier one): it is how the caller
 // builds its index. Record data is never read. A segment without a valid
 // footer was being written when the process stopped, or failed; it is
@@ -339,9 +334,9 @@ func (st *Store) ReadIndex(fn func(KeyHash, Location)) error {
 			fn(e.hash, Location{segment: id, offset: e.off, size: e.size})
 		}
 	}
-	st.activeSegment.Lock()
-	evicted := st.evictLocked(0)
-	st.activeSegment.Unlock()
+	st.segments.Lock()
+	evicted := st.evictLocked(0, 0)
+	st.segments.Unlock()
 	st.evict(evicted)
 	return nil
 }
@@ -358,28 +353,40 @@ func (st *Store) readFooter(id uint64) ([]footerEntry, error) {
 	return entries, errors.Join(err, f.Close())
 }
 
-// Close seals the active segment, waits for every seal chain to complete, and
-// releases all resources; closing the scheduler closes every file in its
-// slots. Close must not race other calls.
+// Close seals every active segment, waits for all seals, then closes all
+// schedulers and directory descriptors. Close must not race other calls.
 func (st *Store) Close() error {
-	a := &st.activeSegment
-	a.Lock()
-	if a.closed {
-		a.Unlock()
+	st.segments.Lock()
+	if st.segments.closed {
+		st.segments.Unlock()
 		return nil
 	}
-	a.closed = true
-	if a.seg != nil {
-		st.sealLocked(a.seg)
-		a.seg = nil
+	st.segments.closed = true
+	st.segments.Unlock()
+	for _, q := range st.writers {
+		q.active.Lock()
+		q.active.closed = true
+		if s := q.active.seg; s != nil {
+			q.sealLocked(s)
+			q.active.seg = nil
+		}
+		q.active.Unlock()
 	}
-	a.Unlock()
 	st.open.Wait()
-	st.reads.mu.Lock()
-	st.reads.closed = true
-	st.reads.mu.Unlock()
-	// Closing the scheduler waits for every accepted ticket.
-	return errors.Join(st.sched.Close(), st.closeDirs())
+	for _, q := range st.readers {
+		q.reads.mu.Lock()
+		q.reads.closed = true
+		q.reads.mu.Unlock()
+	}
+	return errors.Join(st.closeQueues(), st.closeDirs())
+}
+
+func (st *Store) closeQueues() error {
+	var err error
+	for _, q := range st.queues {
+		err = errors.Join(err, q.sched.Close())
+	}
+	return err
 }
 
 // Stats returns a snapshot of the store's counters.
@@ -392,17 +399,6 @@ func (st *Store) Stats() Stats {
 		EvictionErrors:  st.stats.evictionErrors.Load(),
 	}
 }
-
-// submit passes op through the test hook, if any, and submits it, with
-// whenDone run on completion.
-func (st *Store) submit(op iosched.Op, whenDone func(int, error)) (iosched.Ticket, error) {
-	if st.cfg.preSubmit != nil {
-		op = st.cfg.preSubmit(op)
-	}
-	return iosched.SubmitNotify(st.sched, op, whenDone)
-}
-
-// --- Writes ---
 
 // RecordSize returns the size of the record for a value of valueLen bytes
 // under a key of keyLen bytes: the memory Write's buffer should have, and the
@@ -429,9 +425,9 @@ func (st *Store) RecordSize(keyLen, valueLen int) int {
 // business. The caller must not modify buf before the ticket completes;
 // afterwards buf[:n] still holds the value.
 //
-// The record's Location comes from the ticket once the write has landed; the
-// record can be read there from then on. If the process stops before the
-// record's segment is sealed, the record does not survive the restart.
+// The ticket exposes the reserved Location immediately. Wait confirms that
+// the write landed; until then a verified read there may miss. If the process
+// stops before the record's segment is sealed, it does not survive the restart.
 func (st *Store) Write(key, buf []byte, n int) (Ticket, error) {
 	switch {
 	case len(key) == 0:
@@ -453,170 +449,20 @@ func (st *Store) Write(key, buf []byte, n int) (Ticket, error) {
 	rec := buf[:size]
 	tr := recordTrailer{valueLen: uint32(n), keyLen: uint16(len(key))}
 	frameRecord(rec, key, tr)
-	return st.append(rec, HashKey(key))
+	h := HashKey(key)
+	return st.writers[h.Lo%uint64(len(st.writers))].append(rec, h)
 }
 
-// append writes rec, a framed record of key hash h, at the end of the active
-// segment, page-aligned for a direct write, and submits the write, all with
-// the active segment's lock held: the lock orders a segment's submissions, so
-// its open is accepted before its writes and its seal after them. Submit is a
-// non-blocking handoff, so the section stays short.
-//
-// The record that leaves no room for another starts a segment's seal: it is
-// written even if it runs past the segment size, and its write is chained
-// with the seal (see sealOps), so the file ends past the preallocated size
-// with the footer. The next record starts a new segment, whose first write is
-// chained after the open of its file.
-func (st *Store) append(rec []byte, h KeyHash) (Ticket, error) {
-	a := &st.activeSegment
-	a.Lock()
-	var evicted Eviction
-	defer func() {
-		a.Unlock()
-		st.evict(evicted)
-	}()
-	if a.closed {
-		return Ticket{}, ErrClosed
-	}
-	size := int64(len(rec))
-	s, off := a.seg, int64(0)
-	if s == nil {
-		evicted = st.evictLocked(st.cfg.segmentSize)
-		var err error
-		if s, err = st.startLocked(); err != nil {
-			return Ticket{}, err
-		}
-		a.seg = s
-	} else if off = s.pos; st.cfg.directWrites {
-		off = align.PageAlign(off)
-	}
-	end := off + size
-	count := len(s.entries) + 1
-	last := end+footerSize(count+1) > st.cfg.segmentSize
-	fileSize := s.size
-	if last {
-		fileSize = align.PageAlign(end) + footerSize(count)
-	}
-	if extra := fileSize - s.size; extra > 0 {
-		evicted = append(evicted, st.evictLocked(extra)...)
-		if st.cfg.maxSize != 0 && st.stats.diskBytes.Load()+extra > st.cfg.maxSize {
-			return Ticket{}, ErrBusy
-		}
-		st.stats.diskBytes.Add(extra)
-		s.size = fileSize
-	}
-	s.pos = end
-	s.entries = append(s.entries, footerEntry{hash: h, off: uint32(off), size: uint32(size)})
-	op := iosched.VWriteOp(s.slot, rec, off)
-	if off == 0 {
-		op = iosched.VOpenatOp(st.dirFD(s.id), segmentName(s.id), st.createFlags(), 0o644, s.slot).
-			Link(iosched.VFallocateOp(s.slot, st.cfg.segmentSize), op)
-	}
-	var whenDone func(int, error)
-	if last {
-		// Every seal step runs even after an I/O error. The footer is a list of
-		// candidates; read verification decides which records survived.
-		op = op.HardLink(st.sealOps(s, align.PageAlign(end)))
-		whenDone = func(_ int, err error) { st.sealed(s, err) }
-		a.seg = nil
-	}
-	ticket, err := st.submit(op, whenDone)
-	if err != nil {
-		if last {
-			st.closeRejectedSeal(s, err)
-		}
-		return Ticket{}, err
-	}
-	return Ticket{ticket: ticket, loc: Location{segment: s.id, offset: uint32(off), size: uint32(size)}}, nil
-}
-
-// startLocked starts a new segment in a free write slot; its first write
-// creates the file. ErrBusy if every write slot is held by a segment still
-// being sealed. Called with the active segment's lock held.
-func (st *Store) startLocked() (*segment, error) {
-	if st.activeSegment.nextID == math.MaxUint64 {
-		return nil, errors.New("blobstore: segment IDs exhausted")
-	}
-	if st.cfg.maxSize != 0 && st.stats.diskBytes.Load()+st.cfg.segmentSize > st.cfg.maxSize {
-		return nil, ErrBusy
-	}
-	var slot uint32
-	select {
-	case slot = <-st.writeSlots:
-	default:
-		return nil, ErrBusy
-	}
-	a := &st.activeSegment
-	s := &segment{id: a.nextID, slot: slot, size: st.cfg.segmentSize}
-	a.nextID++
-	a.segments = append(a.segments, s)
-	st.stats.diskBytes.Add(s.size)
-	st.stats.segments.Add(1)
-	st.open.Add(1)
-	return s, nil
-}
-
-// createFlags are the open flags of a new segment file. O_EXCL because ids
-// are never reused: a file already there is not ours to overwrite.
-func (st *Store) createFlags() int {
-	flags := os.O_CREATE | os.O_EXCL | os.O_WRONLY
-	if st.cfg.directWrites {
-		flags |= sys.FlDirectIO.OpenFlags()
-	}
-	return flags
-}
-
-// sealOps builds an immutable footer with the final record's submission.
-// Close drains earlier operations; hard links ensure cleanup is attempted
-// even when data, footer, or sync fails. No callback modifies the footer.
-func (st *Store) sealOps(s *segment, off int64) iosched.Op {
-	footer := allocRecord(int(footerSize(len(s.entries))))
-	encodeSegmentFooter(footer, s.id, s.entries)
-	s.entries = nil
-	return iosched.VWriteOp(s.slot, footer, off).HardLink(
-		iosched.VFdatasyncOp(s.slot), iosched.VCloseOp(s.slot), iosched.FsyncOp(st.dirs[s.id%shardCount]))
-}
-
-// sealLocked seals a partial segment during Close. Rotation attaches these
-// operations to the final record instead, under this same write lock.
-func (st *Store) sealLocked(s *segment) {
-	op := st.sealOps(s, s.size-footerSize(len(s.entries)))
-	done := func(_ int, err error) { st.sealed(s, err) }
-	if _, err := st.submit(op, done); err != nil {
-		st.closeRejectedSeal(s, err)
-	}
-}
-
-// A rejected seal never reached dio, so its close cannot drain earlier writes.
-// Submit a real close before releasing the slot or exposing it to eviction.
-func (st *Store) closeRejectedSeal(s *segment, cause error) {
-	done := func(_ int, err error) { st.sealed(s, errors.Join(cause, err)) }
-	if _, err := iosched.SubmitNotify(st.sched, iosched.VCloseOp(s.slot), done); err != nil {
-		// The scheduler cannot accept cleanup. Close owns the remaining handles;
-		// leave this segment ineligible for eviction while releasing the waiter.
-		st.stats.failedSegments.Add(1)
-		st.writeSlots <- s.slot
-		st.open.Done()
-	}
-}
-
-// sealed only publishes completion and releases the slot. Eviction decisions
-// belong to rotation, never to the scheduler completion callback.
-func (st *Store) sealed(s *segment, err error) {
-	if err != nil {
-		st.stats.failedSegments.Add(1)
-	}
-	s.done.Store(true)
-	st.writeSlots <- s.slot
-	st.open.Done()
-}
-
-// Ticket is the completion ticket of a Write. The record's Location is not
-// valid until the write has landed, so only Wait reveals it.
+// Ticket is the completion ticket of a Write.
 type Ticket struct {
 	ticket iosched.Ticket
 	loc    Location
 }
+
+// Location returns the reserved location, even before I/O completes. Reads
+// there may miss until the record lands; callers must verify the record and
+// retain the write buffer until Wait returns.
+func (t Ticket) Location() Location { return t.loc }
 
 // Wait waits for the write and returns where the record landed. On error the
 // record is not readable and there is no Location. (The scheduler reports a

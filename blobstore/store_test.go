@@ -289,7 +289,7 @@ func TestCrashBeforeSeal(t *testing.T) {
 		write(t, st, fmt.Sprintf("filler-%d", i), randomBytes(uint64(i), 100<<10))
 	}
 	recent := write(t, st, "recent", []byte("lost in the crash"))
-	activeID := st.activeSegment.seg.id
+	activeID := st.writers[0].active.seg.id
 	require.Equal(t, activeID, recent.segment)
 	require.NoError(t, st.Close())
 
@@ -319,7 +319,7 @@ func flipByte(t *testing.T, path string, off int64) {
 
 func TestCorruptionIsDetected(t *testing.T) {
 	dir := t.TempDir()
-	st := openStore(t, dir, recorder{}, WithChecksum())
+	st := openStore(t, dir, recorder{})
 	valueLoc := write(t, st, "value-corrupt", randomBytes(1, 10000))
 	trailerLoc := write(t, st, "trailer-corrupt", randomBytes(2, 10000))
 	require.NoError(t, st.Close())
@@ -327,7 +327,7 @@ func TestCorruptionIsDetected(t *testing.T) {
 	flipByte(t, segmentPath(dir, valueLoc.segment), int64(valueLoc.offset)+100)
 	flipByte(t, segmentPath(dir, trailerLoc.segment), int64(trailerLoc.offset+trailerLoc.size)-10)
 
-	st = openStore(t, dir, recorder{}, WithChecksum())
+	st = openStore(t, dir, recorder{})
 	defer func() { require.NoError(t, st.Close()) }()
 	_, err := read(t, st, valueLoc, "value-corrupt")
 	require.ErrorIs(t, err, ErrCorrupt)

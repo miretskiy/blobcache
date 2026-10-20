@@ -1,219 +1,182 @@
-// Package blobcache is a disk cache for large blobs, such as chunks of objects
-// downloaded from cloud storage.
-//
-// A Cache is an index and a memory tier over a blobstore.Store, which does
-// the I/O. Value memory grows on demand up to WithMemory bytes, in blocks
-// shared by contiguous records. Values are never moved. A caller downloads into
-// memory lent by Alloc and hands it back with Put; that memory is the cached value. The store
-// frames the record in place and writes it with one O_DIRECT write through an
-// io_uring scheduler. Put does not wait for disk I/O. Get lends
-// a value in memory to a callback where it lies, or reads it from disk into
-// cache memory with one I/O, lends it, and keeps it. Memory is reclaimed
-// from the oldest blocks; retirement prevents new readers immediately, while
-// existing users delay storage reuse. When no memory can be reclaimed,
-// Alloc and Get return ErrBusy.
-//
-// Records are appended to preallocated segment files. When a segment fills,
-// its index is written as a footer at its end and the segment is never
-// modified again. WithMaxSize targets disk usage by evicting whole segments
-// in FIFO order; memory and index management stay in this package.
+// Package blobcache writes blobs to data.db, index.db, and dedicated object
+// files. NewWriter prepares a download destination; Put publishes it under its
+// key. Inline records stay in bounded mmap memory until evicted. Larger and
+// unknown-size values stream to object files using the same memory budget.
+// Read returns a reader that the caller must close, including after EOF.
 package blobcache
 
 import (
 	"errors"
-	"log/slog"
+	"io"
 	"sync"
 	"sync/atomic"
 
 	"github.com/miretskiy/blobcache/blobstore"
+	"github.com/miretskiy/dio/v2/align"
+	"github.com/miretskiy/dio/v2/alloc"
+)
+
+const (
+	MaxKeyLen = blobstore.MaxKeyLen
+	// SizeUnknown selects streaming to an object file without a promised size.
+	SizeUnknown = blobstore.SizeUnknown
 )
 
 var (
-	// ErrClosed is returned by operations on a closed cache.
-	ErrClosed = blobstore.ErrClosed
-	// ErrEmptyKey is returned for an empty key.
-	ErrEmptyKey = blobstore.ErrEmptyKey
-	// ErrKeyTooLarge is returned for a key longer than MaxKeyLen.
+	ErrEmptyKey    = blobstore.ErrEmptyKey
 	ErrKeyTooLarge = blobstore.ErrKeyTooLarge
-	// ErrValueTooLarge is returned for a record that cannot fit in a segment.
-	ErrValueTooLarge = blobstore.ErrValueTooLarge
-	// ErrBusy is returned when the cache cannot do something right now
-	// without waiting: no memory block can be reclaimed, too
-	// many writes are in flight, or no segment file is ready for the next
-	// write. The caller decides whether to skip caching or retry.
-	ErrBusy = blobstore.ErrBusy
-	// ErrNotFound is returned by Get on a miss: a key that is absent, whose
-	// segment file is gone, or whose record failed verification.
-	ErrNotFound = errors.New("blobcache: not found")
+	ErrNotFound    = blobstore.ErrNotFound
+	ErrCorrupt     = blobstore.ErrCorrupt
+	// ErrBusy means memory is unavailable or disk reuse overlaps an unfinished write.
+	ErrBusy = alloc.ErrExhausted
 )
 
-// MaxKeyLen is the longest key Put accepts.
-const MaxKeyLen = blobstore.MaxKeyLen
+// Writer accepts one value. Call Close on success or failure, including after
+// Put, before closing the Cache. Methods on a single writer must not race each
+// other or Cache.Close.
+// Write and ReadFrom are no longer allowed after Put. Flush waits for data I/O
+// without publishing the record or syncing the file.
+type Writer = blobstore.Writer
 
-// RecordSize returns the memory to Alloc for a value of valueLen bytes under
-// a key of keyLen bytes: the value and the record's framing, padded to a page
-// multiple with direct writes (the default). Put writes the record in place.
-func (c *Cache) RecordSize(keyLen, valueLen int) int { return c.store.RecordSize(keyLen, valueLen) }
-
-// SetLogger sets the logger for every Cache and its store. It is safe to call
-// at any time.
-func SetLogger(l *slog.Logger) {
-	logger.Store(l)
-	blobstore.SetLogger(l)
-}
-
-var logger atomic.Pointer[slog.Logger]
-
-// log returns the package's logger: the one set by SetLogger, or slog's
-// default.
-func log() *slog.Logger {
-	if l := logger.Load(); l != nil {
-		return l
-	}
-	return slog.Default()
+// Reader owns its buffer until Close, even after EOF. Close may be called early;
+// it releases resources without draining the value. WithVerifyChecksums verifies
+// disk values as they are consumed. Resident values are trusted.
+// Methods on one Reader must not race each other or Cache.Close. Read and WriteTo
+// require an open Reader.
+type Reader interface {
+	io.ReadCloser
+	io.WriterTo
+	Size() int64
 }
 
 // Cache is a disk cache. All methods are safe for concurrent use, except that
-// Close must not race other calls.
+// Close must not race other calls. Callers must close all readers and writers first.
+// Methods other than Close require an open Cache.
 type Cache struct {
-	store      *blobstore.Store
-	index      index
-	mem        *memory
-	memoryHits bool
-	inflight   inflight
-	completer  sync.WaitGroup
-	closed     atomic.Bool
-	stats      counters
-	reads      struct {
-		sync.Mutex
-		pending map[readKey]*readFlight
-	}
+	store  *blobstore.Store
+	memory *cacheAllocator
+	values memoryCache
+	closed bool
+
+	reclaimRequests     chan reclaimRequest
+	diskReclaimRequests chan struct{}
+	diskReclaimTrigger  atomic.Uint64
+	reclaimWG           sync.WaitGroup
 }
 
-type counters struct {
-	puts, putErrors  atomic.Uint64
-	hits, memoryHits atomic.Uint64
-	misses, corrupt  atomic.Uint64
-}
-
-// Stats is a point-in-time snapshot of cache counters.
-type Stats struct {
-	Items    int // keys in the index
-	Segments int // segment files
-
-	Puts      uint64 // accepted writes
-	PutErrors uint64 // writes that failed after acceptance
-
-	Hits       uint64 // lookups that found a value
-	MemoryHits uint64 // hits served from memory, without I/O
-	Misses     uint64 // lookups that found nothing, or a segment file that is gone
-	Corrupt    uint64 // records that failed verification (served as misses)
-
-	MemoryUsed int64 // mapped/reserved backing bytes, including free slots
-
-	FailedSegments  uint64 // seal submissions that reported errors
-	DiskBytes       int64  // retained files and reservations; excludes pending/failed unlinks
-	EvictedSegments uint64
-	EvictionErrors  uint64
-
-	WritesInFlight int // writes accepted by Put and not yet completed
-}
-
-// New opens the cache in the directory path, which must exist (see
-// blobstore.Open), and reads the index of what is on disk.
+// New opens or creates data.db, index.db, and objects/. The disk index recovers
+// surviving key metadata; resident value buffers start empty. The directory must
+// have one owner.
 func New(path string, opts ...Option) (*Cache, error) {
 	cfg := defaultConfig()
 	for _, opt := range opts {
 		opt.apply(&cfg)
 	}
-	mem, err := newMemory(cfg.memory)
+	if cfg.memory < 128<<10 || cfg.memory%align.BlockSize != 0 {
+		return nil, errors.New("blobcache: memory must be a page multiple of at least 128 KiB")
+	}
+	memory, err := alloc.NewSlabAllocator(cfg.memory, cfg.allocator...)
 	if err != nil {
 		return nil, err
 	}
-	c := &Cache{
-		index:      newIndex(0),
-		mem:        mem,
-		memoryHits: cfg.memoryHits,
-	}
-	c.inflight.init(maxWritesInFlight)
-	mem.onEvict = c.index.evictMemory
-	cfg.store = append(cfg.store, blobstore.WithEvictionCallback(c.index.evicted))
-	store, err := blobstore.Open(path, cfg.store...)
+	c := &Cache{values: newMemoryCache()}
+	c.memory = &cacheAllocator{Allocator: memory, capacity: cfg.memory, reclaim: c.startCacheReclaim}
+	// Keep the default staging buffer usable even with the smallest budget.
+	storeOpts := append([]blobstore.Option{
+		blobstore.WithStagingSize(min(256<<10, cfg.memory-align.BlockSize)),
+	}, cfg.store...)
+	st, err := blobstore.Open(path, c.memory, c.memory, storeOpts...)
 	if err != nil {
-		return nil, errors.Join(err, mem.close())
+		memory.Close()
+		return nil, err
 	}
-	if err := store.ReadIndex(c.index.loaded); err != nil {
-		return nil, errors.Join(err, store.Close(), mem.close())
-	}
-	c.store = store
-	c.completer.Go(c.complete)
+	st.OnRetire = c.values.retire
+	st.Recover(func(h blobstore.RecordHeader) {
+		c.values.replace(h.Hash, nil, h)
+	})
+	c.store = st
+	c.reclaimRequests = make(chan reclaimRequest, 1)
+	c.diskReclaimRequests = make(chan struct{}, 1)
+	target := st.TargetSize()
+	c.diskReclaimTrigger.Store(target - target/20)
+	c.reclaimWG.Go(c.reclaimLoop)
+	c.reclaimWG.Go(c.diskReclaimLoop)
+	c.startDiskReclaim()
 	return c, nil
 }
 
-// maxWritesInFlight sizes the queue of writes in flight (see inflight).
-const maxWritesInFlight = 4096
+// NewWriter copies key and reserves storage for size bytes, or SizeUnknown.
+// At 80% memory usage, allocations signal background reclamation. Insufficient
+// capacity waits for a reclamation pass before attempting allocation. Each shard
+// uses SIEVE to meet its proportional byte target; only final-reference releases
+// count as reclaimed space. Keys and disk metadata remain indexed.
+// ErrBusy means memory is still unavailable after reclamation, or disk reuse
+// overlaps an unfinished write. The caller should immediately defer Close.
+func (c *Cache) NewWriter(key []byte, size int64) (*Writer, error) {
+	w, err := c.store.NewWriter(key, size)
+	if err == blobstore.ErrBusy {
+		return nil, ErrBusy
+	}
+	return w, err
+}
 
-// Close waits for every accepted write, then closes the store and releases
-// the cache's memory. Every buffer from Alloc must have been given back; if
-// one has not, Close reports it and leaves the memory mapped. Close must not
-// race other calls.
-func (c *Cache) Close() error {
-	if !c.closed.CompareAndSwap(false, true) {
+// Put submits a filled writer. Data and index completion publish the value in
+// the cache; a Read before then may miss or see the previous value. Late I/O
+// failures are logged and leave the new record unpublished. Call Put once, then
+// Close the writer. Neither waits for Linux I/O completion.
+func (c *Cache) Put(w *Writer) error {
+	return c.store.Put(w, c.publish)
+}
+
+func (c *Cache) publish(header blobstore.RecordHeader, buffer *alloc.Buffer) {
+	c.values.replace(header.Hash, buffer, header)
+	c.startDiskReclaim()
+}
+
+// Read returns the value for key, or ErrNotFound. Resident values stay pinned
+// until the reader is closed; other values stream from disk in bounded staging
+// memory. The caller must Close the reader, including after EOF or a read error,
+// before closing the cache. Allocation pressure may return ErrBusy.
+func (c *Cache) Read(key []byte) (Reader, error) {
+	if len(key) == 0 {
+		return nil, ErrEmptyKey
+	}
+	if len(key) > MaxKeyLen {
+		return nil, ErrKeyTooLarge
+	}
+	hash := blobstore.HashKey(key)
+	buffer, header, ok := c.values.lookup(hash)
+	if !ok {
+		return nil, ErrNotFound
+	}
+	if buffer != nil {
+		return newMemoryReader(key, header, buffer)
+	}
+	r, err := c.store.NewReader(key, header)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			c.values.retire(hash, header.ObjectID)
+		}
+		return nil, err
+	}
+	return r, nil
+}
+
+// Close drains accepted puts, joins both reclamation workers, and releases cached
+// buffers before closing the allocator. The caller must close all readers
+// and writers first; Close does not track them. It must not race cache, reader,
+// or writer calls. Repeated calls are harmless.
+func (c *Cache) Close() (err error) {
+	if c.closed {
 		return nil
 	}
-	close(c.inflight.queue)
-	c.completer.Wait()
-	return errors.Join(c.store.Close(), c.mem.close())
-}
-
-// Drain waits until every write accepted before the call has completed:
-// landed on disk, or failed. Drain is the completion barrier for callers
-// that need one, such as the end of a batch.
-func (c *Cache) Drain() {
-	if !c.closed.Load() {
-		c.inflight.drain()
-	}
-}
-
-// Stats returns a snapshot of the cache's counters.
-func (c *Cache) Stats() Stats {
-	st := c.store.Stats()
-	return Stats{
-		Items:           c.index.len(),
-		Segments:        st.Segments,
-		Puts:            c.stats.puts.Load(),
-		PutErrors:       c.stats.putErrors.Load(),
-		Hits:            c.stats.hits.Load(),
-		MemoryHits:      c.stats.memoryHits.Load(),
-		Misses:          c.stats.misses.Load(),
-		Corrupt:         c.stats.corrupt.Load(),
-		MemoryUsed:      c.mem.used(),
-		FailedSegments:  st.FailedSegments,
-		DiskBytes:       st.DiskBytes,
-		EvictedSegments: st.EvictedSegments,
-		EvictionErrors:  st.EvictionErrors,
-		WritesInFlight:  c.inflight.inFlight(),
-	}
-}
-
-// --- Completer ---
-
-// complete is the completer goroutine. It finishes writes in submission
-// order: it waits for each, records errors, and releases the
-// write's pin on the value's memory, which becomes reclaimable.
-func (c *Cache) complete() {
-	for w := range c.inflight.queue {
-		if w.drained != nil {
-			close(w.drained)
-			continue
-		}
-		_, err := w.ticket.Wait()
-		if err != nil {
-			c.stats.putErrors.Add(1)
-			log().Error("blob write failed", "error", err)
-		}
-		c.index.completed(w.hash, w.ticket.Location())
-		w.mem.unpin()
-		c.inflight.unreserve()
-	}
+	c.closed = true
+	c.store.Wait() // Publication can still signal the reclamation workers.
+	close(c.reclaimRequests)
+	close(c.diskReclaimRequests)
+	c.reclaimWG.Wait()
+	err = c.store.Close()
+	c.values.clear()
+	c.memory.Close()
+	return err
 }

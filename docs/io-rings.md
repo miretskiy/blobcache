@@ -6,10 +6,26 @@ One read ring plus one write ring matched the shared ring's read latency, so
 the evidence favors the simpler default rather than proving that every
 multi-ring arrangement is slower in every respect.
 
-Retain independent DIO schedulers and optional CPU affinity. Their useful next
-application is **isolation between different workloads**, with each workload's
-traffic and admission policy kept together. Splitting the reads and writes of
-one workload is not a demonstrated optimization in these measurements.
+Retain independent DIO schedulers and optional CPU affinity. They support
+**isolation between different workloads**, with each workload's traffic and
+admission policy kept together. Small requests can also benefit from multiple
+coordinators, as the later experiment below shows. Splitting the reads and writes
+of the large-record workload is not a demonstrated optimization here.
+
+A subsequent [independent reader/writer experiment](write-balance.md) reached
+both device ceilings with one ring: 2.42 GiB/s reads and 1.14 GiB/s writes.
+It separates the original mixed benchmark's write-generation limit from actual
+device capacity and measures admission's effect with bounded producers.
+
+The [small-request experiment](small-io.md) tests a different boundary:
+4–64 KiB random reads with fixed total concurrency. Additional coordinators
+can improve small-request IOPS before device bandwidth becomes the limit.
+That result does not require dedicated read/write rings.
+
+The historical measurements below predate the fix that limits automatically
+merged writes to the remaining I/O budget and charges data operations following
+an open. Their budget labels describe the configured goal, not a strict limit
+on the write batches that the old implementation submitted.
 
 ## What the latency numbers mean
 
@@ -241,14 +257,14 @@ with each workload's reads and writes kept together.
 
 This isolates userspace scheduling, not device bandwidth or hardware latency.
 Device-level interference still needs measurement and appropriate bounds.
-The current blobstore `Store` routes writes by key and reads by segment; it
-does not provide workload-identity routing. A workload-routing API or ownership
-model should be designed separately, rather than treating the existing
-read/write split as equivalent isolation.
+The current blobstore `Store` uses a single scheduler and does not provide
+workload-identity routing. A workload-routing API or ownership model would
+need to be designed separately.
 
 ## Reproduction and retained evidence
 
-The normal benchmark can reproduce the default-budget topology cases:
+The earlier benchmark supported the following topology controls; these options
+have since been removed from Store:
 
 ```sh
 BLOBCACHE_RINGS=8 BLOBCACHE_WRITE_RINGS=1 \

@@ -1,11 +1,7 @@
 // Package xmap provides a generic sharded container optimized for concurrent access.
 //
-// The package follows the "Sharded Context" pattern: xmap provides the Mechanism
-// (sharding, locking, memory layout, padding) while callers provide the Payload
-// (the map value type and per-shard "Extra" context).
-//
-// Simple usage (like Slab) uses the convenience helpers Put/Get.
-// Complex usage (like Index with eviction) accesses shards directly via Shard().
+// Callers can use Put/Get or lock a shard to update several entries and their
+// shared context together.
 package xmap
 
 import (
@@ -30,7 +26,8 @@ type Map[V any, E any] struct {
 //
 // ALIGNMENT CONTRACT:
 // The total size of Shard[V, E] MUST be a multiple of 64 bytes to prevent
-// false sharing. This is checked at runtime in New().
+// false sharing between shard locks. VerifyAlignment checks the stride in tests;
+// New does not perform a runtime layout check.
 //
 // Base Size: 32 bytes (RWMutex: 24, Map: 8).
 // Therefore, sizeof(E) + 32 must be divisible by 64.
@@ -107,8 +104,8 @@ func (m *Map[V, E]) ShardAt(i int) *Shard[V, E] {
 	return &m.shards[i]
 }
 
-// ForEach iterates over all shards and items.
-// Thread-safe (locks each shard).
+// ForEach visits entries under each shard's read lock. The callback must not
+// mutate Extra or call methods that need the same shard's write lock.
 func (m *Map[V, E]) ForEach(fn func(k Key, v V, extra *E) bool) {
 	for i := range m.shards {
 		s := &m.shards[i]

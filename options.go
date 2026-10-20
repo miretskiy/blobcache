@@ -4,17 +4,17 @@ import (
 	"time"
 
 	"github.com/miretskiy/blobcache/blobstore"
-	"github.com/miretskiy/dio/v2/iosched"
+	"github.com/miretskiy/dio/v2/alloc"
 )
 
 type config struct {
-	store      []blobstore.Option
-	memory     int64
-	memoryHits bool
+	store     []blobstore.Option
+	memory    int64
+	allocator []alloc.Option
 }
 
 func defaultConfig() config {
-	return config{memory: 1 << 30, memoryHits: true}
+	return config{memory: 1 << 30}
 }
 
 // Option configures a Cache.
@@ -30,72 +30,61 @@ func storeOpt(o blobstore.Option) Option {
 	return funcOpt(func(c *config) { c.store = append(c.store, o) })
 }
 
-// WithSegmentSize sets the size of each segment file. Default: 256 MiB.
-func WithSegmentSize(bytes int64) Option { return storeOpt(blobstore.WithSegmentSize(bytes)) }
-
-// WithRings sets the number of independent I/O queues. Default: 1.
-func WithRings(n int) Option { return storeOpt(blobstore.WithRings(n)) }
-
-// WithDedicatedWriteRings reserves n of the queues for write traffic; zero
-// shares all queues. A positive n must be less than WithRings.
-func WithDedicatedWriteRings(n int) Option { return storeOpt(blobstore.WithDedicatedWriteRings(n)) }
-
-// WithCoordinatorCPUs selects a distinct Linux coordinator CPU for each ring.
-func WithCoordinatorCPUs(cpus ...int) Option { return storeOpt(blobstore.WithCoordinatorCPUs(cpus...)) }
-
-// WithMaxSegments bounds retained disk segments, including active reservations.
-// It cannot be combined with WithMaxSize. See blobstore.WithMaxSegments.
-func WithMaxSegments(n int) Option { return storeOpt(blobstore.WithMaxSegments(n)) }
-
-// WithRingDepth sets each io_uring submission queue depth. Default: 256.
+// WithRingDepth sets the io_uring submission queue depth. Default: 256.
 func WithRingDepth(n uint32) Option { return storeOpt(blobstore.WithRingDepth(n)) }
 
-// WithIOBudget sets each ring's per-class in-flight budget in modeled device
+// WithIOBudget sets the scheduler's per-class in-flight budget in modeled device
 // time. Default: 1.5 ms. Zero disables the budgets. See blobstore.WithIOBudget.
 func WithIOBudget(goal time.Duration) Option { return storeOpt(blobstore.WithIOBudget(goal)) }
 
-// WithDirectReads chooses between O_DIRECT reads (the default) and reads
-// through the kernel page cache. Direct reads copy nothing; buffered reads
-// copy each read out of the page cache, which may serve repeated reads of
-// older values. With direct writes (the default) recently written values are
-// not in the page cache.
-func WithDirectReads(enabled bool) Option { return storeOpt(blobstore.WithDirectReads(enabled)) }
-
-// WithDirectWrites chooses between O_DIRECT writes (the default) and writes
-// through the kernel page cache. Direct writes go from the cache's memory to
-// the device with no copy; buffered writes are copied into the page cache and
-// written back by the kernel, and need WithDirectReads(false). See
-// blobstore.WithDirectWrites.
-func WithDirectWrites(enabled bool) Option { return storeOpt(blobstore.WithDirectWrites(enabled)) }
-
 // WithMemory bounds mapped value memory in bytes, a page multiple of at least
-// 128 KiB. Memory grows on demand: normally 16 MiB chunks split into 4 MiB
-// blocks, scaled down for small budgets. Larger records use dedicated mappings
-// under the same limit. Full blocks are retired oldest first; physical reuse
-// waits for existing downloads, writes, or readers. Alloc and Get return ErrBusy
-// when no suitable memory can be reclaimed. Default: 1 GiB. Metadata is additional.
-func WithMemory(bytes int64) Option {
-	return funcOpt(func(c *config) { c.memory = bytes })
+// 128 KiB. Inline records and streaming buffers share one slab. SIEVE drops
+// resident buffers while retaining metadata for live disk records. Writers keep
+// their memory pinned until Close, as do readers; close them all before closing the cache.
+// At 80% occupancy, allocations signal background reclamation toward 75% usage.
+// Required reclamation makes room for the request plus at least another request
+// or 25% of the pool, capped at total capacity. Each shard contributes in
+// proportion to its resident bytes; only final-reference releases count.
+// NewWriter and disk reads return ErrBusy when no suitable storage can be reclaimed.
+// Allocator options can set chunk size and prefault backing memory.
+// Default: 1 GiB, 4 KiB chunks, with pages faulted in on use. Metadata is additional.
+func WithMemory(bytes int64, opts ...alloc.Option) Option {
+	return funcOpt(func(c *config) { c.memory, c.allocator = bytes, opts })
 }
 
-// withoutMemoryHits makes Get ignore values in memory and read everything
-// from disk, for comparing the memory tier with a disk-only cache. Tests and
-// benchmarks only.
-func withoutMemoryHits() Option {
-	return funcOpt(func(c *config) { c.memoryHits = false })
+// WithTargetSize sets the live-payload target. Writes may exceed the target
+// while background reclamation catches up. The initial trigger is 95% of the
+// target. Each completed pass sets headroom to the payload published during that
+// pass plus 25%, with a 1 MiB floor scaled down for small caches. Headroom can
+// grow to the full target; the next trigger is target minus headroom. Requests
+// are capped at 5% of the target, and passes continue until usage is below the
+// updated trigger. Reclamation evicts external objects before inline records,
+// oldest first within each group, and submits external unlinks asynchronously.
+// Inline allocation wraps data.db at the target and retires overlapping records;
+// freed index slots are reused independently. Unfinished writes defer eviction;
+// NewWriter returns ErrBusy if reuse would overlap them. Resident values survive
+// disk retirement until memory reclamation releases them.
+// This is not a filesystem quota. Default: 1 GiB, rounded up to a page with a
+// 64 KiB floor.
+// See blobstore.WithTargetSize.
+func WithTargetSize(bytes int64) Option { return storeOpt(blobstore.WithTargetSize(bytes)) }
+
+// WithDurableIndex enables DIO group commit for descriptor writes (default true).
+func WithDurableIndex(enabled bool) Option { return storeOpt(blobstore.WithDurableIndex(enabled)) }
+
+// WithVerifyChecksums enables verification of stored header CRCs and key/value
+// hashes on disk reads and index recovery. Resident values are trusted.
+// Default: false. Checksums absent from older records are skipped. This does not
+// change the checksums written with new records.
+func WithVerifyChecksums(enabled bool) Option {
+	return storeOpt(blobstore.WithVerifyChecksums(enabled))
 }
 
-// withPreSubmit passes every operation the store submits through fn (see
-// blobstore.TestingWithPreSubmit). Tests only.
-func withPreSubmit(fn func(iosched.Op) iosched.Op) Option {
-	return storeOpt(blobstore.TestingWithPreSubmit(fn))
-}
+// WithInlineThreshold sets the largest known value stored in data.db and
+// retained in memory. Default: 1 MiB. Unknown sizes always use object files.
+func WithInlineThreshold(bytes int64) Option { return storeOpt(blobstore.WithInlineThreshold(bytes)) }
 
-// WithMaxSize targets disk usage for retained segments and reservations. Zero
-// disables eviction. The limit must fit two segments per writer. Pending or
-// failed best-effort unlinks can leave more bytes on disk than this target.
-func WithMaxSize(bytes int64) Option { return storeOpt(blobstore.WithMaxSize(bytes)) }
-
-// WithMaxReadHandles bounds cached segment descriptors across all read rings.
-// Default: 4096.
-func WithMaxReadHandles(n int) Option { return storeOpt(blobstore.WithMaxReadHandles(n)) }
+// WithStagingSize sets reusable disk-read and object-write memory, excluding the
+// retained write header page.
+// Default: 256 KiB, reduced when needed to fit WithMemory. Must be positive.
+func WithStagingSize(bytes int64) Option { return storeOpt(blobstore.WithStagingSize(bytes)) }

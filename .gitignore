@@ -30,3 +30,7 @@ tla2tools.jar
 *_TTrace_*.bin
 *_TTrace_*.tla
 states/
+
+# Local development across blobcache and dio checkouts
+go.work
+go.work.sum

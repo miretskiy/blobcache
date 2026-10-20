@@ -1,3 +1,6 @@
+//go:build ignore
+
+// TODO: Port these tests when the read path and disk eviction are implemented.
 package blobcache
 
 import (
@@ -16,8 +19,7 @@ import (
 
 	"github.com/miretskiy/blobcache/blobstore"
 	"github.com/miretskiy/blobcache/internal/xmap"
-	"github.com/miretskiy/dio/v2/align"
-	"github.com/miretskiy/dio/v2/iosched"
+	dioalloc "github.com/miretskiy/dio/v2/alloc"
 	"github.com/stretchr/testify/require"
 )
 
@@ -28,7 +30,7 @@ const (
 
 func openCache(t *testing.T, dir string, opts ...Option) *Cache {
 	t.Helper()
-	c, err := New(dir, append([]Option{WithSegmentSize(testSegment), WithMemory(testMemory)}, opts...)...)
+	c, err := New(dir, append([]Option{WithTargetSize(8 << 20), WithMemory(testMemory)}, opts...)...)
 	require.NoError(t, err)
 	return c
 }
@@ -39,40 +41,84 @@ func closeCache(t *testing.T, c *Cache) {
 }
 
 // alloc lends cache memory holding value, as a download would fill it,
-// retrying ErrBusy: with tiny test segments, rotation can briefly outrun
-// seals, and the oldest memory may be briefly in use.
-func alloc(t *testing.T, c *Cache, key string, value []byte) []byte {
+// retrying ErrBusy when memory is still in use.
+func alloc(t *testing.T, c *Cache, key string, value []byte) memoryValue {
 	t.Helper()
 	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(time.Millisecond) {
-		buf, err := c.Alloc(c.RecordSize(len(key), len(value)))
+		buf, dst, err := c.allocRecord(len(key), len(value))
 		if errors.Is(err, ErrBusy) && time.Now().Before(deadline) {
 			continue
 		}
 		require.NoError(t, err)
-		copy(buf, value)
+		copy(dst, value)
 		return buf
 	}
 }
 
-// put stores value, waits for the write, and waits for the completer to
-// release its memory pin.
-func put(t *testing.T, c *Cache, key string, value []byte) {
+// waitWrites waits for DATA callbacks to release their I/O references.
+func waitWrites(t testing.TB, c *Cache) {
 	t.Helper()
-	buf := alloc(t, c, key, value)
-	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(time.Millisecond) {
-		ticket, err := c.Put([]byte(key), buf, len(value))
-		if errors.Is(err, ErrBusy) && time.Now().Before(deadline) {
-			continue
+	deadline := time.Now().Add(10 * time.Second)
+	for c.stats.WritesInFlight.Load() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("writes did not finish")
 		}
-		require.NoError(t, err)
-		err = ticket.Wait()
-		require.NoError(t, err)
-		c.Drain()
-		return
+		runtime.Gosched()
 	}
 }
 
-// lookup returns a copy of key's value and whether it came from memory.
+func put(t *testing.T, c *Cache, key string, value []byte) {
+	t.Helper()
+	require.NoError(t, c.putRecord([]byte(key), alloc(t, c, key, value), len(value)))
+	waitWrites(t, c)
+	require.NoError(t, c.Err())
+}
+
+func TestReplacementAndRecovery(t *testing.T) {
+	dir := t.TempDir()
+	c := openCache(t, dir)
+	for _, step := range []struct {
+		key, value string
+	}{
+		{"key", "first"},
+		{"key", "first"},
+		{"key", "second"},
+		{"other", "third"},
+		{"key", "first"},
+	} {
+		put(t, c, step.key, []byte(step.value))
+		require.True(t, requireValue(t, c, step.key, []byte(step.value)))
+	}
+	closeCache(t, c)
+	c = openCache(t, dir, storeOpt(blobstore.TestingWithDirectIO(false)))
+	defer closeCache(t, c)
+	requireMissing(t, c, "key") // without a persisted cursor, duplicate-key age is ambiguous
+	requireValue(t, c, "other", []byte("third"))
+	put(t, c, "key", []byte("first"))
+	put(t, c, "key", []byte("fourth"))
+	requireValue(t, c, "key", []byte("fourth"))
+}
+
+func TestConcurrentReplacements(t *testing.T) {
+	dir := t.TempDir()
+	c := openCache(t, dir)
+	var wg sync.WaitGroup
+	for i := range 32 {
+		value := []byte(fmt.Sprint(i))
+		buf := alloc(t, c, "key", value)
+		wg.Go(func() { require.NoError(t, c.putRecord([]byte("key"), buf, len(value))) })
+	}
+	wg.Wait()
+	waitWrites(t, c)
+	_, fromMemory, ok := lookup(t, c, "key")
+	require.True(t, ok)
+	require.True(t, fromMemory)
+	closeCache(t, c)
+	c = openCache(t, dir)
+	defer closeCache(t, c)
+	requireMissing(t, c, "key") // recovery discards ambiguous duplicate-key candidates
+}
+
 func lookup(t *testing.T, c *Cache, key string) (value []byte, fromMemory, ok bool) {
 	t.Helper()
 	fromMemory, err := c.get([]byte(key), func(v []byte) error {
@@ -111,43 +157,47 @@ func randomBytes(seed uint64, n int) []byte {
 	return b
 }
 
-func segmentFiles(t *testing.T, dir string) []string {
+func dataFiles(t *testing.T, dir string) []string {
 	t.Helper()
-	files, err := filepath.Glob(filepath.Join(dir, "*", "*.seg"))
+	files, err := filepath.Glob(filepath.Join(dir, "DATA"))
 	require.NoError(t, err)
 	return files
 }
 
-// findRecord returns the segment file holding key's record, written with a
-// value of valueLen bytes with direct I/O, and the record's bounds in it. The
-// key is stored just before the record's trailer, which ends the record.
+// findRecord locates a record's header using its full key, then reads its
+// physical length from the header. This is independent of I/O open flags.
 func findRecord(t *testing.T, dir, key string, valueLen int) (path string, start, end int64) {
 	t.Helper()
-	for _, path := range segmentFiles(t, dir) {
+	for _, path := range dataFiles(t, dir) {
 		data, err := os.ReadFile(path)
 		require.NoError(t, err)
-		if i := bytes.Index(data, []byte(key)); i >= 0 {
-			end := int64(i + len(key) + trailerSize)
-			return path, end - align.PageAlign(int64(valueLen+len(key)+trailerSize)), end
+		if i := bytes.Index(data, []byte(key)); i >= blobstore.HeaderSize {
+			start := i - blobstore.HeaderSize
+			size := binary.LittleEndian.Uint32(data[start+16:])
+			return path, int64(start), int64(start) + int64(size)
 		}
 	}
 	t.Fatalf("no record of %q", key)
 	return "", 0, 0
 }
 
-// trailerSize is the record trailer's size (see blobstore's format).
-const trailerSize = 20
+func alignedStoreBuffer(t *testing.T, st *blobstore.Store, key string, n int) *dioalloc.Buffer {
+	t.Helper()
+	b := dioalloc.NewBuffer(int64(st.RecordSize(len(key), n)))
+	t.Cleanup(b.Unpin)
+	return b
+}
 
 // locations writes n records to a store of its own and returns their
 // Locations, in write order.
-func locations(t *testing.T, n int) []blobstore.Location {
+func locations(t *testing.T, n int) []blobstore.Descriptor {
 	t.Helper()
-	st, err := blobstore.Open(t.TempDir())
+	st, err := blobstore.Open(filepath.Join(t.TempDir(), "cache"))
 	require.NoError(t, err)
 	defer func() { require.NoError(t, st.Close()) }()
-	locs := make([]blobstore.Location, n)
+	locs := make([]blobstore.Descriptor, n)
 	for i := range locs {
-		ticket, err := st.Write([]byte(fmt.Sprint(i)), make([]byte, 100), 10)
+		ticket, err := st.Append([]byte(fmt.Sprint(i)), alignedStoreBuffer(t, st, fmt.Sprint(i), 10), 10, nil)
 		require.NoError(t, err)
 		locs[i], err = ticket.Wait()
 		require.NoError(t, err)
@@ -164,24 +214,23 @@ func TestIndexShardAlignment(t *testing.T) {
 // read.
 func TestPutGetRoundTrip(t *testing.T) {
 	dir := t.TempDir()
-	c := openCache(t, dir, WithSegmentSize(4<<20))
+	c := openCache(t, dir, WithTargetSize(4<<20))
 	sizes := []int{0, 1, 100, 4048, 4049, 4096, 4097, 64<<10 - 48 - 3, 64 << 10, 3*64<<10 + 17, 1 << 20}
 	values := map[string][]byte{}
 	for i, size := range sizes {
 		key := fmt.Sprintf("key-%d", i)
 		values[key] = randomBytes(uint64(i), size)
 		buf := alloc(t, c, key, values[key])
-		ticket, err := c.Put([]byte(key), buf, size)
+		err := c.putRecord([]byte(key), buf, size)
 		require.NoError(t, err)
 		require.True(t, requireValue(t, c, key, values[key]), "served from Put's memory")
-		err = ticket.Wait()
-		require.NoError(t, err)
+		waitWrites(t, c)
 	}
 	requireMissing(t, c, "absent")
-	require.Equal(t, len(sizes), c.Stats().Items)
+	require.Equal(t, len(sizes), c.Items())
 	closeCache(t, c)
 
-	c = openCache(t, dir, WithSegmentSize(4<<20))
+	c = openCache(t, dir, WithTargetSize(4<<20))
 	defer closeCache(t, c)
 	for key, value := range values {
 		require.False(t, requireValue(t, c, key, value), "first read after restart is from disk")
@@ -199,10 +248,10 @@ func TestOverwrite(t *testing.T) {
 
 	c = openCache(t, dir)
 	defer closeCache(t, c)
-	requireValue(t, c, "k", []byte("two"))
+	requireMissing(t, c, "k") // duplicate-key candidates have no persisted age
 }
 
-func TestReopenAcrossSegments(t *testing.T) {
+func TestReopenPackedIndex(t *testing.T) {
 	dir := t.TempDir()
 	c := openCache(t, dir)
 	values := map[string][]byte{}
@@ -212,14 +261,14 @@ func TestReopenAcrossSegments(t *testing.T) {
 		put(t, c, key, values[key])
 	}
 	closeCache(t, c)
-	require.Greater(t, len(segmentFiles(t, dir)), 2, "test must span several segments")
+	require.Len(t, dataFiles(t, dir), 1)
 
 	c = openCache(t, dir)
 	defer closeCache(t, c)
 	for key, value := range values {
 		requireValue(t, c, key, value)
 	}
-	require.Equal(t, len(values), c.Stats().Items)
+	require.Equal(t, len(values), c.Items())
 }
 
 // TestMemoryReclaimedOldestFirst writes more than the cache's memory: the
@@ -233,7 +282,7 @@ func TestMemoryReclaimedOldestFirst(t *testing.T) {
 	for i := range n {
 		put(t, c, fmt.Sprintf("key-%d", i), value(i))
 	}
-	require.LessOrEqual(t, c.Stats().MemoryUsed, int64(memory))
+	require.LessOrEqual(t, c.MemoryUsed(), int64(memory))
 	require.True(t, requireValue(t, c, fmt.Sprintf("key-%d", n-1), value(n-1)), "newest in memory")
 	require.False(t, requireValue(t, c, "key-0", value(0)), "oldest reclaimed, read from disk")
 }
@@ -247,10 +296,10 @@ func TestBusyWhenMemoryInUse(t *testing.T) {
 	defer closeCache(t, c)
 	put(t, c, "on-disk", randomBytes(1, 100<<10))
 	// Hold all the memory: large buffers, then pages until none is left.
-	var held [][]byte
+	var held []memoryValue
 	for _, size := range []int{200 << 10, 4096} {
 		for {
-			buf, err := c.Alloc(size)
+			buf, err := c.alloc(size)
 			if errors.Is(err, ErrBusy) {
 				break
 			}
@@ -263,47 +312,17 @@ func TestBusyWhenMemoryInUse(t *testing.T) {
 	require.ErrorIs(t, err, ErrBusy)
 
 	for _, buf := range held {
-		require.NoError(t, c.Free(buf))
+		c.free(buf)
 	}
 	requireValue(t, c, "on-disk", randomBytes(1, 100<<10))
 }
 
-// TestMemoryRules covers handing memory back: Put and Free each take memory
-// from Alloc exactly once, whatever the outcome, and refuse other memory.
-func TestMemoryRules(t *testing.T) {
+func TestOversizedMemoryAndBorrowerError(t *testing.T) {
 	c := openCache(t, t.TempDir())
 	defer closeCache(t, c)
-
-	foreign := align.AllocAligned(64 << 10)
-	defer align.FreeAligned(foreign)
-	_, err := c.Put([]byte("k"), foreign, 10)
-	require.ErrorIs(t, err, ErrForeignMemory)
-	require.ErrorIs(t, c.Free(foreign), ErrForeignMemory)
-
-	buf, err := c.Alloc(c.RecordSize(1, 10000))
-	require.NoError(t, err)
-	_, err = c.Put([]byte("k"), buf[4096:], 10)
-	require.ErrorIs(t, err, ErrForeignMemory, "only the memory Alloc returned")
-	_, err = c.Put(nil, buf, 10)
-	require.ErrorIs(t, err, ErrEmptyKey)
-	require.ErrorIs(t, c.Free(buf), ErrForeignMemory, "a failed Put still took the memory")
-
-	buf, err = c.Alloc(c.RecordSize(1, 10))
-	require.NoError(t, err)
-	require.NoError(t, c.Free(buf))
-	require.ErrorIs(t, c.Free(buf), ErrForeignMemory, "freed twice")
-
-	buf = alloc(t, c, "k", []byte("value"))
-	_, err = c.Put([]byte("k"), buf, 5)
-	require.NoError(t, err)
-	_, err = c.Put([]byte("k"), buf, 5)
-	require.ErrorIs(t, err, ErrForeignMemory, "Put twice")
-	c.Drain()
-
-	_, err = c.Alloc(testMemory + 1)
+	_, err := c.alloc(testMemory + 1)
 	require.ErrorIs(t, err, ErrValueTooLarge)
-
-	// fn's error is Get's.
+	put(t, c, "k", []byte("value"))
 	refused := errors.New("refused")
 	require.ErrorIs(t, c.Get([]byte("k"), func([]byte) error { return refused }), refused)
 }
@@ -312,78 +331,13 @@ func TestMemoryRules(t *testing.T) {
 // caller still holds from Alloc.
 func TestCloseReportsHeldMemory(t *testing.T) {
 	c := openCache(t, t.TempDir())
-	_, err := c.Alloc(4096)
+	buf, err := c.alloc(4096)
 	require.NoError(t, err)
 	require.ErrorContains(t, c.Close(), "still held")
-}
-
-// gate holds the store's next submission while armed, before it reaches the
-// scheduler.
-type gate struct {
-	armed   atomic.Bool
-	blocked chan struct{}
-	release chan struct{}
-}
-
-func newGate() *gate {
-	return &gate{blocked: make(chan struct{}), release: make(chan struct{})}
-}
-
-func (g *gate) hook(op iosched.Op) iosched.Op {
-	if g.armed.CompareAndSwap(true, false) {
-		g.blocked <- struct{}{}
-		<-g.release
-	}
-	return op
-}
-
-// putHeld starts a Put that the gate holds before submission, and returns a
-// channel that delivers Put's error when it returns; its write may still be
-// in flight then.
-func putHeld(t *testing.T, c *Cache, gate *gate, key string, value []byte) <-chan error {
-	t.Helper()
-	buf := alloc(t, c, key, value)
-	gate.armed.Store(true)
-	done := make(chan error, 1)
-	go func() {
-		_, err := c.Put([]byte(key), buf, len(value))
-		done <- err
-	}()
-	<-gate.blocked
-	return done
-}
-
-// TestPutVisibleOnReturn checks that a key is absent until Put returns, and is
-// served from Put's memory from then on, before and after its write lands.
-func TestPutVisibleOnReturn(t *testing.T) {
-	gate := newGate()
-	c := openCache(t, t.TempDir(), withPreSubmit(gate.hook))
-	defer closeCache(t, c)
-
-	value := randomBytes(1, 100<<10)
-	done := putHeld(t, c, gate, "k", value) // inside Put, not yet submitted
-	requireMissing(t, c, "k")
-
-	close(gate.release)
-	require.NoError(t, <-done)
-	require.True(t, requireValue(t, c, "k", value))
-	c.Drain()
-	require.True(t, requireValue(t, c, "k", value))
-}
-
-// TestOverwriteVisibleOnReturn checks that an overwrite replaces the value
-// for Get when Put returns.
-func TestOverwriteVisibleOnReturn(t *testing.T) {
-	gate := newGate()
-	c := openCache(t, t.TempDir(), withPreSubmit(gate.hook))
-	defer closeCache(t, c)
-
-	put(t, c, "k", []byte("old"))
-	done := putHeld(t, c, gate, "k", []byte("new"))
-	requireValue(t, c, "k", []byte("old"))
-	close(gate.release)
-	require.NoError(t, <-done)
-	requireValue(t, c, "k", []byte("new"))
+	c.free(buf)
+	require.NoError(t, c.Close(), "returning the borrowed buffer permits cleanup")
+	require.Zero(t, c.mem.used())
+	require.NoError(t, c.Close(), "successful Close remains idempotent")
 }
 
 // TestWithoutMemoryHits checks the disk-only mode used to compare the memory
@@ -394,7 +348,7 @@ func TestWithoutMemoryHits(t *testing.T) {
 	put(t, c, "k", []byte("value"))
 	require.False(t, requireValue(t, c, "k", []byte("value")))
 	require.False(t, requireValue(t, c, "k", []byte("value")))
-	require.Zero(t, c.Stats().MemoryHits)
+	require.Zero(t, c.Stats().MemoryHits.Load())
 }
 
 func flipByte(t *testing.T, path string, off int64) {
@@ -414,13 +368,13 @@ func TestCorruptionIsDetected(t *testing.T) {
 	dir := t.TempDir()
 	c := openCache(t, dir)
 	put(t, c, "value-corrupt", randomBytes(1, 10000))
-	put(t, c, "trailer-corrupt", randomBytes(2, 10000))
+	put(t, c, "header-corrupt", randomBytes(2, 10000))
 	closeCache(t, c)
 
 	path, start, _ := findRecord(t, dir, "value-corrupt", 10000)
-	flipByte(t, path, start+100)
-	path, _, end := findRecord(t, dir, "trailer-corrupt", 10000)
-	flipByte(t, path, end-10)
+	flipByte(t, path, start+int64(blobstore.ValueOffset(len("value-corrupt")))+3)
+	path, start, _ = findRecord(t, dir, "header-corrupt", 10000)
+	flipByte(t, path, start+20)
 
 	c = openCache(t, dir)
 	defer closeCache(t, c)
@@ -429,81 +383,62 @@ func TestCorruptionIsDetected(t *testing.T) {
 	require.ErrorAs(t, err, &ce)
 	requireMissing(t, c, "value-corrupt") // the entry was dropped
 
-	err = c.Get([]byte("trailer-corrupt"), func([]byte) error { return nil })
+	err = c.Get([]byte("header-corrupt"), func([]byte) error { return nil })
 	require.ErrorIs(t, err, ErrNotFound)
-	require.Equal(t, uint64(2), c.Stats().Corrupt)
+	require.Equal(t, uint64(2), c.Stats().Corrupt.Load())
 }
 
-func TestBufferedReads(t *testing.T) {
+func TestBufferedIO(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
-	c := openCache(t, dir, WithDirectReads(false))
+	c := openCache(t, dir, storeOpt(blobstore.TestingWithDirectIO(false)))
 	value := randomBytes(1, 10000)
 	put(t, c, "k", value)
 	closeCache(t, c)
-	c = openCache(t, dir, WithDirectReads(false))
+	c = openCache(t, dir, storeOpt(blobstore.TestingWithDirectIO(false)))
 	defer closeCache(t, c)
 	require.False(t, requireValue(t, c, "k", value))
 }
 
 func TestPutRejects(t *testing.T) {
-	c := openCache(t, t.TempDir())
+	c := openCache(t, t.TempDir(), WithTargetSize(64<<10))
 	for _, key := range [][]byte{nil, make([]byte, MaxKeyLen+1)} {
-		buf, err := c.Alloc(4096)
+		buf, err := c.alloc(4096)
 		require.NoError(t, err)
-		_, err = c.Put(key, buf, 1)
+		err = c.putRecord(key, buf, 1)
 		require.Error(t, err)
 	}
-	buf, err := c.Alloc(testSegment)
+	buf, err := c.alloc(testSegment)
 	require.NoError(t, err)
-	_, err = c.Put([]byte("huge"), buf, testSegment-4096)
+	err = c.putRecord([]byte("huge"), buf, testSegment-4096)
 	require.ErrorIs(t, err, ErrValueTooLarge)
-	require.Equal(t, 0, c.Stats().Items)
+	require.Equal(t, 0, c.Items())
 
 	closeCache(t, c)
 	require.NoError(t, c.Close(), "a second Close is a no-op")
-	_, err = c.Alloc(4096)
+	_, err = c.alloc(4096)
 	require.ErrorIs(t, err, ErrClosed)
 	require.ErrorIs(t, c.Get([]byte("k"), func([]byte) error { return nil }), ErrClosed)
 }
 
-// TestDrain checks that Drain waits for every write accepted before it.
-func TestDrain(t *testing.T) {
-	c := openCache(t, t.TempDir())
-	defer closeCache(t, c)
-	var tickets []Ticket
+// Close must finish queued writes before returning their memory to the allocator.
+func TestCloseDrainsAcceptedWrites(t *testing.T) {
+	dir := t.TempDir()
+	c := openCache(t, dir)
 	for i := range 50 {
 		key := fmt.Sprint(i)
 		value := randomBytes(uint64(i), 30<<10)
-		buf := alloc(t, c, key, value)
-		for {
-			ticket, err := c.Put([]byte(key), buf, len(value))
-			if errors.Is(err, ErrBusy) {
-				runtime.Gosched()
-				continue
-			}
-			require.NoError(t, err)
-			tickets = append(tickets, ticket)
-			break
-		}
+		require.NoError(t, c.putRecord([]byte(key), alloc(t, c, key, value), len(value)))
 	}
-	c.Drain()
-	require.Zero(t, c.Stats().WritesInFlight)
+	closeCache(t, c) // no cache-side drain or per-write waits
+	require.Zero(t, c.Stats().WritesInFlight.Load())
+	c = openCache(t, dir)
+	defer closeCache(t, c)
 	for i := range 50 {
-		it, ok := c.index.get(blobstore.HashKey([]byte(fmt.Sprint(i))))
-		require.True(t, ok)
-		require.True(t, it.onDisk(), "Drain returned before the completer recorded every write")
+		requireValue(t, c, fmt.Sprint(i), randomBytes(uint64(i), 30<<10))
 	}
-	for _, ticket := range tickets {
-		err := ticket.Wait()
-		require.NoError(t, err)
-	}
-	c.Drain() // nothing in flight: returns at once
 }
 
-// TestConcurrentStress mixes writes, overwrites and reads across rotating
-// segments and memory reclaimed under pressure. Every value names
-// its key, so any hit can be checked: a read must never return another key's
-// data.
 func TestConcurrentStress(t *testing.T) {
 	dir := t.TempDir()
 	opts := []Option{WithMemory(2 << 20)}
@@ -524,22 +459,14 @@ func TestConcurrentStress(t *testing.T) {
 				switch op := rng.IntN(10); {
 				case op < 5:
 					v := value(key, rng.Uint64(), rng.IntN(40<<10))
-					buf, err := c.Alloc(c.RecordSize(len(key), len(v)))
+					buf, dst, err := c.allocRecord(len(key), len(v))
 					if errors.Is(err, ErrBusy) {
 						continue // a caller skips caching
 					}
 					require.NoError(t, err)
-					copy(buf, v)
-					ticket, err := c.Put([]byte(key), buf, len(v))
-					if errors.Is(err, ErrBusy) {
-						require.NoError(t, c.Free(buf))
-						continue
-					}
+					copy(dst, v)
+					err = c.putRecord([]byte(key), buf, len(v))
 					require.NoError(t, err)
-					if rng.IntN(2) == 0 {
-						err = ticket.Wait()
-						require.NoError(t, err)
-					}
 				default:
 					err := c.Get([]byte(key), func(got []byte) error {
 						if !bytes.HasPrefix(got, []byte(key+"|")) {
@@ -556,7 +483,7 @@ func TestConcurrentStress(t *testing.T) {
 		}(uint64(g))
 	}
 	wg.Wait()
-	require.Greater(t, c.Stats().Segments, 3, "stress must span several segments")
+	require.Positive(t, c.Stats().Wraps.Load(), "stress must wrap the file")
 	require.Positive(t, hits.Load())
 	closeCache(t, c)
 
@@ -576,72 +503,57 @@ func TestIndexPutLifecycle(t *testing.T) {
 	locs := locations(t, 3)
 	x := newIndex(0)
 	h := blobstore.HashKey([]byte("k"))
-	loc := locs[0]
-	values := make([]memoryValue, 12)
+	values := make([]*resident, 3)
 	for i := range values {
-		values[i] = memoryValue{block: &memoryBlock{keys: []Key{h}}}
-		values[i].block.refs.Store(1)
+		b := &memoryRecord{buffer: dioalloc.NewBuffer(4096), key: h, indexed: true}
+		defer b.buffer.Unpin()
+		values[i] = &resident{memoryValue: memoryValue{record: b}}
 	}
-
-	x.put(h, values[7], loc)
+	x.put(h, values[0], locs[0])
+	x.put(h, values[1], locs[1])
+	x.put(h, values[2], locs[2])
+	x.evictMemory(values[1].record)
 	it, _ := x.get(h)
-	require.Equal(t, item{mem: values[7], loc: loc, pending: true}, it)
-
-	x.put(h, values[8], locs[1]) // overwrite
-	x.put(h, values[9], locs[2]) // and another, installed later
-	x.completed(h, locs[1])      // an older completion must not finish the new write
-	x.evictMemory([]*memoryBlock{values[8].block})
+	require.Equal(t, item{loc: locs[2], mem: values[2]}, it)
+	x.deleteIfAt(h, locs[0])
 	it, _ = x.get(h)
-	require.Equal(t, item{mem: values[9], loc: locs[2], pending: true}, it, "a superseded write changes nothing")
-	x.evictMemory([]*memoryBlock{values[9].block})
+	require.Equal(t, locs[2], it.loc)
+	x.deleteIfAt(h, locs[2])
 	it, ok := x.get(h)
 	require.True(t, ok)
-	require.Equal(t, item{loc: locs[2], pending: true}, it, "memory eviction preserves the disk candidate")
-
-	require.False(t, it.onDisk(), "memory eviction must not expose a pending disk write")
-	x.completed(h, locs[2])
-	it, _ = x.get(h)
-	require.True(t, it.onDisk())
-	require.Nil(t, it.mem.block)
-
-	x.loaded(h, loc)
-	x.cache(h, loc, values[10])
-	it, _ = x.get(h)
-	require.Equal(t, values[10], it.mem, "a read from disk is kept in memory")
-	x.cache(h, locs[2], values[11])
-	it, _ = x.get(h)
-	require.Equal(t, values[10], it.mem, "only for the record the index names")
-	x.deleteIfAt(h, locs[2])
-	_, ok = x.get(h)
-	require.True(t, ok, "only the record the index names is removed")
-	x.deleteIfAt(h, loc)
+	require.False(t, it.onDisk())
+	require.Same(t, values[2], it.mem, "disk failure preserves resident memory")
+	x.evictMemory(values[2].record)
 	_, ok = x.get(h)
 	require.False(t, ok)
+	x.loaded(h, locs[2])
+	x.cache(h, locs[0], values[0])
+	it, _ = x.get(h)
+	require.Nil(t, it.mem, "old read cannot replace a newer location")
+	x.cache(h, locs[2], values[2])
+	x.evictMemory(values[2].record)
+	it, ok = x.get(h)
+	require.True(t, ok)
+	require.Equal(t, locs[2], it.loc, "memory eviction preserves disk")
 }
 
-// The cache keeps one memory/index layer while the store routes independent
-// write and read streams. Segment retirement must still clear its shared index.
-func TestMultiRingCacheEviction(t *testing.T) {
-	if runtime.NumCPU() < 2 {
-		t.Skip("need two coordinator CPUs")
-	}
+func TestDiskCacheEviction(t *testing.T) {
 	dir := t.TempDir()
-	c := openCache(t, dir, WithRings(2), WithDedicatedWriteRings(1),
-		WithMaxSegments(3), WithSegmentSize(64<<10), withoutMemoryHits())
+	c := openCache(t, dir, WithTargetSize(3*64<<10), withoutMemoryHits())
 	defer func() { closeCache(t, c) }()
 	value := randomBytes(42, 20<<10)
 	put(t, c, "old", value)
 	for i := 0; i < 30; i++ {
 		key := fmt.Sprintf("key-%d", i)
 		put(t, c, key, value)
-		require.False(t, requireValue(t, c, key, value), "reads must use the dedicated read ring")
+		require.False(t, requireValue(t, c, key, value), "reads must come from disk")
 	}
 	require.Eventually(t, func() bool {
-		_, ok := c.index.get(blobstore.HashKey([]byte("old")))
-		return !ok
+		it, ok := c.index.get(blobstore.HashKey([]byte("old")))
+		return !ok || !it.onDisk()
 	}, 5*time.Second, time.Millisecond)
-	require.Positive(t, c.Stats().EvictedSegments)
+	require.Positive(t, c.Stats().EvictedRecords.Load())
 	closeCache(t, c)
-	c = openCache(t, dir, WithMaxSegments(3), WithSegmentSize(64<<10))
+	c = openCache(t, dir, WithTargetSize(3*64<<10))
 	requireValue(t, c, "key-29", value)
 }

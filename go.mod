@@ -1,13 +1,16 @@
 module github.com/miretskiy/blobcache
 
-go 1.25.11
+go 1.27.2
+
+replace github.com/miretskiy/dio/v2 => ../dio
 
 require (
 	github.com/HdrHistogram/hdrhistogram-go v1.3.0
-	github.com/miretskiy/dio/v2 v2.3.0
+	github.com/miretskiy/dio/v2 v2.8.0
 	github.com/shirou/gopsutil/v3 v3.24.5
 	github.com/stretchr/testify v1.11.1
 	github.com/zeebo/xxh3 v1.0.2
+	golang.org/x/sync v0.23.0
 	golang.org/x/sys v0.41.0
 )
 

@@ -62,7 +62,7 @@ func (st *Store) NewReader(key []byte, h RecordHeader) (_ *Reader, err error) {
 	if err != nil {
 		return nil, err
 	}
-	r.buffer = NewBuffer(r.memory)
+	r.buffer = NewBuffer(r.memory.Chunks())
 	// The final read may shorten a chunk. Keep the allocator's slice intact.
 	r.buffer.chunks = append([][]byte(nil), r.buffer.chunks...)
 	r.file = st.data

@@ -12,12 +12,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-type bufferChunks [][]byte
-
-func (c bufferChunks) Chunks() [][]byte { return c }
-
-func makeBufferChunks(sizes ...int) bufferChunks {
-	chunks := make(bufferChunks, len(sizes))
+func makeBufferChunks(sizes ...int) [][]byte {
+	chunks := make([][]byte, len(sizes))
 	for i, size := range sizes {
 		chunks[i] = make([]byte, size)
 	}
@@ -58,7 +54,7 @@ func TestBufferWriter(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, len(part), n)
 	}
-	require.Equal(t, bufferChunks{[]byte("hel"), []byte("lo "), []byte("world!")}, chunks)
+	require.Equal(t, [][]byte{[]byte("hel"), []byte("lo "), []byte("world!")}, chunks)
 	got, err := io.ReadAll(b)
 	require.NoError(t, err)
 	require.Equal(t, reference.Bytes(), got)

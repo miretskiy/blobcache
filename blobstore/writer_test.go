@@ -303,7 +303,7 @@ func TestWriterInlineUsesOnlyReservedPages(t *testing.T) {
 }
 
 func newBufferReader(memory *alloc.Buffer, offset, size int64) *Buffer {
-	b := NewBuffer(memory)
+	b := NewBuffer(memory.Chunks())
 	b.rPos, b.wPos = b.position(offset), b.position(offset+size)
 	return b
 }

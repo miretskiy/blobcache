@@ -90,7 +90,7 @@ func (st *Store) NewWriter(key []byte, size int64) (*Writer, error) {
 		},
 		scheduler: st.scheduler,
 		memory:    memory,
-		buffer:    NewBuffer(memory),
+		buffer:    NewBuffer(memory.Chunks()),
 		limit:     size,
 		hash:      hasher,
 	}

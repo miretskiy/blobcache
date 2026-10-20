@@ -27,8 +27,8 @@ type bufferPosition struct {
 
 // NewBuffer starts with no readable bytes and uses the supplied chunks' full
 // capacity. Each chunk must be nonempty. The caller keeps the memory alive.
-func NewBuffer(memory interface{ Chunks() [][]byte }) *Buffer {
-	b := &Buffer{chunks: memory.Chunks()}
+func NewBuffer(chunks [][]byte) *Buffer {
+	b := &Buffer{chunks: chunks}
 	for _, chunk := range b.chunks {
 		b.capacity += int64(len(chunk))
 	}

@@ -1,10 +1,9 @@
-# Instance-storage baseline: m7gd.8xlarge (2026-10-03)
+# Instance-storage fio baseline: m7gd.8xlarge (2026-10-03–06)
 
-What the local NVMe of the benchmark box sustains for reads and writes, alone
-and together, measured with fio as the baseline for BlobCache benchmarks. All
-XFS numbers below come from one session (2026-10-03, full-volume XFS), at two
-request-size distributions. An earlier round on btrfs is kept at the end
-because it explains earlier decisions; its mixed results are superseded.
+Historical fio measurements of local NVMe throughput and latency on XFS.
+Sections 1–5 were measured on October 3; section 6 on October 6. These describe
+the hardware experiments and their setup, not current BlobCache performance
+or configuration.
 
 ## Setup
 
@@ -17,9 +16,7 @@ because it explains earlier decisions; its mixed results are superseded.
   queue per CPU** (`/sys/block/nvme1n1/mq/*/cpu_list`: queue *i* serves CPU *i*).
 - Filesystem: **XFS** (default `mkfs.xfs`, mounted `noatime`) on the whole
   1641 GiB LVM volume `vg_ws_ephemeral-volume1p1`; the rest of the disk
-  (128 GiB) is the VM's swap. The workspace's btrfs, which the outer system
-  keeps mounted, was migrated online onto a loop file to free the volume.
-  No dedup daemon running.
+  (128 GiB) was the VM's swap. No dedup daemon running during these tests.
 - fio 3.36, `--ioengine=io_uring --direct=1`. Random reads over 16 × 8 GiB
   files; sequential writes into freshly `fallocate`d files (deleted before every
   run, so each run writes preallocated space, as BlobCache does),
@@ -90,11 +87,9 @@ The same split without pinning (`fio-xfs.sh`): 4 readers / 4 writers 0.45
    same bandwidths within a few percent; latencies are lower roughly in
    proportion to the smaller mean request.
 
-## 4. One CPU: how dio submits
+## 4. One CPU: reads and writes sharing a hardware queue
 
-dio submits all I/O from one coordinator thread, so at any moment its reads
-and writes go through the hardware queue of the CPU it runs on. These runs pin
-everything to CPU 0 (script `fio-onecpu.sh`), with submission-latency
+These runs pin everything to CPU 0 (script `fio-onecpu.sh`), with submission-latency
 percentiles enabled. Depths are requests in flight; every request is 1 MiB
 (8 device commands) unless marked mixed. Latencies in ms.
 
@@ -134,18 +129,16 @@ What this shows:
    the queue's 127 entries).
 2. **Neither side needs depth**: two 1 MiB writes in flight reach 1.25 GB/s,
    spending under 1 ms in the device, and 16 MiB of reads (the smallest read
-   depth tested here) already reach 2.56 GB/s; section 5 shows ~1–2 requests
-   of each suffice. More depth adds only latency (Little's law: 128 MiB ÷
+   depth tested here) already reach 2.56 GB/s. Section 5 estimates the depth
+   needed from unloaded latency. More depth adds only latency here (128 MiB ÷
    2.56 GB/s ≈ 50 ms).
 3. **Past ~8 MiB of writes, a writer can fill the queue by itself**: at
    16 MiB (128 commands) reads lose a quarter; at 24–32 MiB they collapse to
    0.3–0.5 GB/s. The reads that get in still finish in 0.6 ms at the device;
    their 275–600 ms clat is time waiting for queue entries held by writes.
 4. **A single submitter that interleaves reads and writes (B) never
-   collapses**: the split follows the submission mix, and whichever side
-   reaches its ceiling sets the total. dio is a single submitter too, but in
-   arrival order, so a burst of queued writes is submitted ahead of reads —
-   case A at high write depth.
+   collapses in these runs**: the split follows the submission mix, and
+   whichever side reaches its ceiling sets the total.
 
 ## 5. Unloaded latency and the depth needed (Little's law)
 
@@ -162,8 +155,8 @@ One request in flight (QD1), on CPU 0, 5 s ramp / 20 s measured (script
 Throughput at QD1: 1 MiB reads 2.28 GB/s, 1 MiB writes 1.22 GB/s; 128 KiB
 writes 1.20 GB/s; 4 KiB reads 12.8k IOPS, writes 30.2k IOPS.
 
-Depth needed to reach the ceilings, by Little's law (ceiling × mean latency ÷
-request size):
+Estimated depth needed to reach the ceilings, using the measured QD1 mean
+latency in Little's law (ceiling × mean latency ÷ request size):
 
 | Request size | Reads (2.56 GB/s) | Writes (1.22 GB/s) |
 |---|---|---|
@@ -172,9 +165,9 @@ request size):
 | mixed | 1.3 requests (1.1 MiB) | 0.9 |
 | 128 KiB | 2.8 requests (0.4 MiB) | 0.9 |
 
-1. **The device is bandwidth-limited, not latency-limited**: ~2 MiB of reads
-   and ~1 MiB of writes in flight reach both ceilings. Any further depth only
-   queues, adding depth ÷ bandwidth of latency.
+1. **The estimates suggest shallow queues suffice**: roughly 2 MiB of reads
+   and 1 MiB of writes in flight. These are estimates from unloaded latency;
+   section 6 reports a measured depth sweep.
 2. **Writes behave like a fixed bandwidth cap**: even 128 KiB writes reach
    1.20 GB/s at one request in flight, and write latency grows in proportion
    to size (~1.4 GB/s at the margin) — consistent with a provisioned
@@ -237,50 +230,6 @@ matches the independent-limits prediction and that check 4 reaches both
 ceilings at once. If either fails, the device shares a budget and the cost
 should be the sum, or reads and writes should share one budget.
 
-## Conclusions
-
-1. Ceilings: 1.22 GB/s writes and 2.56 GB/s reads; together up to ~3.8 GB/s,
-   even through a single hardware queue, as long as writes in flight stay at
-   or below ~8 MiB. About 2 MiB of reads and 1 MiB of writes in flight reach
-   the ceilings; beyond that, depth only adds latency.
-2. A hardware queue holds 127 commands, 16 MiB of 128 KiB commands. A thread
-   submitting deep writes fills its CPU's queue and blocks in the kernel; reads
-   submitted through the same queue wait behind them.
-3. Deep outstanding I/O at the device lowers read throughput and leaves writes
-   untouched.
-
-## Implications for BlobCache
-
-- dio submits all I/O from one coordinator thread. At any moment its
-  submissions land in the queue of the CPU it runs on, so BlobCache's reads
-  and writes share a queue — the "same CPU" case. With writes deep enough to
-  fill that queue, reads wait behind them.
-- Writes saturate with ~1 MiB in flight and reads with ~2 MiB; more than
-  ~8 MiB of writes starves reads sharing the queue. The default write memory limit (256 MiB) allows 32× that;
-  write memory in flight beyond a few MiB only queues. A cap on write I/O in
-  flight, separate from write memory, would keep a single queue at both
-  ceilings. (Not implemented.)
-
-## Appendix: the btrfs round (2026-10-02, superseded)
-
-The instance storage was first btrfs (`compress=zstd:1`, on LVM, with the
-bees dedup daemon running); 1 MiB requests, 10 s ramp / 60 s per point.
-
-- Ceilings: writes 1.20 GB/s (4 jobs), reads 2.41 GB/s; one file reached only
-  0.87 GB/s (1 job, depth 32, measured in a copy-on-write directory; never
-  measured with `nodatacow`).
-- **Copy-on-write stalls.** With btrfs's default copy-on-write and data
-  checksums, O_DIRECT writes under heavy read load stalled for 17–70 seconds
-  (p99 17 s). Writing into a `nodatacow` directory (`chattr +C`) removed the
-  stalls (p99 558 ms). On btrfs, mount with `nodatacow`; BlobCache does not set
-  it. XFS has no data copy-on-write.
-- Mixed runs (16 reader jobs against 4 writer jobs, unpinned, `nodatacow`
-  write files) found reads and writes adding up to 3.84 GB/s at 128 reads in
-  flight and deeper reads starving writes (0.21 GB/s at 512). The same job
-  shapes on XFS did not reproduce this, and why btrfs behaved differently is
-  not established. The conclusion drawn then — "the device favors reads" —
-  does not hold.
-
 ## Reproducing
 
 Scripts are in [`fio/`](fio/) (see its README): `fio-all.sh` runs
@@ -298,5 +247,8 @@ fio --ioengine=io_uring --direct=1 --bs=1M --time_based --ramp_time=5 --runtime=
     $reader [$pin] $writer [$pin]
 ```
 
-Raw JSON and iostat logs: `/instance_storage/fio-xfs/results{,-pin}-{1M,mixed}/`
-on the box (ephemeral).
+The original runs wrote JSON and iostat logs under
+`/instance_storage/fio-xfs/results{,-pin}-{1M,mixed}/` on ephemeral storage.
+No local copy of those raw sweep results was found during the October 21
+cleanup. The raw fio output retained under `local/fio/` is from a separate
+October 9 backing-file initialization, not these baseline sweeps.

@@ -32,6 +32,7 @@ type memoryQueue struct {
 	list          collections.List[residentEntry]
 	hand          collections.Handle
 	residentBytes int64
+	_             [32]byte // Together with the shard's lock and map: 128 bytes.
 }
 
 type memoryCache struct {
@@ -40,8 +41,8 @@ type memoryCache struct {
 }
 
 func newMemoryCache() memoryCache {
-	return memoryCache{entries: collections.NewShardedMap[blobstore.KeyHash, memoryEntry, memoryQueue](
-		4, 0, func(key blobstore.KeyHash) uint64 { return key.Lo },
+	return memoryCache{entries: collections.NewShardedMapWithExtra[blobstore.KeyHash, memoryEntry](
+		4, 0, func(key blobstore.KeyHash) uint64 { return key.Lo }, memoryQueue{},
 	)}
 }
 

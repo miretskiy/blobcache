@@ -4,7 +4,7 @@ go 1.27.2
 
 require (
 	github.com/HdrHistogram/hdrhistogram-go v1.3.0
-	github.com/miretskiy/dio/v2 v2.8.1-0.20261021131543-278f1e512554
+	github.com/miretskiy/dio/v2 v2.8.1-0.20261021133728-709abbb87c8b
 	github.com/stretchr/testify v1.11.1
 	github.com/zeebo/xxh3 v1.0.2
 	golang.org/x/sync v0.23.0

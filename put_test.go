@@ -12,7 +12,6 @@ import (
 	"testing"
 
 	"github.com/miretskiy/blobcache/blobstore"
-	"github.com/miretskiy/blobcache/internal/xmap"
 	"github.com/miretskiy/dio/v2/align"
 	"github.com/miretskiy/dio/v2/alloc"
 	"github.com/stretchr/testify/require"
@@ -432,7 +431,6 @@ func TestPutConfigurationAndOpenFailures(t *testing.T) {
 }
 
 func TestMemoryQueueSecondChance(t *testing.T) {
-	require.NoError(t, xmap.VerifyAlignment[memoryEntry, memoryQueue]())
 	c := newPutCache(t, t.TempDir())
 	var keys []string
 	for i := 0; len(keys) < 3; i++ {

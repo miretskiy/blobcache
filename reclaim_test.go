@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/miretskiy/blobcache/blobstore"
-	"github.com/miretskiy/blobcache/internal/xmap"
 	"github.com/miretskiy/dio/v2/align"
 	"github.com/miretskiy/dio/v2/alloc"
 	"github.com/stretchr/testify/require"
@@ -126,7 +125,7 @@ func TestCacheCloseJoinsReclaimer(t *testing.T) {
 			release()
 		}
 	})
-	c.values.replace(xmap.Key{}, b, blobstore.RecordHeader{})
+	c.values.replace(blobstore.KeyHash{}, b, blobstore.RecordHeader{})
 	c.startCacheReclaim(c.memory.Capacity(), true)
 	select {
 	case <-started:

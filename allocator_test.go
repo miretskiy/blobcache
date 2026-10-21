@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"github.com/miretskiy/blobcache/blobstore"
-	"github.com/miretskiy/blobcache/internal/xmap"
 	"github.com/miretskiy/dio/v2/align"
 	"github.com/miretskiy/dio/v2/alloc"
 	"github.com/stretchr/testify/require"
@@ -37,7 +36,7 @@ func TestMemoryReclaimCountsOnlyReleasedBytes(t *testing.T) {
 		}
 		// Keep order deterministic in one shard. The logical value is smaller
 		// than its reservation: reclamation must count allocated bytes.
-		m.replace(xmap.Key{Lo: uint64(i * m.entries.ShardCount())}, b,
+		m.replace(blobstore.KeyHash{Lo: uint64(i * m.entries.ShardCount())}, b,
 			blobstore.RecordHeader{PhysicalLen: 1})
 	}
 	require.Zero(t, pool.Available())
@@ -45,7 +44,7 @@ func TestMemoryReclaimCountsOnlyReleasedBytes(t *testing.T) {
 	require.Zero(t, m.reclaimCacheMemory(-1))
 	require.Equal(t, int64(3*page), m.reclaimCacheMemory(3*page), "pinned victims contribute no reclaimed bytes")
 	require.Equal(t, int64(3*page), pool.Available())
-	s := m.entries.Shard(xmap.Key{})
+	s := m.entries.Shard(blobstore.KeyHash{})
 	require.Equal(t, 1, s.Extra.list.Len(), "stop after reaching the byte target")
 	require.Equal(t, 5, m.entries.Len(), "all disk metadata survives")
 	for i, b := range pinned {
@@ -64,7 +63,7 @@ func TestCacheAllocatorHeadroom(t *testing.T) {
 		// Fill without proactive requests to exercise required reclamation.
 		buffer, err := c.memory.tryAcquire(align.BlockSize)
 		require.NoError(t, err)
-		c.values.replace(xmap.Key{Lo: uint64(i)}, buffer, blobstore.RecordHeader{})
+		c.values.replace(blobstore.KeyHash{Lo: uint64(i)}, buffer, blobstore.RecordHeader{})
 	}
 	require.Zero(t, c.memory.Available())
 	key := []byte("next")
@@ -125,11 +124,11 @@ func TestCacheAllocatorPinnedExhaustionAndLateRelease(t *testing.T) {
 			require.Equal(t, capacity, b.Cap(), "the allocation is larger than the request")
 			require.Zero(t, a.Available(), "charge the buffer's entire capacity")
 			require.True(t, b.TryInc())
-			m.replace(xmap.Key{}, b, blobstore.RecordHeader{PhysicalLen: 1})
+			m.replace(blobstore.KeyHash{}, b, blobstore.RecordHeader{PhysicalLen: 1})
 			_, err = a.TryAcquire(1)
 			require.ErrorIs(t, err, alloc.ErrExhausted)
 			require.Zero(t, a.Available(), "dropping a cache reference did not release pinned storage")
-			e, ok := m.entries.Get(xmap.Key{})
+			e, ok := m.entries.Get(blobstore.KeyHash{})
 			require.True(t, ok)
 			require.Zero(t, e.resident)
 			ctx, cancel := context.WithCancel(context.Background())

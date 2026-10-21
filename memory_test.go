@@ -6,12 +6,11 @@ import (
 
 	"github.com/miretskiy/blobcache/blobstore"
 	"github.com/miretskiy/dio/v2/alloc"
-	"github.com/miretskiy/dio/v2/collections"
 	"github.com/stretchr/testify/require"
 )
 
 func TestMemoryShardAlignment(t *testing.T) {
-	require.NoError(t, collections.VerifyAlignment[blobstore.KeyHash, memoryEntry, memoryQueue]())
+	require.NoError(t, VerifyAlignment[blobstore.KeyHash, memoryEntry, memoryQueue]())
 }
 
 func TestMemoryIgnoresOlderPublication(t *testing.T) {

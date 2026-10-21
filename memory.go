@@ -42,7 +42,8 @@ type memoryCache struct {
 
 func newMemoryCache() memoryCache {
 	return memoryCache{entries: collections.NewShardedMapWithExtra[blobstore.KeyHash, memoryEntry](
-		4, 0, func(key blobstore.KeyHash) uint64 { return key.Lo }, memoryQueue{},
+		4, memoryQueue{},
+		collections.WithHasher(func(key blobstore.KeyHash) uint64 { return key.Lo }),
 	)}
 }
 

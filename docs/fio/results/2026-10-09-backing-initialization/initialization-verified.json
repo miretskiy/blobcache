@@ -1,0 +1,6 @@
+{
+  "bytes": 1099511627776,
+  "blocks_512": 2147483656,
+  "unwritten_extents": false,
+  "zero_samples_every_GiB": 64
+}

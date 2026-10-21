@@ -1,8 +1,13 @@
-# fio scripts for the instance-storage baseline
+# fio measurements and scripts
 
-The scripts that produced [`../nvme-baseline-m7gd.md`](../nvme-baseline-m7gd.md),
-kept as a record. They expect the benchmark box's layout: an XFS instance
-store at `/instance_storage` (they work under `/instance_storage/fio-xfs`),
+The [m7gd baseline](nvme-baseline-m7gd.md) records the October 3–6 hardware
+measurements. The [October 9 raw output](results/2026-10-09-backing-initialization/)
+contains a separate 1 TiB backing-file initialization, with fio, iostat,
+vmstat, and allocation records. Raw output from the baseline sweeps is unavailable
+locally.
+
+The scripts below produced the baseline measurements. They expect an XFS instance
+store at `/instance_storage` (working under `/instance_storage/fio-xfs`),
 device `nvme1n1`, fio ≥ 3.36 with io_uring, `iostat` (sysstat), and `sudo`.
 
 | Script | What it runs | Doc section |

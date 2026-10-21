@@ -179,7 +179,7 @@ latency in Little's law (ceiling × mean latency ÷ request size):
 ## 6. Disk model: per-class IOPS and bandwidth (2026-10-06)
 
 The numbers an in-flight budget needs, measured by
-[`fio/fio-model.sh`](fio/fio-model.sh): 256 requests in flight (8 jobs ×
+[`fio-model.sh`](fio-model.sh): 256 requests in flight (8 jobs ×
 depth 32); random reads over 8 GiB files; sequential writes into freshly
 fallocated files, as BlobCache writes.
 
@@ -224,7 +224,7 @@ each class needs. A rerun measured 74k 4 KiB write IOPS (83k before): small
 run-to-run drift, irrelevant to large writes.
 
 **Redoing this on another disk:** run dio's `scripts/disk-model.sh DIR` (or
-`fio/fio-model.sh` here, adjusting `root`); take
+`fio-model.sh` here, adjusting `root`); take
 the 4 KiB IOPS and 1 MiB MB/s for each class; check that the 16 KiB result
 matches the independent-limits prediction and that check 4 reaches both
 ceilings at once. If either fails, the device shares a budget and the cost
@@ -232,7 +232,7 @@ should be the sum, or reads and writes should share one budget.
 
 ## Reproducing
 
-Scripts are in [`fio/`](fio/) (see its README): `fio-all.sh` runs
+See the [script reference](README.md): `fio-all.sh` runs
 `fio-xfs.sh` (ceilings, mixed sweep, submitter counts) and `fio-pin.sh` (CPU
 pinning with iostat) at `BS=1M` and the mixed `--bssplit`; `BS` takes one size
 or a `--bssplit` list. `fio-onecpu.sh` and
@@ -250,5 +250,5 @@ fio --ioengine=io_uring --direct=1 --bs=1M --time_based --ramp_time=5 --runtime=
 The original runs wrote JSON and iostat logs under
 `/instance_storage/fio-xfs/results{,-pin}-{1M,mixed}/` on ephemeral storage.
 No local copy of those raw sweep results was found during the October 21
-cleanup. The raw fio output retained under `local/fio/` is from a separate
-October 9 backing-file initialization, not these baseline sweeps.
+cleanup. The retained [raw fio output](results/2026-10-09-backing-initialization/)
+is from a separate October 9 backing-file initialization, not these baseline sweeps.

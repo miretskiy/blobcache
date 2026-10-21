@@ -10,8 +10,10 @@ import (
 	"io"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/miretskiy/blobcache/blobstore"
+	"github.com/miretskiy/blobcache/metrics"
 	"github.com/miretskiy/dio/v2/align"
 	"github.com/miretskiy/dio/v2/alloc"
 )
@@ -27,7 +29,7 @@ var (
 	ErrKeyTooLarge = blobstore.ErrKeyTooLarge
 	ErrNotFound    = blobstore.ErrNotFound
 	ErrCorrupt     = blobstore.ErrCorrupt
-	// ErrBusy means memory is unavailable or disk reuse overlaps an unfinished write.
+	// ErrBusy means memory is unavailable or disk reuse overlaps an open writer.
 	ErrBusy = alloc.ErrExhausted
 )
 
@@ -111,26 +113,38 @@ func New(path string, opts ...Option) (*Cache, error) {
 // uses SIEVE to meet its proportional byte target; only final-reference releases
 // count as reclaimed space. Keys and disk metadata remain indexed.
 // ErrBusy means memory is still unavailable after reclamation, or disk reuse
-// overlaps an unfinished write. The caller should immediately defer Close.
+// overlaps an open writer. The caller should immediately defer Close.
 func (c *Cache) NewWriter(key []byte, size int64) (*Writer, error) {
 	w, err := c.store.NewWriter(key, size)
+	if err != nil {
+		metrics.WriterErrors.Add(1)
+	}
 	if err == blobstore.ErrBusy {
 		return nil, ErrBusy
 	}
 	return w, err
 }
 
-// Put submits a filled writer. Data and index completion publish the value in
-// the cache; a Read before then may miss or see the previous value. Late I/O
-// failures are logged and leave the new record unpublished. Call Put once, then
-// Close the writer. Neither waits for Linux I/O completion.
+// Put waits for a filled writer's data and index writes, then publishes the
+// value in the cache before returning. WithDurableIndex also waits for the
+// index sync. I/O errors are returned and leave the new record unpublished.
+// Concurrent puts proceed independently. Call Put once, then Close the writer
+// on either success or failure.
 func (c *Cache) Put(w *Writer) error {
-	return c.store.Put(w, c.publish)
-}
-
-func (c *Cache) publish(header blobstore.RecordHeader, buffer *alloc.Buffer) {
+	started := time.Now()
+	defer func() { metrics.PutDuration.RecordValue(int64(time.Since(started))) }()
+	if err := c.store.Put(w); err != nil {
+		metrics.PutErrors.Add(1)
+		return err
+	}
+	var buffer *alloc.Buffer
+	if !w.IsExternal() {
+		buffer = w.RetainBuffer()
+	}
+	header := w.Header()
 	c.values.replace(header.Hash, buffer, header)
 	c.startDiskReclaim()
+	return nil
 }
 
 // Read returns the value for key, or ErrNotFound. Resident values stay pinned
@@ -162,7 +176,7 @@ func (c *Cache) Read(key []byte) (Reader, error) {
 	return r, nil
 }
 
-// Close drains accepted puts, joins both reclamation workers, and releases cached
+// Close drains object cleanup, joins both reclamation workers, and releases cached
 // buffers before closing the allocator. The caller must close all readers
 // and writers first; Close does not track them. It must not race cache, reader,
 // or writer calls. Repeated calls are harmless.
@@ -171,7 +185,7 @@ func (c *Cache) Close() (err error) {
 		return nil
 	}
 	c.closed = true
-	c.store.Wait() // Publication can still signal the reclamation workers.
+	c.store.Wait()
 	close(c.reclaimRequests)
 	close(c.diskReclaimRequests)
 	c.reclaimWG.Wait()

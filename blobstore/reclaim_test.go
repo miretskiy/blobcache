@@ -20,14 +20,8 @@ func putReclaimRecord(t *testing.T, st *Store, key string, value []byte) RecordH
 	defer w.Discard()
 	_, err = w.Write(value)
 	require.NoError(t, err)
-	require.NoError(t, st.Put(w, nil))
-	drainTestIndex(t, st) // These policy tests reclaim completed records.
+	require.NoError(t, st.Put(w))
 	return checkWriterRecord(t, st, w, []byte(key), value)
-}
-
-func drainTestIndex(t *testing.T, st *Store) {
-	t.Helper()
-	st.Wait()
 }
 
 func liveStoreHeaders(st *Store) []RecordHeader {

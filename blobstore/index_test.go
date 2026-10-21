@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/miretskiy/blobcache/internal/intrusive"
+	"github.com/miretskiy/dio/v2/collections"
 	"github.com/miretskiy/dio/v2/iosched"
 	"github.com/stretchr/testify/require"
 )
@@ -78,10 +78,11 @@ func indexTestHeader(offset, size uint64, tag byte) RecordHeader {
 	}
 }
 
-func publishIndexHeader(t *testing.T, idx *diskIndex, scheduler iosched.Scheduler, handle intrusive.Handle, h RecordHeader) RecordHeader {
+func publishIndexHeader(t *testing.T, idx *diskIndex, scheduler iosched.Scheduler, handle collections.Handle, h RecordHeader) RecordHeader {
 	t.Helper()
 	h.ObjectID = idx.records(h.Flags).Value(handle).header.ObjectID
-	submitIndexOp(t, scheduler, idx.publish(handle, h))
+	submitIndexOp(t, scheduler, idx.writeOp(handle, h))
+	idx.publish(handle, h)
 	idx.records(h.Flags).Value(handle).pending = false // Both index I/O and writer handoff are complete.
 	return h
 }
@@ -107,14 +108,17 @@ func TestIndexReservationAndOutOfOrderCompletion(t *testing.T) {
 	external.Flags |= FlagExternal
 	external.Flags.SetCompression(CompressionZstd)
 	external.LogicalLen = 1 << 35
-	firstOp := idx.publish(first, inline)
-	secondOp := idx.publish(second, external)
+	firstOp := idx.writeOp(first, inline)
+	secondOp := idx.writeOp(second, external)
+	require.Zero(t, idx.size(), "preparing index writes must not publish reservations")
 	submitIndexOp(t, scheduler, secondOp)
+	idx.publish(second, external)
 	require.Equal(t, RawHeader{}, readIndexSlot(t, idx, 0))
 	partial := reopenTestIndex(t, idx)
 	require.Greater(t, partial.nextObjectID, external.ObjectID)
 	require.Equal(t, map[uint64]RecordHeader{external.ObjectID: external}, indexHeaders(partial))
 	submitIndexOp(t, scheduler, firstOp)
+	idx.publish(first, inline)
 	reopened := reopenTestIndex(t, idx)
 	require.Equal(t, []RecordHeader{inline, external}, indexReservations(reopened))
 	require.Equal(t, inline.PhysicalLen+external.PhysicalLen, reopened.size())

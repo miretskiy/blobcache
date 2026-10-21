@@ -5,9 +5,10 @@ import (
 	"io"
 	"os"
 
-	"github.com/miretskiy/blobcache/internal/intrusive"
+	"github.com/miretskiy/blobcache/metrics"
 	"github.com/miretskiy/dio/v2/align"
 	"github.com/miretskiy/dio/v2/alloc"
+	"github.com/miretskiy/dio/v2/collections"
 	"github.com/miretskiy/dio/v2/iosched"
 	"github.com/zeebo/xxh3"
 )
@@ -22,15 +23,16 @@ var ErrWriterFull = errors.New("blobstore: value exceeds writer reservation")
 // external values reuse staging space after waiting for its writes. The first
 // page stays intact so finish can replace its header without rereading it.
 // Calls are sequential. Write, ReadFrom, and Flush require an open, unpublished
-// writer. Put may be called once; afterward only Size, KeyHash, RetainBuffer,
-// Close, and Discard may be called.
+// writer. Put may be called once; afterward only metadata access, RetainBuffer,
+// Close, and Discard are allowed. The reservation remains protected until Close.
 type Writer struct {
 	store       *Store
 	key         KeyHash
 	file        *os.File
 	vfd         int // -1 for a regular descriptor
 	header      RecordHeader
-	reservation intrusive.Handle // transferred to Put until publication completes
+	reservation collections.Handle // protected until Close
+	committed   bool               // Close releases a committed record or discards an unfinished one
 	scheduler   iosched.Scheduler
 	memory      *alloc.Buffer // owns the allocation referenced by buffer
 	buffer      *Buffer
@@ -43,7 +45,7 @@ type Writer struct {
 // copied before return. size is the expected value size, or SizeUnknown.
 // Inline writes are bounded by their reservation. Keys must fit MaxKeyLen.
 // Allocation exhaustion is returned to the caller. ErrBusy means reuse would
-// overlap an unfinished writer or index write; no I/O wait is added for reuse.
+// overlap an open writer; no I/O wait is added for reuse.
 // External writers wait if all 1024 virtual descriptors are occupied.
 // The caller must Discard the writer when finished, including after Put.
 func (st *Store) NewWriter(key []byte, size int64) (*Writer, error) {
@@ -94,6 +96,8 @@ func (st *Store) NewWriter(key []byte, size int64) (*Writer, error) {
 		limit:     size,
 		hash:      hasher,
 	}
+	metrics.WriterBytes.Add(memory.Cap())
+	metrics.ActiveWriters.Add(1)
 	// Reserve the first 64 bytes for the header that finish writes before publication.
 	w.buffer.wPos = bufferPosition{offset: RecordHeaderSize, pos: RecordHeaderSize}
 	if external {
@@ -128,16 +132,25 @@ func (w *Writer) Size() int64 { return int64(w.header.PhysicalLen) }
 // KeyHash identifies the key copied by NewWriter.
 func (w *Writer) KeyHash() KeyHash { return w.key }
 
-// RetainBuffer returns the submitted record's header and pins its inline buffer,
-// including header and key. The caller owns the reference and must Unpin it.
-// External records return their header with a nil buffer: staging does not hold
-// a complete value. Call after successful Put and before closing the writer.
-func (w *Writer) RetainBuffer() (*alloc.Buffer, RecordHeader) {
-	if w.header.Flags.IsExternal() {
-		return nil, w.header
+// IsExternal reports whether the value is stored in a dedicated object file.
+func (w *Writer) IsExternal() bool { return w.header.Flags.IsExternal() }
+
+// Header returns the record's index metadata. The payload size is final after Put.
+func (w *Writer) Header() RecordHeader {
+	h := w.header
+	h.Hash = w.key
+	return h
+}
+
+// RetainBuffer pins the complete inline record, including header and key.
+// The caller owns the reference and must Unpin it. External records return nil.
+// Call after successful Put and before closing the writer.
+func (w *Writer) RetainBuffer() *alloc.Buffer {
+	if w.IsExternal() {
+		return nil
 	}
 	w.memory.TryInc() // The writer still owns a reference; Close cannot race this call.
-	return w.memory, w.header
+	return w.memory
 }
 
 func (w *Writer) endOffset() int64 {
@@ -239,7 +252,7 @@ func (w *Writer) writeOp(data [][]byte, offset int64) iosched.Op {
 
 // Flush writes buffered bytes, padding the final page, and waits before staging
 // can be reused. The partial page remains available for further writes. No fsync.
-// Put does not call Flush: it transfers the final buffer to asynchronous I/O.
+// Put writes the final header and waits for both data and index completion.
 func (w *Writer) Flush() error {
 	if w.err != nil || w.buffer.Len() == 0 {
 		return w.err
@@ -248,6 +261,10 @@ func (w *Writer) Flush() error {
 	ticket, err := w.scheduler.Submit(w.writeOp(b.padded(b.rPos.pos), w.endOffset()-b.Len()))
 	if err == nil {
 		_, err = ticket.Wait()
+		if ticket.Slat > 0 {
+			metrics.WriteSlat.RecordValue(int64(ticket.Slat))
+			metrics.WriteClat.RecordValue(int64(ticket.Clat))
+		}
 	}
 	w.err = err
 	b.rPos = b.position(b.wPos.pos &^ align.BlockMask)
@@ -279,20 +296,31 @@ func (w *Writer) finish() (iosched.Op, error) {
 	return w.writeOp(b.padded(b.rPos.pos), w.endOffset()-b.Len()).Link(header), nil
 }
 
-// Discard releases the caller's ownership. After Put, completion callbacks own
-// the I/O reference and reservation; closing the writer does not wait for them.
+// Discard releases the caller's ownership. Put has already completed any data
+// and index I/O; an abandoned writer's object cleanup may continue afterward.
 func (w *Writer) Discard() {
 	if w.memory == nil {
 		return
 	}
 	if w.reservation != 0 {
-		w.store.discard(w.reservation, w.header.Flags)
-		w.reservation = 0
-		if w.vfd >= 0 {
-			w.store.closeObject(w.vfd, w.header.ObjectID, true)
+		w.store.mu.Lock()
+		if w.committed {
+			w.store.mu.index.records(w.header.Flags).Value(w.reservation).pending = false
+		} else {
+			w.store.mu.index.remove(w.reservation, w.header.Flags)
 		}
+		w.store.mu.Unlock()
+		w.reservation = 0
 	}
+	if w.vfd >= 0 {
+		w.store.closeObject(w.vfd, w.header.ObjectID, !w.committed)
+		w.vfd = -1
+	}
+	w.file = nil
+	allocated := w.memory.Cap()
 	w.memory.Unpin()
+	metrics.WriterBytes.Add(-allocated)
+	metrics.ActiveWriters.Add(-1)
 	w.memory = nil
 	w.buffer = nil
 }

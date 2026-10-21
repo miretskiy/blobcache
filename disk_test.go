@@ -101,10 +101,10 @@ func TestDiskReclaimContinuesAfterWritesStop(t *testing.T) {
 		t.Cleanup(func() { require.NoError(t, w.Close()) })
 		_, err = w.Write(value)
 		require.NoError(t, err)
-		require.NoError(t, c.store.Put(w, nil))
+		require.NoError(t, c.store.Put(w))
 		require.NoError(t, w.Close())
 	}
-	c.store.Wait()
+	c.store.Wait() // Drain external file cleanup before starting reclamation.
 	c.startDiskReclaim()
 	require.Eventually(t, func() bool {
 		return c.store.Size() < c.diskReclaimTrigger.Load()

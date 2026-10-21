@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 
+	"github.com/miretskiy/blobcache/metrics"
 	"github.com/miretskiy/dio/v2/align"
 	"github.com/miretskiy/dio/v2/alloc"
 	"github.com/miretskiy/dio/v2/iosched"
@@ -62,6 +63,8 @@ func (st *Store) NewReader(key []byte, h RecordHeader) (_ *Reader, err error) {
 	if err != nil {
 		return nil, err
 	}
+	metrics.DiskReadBytes.Add(r.memory.Cap())
+	metrics.DiskReaders.Add(1)
 	r.buffer = NewBuffer(r.memory.Chunks())
 	// The final read may shorten a chunk. Keep the allocator's slice intact.
 	r.buffer.chunks = append([][]byte(nil), r.buffer.chunks...)
@@ -142,6 +145,10 @@ func (r *Reader) next() error {
 	if err == nil {
 		var read int
 		read, err = ticket.Wait()
+		if ticket.Slat > 0 {
+			metrics.ReadSlat.RecordValue(int64(ticket.Slat))
+			metrics.ReadClat.RecordValue(int64(ticket.Clat))
+		}
 		if err == nil && int64(read) < n {
 			err = errors.Join(ErrCorrupt, io.ErrUnexpectedEOF)
 		}
@@ -215,7 +222,10 @@ func (r *Reader) WriteTo(w io.Writer) (int64, error) {
 
 func (r *Reader) Close() error {
 	if r.memory != nil {
+		allocated := r.memory.Cap()
 		r.memory.Unpin()
+		metrics.DiskReadBytes.Add(-allocated)
+		metrics.DiskReaders.Add(-1)
 		r.memory = nil
 	}
 	r.buffer = nil

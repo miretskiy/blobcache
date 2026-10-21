@@ -20,11 +20,8 @@ func publishForRead(t *testing.T, st *Store, key, value []byte) RecordHeader {
 	defer w.Close()
 	_, err = w.Write(value)
 	require.NoError(t, err)
-	require.NoError(t, st.Put(w, nil))
-	st.Wait()
-	h := w.header
-	h.Hash = w.key
-	return h
+	require.NoError(t, st.Put(w))
+	return w.Header()
 }
 
 func TestReaderFragmentedBuffers(t *testing.T) {
@@ -42,9 +39,8 @@ func TestReaderFragmentedBuffers(t *testing.T) {
 			defer w.Close()
 			_, err = w.Write(value)
 			require.NoError(t, err)
-			require.NoError(t, st.Put(w, nil))
-			st.Wait()
-			h := w.header
+			require.NoError(t, st.Put(w))
+			h := w.Header()
 			require.NoError(t, w.Close())
 			r, err := st.NewReader(key, h)
 			require.NoError(t, err)
@@ -65,7 +61,6 @@ func TestReaderFragmentedBuffers(t *testing.T) {
 func TestReaderStaleLocationAndMissingObject(t *testing.T) {
 	st := openTestStore(t, t.TempDir(), WithTargetSize(64<<10), WithInlineThreshold(64<<10))
 	old := publishForRead(t, st, []byte("old"), bytes.Repeat([]byte("v"), (64<<10)-RecordHeaderSize-3))
-	drainTestIndex(t, st) // This test forces reuse after the old publication completes.
 	fresh := publishForRead(t, st, []byte("new"), []byte("value"))
 	require.Equal(t, old.Offset, fresh.Offset)
 	r, err := st.NewReader([]byte("old"), old)

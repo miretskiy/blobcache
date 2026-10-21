@@ -9,7 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/miretskiy/blobcache/internal/intrusive"
+	"github.com/miretskiy/dio/v2/collections"
 	"github.com/miretskiy/dio/v2/iosched"
 )
 
@@ -17,15 +17,15 @@ import (
 type indexEntry struct {
 	header  RecordHeader
 	offset  int64 // byte offset in index.db
-	pending bool  // reservation remains protected through publication
+	pending bool  // writer owns the reservation until Close
 }
 
 // diskIndex orders inline and external reservations separately. Freed index
 // slots are reused independently of data.db. The caller serializes access except size.
 type diskIndex struct {
 	file           *os.File
-	inline         intrusive.List[indexEntry]
-	external       intrusive.List[indexEntry]
+	inline         collections.List[indexEntry]
+	external       collections.List[indexEntry]
 	freeSlots      []int64
 	nextObjectID   uint64
 	appendOffset   int64
@@ -104,7 +104,7 @@ func openDiskIndex(path string, verifyChecksums bool) (_ *diskIndex, err error) 
 func (idx *diskIndex) close() error { return idx.file.Close() }
 
 // records selects the reservation queue; the record's storage kind never changes.
-func (idx *diskIndex) records(flags RecordFlags) *intrusive.List[indexEntry] {
+func (idx *diskIndex) records(flags RecordFlags) *collections.List[indexEntry] {
 	if flags.IsExternal() {
 		return &idx.external
 	}
@@ -112,7 +112,7 @@ func (idx *diskIndex) records(flags RecordFlags) *intrusive.List[indexEntry] {
 }
 
 // reserve claims an ObjectID and an index slot. Data placement belongs to Store.
-func (idx *diskIndex) reserve(dataOffset uint64, flags RecordFlags) intrusive.Handle {
+func (idx *diskIndex) reserve(dataOffset uint64, flags RecordFlags) collections.Handle {
 	offset := idx.appendOffset
 	if n := len(idx.freeSlots); n != 0 {
 		offset = idx.freeSlots[n-1]
@@ -129,22 +129,27 @@ func (idx *diskIndex) reserve(dataOffset uint64, flags RecordFlags) intrusive.Ha
 	return handle
 }
 
-// publish fills a reservation and encodes its single index write. Publication
-// completion releases the reservation.
-func (idx *diskIndex) publish(handle intrusive.Handle, h RecordHeader) iosched.Op {
+// writeOp encodes the index write without publishing the reservation. It can
+// be linked after data I/O; failed chains leave the live index unchanged.
+func (idx *diskIndex) writeOp(handle collections.Handle, h RecordHeader) iosched.Op {
 	entry := idx.records(h.Flags).Value(handle)
-	idx.dataSize.Add(h.PhysicalLen)
-	idx.publishedBytes += h.PhysicalLen
-	entry.header = h
 	var raw RawHeader
 	h.Encode(&raw)
 	return iosched.WriteOp(idx.file, raw[:], entry.offset)
 }
 
+// publish fills a reservation after its I/O completes. The writer keeps it
+// pending until Close so the caller can first publish its cache mapping.
+func (idx *diskIndex) publish(handle collections.Handle, h RecordHeader) {
+	idx.records(h.Flags).Value(handle).header = h
+	idx.dataSize.Add(h.PhysicalLen)
+	idx.publishedBytes += h.PhysicalLen
+}
+
 // coveredInline finds the oldest inline record retired by an allocation.
 // A wrap also retires the unused tail of the older lap, preserving physical
 // append order. Recovery uses the same rule to discard overwritten headers.
-func (idx *diskIndex) coveredInline(start, end, previousEnd uint64) (intrusive.Handle, bool) {
+func (idx *diskIndex) coveredInline(start, end, previousEnd uint64) (collections.Handle, bool) {
 	first, ok := idx.inline.Front()
 	if !ok {
 		return 0, false
@@ -154,7 +159,7 @@ func (idx *diskIndex) coveredInline(start, end, previousEnd uint64) (intrusive.H
 }
 
 // remove retires a completed record or abandons a reservation whose I/O is drained.
-func (idx *diskIndex) remove(handle intrusive.Handle, flags RecordFlags) RecordHeader {
+func (idx *diskIndex) remove(handle collections.Handle, flags RecordFlags) RecordHeader {
 	records := idx.records(flags)
 	entry := records.Value(handle)
 	h := entry.header

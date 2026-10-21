@@ -189,7 +189,6 @@ func TestPutConcurrentMemoryPressure(t *testing.T) {
 		})
 	}
 	require.NoError(t, group.Wait())
-	c.store.Wait()
 	require.Equal(t, workers*iterations, c.values.entries.Len())
 	require.NoError(t, c.Close())
 	require.Len(t, diskRecords(t, dir), workers*iterations)

@@ -40,7 +40,6 @@ func putValue(t *testing.T, c *Cache, key string, value []byte) {
 	require.NoError(t, err)
 	require.Equal(t, len(value), n)
 	require.NoError(t, c.Put(w))
-	c.store.Wait()
 }
 
 // Inspect the retained allocation directly for Put lifetime assertions.
@@ -168,7 +167,7 @@ func TestPutPersistsAndRetains(t *testing.T) {
 				require.Equal(t, int64(len(value)-split), n)
 				require.Equal(t, int64(len(value)), w.Size())
 				require.NoError(t, c.Put(w))
-				c.store.Wait()
+				checkRead(t, c, key, value)
 				require.NoError(t, w.Close())
 				require.Equal(t, 1, c.values.entries.Len())
 				if tc.external {
@@ -179,7 +178,7 @@ func TestPutPersistsAndRetains(t *testing.T) {
 				} else {
 					require.Equal(t, value, retainedValue(t, c, key))
 				}
-				require.NoError(t, c.Close()) // Drains the asynchronous index update.
+				require.NoError(t, c.Close())
 				records := diskRecords(t, dir)
 				require.Len(t, records, 1)
 				require.Equal(t, tc.external, records[0].Flags.IsExternal())
@@ -246,7 +245,6 @@ func TestPutCloseAndReopen(t *testing.T) {
 	_, err = w.Write(value)
 	require.NoError(t, err)
 	require.NoError(t, c.Put(w))
-	c.store.Wait()
 	buffer := residentBuffer(t, c, key)
 	var abandoned []*Writer
 	for _, size := range []int64{10000, SizeUnknown} {
@@ -292,8 +290,7 @@ func TestPutEvictionKeepsWriterMemoryPinned(t *testing.T) {
 	_, err = w.Write(value)
 	require.NoError(t, err)
 	require.NoError(t, c.Put(w))
-	c.store.Wait()
-	buffer, _ := w.RetainBuffer()
+	buffer := w.RetainBuffer()
 	require.NotNil(t, buffer)
 	buffer.Unpin() // Inspect lifetime through the writer's existing reference.
 	_, err = c.NewWriter([]byte("next"), 1)
@@ -336,10 +333,10 @@ func TestPutOpenErrorLeavesCacheUnchanged(t *testing.T) {
 		require.NoError(t, err)
 		_, err = w.Write([]byte("replacement"))
 		require.NoError(t, err)
-		require.NoError(t, c.Put(w))
-		require.NoError(t, w.Close())
+		err = c.Put(w)
+		require.Error(t, err)
+		require.ErrorIs(t, w.Close(), err)
 	}
-	c.store.Wait()
 	checkRead(t, c, []byte("key"), []byte("previous"))
 	r, err := c.Read([]byte("missing"))
 	require.Nil(t, r)
@@ -377,7 +374,6 @@ func TestPutConcurrent(t *testing.T) {
 		})
 	}
 	wg.Wait()
-	c.store.Wait()
 	close(errs)
 	for err := range errs {
 		require.NoError(t, err)
@@ -433,7 +429,6 @@ func TestPutConfigurationAndOpenFailures(t *testing.T) {
 	_, err = w.Write(make([]byte, 300000))
 	require.NoError(t, err)
 	require.NoError(t, c.Put(w))
-	c.store.Wait()
 }
 
 func TestMemoryQueueSecondChance(t *testing.T) {

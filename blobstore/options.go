@@ -63,8 +63,8 @@ func (f funcOpt) apply(c *config) { f(c) }
 func WithTargetSize(bytes int64) Option { return funcOpt(func(c *config) { c.targetSize = bytes }) }
 
 // WithDurableIndex requests DIO group commit for index writes (default true).
-// Put returns after submission in either mode. Data and metadata are not a
-// transaction.
+// Put waits for the index write and, when enabled, its sync. Data and metadata
+// are not a transaction.
 func WithDurableIndex(enabled bool) Option {
 	return funcOpt(func(c *config) { c.indexDurable = enabled })
 }

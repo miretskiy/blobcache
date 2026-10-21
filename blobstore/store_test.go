@@ -2,10 +2,11 @@ package blobstore
 
 import (
 	"bytes"
-	"log/slog"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
+	"testing/synctest"
 
 	"github.com/miretskiy/dio/v2/align"
 	"github.com/miretskiy/dio/v2/alloc"
@@ -79,7 +80,7 @@ func TestStoreReopen(t *testing.T) {
 				if size == 40000 {
 					objectPath = st.objectPath(w.header.ObjectID)
 				}
-				require.NoError(t, st.Put(w, nil))
+				require.NoError(t, st.Put(w))
 				h := checkWriterRecord(t, st, w, key, value)
 				w.Discard()
 				headers = append(headers, h)
@@ -102,7 +103,7 @@ func TestStoreReopen(t *testing.T) {
 			require.Equal(t, uint64(len(before)), w.header.Offset)
 			_, err = w.Write([]byte("next value"))
 			require.NoError(t, err)
-			require.NoError(t, st.Put(w, nil))
+			require.NoError(t, st.Put(w))
 			checkWriterRecord(t, st, w, []byte("next"), []byte("next value"))
 			after, err := os.ReadFile(filepath.Join(dir, "data.db"))
 			require.NoError(t, err)
@@ -137,16 +138,14 @@ func TestStoreReservationOrderAcrossRestarts(t *testing.T) {
 			w := writers[i]
 			_, err := w.Write(values[i])
 			require.NoError(t, err)
-			require.NoError(t, st.Put(w, nil))
+			require.NoError(t, st.Put(w))
 			want[base+i] = w.header
 			want[base+i].Hash = w.key
 			w.Discard()
 		}
-		st.Wait()
 		require.Equal(t, expectedPublishedHeaders(want), indexReservations(st.mu.index), "round %d: Put completion does not reorder entries", round)
-		require.NoError(t, st.Close()) // Drain asynchronous index writes before reopening.
+		require.NoError(t, st.Close())
 		st = openTestStore(t, dir)
-		st.Wait()
 		require.Equal(t, expectedPublishedHeaders(want), indexReservations(st.mu.index), "round %d: restart preserves reservation order", round)
 		var live []RecordHeader
 		live = liveStoreHeaders(st)
@@ -181,7 +180,7 @@ func TestStoreConcurrentWrites(t *testing.T) {
 			if _, err := w.Write([]byte("value")); err != nil {
 				return err
 			}
-			return st.Put(w, nil)
+			return st.Put(w)
 		})
 	}
 	require.NoError(t, group.Wait())
@@ -209,9 +208,6 @@ func TestStoreConcurrentWrites(t *testing.T) {
 func TestPutIOError(t *testing.T) {
 	for _, file := range []string{"data", "index"} {
 		t.Run(file, func(t *testing.T) {
-			var logs bytes.Buffer
-			defer slog.SetDefault(slog.Default())
-			slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
 			st := openTestStore(t, t.TempDir())
 			key := []byte("key")
 			w, err := st.NewWriter(key, SizeUnknown)
@@ -232,17 +228,17 @@ func TestPutIOError(t *testing.T) {
 				require.NoError(t, st.mu.index.file.Close())
 				st.mu.index.file = readOnly
 			}
-			published := false
-			require.NoError(t, st.Put(w, func(RecordHeader, *alloc.Buffer) { published = true }))
-			w.Discard()
+			err = st.Put(w)
+			require.Error(t, err, "Put reports completion errors")
+			require.ErrorIs(t, w.Close(), err)
 			st.Wait()
-			require.False(t, published, "failed I/O never publishes cache metadata")
-			require.Contains(t, logs.String(), "put record")
 			require.Empty(t, indexReservations(st.mu.index))
 			require.Zero(t, st.Size())
+			_, publishedBytes := st.WriteStats()
+			require.Zero(t, publishedBytes, "failed writes must not count as published payload")
+			require.Zero(t, indexFileSize(t, st.mu.index), "a failed data write must cancel the linked index write")
 			require.NoFileExists(t, objectPath)
 			require.Equal(t, [16]uint64{}, st.mu.vfiles)
-
 		})
 	}
 }
@@ -255,4 +251,147 @@ func expectedPublishedHeaders(headers []RecordHeader) []RecordHeader {
 		}
 	}
 	return published
+}
+
+// Pause or reject the next submission. Holding requires synctest: Wait
+// establishes that the caller is blocked before inspecting pending state.
+type heldScheduler struct {
+	iosched.Scheduler
+	holdNext bool
+	held     []chan struct{}
+	reject   error
+}
+
+func holdTestIO(t *testing.T, st *Store) *heldScheduler {
+	t.Helper()
+	require.NoError(t, st.scheduler.Close())
+	backend := iosched.NewPOSIXScheduler()
+	s := &heldScheduler{Scheduler: backend}
+	st.scheduler = s
+	return s
+}
+
+func (s *heldScheduler) Submit(op iosched.Op) (iosched.Ticket, error) {
+	if !s.holdNext {
+		return s.Scheduler.Submit(op)
+	}
+	s.holdNext = false
+	if s.reject != nil {
+		return iosched.Ticket{}, s.reject
+	}
+	resume := make(chan struct{})
+	s.held = append(s.held, resume)
+	<-resume
+	return s.Scheduler.Submit(op)
+}
+
+func (s *heldScheduler) complete(t *testing.T, i int) {
+	t.Helper()
+	close(s.held[i])
+	synctest.Wait()
+}
+
+func TestPendingIndexWritesPreventEvictionAndSlotReuse(t *testing.T) {
+	synctest.Test(t, testPendingIndexWritesPreventEvictionAndSlotReuse)
+}
+
+func testPendingIndexWritesPreventEvictionAndSlotReuse(t *testing.T) {
+	st := openTestStore(t, t.TempDir())
+	scheduler := holdTestIO(t, st)
+	var done [2]bool
+	for i, key := range []string{"first", "second"} {
+		w, err := st.NewWriter([]byte(key), 5)
+		require.NoError(t, err)
+		_, err = w.Write([]byte("value"))
+		require.NoError(t, err)
+		scheduler.holdNext = true
+		go func() {
+			defer w.Discard()
+			require.NoError(t, st.Put(w))
+			done[i] = true
+		}()
+		synctest.Wait()
+		require.False(t, done[i], "Put waits for its index write")
+	}
+	require.Zero(t, st.Reclaim(10), "unfinished index I/O defers eviction without waiting")
+	scheduler.complete(t, 1)
+	require.True(t, done[1], "each Put waits only for its own write")
+	require.False(t, done[0])
+	require.Zero(t, st.Reclaim(10), "completion order does not change inline eviction order")
+	third, err := st.NewWriter([]byte("third"), 5)
+	require.NoError(t, err)
+	_, err = third.Write([]byte("value"))
+	require.NoError(t, err)
+	require.NoError(t, st.Put(third))
+	require.NoError(t, third.Close())
+	require.EqualValues(t, 3*RecordHeaderSize, indexFileSize(t, st.mu.index), "pending slots are not reused")
+	scheduler.complete(t, 0)
+	require.True(t, done[0])
+	require.EqualValues(t, 10, st.Reclaim(10))
+	putReclaimRecord(t, st, "reuse", []byte("fresh"))
+	require.EqualValues(t, 3*RecordHeaderSize, indexFileSize(t, st.mu.index))
+	readReclaimRecord(t, st, "third", third.header, []byte("value"))
+}
+
+func TestPendingWriterDefersInlineRotation(t *testing.T) {
+	const page = align.BlockSize
+	st := openTestStore(t, t.TempDir(), WithTargetSize(16*page))
+	first, err := st.NewWriter([]byte("first"), 4*page-RecordHeaderSize-5)
+	require.NoError(t, err)
+	defer first.Close()
+	for _, key := range []string{"b", "c", "d"} {
+		putReclaimRecord(t, st, key, bytes.Repeat([]byte(key), 4*page-RecordHeaderSize-1))
+	}
+	require.Zero(t, st.Reclaim(1))
+	w, err := st.NewWriter([]byte("reuse"), 1)
+	require.Nil(t, w)
+	require.ErrorIs(t, err, ErrBusy)
+	require.EqualValues(t, 16*page, st.mu.dataAppendOffset, "a deferred rotation does not move the append position")
+	require.NoError(t, first.Close())
+	h := putReclaimRecord(t, st, "reuse", []byte("x"))
+	require.Zero(t, h.Offset)
+}
+
+func TestPutProtectsRecordUntilWriterClose(t *testing.T) {
+	for kind, size := range map[string]int64{"inline": 5, "external": SizeUnknown} {
+		t.Run(kind, func(t *testing.T) {
+			st := openTestStore(t, t.TempDir())
+			w, err := st.NewWriter([]byte("key"), size)
+			require.NoError(t, err)
+			defer w.Close()
+			_, err = w.Write([]byte("value"))
+			require.NoError(t, err)
+			require.NoError(t, st.Put(w))
+			require.Zero(t, st.Reclaim(1), "the caller can publish its cache mapping before Close")
+			readReclaimRecord(t, st, "key", w.Header(), []byte("value"))
+			require.NoError(t, w.Close())
+			require.EqualValues(t, 5, st.Reclaim(1), "Close makes the committed record reclaimable")
+		})
+	}
+}
+
+func TestCloseReleasesRejectedPutReservation(t *testing.T) {
+	for kind, size := range map[string]int64{"inline": 5, "external": SizeUnknown} {
+		t.Run(kind, func(t *testing.T) {
+			st := openTestStore(t, t.TempDir())
+			scheduler := holdTestIO(t, st)
+			w, err := st.NewWriter([]byte("key"), size)
+			require.NoError(t, err)
+			_, err = w.Write([]byte("value"))
+			require.NoError(t, err)
+			path := st.objectPath(w.header.ObjectID)
+			failure := errors.New("submission rejected")
+			scheduler.holdNext, scheduler.reject = true, failure
+			require.ErrorIs(t, st.Put(w), failure)
+			require.ErrorIs(t, w.Close(), failure)
+			st.Wait()
+			require.NoFileExists(t, path)
+			require.Zero(t, st.Size())
+			_, publishedBytes := st.WriteStats()
+			require.Zero(t, publishedBytes)
+			require.Empty(t, indexReservations(st.mu.index))
+			h := putReclaimRecord(t, st, "next", []byte("next"))
+			readReclaimRecord(t, st, "next", h, []byte("next"))
+		})
+	}
 }

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"sync/atomic"
-	"time"
 
 	"github.com/miretskiy/dio/v2/align"
 	"github.com/miretskiy/dio/v2/alloc"
@@ -33,31 +32,33 @@ func (a *cacheAllocator) Available() int64 {
 	return a.Capacity() - a.used.Load()
 }
 
+func (a *cacheAllocator) wrapBuffer(b *alloc.Buffer) *alloc.Buffer {
+	allocated := b.Cap()
+	a.used.Add(allocated)
+	b.WrapRelease(func(release func()) func() {
+		return func() {
+			a.used.Add(-allocated)
+			release()
+		}
+	})
+	return b
+}
+
 func (a *cacheAllocator) tryAcquire(size int64) (*alloc.Buffer, error) {
 	b, err := a.Allocator.TryAcquire(size)
 	if err != nil {
 		return nil, err
 	}
-	allocated := b.Cap()
-	a.used.Add(allocated)
-	b.WrapRelease(func(release func()) func() {
-		return func() {
-			// Subtract before returning chunks so their next lease cannot be
-			// counted alongside the old one if another goroutine reuses them.
-			a.used.Add(-allocated)
-			release()
-		}
-	})
-	return b, nil
+	return a.wrapBuffer(b), nil
 }
 
 func (a *cacheAllocator) TryAcquire(size int64) (*alloc.Buffer, error) {
-	reclaimed := a.Available() < size
-	if reclaimed {
+	needCapacity := a.Available() < size
+	if needCapacity {
 		a.reclaim(align.PageAlign(size), false)
 	}
 	b, err := a.tryAcquire(size)
-	if errors.Is(err, alloc.ErrExhausted) && !reclaimed {
+	if errors.Is(err, alloc.ErrExhausted) && !needCapacity {
 		// Another allocation may have consumed the capacity in our snapshot.
 		a.reclaim(align.PageAlign(size), false)
 		b, err = a.tryAcquire(size)
@@ -69,24 +70,13 @@ func (a *cacheAllocator) TryAcquire(size int64) (*alloc.Buffer, error) {
 	return b, err
 }
 
-// Acquire retries reclamation and acquisition until storage is available or the
-// context is cancelled. Blobstore uses TryAcquire, which waits for a required
-// reclamation pass but does not wait for borrowers to release pinned buffers.
+// Acquire waits for the underlying allocator to supply storage or for the context
+// to be cancelled. Blobstore uses TryAcquire, which requests cache reclamation
+// before returning allocation exhaustion to the caller.
 func (a *cacheAllocator) Acquire(ctx context.Context, size int64) (*alloc.Buffer, error) {
-	b, err := a.TryAcquire(size)
-	if !errors.Is(err, alloc.ErrExhausted) {
-		return b, err
+	b, err := a.Allocator.Acquire(ctx, size)
+	if err != nil {
+		return nil, err
 	}
-	timer := time.NewTicker(100 * time.Millisecond)
-	defer timer.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-timer.C:
-			if b, err := a.TryAcquire(size); !errors.Is(err, alloc.ErrExhausted) {
-				return b, err
-			}
-		}
-	}
+	return a.wrapBuffer(b), nil
 }

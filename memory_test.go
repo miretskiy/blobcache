@@ -169,32 +169,3 @@ func TestMemoryReclaimRedistributesPinnedShare(t *testing.T) {
 	require.Equal(t, 8*page, pool.Available(), "only actual releases count")
 	require.Equal(t, 16, m.entries.Len())
 }
-
-// Isolate metadata maintenance from writer/buffer allocation and disk I/O.
-// Both paths reuse a queue slot and an existing xmap key after warmup.
-func BenchmarkMemoryMetadata(b *testing.B) {
-	for _, evict := range []bool{false, true} {
-		name := "replace"
-		if evict {
-			name = "evict-and-restore"
-		}
-		b.Run(name, func(b *testing.B) {
-			m := newMemoryCache()
-			buffer := alloc.NewBuffer(4096)
-			defer buffer.Unpin()
-			defer m.clear()
-			key := xmap.Key{Lo: 1}
-			header := blobstore.RecordHeader{PhysicalLen: 1}
-			buffer.TryInc()
-			m.replace(key, buffer, header)
-			b.ReportAllocs()
-			for b.Loop() {
-				if evict {
-					m.reclaimCacheMemory(4096)
-				}
-				buffer.TryInc()
-				m.replace(key, buffer, header)
-			}
-		})
-	}
-}

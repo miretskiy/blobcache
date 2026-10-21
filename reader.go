@@ -5,6 +5,7 @@ import (
 	"io"
 
 	"github.com/miretskiy/blobcache/blobstore"
+	"github.com/miretskiy/blobcache/metrics"
 	"github.com/miretskiy/dio/v2/alloc"
 )
 
@@ -25,6 +26,8 @@ func newMemoryReader(key []byte, h blobstore.RecordHeader, memory *alloc.Buffer)
 		memory: memory, chunks: memory.Chunks(), offset: blobstore.RecordHeaderSize,
 		remaining: int64(h.KeyLen) + int64(h.PhysicalLen), size: int64(h.LogicalLen),
 	}
+	metrics.ResidentReadBytes.Add(memory.Cap())
+	metrics.ResidentReaders.Add(1)
 	defer func() {
 		if err != nil {
 			r.Close()
@@ -95,7 +98,10 @@ func (r *memoryReader) WriteTo(w io.Writer) (int64, error) {
 
 func (r *memoryReader) Close() error {
 	if r.memory != nil {
+		allocated := r.memory.Cap()
 		r.memory.Unpin()
+		metrics.ResidentReadBytes.Add(-allocated)
+		metrics.ResidentReaders.Add(-1)
 		r.memory = nil
 	}
 	r.chunks = nil

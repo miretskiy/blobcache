@@ -2,6 +2,7 @@ package blobcache
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -26,7 +27,7 @@ func checkRead(t *testing.T, c *Cache, key, value []byte) {
 	n, err := io.Copy(&got, r)
 	require.NoError(t, err)
 	require.Equal(t, int64(len(value)-len(prefix)), n)
-	require.Equal(t, value, got.Bytes())
+	require.True(t, bytes.Equal(value, got.Bytes()), "payload mismatch")
 	_, err = r.Read(make([]byte, 1))
 	require.ErrorIs(t, err, io.EOF)
 	require.NoError(t, r.Close())
@@ -55,7 +56,6 @@ func TestReadMemoryDiskAndRecovery(t *testing.T) {
 				_, err = w.Write(v.value)
 				require.NoError(t, err)
 				require.NoError(t, c.Put(w))
-				c.store.Wait()
 				require.NoError(t, w.Close())
 				checkRead(t, c, v.key, v.value)
 			}
@@ -224,3 +224,53 @@ func TestReadChecksumPolicyAfterRestart(t *testing.T) {
 		})
 	}
 }
+
+func TestReaderCloseReleasesAllocation(t *testing.T) {
+	for _, kind := range []string{"resident", "inline-disk", "external"} {
+		t.Run(kind, func(t *testing.T) {
+			var opts []Option
+			if kind == "external" {
+				opts = append(opts, WithInlineThreshold(0))
+			}
+			c := newPutCache(t, t.TempDir(), opts...)
+			value := bytes.Repeat([]byte("v"), 12000)
+			putValue(t, c, "key", value)
+			if kind == "inline-disk" {
+				c.values.reclaimCacheMemory(c.memory.Capacity())
+			}
+			r, err := c.Read([]byte("key"))
+			require.NoError(t, err)
+			defer r.Close()
+			var charged int64
+			if resident, ok := r.(*memoryReader); ok {
+				charged = resident.memory.Cap()
+			} else {
+				charged = c.memory.used.Load()
+			}
+			if kind == "resident" {
+				require.Zero(t, c.values.reclaimCacheMemory(c.memory.Capacity()),
+					"an unread reader keeps the evicted buffer pinned")
+			}
+			before := c.memory.used.Load()
+			n, readErr := io.Copy(io.Discard, r)
+			require.NoError(t, readErr)
+			require.EqualValues(t, len(value), n)
+			require.Equal(t, before, c.memory.used.Load(), "EOF currently retains the allocation")
+			require.NoError(t, errors.Join(readErr, r.Close()))
+			require.Equal(t, before-charged, c.memory.used.Load())
+			require.NoError(t, r.Close(), "double Close must not decrement twice")
+
+			// A consumer error still evaluates Close in errors.Join.
+			r, err = c.Read([]byte("key"))
+			require.NoError(t, err)
+			failed := errors.New("consumer failed")
+			_, readErr = r.WriteTo(failingReadConsumer{failed})
+			require.ErrorIs(t, errors.Join(readErr, r.Close()), failed)
+			require.Zero(t, c.memory.used.Load())
+		})
+	}
+}
+
+type failingReadConsumer struct{ err error }
+
+func (w failingReadConsumer) Write([]byte) (int, error) { return 0, w.err }

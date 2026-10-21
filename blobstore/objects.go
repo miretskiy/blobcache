@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 
+	"github.com/miretskiy/blobcache/metrics"
 	"github.com/miretskiy/dio/v2/iosched"
 	"golang.org/x/sys/unix"
 )
@@ -55,29 +56,31 @@ func (st *Store) releaseVFile(vfd int) {
 // Close is submitted after the writer's last I/O. A failed open can leave an
 // empty slot (EBADF); other close failures keep the slot occupied.
 func (st *Store) closeObject(vfd int, id uint64, remove bool) {
-	st.pending.Add(1)
+	st.cleanup.Add(1)
 	complete := func(_ int, err error) {
 		if err == nil || errors.Is(err, unix.EBADF) {
 			st.releaseVFile(vfd)
 		} else {
+			metrics.CloseErrors.Add(1)
 			slog.Error("close object", "object", id, "error", err)
 		}
 		if remove {
 			_, err := iosched.SubmitNotify(st.scheduler, iosched.UnlinkatOp(unix.AT_FDCWD, st.objectPath(id)),
 				func(_ int, err error) {
 					logUnlinkError(id, err)
-					st.pending.Done()
+					st.cleanup.Done()
 				})
 			if err == nil {
 				return
 			}
 			logUnlinkError(id, err)
 		}
-		st.pending.Done()
+		st.cleanup.Done()
 	}
 	if _, err := iosched.SubmitNotify(st.scheduler, iosched.VCloseOp(uint32(vfd)), complete); err != nil {
 		// Nothing was submitted: retain the slot until the scheduler is closed.
+		metrics.CloseErrors.Add(1)
 		slog.Error("submit object close", "object", id, "error", err)
-		st.pending.Done()
+		st.cleanup.Done()
 	}
 }

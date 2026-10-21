@@ -216,28 +216,3 @@ func TestCacheAllocatorConcurrentAccounting(t *testing.T) {
 	require.Equal(t, a.Capacity(), a.Available())
 	require.Equal(t, pool.Capacity(), pool.Available())
 }
-
-func BenchmarkCacheAllocator(b *testing.B) {
-	for _, wrapped := range []bool{false, true} {
-		b.Run(fmt.Sprintf("wrapped=%t", wrapped), func(b *testing.B) {
-			pool, err := alloc.NewSlabAllocator(128 * align.BlockSize)
-			if err != nil {
-				b.Fatal(err)
-			}
-			defer pool.Close()
-			var allocator alloc.Allocator = pool
-			if wrapped {
-				allocator = &cacheAllocator{Allocator: pool, capacity: pool.Capacity(), reclaim: func(int64, bool) {}}
-			}
-			b.ReportAllocs()
-			b.ResetTimer()
-			for range b.N {
-				buffer, err := allocator.TryAcquire(align.BlockSize)
-				if err != nil {
-					b.Fatal(err)
-				}
-				buffer.Unpin()
-			}
-		})
-	}
-}

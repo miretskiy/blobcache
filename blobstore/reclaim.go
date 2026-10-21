@@ -7,13 +7,14 @@ import (
 	"path/filepath"
 	"strconv"
 
-	"github.com/miretskiy/blobcache/internal/intrusive"
+	"github.com/miretskiy/blobcache/metrics"
+	"github.com/miretskiy/dio/v2/collections"
 	"github.com/miretskiy/dio/v2/iosched"
 	"golang.org/x/sys/unix"
 )
 
 // Size reports indexed payload bytes. It excludes framing, padding, index
-// storage, unfinished writers, and objects left behind by failed unlinks.
+// storage, uncommitted writes, and objects left behind by failed unlinks.
 func (st *Store) Size() uint64 { return st.mu.index.size() }
 
 // WriteStats snapshots live indexed payload and cumulative payload published
@@ -30,7 +31,7 @@ func (st *Store) TargetSize() uint64 { return uint64(st.cfg.targetSize) }
 
 // Reclaim evicts external objects first, then inline records, toward bytes of
 // indexed payload. Age and popularity do not protect external objects. Whole
-// records may overshoot the request. An unfinished reservation ends the attempt.
+// records may overshoot the request. An open writer's reservation ends the attempt.
 // Eviction leaves both append positions unchanged. Inline eviction does not
 // release filesystem blocks; later writes reuse them when data.db wraps.
 // Retirements are reported and external unlinks submitted after unlocking.
@@ -60,7 +61,7 @@ retire:
 // bounds a lap, except that a single larger inline record gets the entire file.
 // Overlapping records are retired here even if background eviction has not run.
 // TODO: coordinate overlapping readers when the ring catches them.
-func (st *Store) reserve(h *RecordHeader, inlineSize uint64) (intrusive.Handle, error) {
+func (st *Store) reserve(h *RecordHeader, inlineSize uint64) (collections.Handle, error) {
 	var retired []RecordHeader
 	st.mu.Lock()
 	defer func() {
@@ -106,6 +107,7 @@ func (st *Store) notifyRetired(records []RecordHeader) {
 
 func logUnlinkError(id uint64, err error) {
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		metrics.UnlinkErrors.Add(1)
 		slog.Error("unlink object", "object", id, "error", err)
 	}
 }

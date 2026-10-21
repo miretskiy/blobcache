@@ -5,9 +5,9 @@ import (
 	"sync/atomic"
 
 	"github.com/miretskiy/blobcache/blobstore"
-	"github.com/miretskiy/blobcache/internal/intrusive"
 	"github.com/miretskiy/blobcache/internal/xmap"
 	"github.com/miretskiy/dio/v2/alloc"
+	"github.com/miretskiy/dio/v2/collections"
 )
 
 // Metadata stays in xmap by value, including records without resident buffers.
@@ -16,7 +16,7 @@ import (
 // Neither metadata nor queue entries require an individual heap allocation.
 type memoryEntry struct {
 	header   blobstore.RecordHeader
-	resident intrusive.Handle
+	resident collections.Handle
 }
 
 // Only resident records occupy queue slots. Handles survive slice growth;
@@ -30,8 +30,8 @@ type residentEntry struct {
 }
 
 type memoryQueue struct {
-	list          intrusive.List[residentEntry]
-	hand          intrusive.Handle
+	list          collections.List[residentEntry]
+	hand          collections.Handle
 	residentBytes int64
 	_             [32]byte // Together with xmap's lock and map: two cache lines.
 }
@@ -107,7 +107,7 @@ func (m *memoryCache) retire(key xmap.Key, objectID uint64) {
 }
 
 // remove transfers the queue's buffer reference and its byte count to the caller.
-func (q *memoryQueue) remove(handle intrusive.Handle) (*alloc.Buffer, int64) {
+func (q *memoryQueue) remove(handle collections.Handle) (*alloc.Buffer, int64) {
 	if q.hand == handle {
 		q.hand, _ = q.list.Next(handle)
 	}

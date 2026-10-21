@@ -10,15 +10,15 @@ import (
 func TestVirtualFilesWaitForClose(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		st := openTestStore(t, t.TempDir())
-		scheduler := holdTestIndex(t, st)
+		scheduler := holdTestIO(t, st)
 		w, err := st.NewWriter([]byte("object"), SizeUnknown)
 		require.NoError(t, err)
 		slot := w.vfd
 		for range 1023 {
 			st.acquireVFile()
 		}
-		scheduler.untilHold = 1 // Submitting close must not release the slot yet.
-		require.NoError(t, w.Close())
+		scheduler.holdNext = true // Submitting close must not release the slot yet.
+		go func() { require.NoError(t, w.Close()) }()
 		acquired := -1
 		go func() { acquired = st.acquireVFile() }()
 		synctest.Wait()

@@ -273,12 +273,8 @@ BLOBCACHE_RINGS=8 BLOBCACHE_WRITE_RINGS=1 \
 ```
 
 Independent read/write budget overrides and stage tracing in this report were
-diagnostic additions, not production options. Raw logs, timestamp CSVs,
-analysis scripts, and exact diagnostic patches are retained locally under
-`local/bench-results/2026-10-09-read-budgets/` and
-`local/bench-results/2026-10-09-latency-stages/`. These large artifacts are
-ignored by Git; the measurements and interpretation above are the repository
-record. The earlier full 1/4/8/32-ring budget matrix is under
-`local/bench-results/2026-10-09-budget-matrix/`.
-The matched affinity, coalescing, and CPU-counter controls are under
-`local/bench-results/2026-10-09-ring-isolation/`.
+diagnostic additions, not production options. The ignored local artifacts for
+the budget matrix, latency stages, and matched affinity, coalescing, and
+CPU-counter controls were deleted during cleanup on 2026-10-21. This includes
+raw logs, timestamp CSVs, analysis scripts, and diagnostic patches. The
+measurements and interpretation above remain the repository record.

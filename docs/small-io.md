@@ -234,15 +234,14 @@ Process PMU counters per completed device operation, recording disabled:
 These are raw DIO results, not additional full-blobcache measurements. All
 **17 additional cases passed**, bringing the total to **45 cases and 135 PMU
 windows**, with 100% counter coverage and no trace errors, dropped rows, or
-short submissions. The extended source is retained as `source/smallio-extended.go`
-alongside the original source and patches. No production implementation changed.
+short submissions. No production implementation changed.
 
 ## Reproduction artifacts
 
-The isolated workload and runner are in `/private/tmp/blobcache-small-io`.
-Exact source patches, scripts, configuration, raw counters, and analysis are
-retained in the ignored local directory
-`local/bench-results/2026-10-09-small-io/`. Source patches are relative to DIO
-v2.3.0 and blobcache `ccade2c`; use disposable checkouts to apply them.
-The Linux copy is under the authorized test directory's `small-io/` subtree.
+The isolated workload and runner used `/private/tmp/blobcache-small-io`.
+The ignored local source patches, scripts, configuration, raw counters, and
+analysis were deleted during cleanup on 2026-10-21; this report retains the
+findings. The experiments used DIO v2.3.0 and blobcache `ccade2c`.
+At the time of the experiments, the Linux copy was under the authorized test
+directory's `small-io/` subtree.
 Production implementation files are unchanged.

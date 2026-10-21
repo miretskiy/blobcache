@@ -139,15 +139,15 @@ budgets do not replace application backpressure; Submit itself is nonblocking.
 
 ## Evidence and reproduction
 
-Logs, scripts, independent benchmark source, and analyses are retained locally
-under `local/bench-results/2026-10-09-write-balance/` (ignored by Git). Baselines:
-blobcache `0dd94f2` plus the existing diagnostic recorder, DIO `4b6ca62` / v2.3.0;
+The ignored local logs, scripts, independent benchmark source, and analyses
+were deleted during cleanup on 2026-10-21; this report retains the findings.
+Baselines: blobcache `0dd94f2` plus the existing diagnostic recorder, DIO `4b6ca62` / v2.3.0;
 `ccade2c` adds documentation. Only a benchmark file was added for the independent
 cases. Production code was unchanged and no multi-ring cases were rerun.
 
 The budgeted run retained every trace. The longer budget-off run reached the
 recorder's limit, omitting 1,159 final rows. The common seconds 7–47 interval
-above is fully retained in both, without invalid timestamp order or operation
+above was fully recorded in both, without invalid timestamp order or operation
 errors. Full-run end-to-end histograms, throughput counters, and per-second SQE
 counts are unaffected. All six cases passed; no short submissions or enter
 errors occurred.

@@ -45,7 +45,7 @@ type Writer struct {
 // copied before return. size is the expected value size, or SizeUnknown.
 // Inline writes are bounded by their reservation. Keys must fit MaxKeyLen.
 // Allocation exhaustion is returned to the caller. ErrBusy means reuse would
-// overlap an open writer; no I/O wait is added for reuse.
+// overlap an open writer. Reusing index slots waits if their wipe is in flight.
 // External writers wait if all 1024 virtual descriptors are occupied.
 // The caller must Discard the writer when finished, including after Put.
 func (st *Store) NewWriter(key []byte, size int64) (*Writer, error) {
@@ -296,8 +296,8 @@ func (w *Writer) finish() (iosched.Op, error) {
 	return w.writeOp(b.padded(b.rPos.pos), w.endOffset()-b.Len()).Link(header), nil
 }
 
-// Discard releases the caller's ownership. Put has already completed any data
-// and index I/O; an abandoned writer's object cleanup may continue afterward.
+// Discard releases the caller's ownership and reclaims excess indexed payload.
+// Put has already completed data and index I/O; cleanup may continue afterward.
 func (w *Writer) Discard() {
 	if w.memory == nil {
 		return
@@ -305,9 +305,9 @@ func (w *Writer) Discard() {
 	if w.reservation != 0 {
 		w.store.mu.Lock()
 		if w.committed {
-			w.store.mu.index.records(w.header.Flags).Value(w.reservation).pending = false
+			w.store.mu.index.records.Value(w.reservation).pending = false
 		} else {
-			w.store.mu.index.remove(w.reservation, w.header.Flags)
+			w.store.mu.index.remove(w.reservation)
 		}
 		w.store.mu.Unlock()
 		w.reservation = 0
@@ -323,6 +323,7 @@ func (w *Writer) Discard() {
 	metrics.ActiveWriters.Add(-1)
 	w.memory = nil
 	w.buffer = nil
+	w.store.reclaimExcess()
 }
 
 // Close releases the writer. It is safe to defer immediately after NewWriter.

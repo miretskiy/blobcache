@@ -3,7 +3,10 @@
 package blobstore
 
 import (
+	"crypto/sha256"
 	"errors"
+	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -40,6 +43,7 @@ type Store struct {
 	memory, staging alloc.Allocator
 	cleanup         sync.WaitGroup
 	vfilesAvailable *sync.Cond
+	indexAvailable  *sync.Cond
 
 	// OnRetire reports a disk record leaving the index. Set before using Store.
 	// Calls occur outside the store lock and may run concurrently. Resident data
@@ -69,6 +73,7 @@ func Open(path string, memory, staging alloc.Allocator, opts ...Option) (_ *Stor
 	}
 	st := &Store{base: path, cfg: cfg, memory: memory, staging: staging}
 	st.vfilesAvailable = sync.NewCond(&st.mu)
+	st.indexAvailable = sync.NewCond(&st.mu)
 	defer func() {
 		if err != nil {
 			_ = st.Close()
@@ -100,6 +105,8 @@ func Open(path string, memory, staging alloc.Allocator, opts ...Option) (_ *Stor
 	}
 	st.scheduler = iosched.NewDefaultScheduler(optsIO...)
 	st.recoverIndex()
+	st.logIndexState("open")
+	st.reclaimExcess()
 	return st, nil
 }
 
@@ -123,15 +130,42 @@ func (st *Store) Close() (err error) {
 		st.data = nil
 	}
 	if st.mu.index != nil {
-		err = errors.Join(err, st.mu.index.close())
+		st.logIndexState("close")
+		err = errors.Join(err, st.mu.index.wipeErr, st.mu.index.close())
 		st.mu.index = nil
 	}
 	return err
 }
 
-// Wait drains asynchronous object cleanup.
+// Called only while quiescent, so the fingerprint describes a complete index.
+func (st *Store) logIndexState(event string) {
+	idx := st.mu.index
+	digest := sha256.New()
+	for h := range idx.headers() {
+		var raw RawHeader
+		h.Encode(&raw)
+		digest.Write(raw[:])
+	}
+	slog.Info("blobstore index", "event", event, "path", st.base,
+		"head", idx.head, "reuse_head", idx.reuseHead, "tail", idx.tail, "slots", idx.slots,
+		"data_offset", st.mu.dataAppendOffset, "data_wrap_id", idx.dataWrapID,
+		"next_object_id", idx.nextObjectID, "records", idx.records.Len(), "live_bytes", idx.size(),
+		"headers_sha256", fmt.Sprintf("%x", digest.Sum(nil)))
+}
+
+// Wait drains asynchronous index wipes and object cleanup.
 // Stop submitting new work before using it as a shutdown barrier.
 func (st *Store) Wait() { st.cleanup.Wait() }
+
+// IOQueueStats reports the asynchronous scheduler's submission depths and
+// lifetime high-water marks. Synchronous backends return false.
+func (st *Store) IOQueueStats() (iosched.QueueStats, bool) {
+	scheduler, ok := st.scheduler.(interface{ QueueStats() iosched.QueueStats })
+	if !ok {
+		return iosched.QueueStats{}, false
+	}
+	return scheduler.QueueStats(), true
+}
 
 // Put soft-links this writer's final data and index writes, waits for their
 // shared ticket, then updates the disk index. A data failure cancels the index write.

@@ -71,7 +71,7 @@ func TestReaderStaleLocationAndMissingObject(t *testing.T) {
 	require.Nil(t, r)
 	require.ErrorIs(t, err, ErrNotFound)
 
-	object := publishForRead(t, st, []byte("object"), bytes.Repeat([]byte("v"), 70000))
+	object := putReclaimSizedRecord(t, st, "object", bytes.Repeat([]byte("v"), 40000), SizeUnknown)
 	r, err = st.NewReader([]byte("object"), object)
 	require.NoError(t, err)
 	defer r.Close()

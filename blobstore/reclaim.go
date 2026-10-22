@@ -4,8 +4,6 @@ import (
 	"errors"
 	"log/slog"
 	"os"
-	"path/filepath"
-	"strconv"
 
 	"github.com/miretskiy/blobcache/metrics"
 	"github.com/miretskiy/dio/v2/collections"
@@ -25,82 +23,232 @@ func (st *Store) WriteStats() (liveBytes, publishedBytes uint64) {
 	return st.mu.index.size(), st.mu.index.publishedBytes
 }
 
-// TargetSize is the live-payload target for reclamation policy. Writes may
-// exceed it until reclamation runs; data.db retains allocated blocks on wrap.
+// TargetSize is the live-payload target. Open writers can temporarily exceed
+// it; closing them reclaims the excess. data.db retains allocated blocks on wrap.
 func (st *Store) TargetSize() uint64 { return uint64(st.cfg.targetSize) }
 
-// Reclaim evicts external objects first, then inline records, toward bytes of
-// indexed payload. Age and popularity do not protect external objects. Whole
-// records may overshoot the request. An open writer's reservation ends the attempt.
-// Eviction leaves both append positions unchanged. Inline eviction does not
-// release filesystem blocks; later writes reuse them when data.db wraps.
-// Retirements are reported and external unlinks submitted after unlocking.
-// Unoverwritten index records can return after reopening.
-func (st *Store) Reclaim(bytes uint64) (reclaimed uint64) {
-	var retired []RecordHeader
-	st.mu.Lock()
-retire:
-	for _, flags := range []RecordFlags{FlagExternal, 0} {
-		records := st.mu.index.records(flags)
-		for first, ok := records.Front(); ok && reclaimed < bytes; first, ok = records.Front() {
-			if records.Value(first).pending {
-				break retire
-			}
-			h := st.mu.index.remove(first, flags)
-			reclaimed += h.PhysicalLen
-			retired = append(retired, h)
-		}
+func (st *Store) excess() uint64 {
+	if size, target := st.Size(), st.TargetSize(); size > target {
+		return size - target
 	}
-	st.mu.Unlock()
-	st.notifyRetired(retired)
-	return reclaimed
+	return 0
 }
 
-// reserve assigns an index slot and data extent. Only inline allocation rotates
-// data.db; eviction and external writes never move its append offset. The target
-// bounds a lap, except that a single larger inline record gets the entire file.
-// Overlapping records are retired here even if background eviction has not run.
-// TODO: coordinate overlapping readers when the ring catches them.
-func (st *Store) reserve(h *RecordHeader, inlineSize uint64) (collections.Handle, error) {
-	var retired []RecordHeader
+// Closing a writer releases its pending reservation, which may have blocked
+// the FIFO. Drain excess payload then, including final sizes of streamed values.
+// Each pass submits its I/O to dio; further passes wait for the one active wipe.
+func (st *Store) reclaimExcess() {
 	st.mu.Lock()
-	defer func() {
-		st.mu.Unlock()
-		st.notifyRetired(retired)
-	}()
-	start := st.mu.dataAppendOffset
-	if inlineSize != 0 {
-		if start+inlineSize > max(st.TargetSize(), inlineSize) {
-			start = 0
+	defer st.mu.Unlock()
+	idx := st.mu.index
+	for {
+		bytes := st.excess()
+		if bytes == 0 || idx.wipeErr != nil {
+			return
 		}
-		end := start + inlineSize
+		if idx.head != idx.reuseHead {
+			st.indexAvailable.Wait()
+			continue // Another writer may already have removed the excess.
+		}
+		batch := st.reclaimLocked(bytes, 0, 0)
+		if batch.end == 0 {
+			return
+		}
+		st.mu.Unlock()
+		st.submitReclaim(batch)
+		st.mu.Lock()
+	}
+}
+
+// Bound both the mutex hold and the immutable wipe buffer.
+const reclaimSlots = 4096
+
+// indexReclaim is one reclamation request, prepared under Store.mu and
+// submitted after releasing it.
+type indexReclaim struct {
+	// op wipes retired index slots using its own immutable header buffer.
+	op iosched.Op
+	// end is the exclusive logical slot boundary released by a successful wipe;
+	// zero means this request is empty.
+	end uint64
+	// bytes counts retired payload from both inline and external records.
+	bytes uint64
+	// records holds copies of retired headers for callbacks and external-file
+	// unlink requests. The original index entries have already been removed.
+	records []RecordHeader
+}
+
+// Reclaim evicts an oldest prefix, regardless of storage kind. Each pass is
+// bounded by reclaimSlots; whole records may overshoot the byte request.
+// An unfinished writer ends the pass. Concurrent evictors wait for the current
+// index wipe; ordinary reservations wait only when they need protected slots.
+func (st *Store) Reclaim(bytes uint64) uint64 {
+	if bytes == 0 {
+		return 0
+	}
+	for {
+		st.mu.Lock()
 		idx := st.mu.index
-		for first, covered := idx.coveredInline(start, end, st.mu.dataAppendOffset); covered; first, covered = idx.coveredInline(start, end, st.mu.dataAppendOffset) {
-			if idx.inline.Value(first).pending {
+		for idx.head != idx.reuseHead && idx.wipeErr == nil {
+			st.indexAvailable.Wait()
+		}
+		if idx.wipeErr != nil {
+			st.mu.Unlock()
+			return 0
+		}
+		batch := st.reclaimLocked(bytes, 0, 0)
+		st.mu.Unlock()
+		if batch.end == 0 {
+			return 0
+		}
+		st.submitReclaim(batch)
+		if batch.bytes != 0 {
+			return batch.bytes
+		}
+		// A batch of abandoned slots freed no payload. Continue to the live prefix.
+	}
+}
+
+// reclaimLocked sweeps one FIFO prefix for payload, index slots, and inline
+// placement together. A pending writer stops the sweep; head != reuseHead
+// excludes another batch. External records in the prefix are retired too.
+func (st *Store) reclaimLocked(bytes, until, inlineSize uint64) indexReclaim {
+	idx := st.mu.index
+	start := idx.head
+	limit := min(idx.tail, start+reclaimSlots)
+	dataStart := st.dataStart(inlineSize)
+	var batch indexReclaim
+	for idx.head < limit {
+		if batch.bytes >= bytes && idx.head >= until &&
+			(inlineSize == 0 || !idx.covered(dataStart+inlineSize, dataStart < st.mu.dataAppendOffset)) {
+			break
+		}
+		first, ok := idx.records.Front()
+		if !ok {
+			idx.head = limit
+			break
+		}
+		entry := idx.records.Value(first)
+		position := idx.position(entry.slot)
+		if position > idx.head {
+			idx.head = min(position, limit)
+			continue
+		}
+		if entry.pending {
+			break
+		}
+		idx.head++
+		h := idx.remove(first)
+		batch.bytes += h.PhysicalLen
+		batch.records = append(batch.records, h)
+	}
+	if idx.head != start {
+		batch.end = idx.head
+		batch.op = idx.wipeOp(start, batch.end)
+		st.cleanup.Add(1)
+	}
+	return batch
+}
+
+// submitReclaim runs outside mu. Only the completed wipe releases index slots;
+// external unlinks address unique ObjectIDs and do not gate their reuse.
+func (st *Store) submitReclaim(batch indexReclaim) {
+	st.notifyRetired(batch.records)
+	complete := func(_ int, err error) {
+		st.mu.Lock()
+		idx := st.mu.index
+		if err == nil {
+			idx.reuseHead = batch.end
+		} else {
+			idx.wipeErr = err
+		}
+		st.indexAvailable.Broadcast()
+		st.mu.Unlock()
+		if err != nil {
+			slog.Error("wipe index", "error", err)
+		}
+		st.cleanup.Done()
+	}
+	if _, err := iosched.SubmitNotify(st.scheduler, batch.op, complete); err != nil {
+		complete(0, err)
+	}
+}
+
+// reserve assigns an index slot and inline placement together. A data overlap
+// evicts the whole FIFO prefix through that inline record. Active readers do
+// not pin disk locations; unfinished writers still prevent their reuse.
+func (st *Store) reserve(h *RecordHeader, inlineSize uint64) (collections.Handle, error) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	idx := st.mu.index
+	for {
+		if idx.wipeErr != nil {
+			return 0, idx.wipeErr
+		}
+		start := st.dataStart(inlineSize)
+		var until uint64
+		if idx.full() && !idx.growable() {
+			until = idx.head + 1
+		}
+		needsSpace := until != 0 || inlineSize != 0 && idx.covered(start+inlineSize, start < st.mu.dataAppendOffset)
+		bytes := st.excess()
+		if needsSpace || bytes != 0 && idx.head == idx.reuseHead {
+			if idx.head != idx.reuseHead {
+				st.indexAvailable.Wait()
+				continue
+			}
+			batch := st.reclaimLocked(bytes, until, inlineSize)
+			if batch.end == 0 && needsSpace {
 				return 0, ErrBusy
 			}
-			retired = append(retired, idx.remove(first, 0))
+			if batch.end != 0 {
+				st.mu.Unlock()
+				st.submitReclaim(batch)
+				st.mu.Lock()
+				// Other reservations may have advanced placement while unlocked.
+				continue
+			}
+			// Pending writers may defer the byte target, but never permit overlap.
 		}
-		st.mu.dataAppendOffset = end
+		if inlineSize != 0 {
+			if start < st.mu.dataAppendOffset {
+				idx.dataWrapID = idx.nextObjectID
+			}
+			st.mu.dataAppendOffset = start + inlineSize
+		}
+		h.Offset = start
+		handle := idx.reserve(start, h.Flags)
+		h.ObjectID = idx.records.Value(handle).header.ObjectID
+		return handle, nil
 	}
-	h.Offset = start
-	handle := st.mu.index.reserve(start, h.Flags)
-	h.ObjectID = st.mu.index.records(h.Flags).Value(handle).header.ObjectID
-	return handle, nil
 }
 
-// notifyRetired runs without Store.mu. Unlink completion only logs failures;
-// neither foreground reservations nor the evictor wait for filesystem cleanup.
+func (st *Store) dataStart(size uint64) uint64 {
+	start := st.mu.dataAppendOffset
+	if size != 0 && start+size > max(st.TargetSize(), size) {
+		return 0
+	}
+	return start
+}
+
+// notifyRetired runs without Store.mu. Resident copies may survive disk
+// eviction; callbacks compare ObjectIDs so replacements remain untouched.
 func (st *Store) notifyRetired(records []RecordHeader) {
 	for _, h := range records {
 		if st.OnRetire != nil {
 			st.OnRetire(h.Hash, h.ObjectID)
 		}
 		if h.Flags.IsExternal() {
-			path := filepath.Join(st.base, "objects", strconv.FormatUint(h.ObjectID, 10))
-			_, err := iosched.SubmitNotify(st.scheduler, iosched.UnlinkatOp(unix.AT_FDCWD, path),
-				func(_ int, err error) { logUnlinkError(h.ObjectID, err) })
-			logUnlinkError(h.ObjectID, err)
+			st.cleanup.Add(1)
+			_, err := iosched.SubmitNotify(st.scheduler, iosched.UnlinkatOp(unix.AT_FDCWD, st.objectPath(h.ObjectID)),
+				func(_ int, err error) {
+					logUnlinkError(h.ObjectID, err)
+					st.cleanup.Done()
+				})
+			if err != nil {
+				logUnlinkError(h.ObjectID, err)
+				st.cleanup.Done()
+			}
 		}
 	}
 }
@@ -114,15 +262,8 @@ func logUnlinkError(id uint64, err error) {
 
 // recoverIndex restores data placement from the newest retained reservation.
 func (st *Store) recoverIndex() {
-	var newestID uint64
-	for _, flags := range []RecordFlags{FlagExternal, 0} {
-		records := st.mu.index.records(flags)
-		if handle, ok := records.Back(); ok {
-			h := records.Value(handle).header
-			if h.ObjectID > newestID {
-				newestID = h.ObjectID
-				st.mu.dataAppendOffset = h.dataEnd()
-			}
-		}
+	idx := st.mu.index
+	if newest, ok := idx.records.Back(); ok {
+		st.mu.dataAppendOffset = idx.records.Value(newest).header.dataEnd()
 	}
 }

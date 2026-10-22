@@ -8,39 +8,12 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/miretskiy/blobcache/blobstore"
 	"github.com/miretskiy/dio/v2/align"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 )
-
-func TestDiskReclaimPolicyTargets(t *testing.T) {
-	const gib = uint64(1 << 30)
-	const target = 1024 * gib
-	p := diskReclaimPolicy{headroom: target / 20}
-	trigger := target - p.headroom
-	require.Zero(t, p.reclaimBytes(trigger-1, target))
-	require.Equal(t, target/20, p.reclaimBytes(trigger, target), "start with a 5%% reserve")
-
-	// These bytes arrived over the entire deletion, irrespective of how long
-	// it took. Leave that space plus 25%, and reclaim a further batch at it.
-	p.observe(2*gib, target)
-	require.Equal(t, 5*gib/2, p.headroom)
-	trigger = target - p.headroom
-	require.Equal(t, p.headroom+100, p.reclaimBytes(trigger+100, target))
-
-	p.observe(target/10, target)
-	require.Greater(t, p.headroom, target/20, "the reserve is not limited to one batch")
-	require.Equal(t, target/20, p.reclaimBytes(target-p.headroom, target), "each request stays bounded")
-	p.observe(0, target)
-	require.EqualValues(t, 1<<20, p.headroom, "quiescent passes discard the old traffic estimate")
-	p.observe(2*target, target)
-	require.Equal(t, target, p.headroom)
-	require.Zero(t, p.reclaimBytes(0, target), "an empty cache cannot spin at a zero trigger")
-	require.Equal(t, target/20, p.reclaimBytes(2*target, target))
-}
 
 func TestDiskReclaimKeepsResidentValues(t *testing.T) {
 	const target = 64 << 10
@@ -66,7 +39,9 @@ func TestDiskReclaimKeepsResidentValues(t *testing.T) {
 	require.NoError(t, err)
 	require.EqualValues(t, 3*align.PageAlign(blobstore.RecordHeaderSize+1+int64(len(value))), info.Size())
 	for _, h := range diskRecords(t, dir) {
-		require.False(t, h.Flags.IsDeleted(), "eviction flags are only in memory")
+		if h.Flags.IsDeleted() {
+			require.Equal(t, blobstore.RecordHeader{Flags: blobstore.FlagDeleted}, h)
+		}
 	}
 }
 
@@ -87,13 +62,14 @@ func TestDiskRetirementRemovesMetadataAndPreservesReplacement(t *testing.T) {
 	require.ErrorIs(t, err, ErrNotFound)
 }
 
-func TestDiskReclaimContinuesAfterWritesStop(t *testing.T) {
+func TestWriterCloseReclaimsWithoutAnotherPut(t *testing.T) {
 	const target = 64 << 10
 	dir := t.TempDir()
-	c := newPutCache(t, dir, WithTargetSize(target), WithInlineThreshold(0))
+	c := newPutCache(t, dir, WithMemory(1<<20), WithTargetSize(target), WithInlineThreshold(0))
 	value := bytes.Repeat([]byte("v"), 2<<10)
-	// Publish directly, then signal after writes stop. Its excess requires
-	// multiple bounded reclamation passes without another Put.
+	// Keep the writers open so the FIFO cannot retire them. Closing them must
+	// reclaim the excess even though no more Put calls arrive.
+	var writers []*Writer
 	for i := range 40 {
 		key := []byte(fmt.Sprint(i))
 		w, err := c.NewWriter(key, int64(len(value)))
@@ -102,19 +78,19 @@ func TestDiskReclaimContinuesAfterWritesStop(t *testing.T) {
 		_, err = w.Write(value)
 		require.NoError(t, err)
 		require.NoError(t, c.store.Put(w))
+		writers = append(writers, w)
+	}
+	require.Greater(t, c.store.Size(), uint64(target))
+	for _, w := range writers {
 		require.NoError(t, w.Close())
 	}
-	c.store.Wait() // Drain external file cleanup before starting reclamation.
-	c.startDiskReclaim()
-	require.Eventually(t, func() bool {
-		return c.store.Size() < c.diskReclaimTrigger.Load()
-	}, 5*time.Second, time.Millisecond)
-	// Join the worker before checking the completed unlinks.
+	require.LessOrEqual(t, c.store.Size(), uint64(target))
+	// Drain dio cleanup before checking the completed unlinks.
 	require.NoError(t, c.Close())
 	objects, err := os.ReadDir(filepath.Join(dir, "objects"))
 	require.NoError(t, err)
 	require.NotEmpty(t, objects)
-	require.Less(t, uint64(len(objects)*len(value)), c.diskReclaimTrigger.Load())
+	require.LessOrEqual(t, len(objects)*len(value), target)
 }
 
 func TestPutConcurrentDiskReclamation(t *testing.T) {
@@ -150,5 +126,5 @@ func TestPutConcurrentDiskReclamation(t *testing.T) {
 	objects, err := os.ReadDir(filepath.Join(dir, "objects"))
 	require.NoError(t, err)
 	require.NotEmpty(t, objects)
-	require.Less(t, len(objects)*(8<<10), target)
+	require.LessOrEqual(t, len(objects)*(8<<10), target)
 }

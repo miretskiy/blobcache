@@ -1,7 +1,6 @@
 package blobstore
 
 import (
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -80,10 +79,10 @@ func indexTestHeader(offset, size uint64, tag byte) RecordHeader {
 
 func publishIndexHeader(t *testing.T, idx *diskIndex, scheduler iosched.Scheduler, handle collections.Handle, h RecordHeader) RecordHeader {
 	t.Helper()
-	h.ObjectID = idx.records(h.Flags).Value(handle).header.ObjectID
+	h.ObjectID = idx.records.Value(handle).header.ObjectID
 	submitIndexOp(t, scheduler, idx.writeOp(handle, h))
 	idx.publish(handle, h)
-	idx.records(h.Flags).Value(handle).pending = false // Both index I/O and writer handoff are complete.
+	idx.records.Value(handle).pending = false // Both index I/O and writer handoff are complete.
 	return h
 }
 
@@ -98,8 +97,8 @@ func TestIndexReservationAndOutOfOrderCompletion(t *testing.T) {
 	inline := indexTestHeader(0, 12345, 1)
 	external := indexTestHeader(inline.dataEnd(), 1<<33, 2)
 	first, second := idx.reserve(0, 0), idx.reserve(external.Offset, FlagExternal)
-	inline.ObjectID = idx.inline.Value(first).header.ObjectID
-	external.ObjectID = idx.external.Value(second).header.ObjectID
+	inline.ObjectID = idx.records.Value(first).header.ObjectID
+	external.ObjectID = idx.records.Value(second).header.ObjectID
 	require.GreaterOrEqual(t, inline.ObjectID, before)
 	require.Equal(t, inline.ObjectID+1, external.ObjectID)
 	require.Empty(t, indexHeaders(idx))
@@ -127,34 +126,49 @@ func TestIndexReservationAndOutOfOrderCompletion(t *testing.T) {
 	require.Equal(t, raw, readIndexSlot(t, idx, 0), "the index stores the exact record header")
 }
 
-func TestIndexReusesRetiredSlotsWithoutPersistingDeletion(t *testing.T) {
+func evictIndexHeaders(t *testing.T, idx *diskIndex, scheduler iosched.Scheduler, count int) {
+	t.Helper()
+	start := idx.head
+	for range count {
+		first, ok := idx.records.Front()
+		require.True(t, ok)
+		idx.head = idx.position(idx.records.Value(first).slot) + 1
+		idx.remove(first)
+	}
+	ticket, err := scheduler.Submit(idx.wipeOp(start, idx.head))
+	require.NoError(t, err)
+	_, err = ticket.Wait()
+	require.NoError(t, err)
+	idx.reuseHead = idx.head
+}
+
+func TestIndexReusesClearedPrefixInFIFOOrder(t *testing.T) {
 	idx, scheduler := newTestDiskIndex(t)
 	var old []RecordHeader
 	for i := range 4 {
 		old = append(old, putIndexHeader(t, idx, scheduler, indexTestHeader(uint64(i)*4096, 100, byte(i))))
 	}
-	before, err := os.ReadFile(idx.file.Name())
-	require.NoError(t, err)
-	for first, ok := idx.inline.Front(); ok; first, ok = idx.inline.Front() {
-		idx.remove(first, 0)
-	}
-	after, err := os.ReadFile(idx.file.Name())
-	require.NoError(t, err)
-	require.Equal(t, before, after)
+	evictIndexHeaders(t, idx, scheduler, 2)
 	h := putIndexHeader(t, idx, scheduler, indexTestHeader(16384, 200, 4))
 	reopened := reopenTestIndex(t, idx)
-	require.Equal(t, append(old[:3], h), indexReservations(reopened), "unoverwritten headers can return")
+	require.Equal(t, append(old[2:], h), indexReservations(reopened))
+	require.EqualValues(t, 2, reopened.head)
+	require.EqualValues(t, 5, reopened.tail)
+	var free RecordHeader
+	raw := readIndexSlot(t, idx, 1)
+	require.NoError(t, raw.Decode(&free, true))
+	require.True(t, free.Flags.IsDeleted(), "unused cleared slots stay cleared after reopen")
 	require.EqualValues(t, 4*RecordHeaderSize, indexFileSize(t, idx), "reuse does not grow index.db")
 }
 
 func TestIndexRecoveryHandlesAbandonedReservationAtWrap(t *testing.T) {
 	idx, scheduler := newTestDiskIndex(t)
 	putIndexHeader(t, idx, scheduler, indexTestHeader(0, 7000, 1))
-	tail := putIndexHeader(t, idx, scheduler, indexTestHeader(8192, 100, 2))
-	old, _ := idx.inline.Front()
-	idx.remove(old, 0) // Rotation retired this header, but its slot still contains it.
+	putIndexHeader(t, idx, scheduler, indexTestHeader(8192, 100, 2))
+	tail := putIndexHeader(t, idx, scheduler, indexTestHeader(12288, 100, 3))
+	evictIndexHeaders(t, idx, scheduler, 2)
 	first, second := idx.reserve(0, 0), idx.reserve(4096, 0)
-	idx.remove(first, 0) // The first writer after wrapping never publishes.
+	idx.remove(first) // The first writer after wrapping never publishes.
 	h := publishIndexHeader(t, idx, scheduler, second, indexTestHeader(4096, 100, 3))
 	reopened := reopenTestIndex(t, idx)
 	require.Equal(t, []RecordHeader{tail, h}, indexReservations(reopened))
@@ -179,5 +193,45 @@ func TestIndexOpenBatchesAndPartialTail(t *testing.T) {
 	require.NoError(t, err)
 	idx = reopenTestIndex(t, idx)
 	require.Equal(t, want, indexHeaders(idx))
-	require.EqualValues(t, count*RecordHeaderSize, idx.appendOffset)
+	require.EqualValues(t, count, idx.tail)
+}
+
+func TestIndexWipeCrossesEnd(t *testing.T) {
+	idx, scheduler := newTestDiskIndex(t)
+	for i := range 4 {
+		putIndexHeader(t, idx, scheduler, indexTestHeader(uint64(i)*4096, 100, byte(i)))
+	}
+	evictIndexHeaders(t, idx, scheduler, 3)
+	var newer []RecordHeader
+	for i := range 3 {
+		newer = append(newer, putIndexHeader(t, idx, scheduler, indexTestHeader(uint64(i+4)*4096, 100, byte(i+4))))
+	}
+	evictIndexHeaders(t, idx, scheduler, 2) // Physical slots 3 and 0.
+	require.Equal(t, newer[1:], indexReservations(reopenTestIndex(t, idx)))
+	for _, slot := range []uint64{3, 0} {
+		var h RecordHeader
+		raw := readIndexSlot(t, idx, slot)
+		require.NoError(t, raw.Decode(&h, true))
+		require.Equal(t, RecordHeader{Flags: FlagDeleted}, h)
+	}
+}
+
+func TestIndexGrowsAtEndAfterWrap(t *testing.T) {
+	idx, scheduler := newTestDiskIndex(t)
+	for i := range 3 {
+		putIndexHeader(t, idx, scheduler, indexTestHeader(uint64(i)*4096, 100, byte(i)))
+	}
+	evictIndexHeaders(t, idx, scheduler, 1)
+	putIndexHeader(t, idx, scheduler, indexTestHeader(3*4096, 100, 3))
+	require.True(t, idx.full())
+	require.False(t, idx.growable(), "growth cannot insert new slots into the middle of the FIFO")
+	evictIndexHeaders(t, idx, scheduler, 2)
+	var newer []RecordHeader
+	for i := range 3 {
+		newer = append(newer, putIndexHeader(t, idx, scheduler, indexTestHeader(uint64(i+4)*4096, 100, byte(i+4))))
+	}
+	require.EqualValues(t, 4, idx.slots)
+	require.EqualValues(t, 4*RecordHeaderSize, indexFileSize(t, idx))
+	evictIndexHeaders(t, idx, scheduler, 2)
+	require.Equal(t, newer[1:], indexReservations(reopenTestIndex(t, idx)))
 }

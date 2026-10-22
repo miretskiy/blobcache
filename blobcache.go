@@ -9,7 +9,6 @@ import (
 	"errors"
 	"io"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/miretskiy/blobcache/blobstore"
@@ -60,10 +59,8 @@ type Cache struct {
 	values memoryCache
 	closed bool
 
-	reclaimRequests     chan reclaimRequest
-	diskReclaimRequests chan struct{}
-	diskReclaimTrigger  atomic.Uint64
-	reclaimWG           sync.WaitGroup
+	reclaimRequests chan reclaimRequest
+	reclaimWG       sync.WaitGroup
 }
 
 // New opens or creates data.db, index.db, and objects/. The disk index recovers
@@ -98,12 +95,7 @@ func New(path string, opts ...Option) (*Cache, error) {
 	})
 	c.store = st
 	c.reclaimRequests = make(chan reclaimRequest, 1)
-	c.diskReclaimRequests = make(chan struct{}, 1)
-	target := st.TargetSize()
-	c.diskReclaimTrigger.Store(target - target/20)
 	c.reclaimWG.Go(c.reclaimLoop)
-	c.reclaimWG.Go(c.diskReclaimLoop)
-	c.startDiskReclaim()
 	return c, nil
 }
 
@@ -143,7 +135,6 @@ func (c *Cache) Put(w *Writer) error {
 	}
 	header := w.Header()
 	c.values.replace(header.Hash, buffer, header)
-	c.startDiskReclaim()
 	return nil
 }
 
@@ -176,7 +167,7 @@ func (c *Cache) Read(key []byte) (Reader, error) {
 	return r, nil
 }
 
-// Close drains object cleanup, joins both reclamation workers, and releases cached
+// Close joins the memory reclaimer, drains cleanup, and releases cached
 // buffers before closing the allocator. The caller must close all readers
 // and writers first; Close does not track them. It must not race cache, reader,
 // or writer calls. Repeated calls are harmless.
@@ -185,9 +176,7 @@ func (c *Cache) Close() (err error) {
 		return nil
 	}
 	c.closed = true
-	c.store.Wait()
 	close(c.reclaimRequests)
-	close(c.diskReclaimRequests)
 	c.reclaimWG.Wait()
 	err = c.store.Close()
 	c.values.clear()

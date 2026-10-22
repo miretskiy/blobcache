@@ -54,17 +54,12 @@ type funcOpt func(*config)
 
 func (f funcOpt) apply(c *config) { f(c) }
 
-// WithTargetSize sets the live-payload target exposed to reclamation policy.
-// Default: 1 GiB, rounded up to a page with a 64 KiB floor. Writes may exceed
-// this target until the caller invokes Reclaim. Inline allocation wraps data.db
-// at this extent, except that a single larger inline record can exceed it.
-// Eviction leaves data placement unchanged and reuses freed index slots.
-// Both files retain their allocated blocks; this is not a filesystem quota.
+// WithTargetSize sets a soft limit on cached disk payload, evicting oldest
+// records first. Default: 1 GiB, rounded up to a page with a 64 KiB minimum.
 func WithTargetSize(bytes int64) Option { return funcOpt(func(c *config) { c.targetSize = bytes }) }
 
-// WithDurableIndex requests DIO group commit for index writes (default true).
-// Put waits for the index write and, when enabled, its sync. Data and metadata
-// are not a transaction.
+// WithDurableIndex controls whether Put waits for index writes to be synced to
+// disk. Default: true.
 func WithDurableIndex(enabled bool) Option {
 	return funcOpt(func(c *config) { c.indexDurable = enabled })
 }
@@ -75,9 +70,8 @@ func WithInlineThreshold(bytes int64) Option {
 	return funcOpt(func(c *config) { c.inlineThreshold = bytes })
 }
 
-// WithStagingSize sets reusable memory requested for disk reads and object-file
-// writes, excluding the retained write header page. Default: 256 KiB.
-// bytes must be positive.
+// WithStagingSize sets the buffer size for disk reads and streaming writes.
+// Default: 256 KiB. bytes must be positive.
 func WithStagingSize(bytes int64) Option {
 	return funcOpt(func(c *config) { c.stagingSize = bytes })
 }
@@ -88,10 +82,8 @@ func WithDataIntegrity(integrity DataIntegrity) Option {
 	return funcOpt(func(c *config) { c.flags.SetDataIntegrity(integrity) })
 }
 
-// WithVerifyChecksums enables verification of stored header CRCs and key/value
-// hashes on reads and index recovery. Default: false. Each record's flags decide
-// which checksums are present; records written without them remain readable.
-// This does not change the checksums written with new records.
+// WithVerifyChecksums enables verification of stored checksums on reads and
+// index recovery. Default: false.
 func WithVerifyChecksums(enabled bool) Option {
 	return funcOpt(func(c *config) { c.verifyChecksums = enabled })
 }
@@ -99,11 +91,11 @@ func WithVerifyChecksums(enabled bool) Option {
 // WithRingDepth sets the io_uring submission queue depth. Default: 256.
 func WithRingDepth(n uint32) Option { return funcOpt(func(c *config) { c.ringDepth = n }) }
 
-// WithIOBudget sets per-class modeled device time in flight. Zero disables it.
+// WithIOBudget limits modeled device time in flight per I/O class.
+// Default: 1.5 ms. Zero disables the limit.
 func WithIOBudget(d time.Duration) Option { return funcOpt(func(c *config) { c.ioBudget = d }) }
 
-// TestingWithDirectIO selects I/O mode for this store only. Production uses
-// direct I/O. Independent options allow tests to open stores in parallel.
+// TestingWithDirectIO enables or disables direct I/O for tests. Default: true.
 func TestingWithDirectIO(enable bool) Option {
 	return funcOpt(func(c *config) { c.directIO = enable })
 }

@@ -15,7 +15,12 @@ import (
 
 func putReclaimRecord(t *testing.T, st *Store, key string, value []byte) RecordHeader {
 	t.Helper()
-	w, err := st.NewWriter([]byte(key), int64(len(value)))
+	return putReclaimSizedRecord(t, st, key, value, int64(len(value)))
+}
+
+func putReclaimSizedRecord(t *testing.T, st *Store, key string, value []byte, size int64) RecordHeader {
+	t.Helper()
+	w, err := st.NewWriter([]byte(key), size)
 	require.NoError(t, err)
 	defer w.Discard()
 	_, err = w.Write(value)
@@ -53,25 +58,27 @@ func readReclaimRecord(t *testing.T, st *Store, key string, h RecordHeader, valu
 	require.Equal(t, value, actual)
 }
 
-func TestEvictionPrefersExternalWithoutRotatingData(t *testing.T) {
+func TestEvictionUsesFIFOAcrossStorageKinds(t *testing.T) {
 	st := openTestStore(t, t.TempDir(), WithTargetSize(64<<10))
 	a := putReclaimRecord(t, st, "a", []byte("inline"))
 	object := putReclaimRecord(t, st, "recent", bytes.Repeat([]byte("e"), 40000))
-	dataOffset, indexOffset := st.mu.dataAppendOffset, st.mu.index.appendOffset
+	dataOffset, indexTail := st.mu.dataAppendOffset, st.mu.index.tail
+	indexSize := indexFileSize(t, st.mu.index)
 	var retired []uint64
 	st.OnRetire = func(_ KeyHash, id uint64) {
 		require.True(t, st.mu.TryLock(), "callbacks run outside the store mutex")
 		st.mu.Unlock()
 		retired = append(retired, id)
 	}
-	require.Equal(t, object.PhysicalLen, st.Reclaim(1), "the newer external record goes before the older inline record")
-	require.Equal(t, []uint64{object.ObjectID}, retired)
+	require.Equal(t, a.PhysicalLen, st.Reclaim(1), "the older inline record goes before the newer external record")
+	require.Equal(t, []uint64{a.ObjectID}, retired)
 	require.Equal(t, dataOffset, st.mu.dataAppendOffset)
-	require.Equal(t, indexOffset, st.mu.index.appendOffset)
-	readReclaimRecord(t, st, "a", a, []byte("inline"))
+	require.Equal(t, indexTail, st.mu.index.tail)
+	readReclaimRecord(t, st, "recent", object, bytes.Repeat([]byte("e"), 40000))
 	next := putReclaimRecord(t, st, "next", []byte("value"))
 	require.Equal(t, dataOffset, next.Offset, "eviction does not reset data placement")
-	require.Equal(t, indexOffset, indexFileSize(t, st.mu.index), "the freed index slot is reused")
+	require.Equal(t, indexSize, indexFileSize(t, st.mu.index), "the freed index slot is reused")
+	require.Equal(t, object.PhysicalLen, st.Reclaim(1))
 	path := filepath.Join(st.base, "objects", strconv.FormatUint(object.ObjectID, 10))
 	require.NoError(t, st.Close()) // Drain accepted unlinks before checking the filesystem.
 	require.NoFileExists(t, path)
@@ -110,7 +117,7 @@ func TestInlineRotationRetiresOverlapWithoutBackgroundEviction(t *testing.T) {
 	readReclaimRecord(t, st, "g", g, bytes.Repeat([]byte("g"), 4*page-RecordHeaderSize-1))
 }
 
-func TestInlineEvictionDoesNotWriteFilesOrMoveAppendOffsets(t *testing.T) {
+func TestInlineEvictionClearsIndexWithoutChangingDataOrTail(t *testing.T) {
 	st := openTestStore(t, t.TempDir())
 	for _, key := range []string{"a", "b", "c", "d"} {
 		putReclaimRecord(t, st, key, bytes.Repeat([]byte(key), 100))
@@ -119,20 +126,26 @@ func TestInlineEvictionDoesNotWriteFilesOrMoveAppendOffsets(t *testing.T) {
 	require.NoError(t, err)
 	beforeIndex, err := os.ReadFile(st.mu.index.file.Name())
 	require.NoError(t, err)
-	dataOffset, indexOffset := st.mu.dataAppendOffset, st.mu.index.appendOffset
+	dataOffset, indexTail := st.mu.dataAppendOffset, st.mu.index.tail
 	require.EqualValues(t, 200, st.Reclaim(150))
 	require.EqualValues(t, 200, st.Size())
 	require.Equal(t, dataOffset, st.mu.dataAppendOffset)
-	require.Equal(t, indexOffset, st.mu.index.appendOffset)
+	require.Equal(t, indexTail, st.mu.index.tail)
+	st.Wait()
 	afterData, err := os.ReadFile(st.data.Name())
 	require.NoError(t, err)
 	afterIndex, err := os.ReadFile(st.mu.index.file.Name())
 	require.NoError(t, err)
 	require.Equal(t, beforeData, afterData)
-	require.Equal(t, beforeIndex, afterIndex)
+	require.Equal(t, beforeIndex[2*RecordHeaderSize:], afterIndex[2*RecordHeaderSize:])
+	for slot := range 2 {
+		var h RecordHeader
+		require.NoError(t, (*RawHeader)(afterIndex[slot*RecordHeaderSize:]).Decode(&h, true))
+		require.Equal(t, RecordHeader{Flags: FlagDeleted}, h)
+	}
 }
 
-func TestRotationSkipsUnusedTailAndPreservesExternalRecords(t *testing.T) {
+func TestRotationEvictsExternalRecordsInCoveredPrefix(t *testing.T) {
 	const page = align.BlockSize
 	st := openTestStore(t, t.TempDir(), WithTargetSize(16*page), WithInlineThreshold(16*page))
 	put := func(key string, pages int) RecordHeader {
@@ -140,13 +153,75 @@ func TestRotationSkipsUnusedTailAndPreservesExternalRecords(t *testing.T) {
 	}
 	put("a", 12)
 	put("b", 4)
-	object := putReclaimRecord(t, st, "object", bytes.Repeat([]byte("o"), 17*page))
+	putReclaimSizedRecord(t, st, "object", []byte("o"), SizeUnknown)
 	put("c", 10)      // Wrap, leaving b in the old lap's tail.
 	d := put("d", 10) // Wrap again; retire that tail before overwriting c.
 	require.Zero(t, d.Offset)
-	require.Equal(t, []RecordHeader{object, d}, liveStoreHeaders(st))
+	require.Equal(t, []RecordHeader{d}, liveStoreHeaders(st))
 	readReclaimRecord(t, st, "d", d, bytes.Repeat([]byte("d"), 10*page-RecordHeaderSize-1))
-	readReclaimRecord(t, st, "object", object, bytes.Repeat([]byte("o"), 17*page))
+}
+
+func TestInlineSweepRetiresInterleavedExternalRecords(t *testing.T) {
+	const page = align.BlockSize
+	dir := t.TempDir()
+	st := openTestStore(t, dir, WithTargetSize(16*page))
+	put := func(key string, pages int) RecordHeader {
+		return putReclaimRecord(t, st, key, bytes.Repeat([]byte(key), pages*page-RecordHeaderSize-len(key)))
+	}
+	a := put("a", 4)
+	x := putReclaimSizedRecord(t, st, "x", []byte("x"), SizeUnknown)
+	b := put("b", 4)
+	y := putReclaimSizedRecord(t, st, "y", []byte("y"), SizeUnknown)
+	c := put("c", 8)
+	var retired []uint64
+	st.OnRetire = func(_ KeyHash, id uint64) { retired = append(retired, id) }
+	next := put("n", 6) // Covers a and part of b, retiring x in the same sweep.
+	require.Equal(t, []uint64{a.ObjectID, x.ObjectID, b.ObjectID}, retired)
+	require.Equal(t, []RecordHeader{y, c, next}, liveStoreHeaders(st))
+	xPath, yPath := st.objectPath(x.ObjectID), st.objectPath(y.ObjectID)
+	require.NoError(t, st.Close())
+	require.NoFileExists(t, xPath)
+	require.FileExists(t, yPath)
+	st = openTestStore(t, dir, WithTargetSize(16*page))
+	require.Equal(t, []RecordHeader{y, c, next}, recoveredStoreHeaders(t, st))
+	readReclaimRecord(t, st, "y", y, []byte("y"))
+	readReclaimRecord(t, st, "c", c, bytes.Repeat([]byte("c"), 8*page-RecordHeaderSize-1))
+	readReclaimRecord(t, st, "n", next, bytes.Repeat([]byte("n"), 6*page-RecordHeaderSize-1))
+}
+
+func TestInlineAppendKeepsExternalOnlyIndex(t *testing.T) {
+	dir := t.TempDir()
+	st := openTestStore(t, dir)
+	value := bytes.Repeat([]byte("e"), 40000)
+	external := putReclaimRecord(t, st, "external", value)
+	require.NoError(t, st.Close())
+	st = openTestStore(t, dir)
+	inline := putReclaimRecord(t, st, "inline", []byte("new"))
+	require.Equal(t, external.Offset, inline.Offset, "external reservations do not advance data placement")
+	require.Equal(t, []RecordHeader{external, inline}, liveStoreHeaders(st))
+	readReclaimRecord(t, st, "external", external, value)
+}
+
+func TestInlineSweepPastExternalFromOlderLap(t *testing.T) {
+	const page = align.BlockSize
+	st := openTestStore(t, t.TempDir(), WithTargetSize(16*page))
+	put := func(key string, pages int) RecordHeader {
+		return putReclaimRecord(t, st, key, bytes.Repeat([]byte(key), pages*page-RecordHeaderSize-len(key)))
+	}
+	put("a", 5)
+	put("b", 7)
+	x := putReclaimSizedRecord(t, st, "x", []byte("x"), SizeUnknown) // Old lap, offset 12 pages.
+	w, err := st.NewWriter([]byte("unused"), 5*page-RecordHeaderSize-6)
+	require.NoError(t, err)
+	require.NoError(t, w.Close()) // Wraps and leaves a five-page gap.
+	put("c", 8)                   // Reuses b's space and crosses x's old cursor.
+	d := put("d", 3)
+	e := put("e", 8) // Wraps again and must retire c even if x is still ahead of it.
+	require.Equal(t, []RecordHeader{d, e}, liveStoreHeaders(st))
+	st.Wait()
+	require.NoFileExists(t, st.objectPath(x.ObjectID))
+	readReclaimRecord(t, st, "d", d, bytes.Repeat([]byte("d"), 3*page-RecordHeaderSize-1))
+	readReclaimRecord(t, st, "e", e, bytes.Repeat([]byte("e"), 8*page-RecordHeaderSize-1))
 }
 
 func TestStoreFailedUnlinkIsLogged(t *testing.T) {
@@ -183,8 +258,8 @@ func TestWriteStatsPreserveIngressAcrossReclamation(t *testing.T) {
 	pending.Discard()
 	putReclaimRecord(t, st, "inline", bytes.Repeat([]byte("i"), 100))
 	putReclaimRecord(t, st, "object", bytes.Repeat([]byte("o"), 40000))
-	require.EqualValues(t, 40000, st.Reclaim(1))
+	require.EqualValues(t, 100, st.Reclaim(1))
 	live, published = st.WriteStats()
-	require.EqualValues(t, 100, live)
+	require.EqualValues(t, 40000, live)
 	require.EqualValues(t, 40100, published)
 }

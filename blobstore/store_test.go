@@ -282,6 +282,9 @@ func (s *heldScheduler) Submit(op iosched.Op) (iosched.Ticket, error) {
 	resume := make(chan struct{})
 	s.held = append(s.held, resume)
 	<-resume
+	if s.reject != nil {
+		return iosched.Ticket{}, s.reject
+	}
 	return s.Scheduler.Submit(op)
 }
 
@@ -394,4 +397,121 @@ func TestCloseReleasesRejectedPutReservation(t *testing.T) {
 			readReclaimRecord(t, st, "next", h, []byte("next"))
 		})
 	}
+}
+
+func TestIndexReuseWaitsForWipeAndSerializesEviction(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		st := openTestStore(t, t.TempDir())
+		scheduler := holdTestIO(t, st)
+		for _, key := range []string{"a", "b", "c"} {
+			putReclaimRecord(t, st, key, []byte("value"))
+		}
+		scheduler.holdNext = true
+		var first, second, reserved bool
+		go func() {
+			require.EqualValues(t, 5, st.Reclaim(1))
+			first = true
+		}()
+		synctest.Wait()
+		require.EqualValues(t, 1, st.mu.index.head)
+		require.Zero(t, st.mu.index.reuseHead)
+		go func() {
+			putReclaimRecord(t, st, "new", []byte("fresh"))
+			reserved = true
+		}()
+		go func() {
+			require.EqualValues(t, 5, st.Reclaim(1))
+			second = true
+		}()
+		synctest.Wait()
+		require.False(t, first)
+		require.False(t, second, "another eviction waits for the first wipe")
+		require.False(t, reserved, "tail cannot enter slots whose wipe is unfinished")
+		require.Len(t, scheduler.held, 1)
+		scheduler.complete(t, 0)
+		require.True(t, first)
+		require.True(t, second)
+		require.True(t, reserved)
+		st.Wait()
+		require.Equal(t, st.mu.index.head, st.mu.index.reuseHead)
+		require.Equal(t, liveStoreHeaders(st), indexReservations(reopenTestIndex(t, st.mu.index)))
+	})
+}
+
+func TestReservationUsesReadySlotsDuringWipe(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		st := openTestStore(t, t.TempDir())
+		scheduler := holdTestIO(t, st)
+		for _, key := range []string{"a", "b", "c", "d"} {
+			putReclaimRecord(t, st, key, []byte("value"))
+		}
+		require.EqualValues(t, 10, st.Reclaim(10))
+		putReclaimRecord(t, st, "e", []byte("value"))
+		scheduler.holdNext = true
+		go func() { require.EqualValues(t, 5, st.Reclaim(1)) }()
+		synctest.Wait()
+		putReclaimRecord(t, st, "f", []byte("value")) // The second already-cleared slot.
+		require.EqualValues(t, 6, st.mu.index.tail)
+		require.EqualValues(t, 2, st.mu.index.reuseHead)
+		scheduler.complete(t, 0)
+	})
+}
+
+func TestConcurrentWriterCloseRechecksSizeAfterWipe(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		st := openTestStore(t, t.TempDir(), WithTargetSize(64<<10), WithInlineThreshold(0))
+		st.staging = st.memory // Enough staging for all four open writers.
+		var writers []*Writer
+		for _, key := range []string{"a", "b", "c", "d"} {
+			w, err := st.NewWriter([]byte(key), SizeUnknown)
+			require.NoError(t, err)
+			_, err = w.Write(bytes.Repeat([]byte(key), 24<<10))
+			require.NoError(t, err)
+			require.NoError(t, st.Put(w))
+			writers = append(writers, w)
+		}
+		scheduler := holdTestIO(t, st)
+		scheduler.holdNext = true
+		var closed [4]bool
+		go func() { require.NoError(t, writers[0].Close()); closed[0] = true }()
+		synctest.Wait()
+		// Complete the descriptor close, then hold the eviction batch it triggers.
+		scheduler.holdNext = true
+		scheduler.complete(t, 0)
+		for i := 1; i < len(writers); i++ {
+			go func() { require.NoError(t, writers[i].Close()); closed[i] = true }()
+		}
+		synctest.Wait()
+		require.EqualValues(t, 72<<10, st.Size(), "only the first batch has retired a record")
+		scheduler.complete(t, 1)
+		require.Equal(t, [4]bool{true, true, true, true}, closed)
+		require.EqualValues(t, 48<<10, st.Size(), "waiting writers must not repeat a stale byte request")
+		require.Equal(t, []RecordHeader{writers[2].Header(), writers[3].Header()}, liveStoreHeaders(st))
+	})
+}
+
+func TestIndexWipeFailureWakesReservations(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		st := openTestStore(t, t.TempDir())
+		scheduler := holdTestIO(t, st)
+		putReclaimRecord(t, st, "old", []byte("value"))
+		scheduler.holdNext = true
+		go func() { require.EqualValues(t, 5, st.Reclaim(1)) }()
+		synctest.Wait()
+		failure := errors.New("index wipe failed")
+		var finished bool
+		go func() {
+			w, err := st.NewWriter([]byte("new"), 5)
+			require.Nil(t, w)
+			require.ErrorIs(t, err, failure)
+			finished = true
+		}()
+		synctest.Wait()
+		require.False(t, finished)
+		scheduler.reject = failure
+		scheduler.complete(t, 0)
+		require.True(t, finished)
+		require.Zero(t, st.mu.index.reuseHead)
+		require.ErrorIs(t, st.Close(), failure)
+	})
 }

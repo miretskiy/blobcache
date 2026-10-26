@@ -74,6 +74,42 @@ func TestReadMemoryDiskAndRecovery(t *testing.T) {
 	}
 }
 
+func TestRead64BitKeyHash(t *testing.T) {
+	for _, external := range []bool{false, true} {
+		name := "inline"
+		if external {
+			name = "external"
+		}
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			opts := []Option{storeOpt(blobstore.WithDataIntegrity(blobstore.DataIntegrityNone))}
+			c := newPutCache(t, dir, opts...)
+			key := bytes.Repeat([]byte("k"), 10000) // Exceeds the disk reader's staging size.
+			value := []byte("value")
+			if external {
+				value = bytes.Repeat(value, 8000)
+			}
+			putValue(t, c, string(key), value)
+			require.NoError(t, c.Close())
+
+			c = newPutCache(t, dir, opts...)
+			checkRead(t, c, key, value)
+			entry, ok := c.values.entries.Get(blobstore.HashKey(key))
+			require.True(t, ok, "persisted key hash recovers without reading the data files")
+			require.Zero(t, entry.resident, "read the actual disk record")
+
+			// Force a hash collision, with the mismatch beyond the first read.
+			wrong := bytes.Clone(key)
+			wrong[len(wrong)-1] ^= 1
+			c.values.replace(blobstore.HashKey(wrong), nil, entry.header)
+			r, err := c.Read(wrong)
+			require.Nil(t, r)
+			require.ErrorIs(t, err, ErrNotFound, "full keys must match even without integrity checks")
+			checkRead(t, c, key, value)
+		})
+	}
+}
+
 func TestReadPinsUntilClose(t *testing.T) {
 	c := newPutCache(t, t.TempDir())
 	value := bytes.Repeat([]byte("original"), 1000)
@@ -167,7 +203,7 @@ func TestRecoveryUsesIndexWithoutDataFiles(t *testing.T) {
 		hash := blobstore.HashKey([]byte(key))
 		entry, ok := c.values.entries.Get(hash)
 		require.True(t, ok)
-		require.Equal(t, hash, entry.header.Hash)
+		require.Equal(t, hash, entry.header.KeyHash())
 		require.Zero(t, entry.resident)
 	}
 	r, err := c.Read([]byte("object"))
@@ -184,8 +220,8 @@ func TestReadChecksumPolicyAfterRestart(t *testing.T) {
 	}{
 		{"absent/default", blobstore.DataIntegrityNone, false},
 		{"absent/verify", blobstore.DataIntegrityNone, true},
-		{"present/default", blobstore.DataIntegrityXXHash128, false},
-		{"present/verify", blobstore.DataIntegrityXXHash128, true},
+		{"present/default", blobstore.DataIntegrityCRC32C, false},
+		{"present/verify", blobstore.DataIntegrityCRC32C, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
@@ -202,7 +238,7 @@ func TestReadChecksumPolicyAfterRestart(t *testing.T) {
 
 			// Reverse the write policy at restart: verification must use the
 			// existing record's flags, independently of new writes' configuration.
-			writeIntegrity := blobstore.DataIntegrityXXHash128
+			writeIntegrity := blobstore.DataIntegrityCRC32C
 			if tc.integrity == writeIntegrity {
 				writeIntegrity = blobstore.DataIntegrityNone
 			}
@@ -215,7 +251,7 @@ func TestReadChecksumPolicyAfterRestart(t *testing.T) {
 			require.NoError(t, err)
 			defer r.Close()
 			got, err := io.ReadAll(r)
-			if tc.verify && tc.integrity == blobstore.DataIntegrityXXHash128 {
+			if tc.verify && tc.integrity == blobstore.DataIntegrityCRC32C {
 				require.ErrorIs(t, err, ErrCorrupt)
 			} else {
 				require.NoError(t, err)

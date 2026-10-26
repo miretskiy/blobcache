@@ -169,7 +169,9 @@ func (st *Store) submitReclaim(batch indexReclaim) {
 		}
 		st.cleanup.Done()
 	}
-	if _, err := iosched.SubmitNotify(st.scheduler, batch.op, complete); err != nil {
+	// Retired slots cannot be reused until this wipe completes. Its admission
+	// bypasses admission limits and accounting so overload cannot prevent reclamation.
+	if _, err := iosched.SubmitNotify(st.writeScheduler(), batch.op.MustAdmit(), complete); err != nil {
 		complete(0, err)
 	}
 }
@@ -236,11 +238,11 @@ func (st *Store) dataStart(size uint64) uint64 {
 func (st *Store) notifyRetired(records []RecordHeader) {
 	for _, h := range records {
 		if st.OnRetire != nil {
-			st.OnRetire(h.Hash, h.ObjectID)
+			st.OnRetire(h.KeyHash(), h.ObjectID)
 		}
 		if h.Flags.IsExternal() {
 			st.cleanup.Add(1)
-			_, err := iosched.SubmitNotify(st.scheduler, iosched.UnlinkatOp(unix.AT_FDCWD, st.objectPath(h.ObjectID)),
+			_, err := iosched.SubmitNotify(st.writeScheduler(), iosched.UnlinkatOp(unix.AT_FDCWD, st.objectPath(h.ObjectID)),
 				func(_ int, err error) {
 					logUnlinkError(h.ObjectID, err)
 					st.cleanup.Done()

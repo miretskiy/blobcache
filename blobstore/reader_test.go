@@ -25,7 +25,7 @@ func publishForRead(t *testing.T, st *Store, key, value []byte) RecordHeader {
 }
 
 func TestReaderFragmentedBuffers(t *testing.T) {
-	for _, integrity := range []DataIntegrity{DataIntegrityNone, DataIntegrityXXHash128} {
+	for _, integrity := range []DataIntegrity{DataIntegrityNone, DataIntegrityCRC32C} {
 		t.Run(string(rune('0'+integrity)), func(t *testing.T) {
 			pool, err := alloc.NewExtentAllocator(align.BlockSize, 32)
 			require.NoError(t, err)
@@ -75,11 +75,12 @@ func TestReaderStaleLocationAndMissingObject(t *testing.T) {
 	r, err = st.NewReader([]byte("object"), object)
 	require.NoError(t, err)
 	defer r.Close()
-	file := r.file
-	require.NoError(t, r.Close())
-	_, err = file.Stat()
-	require.ErrorIs(t, err, os.ErrClosed, "early Close closes the external descriptor")
+	// Each refill opens its own descriptor, so removing the object mid-stream
+	// fails the next refill rather than reading through a retained descriptor.
 	require.NoError(t, os.Remove(filepath.Join(st.base, "objects", strconv.FormatUint(object.ObjectID, 10))))
+	_, err = io.Copy(io.Discard, r)
+	require.ErrorIs(t, err, os.ErrNotExist)
+	require.NoError(t, r.Close())
 	r, err = st.NewReader([]byte("object"), object)
 	require.Nil(t, r)
 	require.ErrorIs(t, err, ErrNotFound)
@@ -130,6 +131,19 @@ func TestReaderDetectsCorruptAndTruncatedData(t *testing.T) {
 	}
 }
 
+func TestReaderAllowsMissingPadding(t *testing.T) {
+	st := openTestStore(t, t.TempDir(), WithInlineThreshold(0), WithVerifyChecksums(true))
+	key, value := []byte("key"), []byte("value")
+	h := publishForRead(t, st, key, value)
+	require.NoError(t, os.Truncate(st.objectPath(h.ObjectID), RecordHeaderSize+int64(len(key)+len(value))))
+	r, err := st.NewReader(key, h)
+	require.NoError(t, err)
+	defer r.Close()
+	got, err := io.ReadAll(r)
+	require.NoError(t, err)
+	require.Equal(t, value, got)
+}
+
 func TestHeaderChecksumPolicyAfterRestart(t *testing.T) {
 	for _, flags := range []RecordFlags{0, FlagHeaderIntegrity} {
 		dir := t.TempDir()
@@ -139,8 +153,8 @@ func TestHeaderChecksumPolicyAfterRestart(t *testing.T) {
 		require.NoError(t, st.Close())
 		// Change only the CRC bytes, leaving decoded metadata and payload intact.
 		for name, offset := range map[string]int64{
-			"data.db":  60,
-			"index.db": 60,
+			"data.db":  RecordHeaderSize - 4,
+			"index.db": RecordHeaderSize - 4,
 		} {
 			f, err := os.OpenFile(filepath.Join(dir, name), os.O_RDWR, 0)
 			require.NoError(t, err)

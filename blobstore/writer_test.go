@@ -3,6 +3,7 @@ package blobstore
 import (
 	"bytes"
 	"errors"
+	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
@@ -12,7 +13,6 @@ import (
 	"github.com/miretskiy/dio/v2/align"
 	"github.com/miretskiy/dio/v2/alloc"
 	"github.com/stretchr/testify/require"
-	"github.com/zeebo/xxh3"
 )
 
 func checkWriterRecord(t *testing.T, st *Store, w *Writer, key, value []byte) RecordHeader {
@@ -21,8 +21,8 @@ func checkWriterRecord(t *testing.T, st *Store, w *Writer, key, value []byte) Re
 	require.Equal(t, uint64(len(value)), h.PhysicalLen)
 	require.Equal(t, h.PhysicalLen, h.LogicalLen)
 	require.Equal(t, uint16(len(key)), h.KeyLen)
-	if h.Flags.DataIntegrity() == DataIntegrityXXHash128 {
-		require.Equal(t, xxh3.Hash128(append(bytes.Clone(key), value...)), h.Hash)
+	if h.Flags.DataIntegrity() == DataIntegrityCRC32C {
+		require.Equal(t, uint64(crc32.Checksum(append(bytes.Clone(key), value...), crc32.MakeTable(crc32.Castagnoli))), h.Hash)
 	} else {
 		require.Zero(t, h.Hash)
 	}

@@ -11,27 +11,35 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"sync/atomic"
 
-	"github.com/miretskiy/blobcache/metrics"
 	"github.com/miretskiy/dio/v2/alloc"
 	"github.com/miretskiy/dio/v2/iosched"
 	"github.com/miretskiy/dio/v2/sys"
 	"github.com/zeebo/xxh3"
 )
 
-type KeyHash = xxh3.Uint128
+// KeyHash identifies a lookup candidate; readers always compare the full key.
+type KeyHash = uint64
 
-func HashKey(key []byte) KeyHash { return xxh3.Hash128(key) }
+// HashKey returns the XXH3-64 hash of key, stable across restarts for
+// persisted index lookups. Records carry FlagKeyHashXXH3.
+func HashKey(key []byte) KeyHash { return xxh3.Hash(key) }
 
 var (
+	// ErrRejected is returned when a scheduler declines I/O at a configured queue limit.
+	ErrRejected    = iosched.ErrRejected
 	ErrEmptyKey    = errors.New("blobstore: empty key")
 	ErrKeyTooLarge = errors.New("blobstore: key too large")
 	ErrNotFound    = errors.New("blobstore: key not found")
 	ErrCorrupt     = errors.New("blobstore: corrupt record")
 	ErrBusy        = errors.New("blobstore: reuse overlaps an open writer")
+	// ErrNoDescriptors means a scheduler's virtual descriptor table is full:
+	// open external readers and writers each hold a slot. It wraps ENFILE.
+	ErrNoDescriptors = errors.New("blobstore: virtual file descriptors exhausted")
 )
 
-// Store owns its files and scheduler, and borrows memory and staging allocators.
+// Store owns its files and schedulers, and borrows memory and staging allocators.
 // A cache directory must have one owner. Close all readers and writers before
 // closing Store; release retained buffers before closing the allocators.
 // Methods other than Close require an open Store.
@@ -39,10 +47,12 @@ type Store struct {
 	base            string
 	cfg             config
 	data            *os.File
-	scheduler       iosched.Scheduler
+	schedulers      []iosched.Scheduler
+	disk            *iosched.DiskPolicy
+	nextRead        atomic.Uint64
+	nextWrite       atomic.Uint64
 	memory, staging alloc.Allocator
 	cleanup         sync.WaitGroup
-	vfilesAvailable *sync.Cond
 	indexAvailable  *sync.Cond
 
 	// OnRetire reports a disk record leaving the index. Set before using Store.
@@ -55,7 +65,6 @@ type Store struct {
 		sync.Mutex
 		dataAppendOffset uint64
 		index            *diskIndex
-		vfiles           [16]uint64 // 1024 occupied virtual descriptor slots
 	}
 }
 
@@ -72,7 +81,6 @@ func Open(path string, memory, staging alloc.Allocator, opts ...Option) (_ *Stor
 		return nil, err
 	}
 	st := &Store{base: path, cfg: cfg, memory: memory, staging: staging}
-	st.vfilesAvailable = sync.NewCond(&st.mu)
 	st.indexAvailable = sync.NewCond(&st.mu)
 	defer func() {
 		if err != nil {
@@ -97,13 +105,9 @@ func Open(path string, memory, staging alloc.Allocator, opts ...Option) (_ *Stor
 	if err != nil {
 		return nil, err
 	}
-	optsIO := []iosched.Option{iosched.WithRingDepth(cfg.ringDepth), iosched.WithVFiles(1024)}
-	if cfg.ioBudget == 0 {
-		optsIO = append(optsIO, iosched.WithoutIOBudget())
-	} else {
-		optsIO = append(optsIO, iosched.WithLatencyGoal(cfg.ioBudget))
+	if err := st.openSchedulers(); err != nil {
+		return nil, err
 	}
-	st.scheduler = iosched.NewDefaultScheduler(optsIO...)
 	st.recoverIndex()
 	st.logIndexState("open")
 	st.reclaimExcess()
@@ -117,14 +121,14 @@ func (st *Store) fileFlags() sys.OpenFlag {
 	return 0
 }
 
-// Close drains the scheduler before closing the files. It must not race Store
+// Close drains every scheduler before closing the shared files. It must not race Store
 // or reader/writer methods. The caller remains responsible for the allocators.
 func (st *Store) Close() (err error) {
 	st.Wait()
-	if st.scheduler != nil {
-		err = st.scheduler.Close()
-		st.scheduler = nil
+	for _, scheduler := range st.schedulers {
+		err = errors.Join(err, scheduler.Close())
 	}
+	st.schedulers = nil
 	if st.data != nil {
 		err = errors.Join(err, st.data.Close())
 		st.data = nil
@@ -157,18 +161,9 @@ func (st *Store) logIndexState(event string) {
 // Stop submitting new work before using it as a shutdown barrier.
 func (st *Store) Wait() { st.cleanup.Wait() }
 
-// IOQueueStats reports the asynchronous scheduler's submission depths and
-// lifetime high-water marks. Synchronous backends return false.
-func (st *Store) IOQueueStats() (iosched.QueueStats, bool) {
-	scheduler, ok := st.scheduler.(interface{ QueueStats() iosched.QueueStats })
-	if !ok {
-		return iosched.QueueStats{}, false
-	}
-	return scheduler.QueueStats(), true
-}
-
-// Put soft-links this writer's final data and index writes, waits for their
-// shared ticket, then updates the disk index. A data failure cancels the index write.
+// Put soft-links this writer's final data write, external descriptor close,
+// and index write, waits for their shared ticket, then updates the disk index.
+// A data failure cancels the index write and leaves cleanup to Writer.Close.
 // WithDurableIndex also waits for the index sync. Submission and completion
 // errors are returned to the caller. Concurrent puts proceed independently.
 // The record remains protected from reclamation until the writer is closed,
@@ -187,18 +182,12 @@ func (st *Store) Put(w *Writer) error {
 	if st.cfg.indexDurable {
 		indexOp = indexOp.Durable()
 	}
-	ticket, err := st.scheduler.Submit(op.Link(indexOp))
-	if err != nil {
-		w.err = err
-		return err
+	if w.IsExternal() {
+		op = op.Link(iosched.VCloseOp(uint32(w.vfd)), indexOp)
+	} else {
+		op = op.Link(indexOp)
 	}
-	_, err = ticket.Wait()
-	if ticket.Slat > 0 { // Admission failures never reached the ring.
-		metrics.WriteSlat.RecordValue(int64(ticket.Slat))
-		metrics.WriteClat.RecordValue(int64(ticket.Clat))
-	}
-	if err != nil {
-		w.err = err
+	if err := w.submit(op, true); err != nil {
 		return err
 	}
 	st.mu.Lock()
@@ -211,8 +200,12 @@ func (st *Store) Put(w *Writer) error {
 // Recover visits the index metadata in ObjectID order without reading data files.
 // Call after Open, before using the Store. Missing or reused records are handled
 // when read; no key or payload scan is needed to rebuild the lookup.
+// Records whose key hash is not XXH3 cannot match a lookup and are skipped;
+// they keep their index slot and data placement until evicted.
 func (st *Store) Recover(visit func(RecordHeader)) {
 	for h := range st.mu.index.headers() {
-		visit(h)
+		if h.Flags.HasXXH3KeyHash() {
+			visit(h)
+		}
 	}
 }

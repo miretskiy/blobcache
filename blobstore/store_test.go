@@ -27,7 +27,7 @@ func openTestStore(t *testing.T, path string, opts ...Option) *Store {
 		TestingWithDirectIO(false),
 		WithInlineThreshold(32 << 10),
 		WithStagingSize(8 << 10),
-		WithDataIntegrity(DataIntegrityXXHash128),
+		WithDataIntegrity(DataIntegrityCRC32C),
 	}, opts...)
 	st, err := Open(path, memory, staging, opts...)
 	require.NoError(t, err)
@@ -50,7 +50,7 @@ func TestOpenCreatesFiles(t *testing.T) {
 		require.Zero(t, info.Size())
 	}
 	require.EqualValues(t, 0, indexFileSize(t, st.mu.index))
-	require.NotNil(t, st.scheduler)
+	require.NotNil(t, st.schedulers[0])
 	require.Empty(t, indexReservations(st.mu.index))
 	require.Zero(t, st.mu.dataAppendOffset)
 
@@ -140,7 +140,7 @@ func TestStoreReservationOrderAcrossRestarts(t *testing.T) {
 			require.NoError(t, err)
 			require.NoError(t, st.Put(w))
 			want[base+i] = w.header
-			want[base+i].Hash = w.key
+			want[base+i].Hash = w.Header().Hash
 			w.Discard()
 		}
 		require.Equal(t, expectedPublishedHeaders(want), indexReservations(st.mu.index), "round %d: Put completion does not reorder entries", round)
@@ -217,8 +217,9 @@ func TestPutIOError(t *testing.T) {
 			require.NoError(t, err)
 			objectPath := st.objectPath(w.header.ObjectID)
 			if file == "data" {
+				require.NoError(t, w.Flush()) // Opens the object with its first write.
 				// Leave the slot reserved but remove its descriptor to fail data I/O.
-				ticket, err := st.scheduler.Submit(iosched.VCloseOp(uint32(w.vfd)))
+				ticket, err := st.schedulers[0].Submit(iosched.VCloseOp(uint32(w.vfd)))
 				require.NoError(t, err)
 				_, err = ticket.Wait()
 				require.NoError(t, err)
@@ -238,7 +239,6 @@ func TestPutIOError(t *testing.T) {
 			require.Zero(t, publishedBytes, "failed writes must not count as published payload")
 			require.Zero(t, indexFileSize(t, st.mu.index), "a failed data write must cancel the linked index write")
 			require.NoFileExists(t, objectPath)
-			require.Equal(t, [16]uint64{}, st.mu.vfiles)
 		})
 	}
 }
@@ -264,10 +264,8 @@ type heldScheduler struct {
 
 func holdTestIO(t *testing.T, st *Store) *heldScheduler {
 	t.Helper()
-	require.NoError(t, st.scheduler.Close())
-	backend := iosched.NewPOSIXScheduler()
-	s := &heldScheduler{Scheduler: backend}
-	st.scheduler = s
+	s := &heldScheduler{Scheduler: st.schedulers[0]}
+	st.schedulers[0] = s
 	return s
 }
 
@@ -475,15 +473,13 @@ func TestConcurrentWriterCloseRechecksSizeAfterWipe(t *testing.T) {
 		var closed [4]bool
 		go func() { require.NoError(t, writers[0].Close()); closed[0] = true }()
 		synctest.Wait()
-		// Complete the descriptor close, then hold the eviction batch it triggers.
-		scheduler.holdNext = true
-		scheduler.complete(t, 0)
+		// Put already closed each descriptor; Close now waits on the index wipe.
 		for i := 1; i < len(writers); i++ {
 			go func() { require.NoError(t, writers[i].Close()); closed[i] = true }()
 		}
 		synctest.Wait()
 		require.EqualValues(t, 72<<10, st.Size(), "only the first batch has retired a record")
-		scheduler.complete(t, 1)
+		scheduler.complete(t, 0)
 		require.Equal(t, [4]bool{true, true, true, true}, closed)
 		require.EqualValues(t, 48<<10, st.Size(), "waiting writers must not repeat a stale byte request")
 		require.Equal(t, []RecordHeader{writers[2].Header(), writers[3].Header()}, liveStoreHeaders(st))
@@ -514,4 +510,38 @@ func TestIndexWipeFailureWakesReservations(t *testing.T) {
 		require.Zero(t, st.mu.index.reuseHead)
 		require.ErrorIs(t, st.Close(), failure)
 	})
+}
+
+func TestRecoverSkipsForeignKeyHash(t *testing.T) {
+	dir := t.TempDir()
+	st := openTestStore(t, dir)
+	var published []RecordHeader
+	for _, key := range []string{"fnv", "xxh3"} {
+		h := publishForRead(t, st, []byte(key), []byte("value"))
+		require.True(t, h.Flags.HasXXH3KeyHash())
+		require.Equal(t, HashKey([]byte(key)), h.KeyHash())
+		published = append(published, h)
+	}
+	require.NoError(t, st.Close())
+
+	// Rewrite the first index entry as if an older binary had hashed its key.
+	index, err := os.OpenFile(filepath.Join(dir, "index.db"), os.O_RDWR, 0)
+	require.NoError(t, err)
+	var raw RawHeader
+	_, err = index.ReadAt(raw[:], 0)
+	require.NoError(t, err)
+	var h RecordHeader
+	require.NoError(t, raw.Decode(&h, true))
+	require.Equal(t, published[0].ObjectID, h.ObjectID)
+	h.Flags &^= FlagKeyHashXXH3
+	h.Encode(&raw)
+	_, err = index.WriteAt(raw[:], 0)
+	require.NoError(t, err)
+	require.NoError(t, index.Close())
+
+	st = openTestStore(t, dir)
+	var recovered []uint64
+	st.Recover(func(h RecordHeader) { recovered = append(recovered, h.ObjectID) })
+	require.Equal(t, []uint64{published[1].ObjectID}, recovered)
+	require.Len(t, indexReservations(st.mu.index), 2, "the skipped record keeps its placement")
 }

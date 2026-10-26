@@ -15,6 +15,7 @@ import (
 	"github.com/miretskiy/blobcache/metrics"
 	"github.com/miretskiy/dio/v2/align"
 	"github.com/miretskiy/dio/v2/alloc"
+	"github.com/miretskiy/dio/v2/iosched"
 )
 
 const (
@@ -24,10 +25,16 @@ const (
 )
 
 var (
-	ErrEmptyKey    = blobstore.ErrEmptyKey
-	ErrKeyTooLarge = blobstore.ErrKeyTooLarge
-	ErrNotFound    = blobstore.ErrNotFound
-	ErrCorrupt     = blobstore.ErrCorrupt
+	// ErrRejected means I/O exceeded a configured scheduler admission limit.
+	// Close the writer/reader normally; a rejected fill is not published.
+	ErrRejected = blobstore.ErrRejected
+	// ErrNoDescriptors means too many external readers and writers are open
+	// on one scheduler. It wraps syscall.ENFILE.
+	ErrNoDescriptors = blobstore.ErrNoDescriptors
+	ErrEmptyKey      = blobstore.ErrEmptyKey
+	ErrKeyTooLarge   = blobstore.ErrKeyTooLarge
+	ErrNotFound      = blobstore.ErrNotFound
+	ErrCorrupt       = blobstore.ErrCorrupt
 	// ErrBusy means memory is unavailable or disk reuse overlaps an open writer.
 	ErrBusy = alloc.ErrExhausted
 )
@@ -91,7 +98,7 @@ func New(path string, opts ...Option) (*Cache, error) {
 	}
 	st.OnRetire = c.values.retire
 	st.Recover(func(h blobstore.RecordHeader) {
-		c.values.replace(h.Hash, nil, h)
+		c.values.replace(h.KeyHash(), nil, h)
 	})
 	c.store = st
 	c.reclaimRequests = make(chan reclaimRequest, 1)
@@ -134,7 +141,7 @@ func (c *Cache) Put(w *Writer) error {
 		buffer = w.RetainBuffer()
 	}
 	header := w.Header()
-	c.values.replace(header.Hash, buffer, header)
+	c.values.replace(header.KeyHash(), buffer, header)
 	return nil
 }
 
@@ -166,6 +173,15 @@ func (c *Cache) Read(key []byte) (Reader, error) {
 	}
 	return r, nil
 }
+
+// IOSchedulerStats reports each scheduler's role, backend, requested CPU
+// affinity, and write budget, in WithSchedulerCPUs order.
+func (c *Cache) IOSchedulerStats() []blobstore.SchedulerStats {
+	return c.store.IOSchedulerStats()
+}
+
+// IODiskStats reports outstanding admission charges across all rings.
+func (c *Cache) IODiskStats() iosched.DiskStats { return c.store.IODiskStats() }
 
 // Close joins the memory reclaimer, drains cleanup, and releases cached
 // buffers before closing the allocator. The caller must close all readers

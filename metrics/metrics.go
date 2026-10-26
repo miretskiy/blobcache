@@ -26,6 +26,9 @@ var (
 	WriteClat = newHistogram()
 )
 
+// ReadRetries counts disk refills resubmitted after an EAGAIN completion.
+var ReadRetries atomic.Int64
+
 // Live ownership gauges. Byte counts include allocation padding. Resident reads
 // can pin the same buffer more than once. These counts must not be added to
 // estimate unique memory usage.
@@ -83,4 +86,5 @@ func Reset() {
 	PutErrors.Store(0)
 	CloseErrors.Store(0)
 	UnlinkErrors.Store(0)
+	ReadRetries.Store(0)
 }

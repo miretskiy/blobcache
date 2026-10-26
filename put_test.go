@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
@@ -15,7 +16,6 @@ import (
 	"github.com/miretskiy/dio/v2/align"
 	"github.com/miretskiy/dio/v2/alloc"
 	"github.com/stretchr/testify/require"
-	"github.com/zeebo/xxh3"
 )
 
 func newPutCache(t *testing.T, dir string, opts ...Option) *Cache {
@@ -23,7 +23,7 @@ func newPutCache(t *testing.T, dir string, opts ...Option) *Cache {
 	c, err := New(dir, append([]Option{
 		WithMemory(128 << 10), WithInlineThreshold(32 << 10), WithStagingSize(8 << 10),
 		storeOpt(blobstore.TestingWithDirectIO(false)),
-		storeOpt(blobstore.WithDataIntegrity(blobstore.DataIntegrityXXHash128)),
+		storeOpt(blobstore.WithDataIntegrity(blobstore.DataIntegrityCRC32C)),
 	}, opts...)...)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, c.Close()) })
@@ -116,7 +116,7 @@ func checkDiskValue(t *testing.T, dir string, h blobstore.RecordHeader, key, val
 	require.NoError(t, err)
 	var actual blobstore.RecordHeader
 	require.NoError(t, (*blobstore.RawHeader)(data).Decode(&actual, true))
-	require.Equal(t, blobstore.HashKey(key), h.Hash, "index hash identifies the key")
+	require.Equal(t, blobstore.HashKey(key), h.KeyHash(), "index hash identifies the key")
 	h.Hash = actual.Hash
 	require.Equal(t, h, actual)
 	start := blobstore.RecordHeaderSize + len(key)
@@ -125,7 +125,7 @@ func checkDiskValue(t *testing.T, dir string, h blobstore.RecordHeader, key, val
 	require.Equal(t, make([]byte, len(data)-start-len(value)), data[start+len(value):])
 	require.Equal(t, uint64(len(value)), h.PhysicalLen)
 	require.Equal(t, h.PhysicalLen, h.LogicalLen)
-	require.Equal(t, xxh3.Hash128(append(bytes.Clone(key), value...)), h.Hash)
+	require.Equal(t, uint64(crc32.Checksum(append(bytes.Clone(key), value...), crc32.MakeTable(crc32.Castagnoli))), h.Hash)
 }
 
 func TestPutPersistsAndRetains(t *testing.T) {
@@ -387,7 +387,6 @@ func TestPutConfigurationAndOpenFailures(t *testing.T) {
 		WithMemory(-1), WithMemory(0), WithMemory(128<<10 - 1), WithMemory(128<<10 + 1),
 		WithInlineThreshold(-1),
 		WithStagingSize(0), WithStagingSize(-1),
-		WithIOBudget(-1),
 	} {
 		c, err := New(t.TempDir(), WithMemory(128<<10), option)
 		require.Error(t, err)
@@ -435,7 +434,7 @@ func TestMemoryQueueSecondChance(t *testing.T) {
 	var keys []string
 	for i := 0; len(keys) < 3; i++ {
 		key := fmt.Sprint(i)
-		if blobstore.HashKey([]byte(key)).Lo%uint64(c.values.entries.ShardCount()) == 0 {
+		if blobstore.HashKey([]byte(key))%uint64(c.values.entries.ShardCount()) == 0 {
 			keys = append(keys, key)
 			putValue(t, c, key, []byte(key))
 		}

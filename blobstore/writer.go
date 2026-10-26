@@ -2,6 +2,7 @@ package blobstore
 
 import (
 	"errors"
+	"hash/crc32"
 	"io"
 	"os"
 
@@ -10,7 +11,6 @@ import (
 	"github.com/miretskiy/dio/v2/alloc"
 	"github.com/miretskiy/dio/v2/collections"
 	"github.com/miretskiy/dio/v2/iosched"
-	"github.com/zeebo/xxh3"
 )
 
 // SizeUnknown selects a dedicated object file with no promised value size.
@@ -29,7 +29,7 @@ type Writer struct {
 	store       *Store
 	key         KeyHash
 	file        *os.File
-	vfd         int // -1 for a regular descriptor
+	vfd         int // -1 for inline records or an unopened/closed external descriptor
 	header      RecordHeader
 	reservation collections.Handle // protected until Close
 	committed   bool               // Close releases a committed record or discards an unfinished one
@@ -37,7 +37,7 @@ type Writer struct {
 	memory      *alloc.Buffer // owns the allocation referenced by buffer
 	buffer      *Buffer
 	limit       int64 // maximum value size, or SizeUnknown; actual size is header.PhysicalLen
-	hash        *xxh3.Hasher
+	checksum    uint32
 	err         error
 }
 
@@ -46,7 +46,7 @@ type Writer struct {
 // Inline writes are bounded by their reservation. Keys must fit MaxKeyLen.
 // Allocation exhaustion is returned to the caller. ErrBusy means reuse would
 // overlap an open writer. Reusing index slots waits if their wipe is in flight.
-// External writers wait if all 1024 virtual descriptors are occupied.
+// External files open with the first write; descriptor exhaustion returns ErrNoDescriptors.
 // The caller must Discard the writer when finished, including after Put.
 func (st *Store) NewWriter(key []byte, size int64) (*Writer, error) {
 	if len(key) == 0 {
@@ -77,28 +77,22 @@ func (st *Store) NewWriter(key []byte, size int64) (*Writer, error) {
 		return nil, err
 	}
 
-	var hasher *xxh3.Hasher
-	if st.cfg.flags.DataIntegrity() == DataIntegrityXXHash128 {
-		hasher = xxh3.New()
-	}
-
 	w := &Writer{
 		store: st,
 		key:   HashKey(key),
 		file:  storeFile,
 		vfd:   -1,
 		header: RecordHeader{
-			Flags: st.cfg.flags,
+			Flags: st.cfg.flags | FlagKeyHashXXH3,
 		},
-		scheduler: st.scheduler,
+		scheduler: st.writeScheduler(),
 		memory:    memory,
 		buffer:    NewBuffer(memory.Chunks()),
 		limit:     size,
-		hash:      hasher,
 	}
 	metrics.WriterBytes.Add(memory.Cap())
 	metrics.ActiveWriters.Add(1)
-	// Reserve the first 64 bytes for the header that finish writes before publication.
+	// Reserve space for the header that finish writes before publication.
 	w.buffer.wPos = bufferPosition{offset: RecordHeaderSize, pos: RecordHeaderSize}
 	if external {
 		w.header.Flags |= FlagExternal
@@ -113,13 +107,6 @@ func (st *Store) NewWriter(key []byte, size int64) (*Writer, error) {
 		return nil, err
 	}
 
-	if external {
-		w.vfd, err = st.openObject(w.header.ObjectID)
-		if err != nil {
-			w.Discard()
-			return nil, err
-		}
-	}
 	if err := w.writeKey(key); err != nil {
 		w.Discard()
 		return nil, err
@@ -237,14 +224,14 @@ func (w *Writer) writable() ([]byte, error) {
 }
 
 func (w *Writer) advance(n int) {
-	if w.hash != nil {
-		w.hash.Write(w.buffer.writable()[:n])
+	if w.header.Flags.DataIntegrity() == DataIntegrityCRC32C {
+		w.checksum = crc32.Update(w.checksum, crcTable, w.buffer.writable()[:n])
 	}
 	w.buffer.wPos.advance(w.buffer.chunks, n)
 }
 
 func (w *Writer) writeOp(data [][]byte, offset int64) iosched.Op {
-	if w.vfd >= 0 {
+	if w.IsExternal() {
 		return iosched.VWritevOp(uint32(w.vfd), data, offset)
 	}
 	return iosched.WritevOp(w.file, data, offset)
@@ -258,17 +245,39 @@ func (w *Writer) Flush() error {
 		return w.err
 	}
 	b := w.buffer
-	ticket, err := w.scheduler.Submit(w.writeOp(b.padded(b.rPos.pos), w.endOffset()-b.Len()))
-	if err == nil {
-		_, err = ticket.Wait()
-		if ticket.Slat > 0 {
-			metrics.WriteSlat.RecordValue(int64(ticket.Slat))
-			metrics.WriteClat.RecordValue(int64(ticket.Clat))
-		}
-	}
-	w.err = err
+	err := w.submit(w.writeOp(b.padded(b.rPos.pos), w.endOffset()-b.Len()), false)
 	b.rPos = b.position(b.wPos.pos &^ align.BlockMask)
 	return err
+}
+
+// submit links the first I/O to its open and records descriptor ownership from
+// individual results. A final chain ends with close -> index write.
+func (w *Writer) submit(op iosched.Op, final bool) error {
+	opening := w.IsExternal() && w.vfd < 0
+	if opening {
+		op = w.store.openObject(w.header.ObjectID, os.O_CREATE|os.O_TRUNC|os.O_RDWR).Link(op)
+	}
+	ticket, err := w.scheduler.Submit(op)
+	if err != nil {
+		w.err = err
+		return err
+	}
+	_, err = ticket.Wait()
+	if ticket.Slat > 0 {
+		metrics.WriteSlat.RecordValue(int64(ticket.Slat))
+		metrics.WriteClat.RecordValue(int64(ticket.Clat))
+	}
+	if opening || (final && w.IsExternal()) {
+		results := ticket.AllResults()
+		if opening && results[0].Err == nil {
+			w.vfd = results[0].N
+		}
+		if final && results[len(results)-2].Err == nil {
+			w.vfd = -1 // Close succeeded even if the following index write failed.
+		}
+	}
+	w.err = openError(err)
+	return w.err
 }
 
 // finish encodes the final header before submitting the last data batch. Earlier
@@ -279,8 +288,8 @@ func (w *Writer) finish() (iosched.Op, error) {
 	}
 	h := &w.header
 	h.LogicalLen = h.PhysicalLen
-	if w.hash != nil {
-		h.Hash = w.hash.Sum128()
+	if h.Flags.DataIntegrity() == DataIntegrityCRC32C {
+		h.Hash = uint64(w.checksum)
 	}
 	h.Encode((*RawHeader)(w.memory.Chunks()[0]))
 	b := w.buffer
@@ -313,8 +322,11 @@ func (w *Writer) Discard() {
 		w.reservation = 0
 	}
 	if w.vfd >= 0 {
-		w.store.closeObject(w.vfd, w.header.ObjectID, !w.committed)
+		w.store.closeObject(w.scheduler, w.vfd, w.header.ObjectID, !w.committed)
 		w.vfd = -1
+	} else if w.IsExternal() && !w.committed {
+		// A final chain can close the file successfully before its index fails.
+		w.store.unlinkObject(w.header.ObjectID)
 	}
 	w.file = nil
 	allocated := w.memory.Cap()

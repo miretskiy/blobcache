@@ -24,7 +24,7 @@ func TestMemoryReadWithoutStore(t *testing.T) {
 	}
 	// Leave the payload checksum unset: resident reads trust memory even when
 	// the record flags say a checksum is present.
-	h.Flags.SetDataIntegrity(blobstore.DataIntegrityXXHash128)
+	h.Flags.SetDataIntegrity(blobstore.DataIntegrityCRC32C)
 	var raw blobstore.RawHeader
 	h.Encode(&raw)
 	framed := append(append(raw[:], key...), value...)

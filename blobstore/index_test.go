@@ -1,6 +1,7 @@
 package blobstore
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -9,6 +10,21 @@ import (
 	"github.com/miretskiy/dio/v2/iosched"
 	"github.com/stretchr/testify/require"
 )
+
+func TestIndexRejectsOldRecordFormat(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "index.db")
+	old := make([]byte, 64)
+	copy(old, []byte{0xc5, 0xca, 0x0b, 0xb1})
+	require.NoError(t, os.WriteFile(path, old, 0o600))
+	for _, verify := range []bool{false, true} {
+		idx, err := openDiskIndex(path, verify)
+		require.Nil(t, idx)
+		require.ErrorIs(t, err, ErrBadMagic)
+	}
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, old, data, "opening an incompatible cache must not change its files")
+}
 
 func newTestDiskIndex(t *testing.T) (*diskIndex, *iosched.POSIXScheduler) {
 	t.Helper()
@@ -73,7 +89,7 @@ func indexFileSize(t *testing.T, idx *diskIndex) int64 {
 func indexTestHeader(offset, size uint64, tag byte) RecordHeader {
 	return RecordHeader{
 		Flags: FlagHeaderIntegrity, Offset: offset, PhysicalLen: size, LogicalLen: size,
-		KeyLen: 1, Hash: KeyHash{Lo: uint64(tag)},
+		KeyLen: 1, Hash: uint64(tag),
 	}
 }
 

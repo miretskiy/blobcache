@@ -4,34 +4,33 @@ import (
 	"encoding/hex"
 	"math"
 	"testing"
-
-	"github.com/zeebo/xxh3"
 )
 
 func goldenRecordHeader() RecordHeader {
 	return RecordHeader{
-		Flags:       0xa487, // version 10, LZ4, XXHash128, header CRC, external, deleted
+		Flags:       0xa48f, // version 10, LZ4, CRC32C, XXH3 key hash, header CRC, external, deleted
 		ObjectID:    0x0706050403020100,
 		Offset:      0x3837363534333231,
 		PhysicalLen: 0x0807060504030201,
 		LogicalLen:  0x1817161514131211,
 		KeyLen:      0x201f,
-		Hash:        xxh3.Uint128{Lo: 0x2827262524232221, Hi: 0x302f2e2d2c2b2a29},
+		Hash:        0x2827262524232221,
 	}
 }
 
 func goldenRawHeader(t *testing.T) RawHeader {
 	t.Helper()
-	// Fixed wire fixture: little-endian fields, numeric object ID and both hash halves,
-	// zero reserved bytes, and CRC32C 0xd917d235 over bytes [4:60).
-	const wire = "c5ca0bb187a40000" +
+	// Fixed wire fixture: little-endian fields, numeric object ID and 64-bit hash,
+	// zero reserved bytes, and CRC32C 0x0dff3ae5 over bytes [4:60).
+	const wire = "c6ca0bb18fa40000" +
 		"0001020304050607" +
 		"3132333435363738" +
 		"0102030405060708" +
 		"1112131415161718" +
 		"1f20" +
-		"2122232425262728292a2b2c2d2e2f30" +
-		"000035d217d9"
+		"2122232425262728" +
+		"00000000000000000000" +
+		"e53aff0d"
 	b, err := hex.DecodeString(wire)
 	if err != nil {
 		t.Fatal(err)
@@ -80,7 +79,7 @@ func TestRecordHeaderRoundTrip(t *testing.T) {
 		{name: "maximum", header: RecordHeader{
 			Flags: math.MaxUint16, ObjectID: uint64(math.MaxUint64),
 			Offset: math.MaxUint64, PhysicalLen: math.MaxUint64, LogicalLen: math.MaxUint64, KeyLen: math.MaxUint16,
-			Hash: xxh3.Uint128{Lo: math.MaxUint64, Hi: math.MaxUint64},
+			Hash: math.MaxUint64,
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -114,7 +113,7 @@ func TestRecordHeaderEncodeReusedBuffer(t *testing.T) {
 	// its old fields and CRC as well as the reserved bytes.
 	var empty RecordHeader
 	empty.Encode(&raw)
-	want = RawHeader{0xc5, 0xca, 0x0b, 0xb1}
+	want = RawHeader{0xc6, 0xca, 0x0b, 0xb1}
 	if raw != want {
 		t.Fatalf("encoding empty header into reused memory:\n got %x\nwant %x", raw, want)
 	}
@@ -122,7 +121,7 @@ func TestRecordHeaderEncodeReusedBuffer(t *testing.T) {
 
 func TestRecordHeaderDecodeRejectsCorruption(t *testing.T) {
 	valid := goldenRawHeader(t)
-	unchanged := RecordHeader{Flags: 0x5555, ObjectID: uint64(math.MaxUint64), Offset: 5, PhysicalLen: 1, LogicalLen: 2, KeyLen: 3, Hash: xxh3.Uint128{Lo: 4}}
+	unchanged := RecordHeader{Flags: 0x5555, ObjectID: uint64(math.MaxUint64), Offset: 5, PhysicalLen: 1, LogicalLen: 2, KeyLen: 3, Hash: 4}
 	for offset := range valid {
 		for bit := range 8 {
 			if offset == 4 && bit == 1 {

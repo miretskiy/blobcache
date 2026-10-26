@@ -125,7 +125,7 @@ func TestCacheCloseJoinsReclaimer(t *testing.T) {
 			release()
 		}
 	})
-	c.values.replace(blobstore.KeyHash{}, b, blobstore.RecordHeader{})
+	c.values.replace(blobstore.KeyHash(0), b, blobstore.RecordHeader{})
 	c.startCacheReclaim(c.memory.Capacity(), true)
 	select {
 	case <-started:

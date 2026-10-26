@@ -40,7 +40,7 @@ func TestMemoryHandlesSurviveGrowthAndEviction(t *testing.T) {
 	buffers := make([]*alloc.Buffer, count)
 	for i := range keys {
 		// Exercise repeated list growth within one shard.
-		keys[i] = blobstore.KeyHash{Lo: uint64(i * m.entries.ShardCount()), Hi: 1}
+		keys[i] = blobstore.KeyHash(i * m.entries.ShardCount())
 		buffers[i], err = pool.TryAcquire(4096)
 		require.NoError(t, err)
 		m.replace(keys[i], buffers[i], blobstore.RecordHeader{Offset: uint64(i * 4096)})
@@ -86,7 +86,7 @@ func TestMemoryConcurrentReplacementAndEviction(t *testing.T) {
 			buffer := alloc.NewBuffer(4096)
 			defer buffer.Unpin()
 			for i := range 256 {
-				key := blobstore.KeyHash{Lo: uint64(i % 32), Hi: 1}
+				key := blobstore.KeyHash(i % 32)
 				buffer.TryInc() // This goroutine owns a reference throughout.
 				m.replace(key, buffer, blobstore.RecordHeader{Offset: uint64(worker * 4096)})
 				if pinned, _, _ := m.lookup(key); pinned != nil {
@@ -129,7 +129,7 @@ func TestMemoryReclaimProportionalShares(t *testing.T) {
 		for i := range pages {
 			b, err := pool.TryAcquire(page)
 			require.NoError(t, err)
-			m.replace(blobstore.KeyHash{Lo: uint64(i*m.entries.ShardCount() + shard)}, b, blobstore.RecordHeader{})
+			m.replace(blobstore.KeyHash(i*m.entries.ShardCount()+shard), b, blobstore.RecordHeader{})
 		}
 	}
 	require.Equal(t, 10*page, m.reclaimCacheMemory(10*page))
@@ -162,7 +162,7 @@ func TestMemoryReclaimRedistributesPinnedShare(t *testing.T) {
 				require.True(t, b.TryInc())
 				pinned = append(pinned, b)
 			}
-			m.replace(blobstore.KeyHash{Lo: uint64(i*m.entries.ShardCount() + shard)}, b, blobstore.RecordHeader{})
+			m.replace(blobstore.KeyHash(i*m.entries.ShardCount()+shard), b, blobstore.RecordHeader{})
 		}
 	}
 	require.Equal(t, 8*page, m.reclaimCacheMemory(8*page))

@@ -3,20 +3,28 @@ package blobstore
 import (
 	"bytes"
 	"errors"
+	"hash/crc32"
 	"io"
 	"os"
-	"path/filepath"
-	"strconv"
+	"syscall"
+	"time"
 
 	"github.com/miretskiy/blobcache/metrics"
 	"github.com/miretskiy/dio/v2/align"
 	"github.com/miretskiy/dio/v2/alloc"
 	"github.com/miretskiy/dio/v2/iosched"
-	"github.com/miretskiy/dio/v2/sys"
-	"github.com/zeebo/xxh3"
 )
 
-// Reader owns a buffer reference and, for external records, an open file.
+// readRetries bounds resubmissions of a refill that completed with EAGAIN.
+// Backoff doubles from readRetryBackoff, sleeping about 5 ms in total.
+const (
+	readRetries      = 8
+	readRetryBackoff = 20 * time.Microsecond
+)
+
+// Reader owns a buffer reference. External records open, read and close their
+// object file within each refill, so a reader holds no descriptor between
+// refills; a record evicted mid-stream fails its next refill with ENOENT.
 // Close is required even after EOF. Closing early releases resources without
 // reading or verifying the rest of the value. Methods on one Reader must not
 // race each other or Store.Close. Read and WriteTo require an open Reader.
@@ -25,15 +33,15 @@ import (
 // checks any stored payload hash as the last bytes are consumed; earlier streaming
 // bytes may already have reached the caller when an error is reported.
 type Reader struct {
+	store      *Store
 	scheduler  iosched.Scheduler
-	file       *os.File
 	memory     *alloc.Buffer
 	buffer     *Buffer
 	header     RecordHeader
 	offset     int64 // next disk read, initially the record header's offset
 	remaining  int64 // framed bytes not yet loaded from disk
-	hash       *xxh3.Hasher
-	verifyData bool // Construction-time decision: verification enabled and a supported hash stored.
+	checksum   uint32
+	verifyData bool // Construction-time decision: verification enabled and a supported checksum stored.
 	err        error
 }
 
@@ -46,9 +54,10 @@ type Reader struct {
 func (st *Store) NewReader(key []byte, h RecordHeader) (_ *Reader, err error) {
 	verifyChecksums := st.cfg.verifyChecksums
 	r := &Reader{
-		scheduler:  st.scheduler,
+		store:      st,
+		scheduler:  st.readScheduler(),
 		header:     h,
-		verifyData: verifyChecksums && h.Flags.DataIntegrity() == DataIntegrityXXHash128,
+		verifyData: verifyChecksums && h.Flags.DataIntegrity() == DataIntegrityCRC32C,
 	}
 	defer func() {
 		if err != nil {
@@ -68,19 +77,12 @@ func (st *Store) NewReader(key []byte, h RecordHeader) (_ *Reader, err error) {
 	r.buffer = NewBuffer(r.memory.Chunks())
 	// The final read may shorten a chunk. Keep the allocator's slice intact.
 	r.buffer.chunks = append([][]byte(nil), r.buffer.chunks...)
-	r.file = st.data
-	if h.Flags.IsExternal() {
-		r.file, err = sys.OpenDirect(filepath.Join(st.base, "objects", strconv.FormatUint(h.ObjectID, 10)), st.fileFlags())
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, ErrNotFound
-		}
-		if err != nil {
-			return nil, err
-		}
-	}
 	r.offset, r.remaining = h.fileOffset(), total
 
 	if err := r.next(); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, ErrNotFound
+		}
 		return nil, err
 	}
 	var actual RecordHeader
@@ -109,8 +111,7 @@ func (st *Store) NewReader(key []byte, h RecordHeader) (_ *Reader, err error) {
 		rest = rest[n:]
 	}
 	if r.verifyData {
-		r.hash = xxh3.New()
-		r.hash.Write(key)
+		r.checksum = crc32.Update(0, crcTable, key)
 	}
 	if err := r.verifyEnd(); err != nil { // Includes empty values.
 		return nil, err
@@ -141,17 +142,16 @@ func (r *Reader) next() error {
 	} else {
 		chunks = chunks[:end.chunk]
 	}
-	ticket, err := r.scheduler.Submit(iosched.ReadvOp(r.file, chunks, r.offset))
-	if err == nil {
-		var read int
-		read, err = ticket.Wait()
-		if ticket.Slat > 0 {
-			metrics.ReadSlat.RecordValue(int64(ticket.Slat))
-			metrics.ReadClat.RecordValue(int64(ticket.Clat))
-		}
-		if err == nil && int64(read) < n {
-			err = errors.Join(ErrCorrupt, io.ErrUnexpectedEOF)
-		}
+	err := r.load(chunks, n)
+	for attempt := 0; errors.Is(err, syscall.EAGAIN) && attempt < readRetries; attempt++ {
+		// A direct read CQE can return EAGAIN without RWF_NOWAIT: XFS fails
+		// xfs_ilock_nowait mid-read and io_uring declines to reissue from the
+		// completion context (traced on 6.8 aws; fixed in Linux 6.14 by
+		// b08e02045002). Nothing from this refill has been consumed, so back
+		// off and resubmit the same chain.
+		metrics.ReadRetries.Add(1)
+		time.Sleep(readRetryBackoff << attempt)
+		err = r.load(chunks, n)
 	}
 	if err != nil {
 		r.err = err
@@ -164,11 +164,61 @@ func (r *Reader) next() error {
 	return nil
 }
 
+// load submits one refill of n bytes into chunks and waits for it.
+func (r *Reader) load(chunks [][]byte, n int64) error {
+	if r.header.Flags.IsExternal() {
+		return r.loadExternal(chunks, n)
+	}
+	ticket, err := r.scheduler.Submit(iosched.ReadvOp(r.store.data, chunks, r.offset))
+	if err != nil {
+		return err
+	}
+	read, err := r.wait(ticket)
+	if err != nil {
+		return err
+	}
+	return checkRead(read, n)
+}
+
+// loadExternal opens, reads and closes the object file in one chain. The close
+// is hard-linked so it runs even if the read fails, leaving nothing to clean up
+// and letting a failed refill be resubmitted as is.
+func (r *Reader) loadExternal(chunks [][]byte, n int64) error {
+	op := r.store.openObject(r.header.ObjectID, os.O_RDONLY).Link(
+		iosched.VReadvOp(iosched.AllocateVFD, chunks, r.offset).HardLink(
+			iosched.VCloseOp(iosched.AllocateVFD)))
+	ticket, err := r.scheduler.Submit(op)
+	if err != nil {
+		return err
+	}
+	if _, err := r.wait(ticket); err != nil {
+		return openError(err)
+	}
+	return checkRead(ticket.AllResults()[1].N, n)
+}
+
+// wait returns the root operation's count and the first error in the chain.
+func (r *Reader) wait(ticket iosched.Ticket) (int, error) {
+	n, err := ticket.Wait()
+	if ticket.Slat > 0 {
+		metrics.ReadSlat.RecordValue(int64(ticket.Slat))
+		metrics.ReadClat.RecordValue(int64(ticket.Clat))
+	}
+	return n, err
+}
+
+func checkRead(read int, n int64) error {
+	if int64(read) < n {
+		return errors.Join(ErrCorrupt, io.ErrUnexpectedEOF)
+	}
+	return nil
+}
+
 func (r *Reader) verifyEnd() error {
 	if !r.verifyData {
 		return nil
 	}
-	if r.remaining == 0 && r.buffer.Len() == 0 && r.hash.Sum128() != r.header.Hash {
+	if r.remaining == 0 && r.buffer.Len() == 0 && uint64(r.checksum) != r.header.Hash {
 		r.err = ErrCorrupt
 	}
 	return r.err
@@ -176,7 +226,7 @@ func (r *Reader) verifyEnd() error {
 
 func (r *Reader) consume(n int) error {
 	if r.verifyData {
-		r.hash.Write(r.buffer.readable()[:n])
+		r.checksum = crc32.Update(r.checksum, crcTable, r.buffer.readable()[:n])
 	}
 	r.buffer.rPos.advance(r.buffer.chunks, n)
 	return r.verifyEnd()
@@ -229,11 +279,6 @@ func (r *Reader) Close() error {
 		r.memory = nil
 	}
 	r.buffer = nil
-	r.scheduler = nil
-	if r.file != nil && r.header.Flags.IsExternal() {
-		err := r.file.Close()
-		r.file = nil
-		return err
-	}
+	r.store = nil
 	return nil
 }

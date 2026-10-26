@@ -7,7 +7,6 @@ import (
 	"math"
 
 	"github.com/miretskiy/dio/v2/align"
-	"github.com/zeebo/xxh3"
 )
 
 // Records in index.db, data.db, and objects/ share this packed header.
@@ -17,7 +16,7 @@ import (
 // Offset records the data.db cursor at reservation; external file I/O starts at zero.
 // All integers are little endian.
 //
-// [ 0: 4) magic (0xB10BCAC5)
+// [ 0: 4) magic (0xB10BCAC6)
 // [ 4: 6) flags (RecordFlags, uint16)
 // [ 6: 8) reserved
 // [ 8:16) ObjectID (uint64)
@@ -25,14 +24,14 @@ import (
 // [24:32) stored value size, excluding header, key, and padding
 // [32:40) original value size before compression
 // [40:42) key length
-// [42:58) Hash (Lo then Hi): key hash in index.db; key/value checksum in data files
-// [58:60) reserved
+// [42:50) Hash: key hash (XXH3-64 with FlagKeyHashXXH3) in index.db; CRC32C of key/value in data files
+// [50:60) reserved; pads index.db slots to 64 bytes so none crosses a sector
 // [60:64) CRC32C of header[4:60) when FlagHeaderIntegrity is set; zero otherwise
 
 const RecordHeaderSize = 64
 const MaxKeyLen = math.MaxUint16
 
-const recordMagic uint32 = 0xB10BCAC5
+const recordMagic uint32 = 0xB10BCAC6
 
 var (
 	ErrBadMagic = errors.New("invalid header magic")
@@ -55,8 +54,11 @@ type RecordHeader struct {
 	PhysicalLen uint64 // stored value bytes; excludes header, key, and padding
 	LogicalLen  uint64 // original value bytes before compression
 	KeyLen      uint16
-	Hash        xxh3.Uint128 // key hash in index.db; key/value checksum in data files
+	Hash        uint64 // index key hash; key/value CRC32C in data files
 }
+
+// KeyHash returns the lookup identity from an index header.
+func (h RecordHeader) KeyHash() KeyHash { return h.Hash }
 
 type RecordFlags uint16
 
@@ -66,6 +68,8 @@ const (
 	FlagHeaderIntegrity RecordFlags = 0b0000_0000_0000_0010
 	// FlagExternal identifies records stored in a dedicated object file.
 	FlagExternal RecordFlags = 0b0000_0000_0000_0100
+	// FlagKeyHashXXH3 marks an index Hash computed by HashKey (XXH3-64).
+	FlagKeyHashXXH3 RecordFlags = 0b0000_0000_0000_1000
 
 	maskDataIntegrity  RecordFlags = 0b0000_0001_1000_0000
 	shiftDataIntegrity             = 7
@@ -91,7 +95,7 @@ type DataIntegrity uint8
 
 const (
 	DataIntegrityNone DataIntegrity = iota
-	DataIntegrityXXHash128
+	DataIntegrityCRC32C
 
 	numDataIntegrity = 4
 )
@@ -112,8 +116,7 @@ func (h *RecordHeader) Encode(raw *RawHeader) {
 	binary.LittleEndian.PutUint64(raw[32:40], h.LogicalLen)
 	binary.LittleEndian.PutUint16(raw[40:42], h.KeyLen)
 
-	binary.LittleEndian.PutUint64(raw[42:50], h.Hash.Lo)
-	binary.LittleEndian.PutUint64(raw[50:58], h.Hash.Hi)
+	binary.LittleEndian.PutUint64(raw[42:50], h.Hash)
 
 	if h.Flags.HasHeaderIntegrity() {
 		crc := crc32.Checksum(raw[4:60], crcTable)
@@ -142,8 +145,7 @@ func (raw *RawHeader) Decode(h *RecordHeader, verifyChecksums bool) error {
 	h.PhysicalLen = binary.LittleEndian.Uint64(raw[24:32])
 	h.LogicalLen = binary.LittleEndian.Uint64(raw[32:40])
 	h.KeyLen = binary.LittleEndian.Uint16(raw[40:42])
-	h.Hash.Lo = binary.LittleEndian.Uint64(raw[42:50])
-	h.Hash.Hi = binary.LittleEndian.Uint64(raw[50:58])
+	h.Hash = binary.LittleEndian.Uint64(raw[42:50])
 
 	return nil
 }
@@ -173,6 +175,10 @@ func (f RecordFlags) IsDeleted() bool {
 
 func (f RecordFlags) HasHeaderIntegrity() bool {
 	return f&FlagHeaderIntegrity != 0
+}
+
+func (f RecordFlags) HasXXH3KeyHash() bool {
+	return f&FlagKeyHashXXH3 != 0
 }
 
 func (f RecordFlags) DataIntegrity() DataIntegrity {

@@ -17,9 +17,8 @@ func (c *config) schedulerWriteBudget(i int) time.Duration {
 
 func (st *Store) openSchedulers() error {
 	st.disk = iosched.NewDiskPolicy(iosched.WithLatencyGoal(st.cfg.ioBudget), iosched.WithoutReadIOBudget(),
-		iosched.WithRejectWriteQueueDepth(st.cfg.rejectWriteDepth), iosched.WithRejectWriteBacklog(st.cfg.rejectWriteBytes),
-		iosched.WithWriteBacklogLowWatermark(st.cfg.writeBacklogLowWatermark),
-		iosched.WithRejectReadQueueDepth(st.cfg.rejectReadDepth), iosched.WithRejectReadBacklog(st.cfg.rejectReadBytes))
+		iosched.WithWriteBacklogLimit(st.cfg.writeBacklog), iosched.WithWriteBacklogRecovery(st.cfg.writeBacklogRecovery),
+		iosched.WithReadBacklogLimit(st.cfg.readBacklog))
 	for i, cpu := range st.cfg.schedulerCPUs {
 		opts := []iosched.Option{iosched.WithDiskPolicy(st.disk),
 			iosched.WithRingDepth(st.cfg.ringDepth), iosched.WithVFiles(1024)}

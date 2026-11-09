@@ -23,15 +23,17 @@ func TestCacheMultipleSchedulers(t *testing.T) {
 			dir := t.TempDir()
 			c := newPutCache(t, dir, WithSchedulerCPUs(-1, -1, -1, -1),
 				WithWriteSchedulers(writes), WithVerifyChecksums(true))
-			// Publishing an older writer last must not replace newer metadata,
-			// including when the writers use different rings.
-			old, err := c.NewWriter([]byte("key"), 3)
+			// Replacement remains readable across write and read rings.
+			old, err := c.NewWriter([]byte("key"))
 			require.NoError(t, err)
 			defer old.Close()
 			_, err = old.Write([]byte("old"))
 			require.NoError(t, err)
+
+			err = c.Put(old)
+			require.NoError(t, err)
 			putValue(t, c, "key", []byte("new"))
-			require.NoError(t, c.Put(old))
+
 			require.NoError(t, old.Close())
 			held, err := c.Read([]byte("key"))
 			require.NoError(t, err)
@@ -61,7 +63,7 @@ func TestCacheReadRejectionReleasesBuffers(t *testing.T) {
 		t.Skip("io_uring unavailable")
 	}
 	dir := t.TempDir()
-	c := newPutCache(t, dir, WithMemory(16<<20), WithRejectReadBacklog(1))
+	c := newPutCache(t, dir, WithMemory(16<<20), WithReadBacklogLimit(1))
 	putValue(t, c, "held", make([]byte, 40000))
 	objects, err := filepath.Glob(filepath.Join(dir, "objects", "*"))
 	require.NoError(t, err)
@@ -91,11 +93,10 @@ func TestCacheReadRejectionReleasesBuffers(t *testing.T) {
 		_, err := signal.Write(framed[:8192])
 		require.NoError(t, err)
 		require.NoError(t, <-done)
-		c.store.Wait()
-		require.Zero(t, c.memory.used.Load())
-		require.Zero(t, c.IODiskStats().Reads.Bytes)
+		require.Zero(t, (c.memory.Capacity() - c.memory.Available()))
+		require.Eventually(t, func() bool { return c.IODiskStats().Reads.Backlog == 0 }, time.Second, time.Millisecond)
 	}()
-	require.Eventually(t, func() bool { return c.IODiskStats().Reads.Bytes > 0 }, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return c.IODiskStats().Reads.Backlog > 0 }, time.Second, time.Millisecond)
 	// Observing the counters may precede publication of the rejection token.
 	require.Eventually(t, func() bool {
 		reader, err := c.Read([]byte("100"))
@@ -106,11 +107,11 @@ func TestCacheReadRejectionReleasesBuffers(t *testing.T) {
 		require.ErrorIs(t, err, ErrRejected)
 		return true
 	}, time.Second, time.Millisecond)
-	heldMemory := c.memory.used.Load()
+	heldMemory := (c.memory.Capacity() - c.memory.Available())
 	for _, size := range []int{100, 40000} {
 		reader, err := c.Read([]byte(fmt.Sprint(size)))
 		require.ErrorIs(t, err, ErrRejected)
 		require.Nil(t, reader)
-		require.Equal(t, heldMemory, c.memory.used.Load(), "rejected readers return their staging memory")
+		require.Equal(t, heldMemory, (c.memory.Capacity() - c.memory.Available()), "rejected readers return their staging memory")
 	}
 }

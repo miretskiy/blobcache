@@ -1,7 +1,7 @@
 // Package blobcache writes blobs to data.db, index.db, and dedicated object
 // files. NewWriter prepares a download destination; Put publishes it under its
-// key. Inline records stay in bounded mmap memory until evicted. Larger and
-// unknown-size values stream to object files using the same memory budget.
+// key. Inline records stay in bounded mmap memory until evicted. Larger values
+// use object files and the same memory budget.
 // Read returns a reader that the caller must close, including after EOF.
 package blobcache
 
@@ -18,11 +18,7 @@ import (
 	"github.com/miretskiy/dio/v2/iosched"
 )
 
-const (
-	MaxKeyLen = blobstore.MaxKeyLen
-	// SizeUnknown selects streaming to an object file without a promised size.
-	SizeUnknown = blobstore.SizeUnknown
-)
+const MaxKeyLen = blobstore.MaxKeyLen
 
 var (
 	// ErrRejected means I/O exceeded a configured scheduler admission limit.
@@ -39,11 +35,9 @@ var (
 	ErrBusy = alloc.ErrExhausted
 )
 
-// Writer accepts one value. Call Close on success or failure, including after
-// Put, before closing the Cache. Methods on a single writer must not race each
+// Writer accepts one value. Close it before closing the Cache; Close does
+// nothing after Put has closed it. Methods on one writer must not race each
 // other or Cache.Close.
-// Write and ReadFrom are no longer allowed after Put. Flush waits for data I/O
-// without publishing the record or syncing the file.
 type Writer = blobstore.Writer
 
 // Reader owns its buffer until Close, even after EOF. Close may be called early;
@@ -57,16 +51,19 @@ type Reader interface {
 	Size() int64
 }
 
+// minMemory leaves room for resident values and concurrent staging buffers.
+const minMemory = 4 << 20
+
 // Cache is a disk cache. All methods are safe for concurrent use, except that
 // Close must not race other calls. Callers must close all readers and writers first.
 // Methods other than Close require an open Cache.
 type Cache struct {
 	store  *blobstore.Store
-	memory *cacheAllocator
+	memory *alloc.Allocator
 	values memoryCache
 	closed bool
 
-	reclaimRequests chan reclaimRequest
+	reclaimRequests chan int64
 	reclaimWG       sync.WaitGroup
 }
 
@@ -78,71 +75,73 @@ func New(path string, opts ...Option) (*Cache, error) {
 	for _, opt := range opts {
 		opt.apply(&cfg)
 	}
-	if cfg.memory < 128<<10 || cfg.memory%align.BlockSize != 0 {
-		return nil, errors.New("blobcache: memory must be a page multiple of at least 128 KiB")
-	}
-	memory, err := alloc.NewSlabAllocator(cfg.memory, cfg.allocator...)
-	if err != nil {
-		return nil, err
+	if cfg.memory < minMemory {
+		return nil, errors.New("blobcache: memory must be at least 4 MiB")
 	}
 	c := &Cache{values: newMemoryCache()}
-	c.memory = &cacheAllocator{Allocator: memory, capacity: cfg.memory, reclaim: c.startCacheReclaim}
+	// The allocator uses whole spans; round down to stay within the budget.
+	// Writers initialize their contents and padding; readers fill every exposed
+	// byte from disk. Avoid clearing the full inline capacity on every fill.
+	allocatorOpts := append([]alloc.Option{alloc.WithoutZeroing()}, cfg.allocator...)
+	memory := alloc.NewAllocator(cfg.memory/alloc.MaxAllocationSize*alloc.MaxAllocationSize, allocatorOpts...)
+	c.memory = memory
 	// Keep the default staging buffer usable even with the smallest budget.
 	storeOpts := append([]blobstore.Option{
-		blobstore.WithStagingSize(min(256<<10, cfg.memory-align.BlockSize)),
+		blobstore.WithStagingSize(min(256<<10, c.memory.Capacity()-align.BlockSize)),
 	}, cfg.store...)
-	st, err := blobstore.Open(path, c.memory, c.memory, storeOpts...)
+	storeOpts = append(storeOpts, blobstore.WithRetireFunc(func(h blobstore.RecordHeader) {
+		c.values.retire(h.KeyHash(), h.ObjectID)
+	}))
+	st, err := blobstore.Open(path, c.memory, storeOpts...)
 	if err != nil {
 		memory.Close()
 		return nil, err
 	}
-	st.OnRetire = c.values.retire
-	st.Recover(func(h blobstore.RecordHeader) {
-		c.values.replace(h.KeyHash(), nil, h)
-	})
+	for h := range st.Records() {
+		if h.Flags.HasXXH3KeyHash() {
+			c.values.replace(h.KeyHash(), blobstore.Memory{}, h, false)
+		}
+	}
 	c.store = st
-	c.reclaimRequests = make(chan reclaimRequest, 1)
+	c.reclaimRequests = make(chan int64, 1)
 	c.reclaimWG.Go(c.reclaimLoop)
 	return c, nil
 }
 
-// NewWriter copies key and reserves storage for size bytes, or SizeUnknown.
-// At 80% memory usage, allocations signal background reclamation. Insufficient
-// capacity waits for a reclamation pass before attempting allocation. Each shard
-// uses SIEVE to meet its proportional byte target; only final-reference releases
-// count as reclaimed space. Keys and disk metadata remain indexed.
-// ErrBusy means memory is still unavailable after reclamation, or disk reuse
-// overlaps an open writer. The caller should immediately defer Close.
-func (c *Cache) NewWriter(key []byte, size int64) (*Writer, error) {
-	w, err := c.store.NewWriter(key, size)
+// NewWriter copies key and allocates capacity for a complete inline value.
+// The value size need not be known. Put reserves storage using the number of bytes written.
+// Defer Close immediately.
+func (c *Cache) NewWriter(key []byte) (*Writer, error) {
+	w, err := c.store.NewWriter(key)
+	c.startCacheReclaim(0)
 	if err != nil {
 		metrics.WriterErrors.Add(1)
-	}
-	if err == blobstore.ErrBusy {
-		return nil, ErrBusy
 	}
 	return w, err
 }
 
-// Put waits for a filled writer's data and index writes, then publishes the
-// value in the cache before returning. WithDurableIndex also waits for the
-// index sync. I/O errors are returned and leave the new record unpublished.
-// Concurrent puts proceed independently. Call Put once, then Close the writer
-// on either success or failure.
+// Put publishes inline memory immediately and submits its disk write without
+// waiting. External values become readable after their writes complete. Disk
+// failures for accepted inline values are recorded in PutErrors; their memory
+// stays readable. Put consumes and closes w.
 func (c *Cache) Put(w *Writer) error {
 	started := time.Now()
 	defer func() { metrics.PutDuration.RecordValue(int64(time.Since(started))) }()
-	if err := c.store.Put(w); err != nil {
+	err := c.store.Put(w, func(h blobstore.RecordHeader, memory blobstore.Memory) {
+		c.values.replace(h.KeyHash(), memory, h, isResident(memory))
+	}, func(h blobstore.RecordHeader, err error) {
+		if err != nil {
+			metrics.PutErrors.Add(1)
+		}
+		c.values.complete(h, err)
+	})
+	if err != nil {
 		metrics.PutErrors.Add(1)
-		return err
+		if errors.Is(err, blobstore.ErrBusy) {
+			return ErrBusy
+		}
 	}
-	var buffer *alloc.Buffer
-	if !w.IsExternal() {
-		buffer = w.RetainBuffer()
-	}
-	header := w.Header()
-	c.values.replace(header.KeyHash(), buffer, header)
-	return nil
+	return err
 }
 
 // Read returns the value for key, or ErrNotFound. Resident values stay pinned
@@ -161,10 +160,11 @@ func (c *Cache) Read(key []byte) (Reader, error) {
 	if !ok {
 		return nil, ErrNotFound
 	}
-	if buffer != nil {
+	if isResident(buffer) {
 		return newMemoryReader(key, header, buffer)
 	}
 	r, err := c.store.NewReader(key, header)
+	c.startCacheReclaim(0)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			c.values.retire(hash, header.ObjectID)

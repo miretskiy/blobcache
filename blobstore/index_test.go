@@ -6,8 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/miretskiy/dio/v2/collections"
-	"github.com/miretskiy/dio/v2/iosched"
 	"github.com/stretchr/testify/require"
 )
 
@@ -17,58 +15,13 @@ func TestIndexRejectsOldRecordFormat(t *testing.T) {
 	copy(old, []byte{0xc5, 0xca, 0x0b, 0xb1})
 	require.NoError(t, os.WriteFile(path, old, 0o600))
 	for _, verify := range []bool{false, true} {
-		idx, err := openDiskIndex(path, verify)
+		idx, err := loadDiskIndex(path, verify)
 		require.Nil(t, idx)
 		require.ErrorIs(t, err, ErrBadMagic)
 	}
 	data, err := os.ReadFile(path)
 	require.NoError(t, err)
 	require.Equal(t, old, data, "opening an incompatible cache must not change its files")
-}
-
-func newTestDiskIndex(t *testing.T) (*diskIndex, *iosched.POSIXScheduler) {
-	t.Helper()
-	idx, err := openDiskIndex(filepath.Join(t.TempDir(), "index.db"), true)
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, idx.close()) })
-	scheduler := iosched.NewPOSIXScheduler()
-	t.Cleanup(func() { require.NoError(t, scheduler.Close()) })
-	return idx, scheduler
-}
-
-func reopenTestIndex(t *testing.T, idx *diskIndex) *diskIndex {
-	t.Helper()
-	reopened, err := openDiskIndex(idx.file.Name(), true)
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, reopened.close()) })
-	return reopened
-}
-
-func submitIndexOp(t *testing.T, scheduler iosched.Scheduler, op iosched.Op) {
-	t.Helper()
-	ticket, err := scheduler.Submit(op)
-	require.NoError(t, err)
-	n, err := ticket.Wait()
-	require.NoError(t, err)
-	require.Equal(t, RecordHeaderSize, n)
-}
-
-func readIndexSlot(t *testing.T, idx *diskIndex, slot uint64) RawHeader {
-	t.Helper()
-	var raw RawHeader
-	_, err := idx.file.ReadAt(raw[:], int64(slot)*RecordHeaderSize)
-	require.NoError(t, err)
-	return raw
-}
-
-func indexHeaders(idx *diskIndex) map[uint64]RecordHeader {
-	headers := make(map[uint64]RecordHeader)
-	for h := range idx.headers() {
-		if h.KeyLen != 0 && !h.Flags.IsDeleted() {
-			headers[h.ObjectID] = h
-		}
-	}
-	return headers
 }
 
 func indexReservations(idx *diskIndex) []RecordHeader {
@@ -79,11 +32,15 @@ func indexReservations(idx *diskIndex) []RecordHeader {
 	return headers
 }
 
-func indexFileSize(t *testing.T, idx *diskIndex) int64 {
-	t.Helper()
-	info, err := idx.file.Stat()
-	require.NoError(t, err)
-	return info.Size()
+// indexHeaders returns published records; pending reservations have no key yet.
+func indexHeaders(idx *diskIndex) map[uint64]RecordHeader {
+	headers := make(map[uint64]RecordHeader)
+	for h := range idx.headers() {
+		if h.KeyLen != 0 {
+			headers[h.ObjectID] = h
+		}
+	}
+	return headers
 }
 
 func indexTestHeader(offset, size uint64, tag byte) RecordHeader {
@@ -93,161 +50,85 @@ func indexTestHeader(offset, size uint64, tag byte) RecordHeader {
 	}
 }
 
-func publishIndexHeader(t *testing.T, idx *diskIndex, scheduler iosched.Scheduler, handle collections.Handle, h RecordHeader) RecordHeader {
+func writeIndexFile(t *testing.T, path string, headers ...RecordHeader) {
 	t.Helper()
-	h.ObjectID = idx.records.Value(handle).header.ObjectID
-	submitIndexOp(t, scheduler, idx.writeOp(handle, h))
-	idx.publish(handle, h)
-	idx.records.Value(handle).pending = false // Both index I/O and writer handoff are complete.
-	return h
+	data := make([]byte, len(headers)*RecordHeaderSize)
+	for i, h := range headers {
+		h.Encode((*RawHeader)(data[i*RecordHeaderSize:]))
+	}
+	require.NoError(t, os.WriteFile(path, data, 0o644))
 }
 
-func putIndexHeader(t *testing.T, idx *diskIndex, scheduler iosched.Scheduler, h RecordHeader) RecordHeader {
-	t.Helper()
-	return publishIndexHeader(t, idx, scheduler, idx.reserve(h.Offset, h.Flags), h)
-}
-
-func TestIndexReservationAndOutOfOrderCompletion(t *testing.T) {
+func TestIndexSnapshotSkipsPendingWriters(t *testing.T) {
 	before := uint64(time.Now().UnixNano())
-	idx, scheduler := newTestDiskIndex(t)
+	path := filepath.Join(t.TempDir(), "index.db")
+	idx, err := loadDiskIndex(path, true)
+	require.NoError(t, err)
 	inline := indexTestHeader(0, 12345, 1)
 	external := indexTestHeader(inline.dataEnd(), 1<<33, 2)
+	external.Flags |= FlagExternal
 	first, second := idx.reserve(0, 0), idx.reserve(external.Offset, FlagExternal)
+	idx.reserve(1<<20, 0) // A writer still open at Close.
 	inline.ObjectID = idx.records.Value(first).header.ObjectID
 	external.ObjectID = idx.records.Value(second).header.ObjectID
 	require.GreaterOrEqual(t, inline.ObjectID, before)
 	require.Equal(t, inline.ObjectID+1, external.ObjectID)
-	require.Empty(t, indexHeaders(idx))
-	require.Zero(t, idx.size())
-	require.Zero(t, indexFileSize(t, idx), "no index-specific prefix")
-	external.Flags |= FlagExternal
-	external.Flags.SetCompression(CompressionZstd)
-	external.LogicalLen = 1 << 35
-	firstOp := idx.writeOp(first, inline)
-	secondOp := idx.writeOp(second, external)
-	require.Zero(t, idx.size(), "preparing index writes must not publish reservations")
-	submitIndexOp(t, scheduler, secondOp)
+	require.Zero(t, idx.size(), "reservations are not published")
 	idx.publish(second, external)
-	require.Equal(t, RawHeader{}, readIndexSlot(t, idx, 0))
-	partial := reopenTestIndex(t, idx)
-	require.Greater(t, partial.nextObjectID, external.ObjectID)
-	require.Equal(t, map[uint64]RecordHeader{external.ObjectID: external}, indexHeaders(partial))
-	submitIndexOp(t, scheduler, firstOp)
 	idx.publish(first, inline)
-	reopened := reopenTestIndex(t, idx)
-	require.Equal(t, []RecordHeader{inline, external}, indexReservations(reopened))
-	require.Equal(t, inline.PhysicalLen+external.PhysicalLen, reopened.size())
-	var raw RawHeader
-	inline.Encode(&raw)
-	require.Equal(t, raw, readIndexSlot(t, idx, 0), "the index stores the exact record header")
-}
+	idx.records.Value(first).pending = false
+	idx.records.Value(second).pending = false
+	require.NoError(t, idx.save(path))
 
-func evictIndexHeaders(t *testing.T, idx *diskIndex, scheduler iosched.Scheduler, count int) {
-	t.Helper()
-	start := idx.head
-	for range count {
-		first, ok := idx.records.Front()
-		require.True(t, ok)
-		idx.head = idx.position(idx.records.Value(first).slot) + 1
-		idx.remove(first)
-	}
-	ticket, err := scheduler.Submit(idx.wipeOp(start, idx.head))
+	loaded, err := loadDiskIndex(path, true)
 	require.NoError(t, err)
-	_, err = ticket.Wait()
-	require.NoError(t, err)
-	idx.reuseHead = idx.head
+	require.Equal(t, []RecordHeader{inline, external}, indexReservations(loaded))
+	require.Equal(t, inline.PhysicalLen+external.PhysicalLen, loaded.size())
+	require.Greater(t, loaded.nextObjectID, external.ObjectID)
+	_, err = os.Stat(path + ".tmp")
+	require.ErrorIs(t, err, os.ErrNotExist)
 }
 
-func TestIndexReusesClearedPrefixInFIFOOrder(t *testing.T) {
-	idx, scheduler := newTestDiskIndex(t)
-	var old []RecordHeader
-	for i := range 4 {
-		old = append(old, putIndexHeader(t, idx, scheduler, indexTestHeader(uint64(i)*4096, 100, byte(i))))
+func TestIndexLoadReplaysInlinePlacement(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "index.db")
+	headers := []RecordHeader{
+		indexTestHeader(0, 7000, 1),
+		indexTestHeader(8192, 100, 2),
+		indexTestHeader(12288, 100, 3),
+		indexTestHeader(4096, 100, 5), // Wrapped; ObjectID 4 at offset 0 never published.
 	}
-	evictIndexHeaders(t, idx, scheduler, 2)
-	h := putIndexHeader(t, idx, scheduler, indexTestHeader(16384, 200, 4))
-	reopened := reopenTestIndex(t, idx)
-	require.Equal(t, append(old[2:], h), indexReservations(reopened))
-	require.EqualValues(t, 2, reopened.head)
-	require.EqualValues(t, 5, reopened.tail)
-	var free RecordHeader
-	raw := readIndexSlot(t, idx, 1)
-	require.NoError(t, raw.Decode(&free, true))
-	require.True(t, free.Flags.IsDeleted(), "unused cleared slots stay cleared after reopen")
-	require.EqualValues(t, 4*RecordHeaderSize, indexFileSize(t, idx), "reuse does not grow index.db")
+	for i, id := range []uint64{1, 2, 3, 5} {
+		headers[i].ObjectID = id
+	}
+	writeIndexFile(t, path, headers[3], headers[0], headers[2], headers[1])
+	idx, err := loadDiskIndex(path, true)
+	require.NoError(t, err)
+	require.Equal(t, headers[1:], indexReservations(idx), "the wrapped record retires the older overlap")
+	require.EqualValues(t, 5, idx.dataWrapID)
+	require.Greater(t, idx.nextObjectID, uint64(5))
 }
 
-func TestIndexRecoveryHandlesAbandonedReservationAtWrap(t *testing.T) {
-	idx, scheduler := newTestDiskIndex(t)
-	putIndexHeader(t, idx, scheduler, indexTestHeader(0, 7000, 1))
-	putIndexHeader(t, idx, scheduler, indexTestHeader(8192, 100, 2))
-	tail := putIndexHeader(t, idx, scheduler, indexTestHeader(12288, 100, 3))
-	evictIndexHeaders(t, idx, scheduler, 2)
-	first, second := idx.reserve(0, 0), idx.reserve(4096, 0)
-	idx.remove(first) // The first writer after wrapping never publishes.
-	h := publishIndexHeader(t, idx, scheduler, second, indexTestHeader(4096, 100, 3))
-	reopened := reopenTestIndex(t, idx)
-	require.Equal(t, []RecordHeader{tail, h}, indexReservations(reopened))
-	require.Greater(t, reopened.nextObjectID, h.ObjectID)
-}
-
-func TestIndexOpenBatchesAndPartialTail(t *testing.T) {
-	idx, _ := newTestDiskIndex(t)
+func TestIndexLoadsSlotFormatInBatches(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "index.db")
 	const count = 2051
-	want := make(map[uint64]RecordHeader)
+	base := uint64(time.Now().UnixNano())
+	var want []RecordHeader
 	data := make([]byte, count*RecordHeaderSize+RecordHeaderSize/2)
 	for sequence := range count {
-		if sequence%17 == 0 {
-			continue
-		}
 		h := indexTestHeader(uint64(sequence)*4096, uint64(sequence+1), byte(sequence))
-		h.ObjectID = idx.nextObjectID + uint64(sequence)
-		want[h.ObjectID] = h
+		h.ObjectID = base + uint64(sequence)
+		switch {
+		case sequence%17 == 0:
+			continue // An empty slot.
+		case sequence%13 == 0:
+			h = RecordHeader{Flags: FlagDeleted, ObjectID: h.ObjectID}
+		default:
+			want = append(want, h)
+		}
 		h.Encode((*RawHeader)(data[sequence*RecordHeaderSize:]))
 	}
-	_, err := idx.file.WriteAt(data, 0)
+	require.NoError(t, os.WriteFile(path, data, 0o644))
+	idx, err := loadDiskIndex(path, true)
 	require.NoError(t, err)
-	idx = reopenTestIndex(t, idx)
-	require.Equal(t, want, indexHeaders(idx))
-	require.EqualValues(t, count, idx.tail)
-}
-
-func TestIndexWipeCrossesEnd(t *testing.T) {
-	idx, scheduler := newTestDiskIndex(t)
-	for i := range 4 {
-		putIndexHeader(t, idx, scheduler, indexTestHeader(uint64(i)*4096, 100, byte(i)))
-	}
-	evictIndexHeaders(t, idx, scheduler, 3)
-	var newer []RecordHeader
-	for i := range 3 {
-		newer = append(newer, putIndexHeader(t, idx, scheduler, indexTestHeader(uint64(i+4)*4096, 100, byte(i+4))))
-	}
-	evictIndexHeaders(t, idx, scheduler, 2) // Physical slots 3 and 0.
-	require.Equal(t, newer[1:], indexReservations(reopenTestIndex(t, idx)))
-	for _, slot := range []uint64{3, 0} {
-		var h RecordHeader
-		raw := readIndexSlot(t, idx, slot)
-		require.NoError(t, raw.Decode(&h, true))
-		require.Equal(t, RecordHeader{Flags: FlagDeleted}, h)
-	}
-}
-
-func TestIndexGrowsAtEndAfterWrap(t *testing.T) {
-	idx, scheduler := newTestDiskIndex(t)
-	for i := range 3 {
-		putIndexHeader(t, idx, scheduler, indexTestHeader(uint64(i)*4096, 100, byte(i)))
-	}
-	evictIndexHeaders(t, idx, scheduler, 1)
-	putIndexHeader(t, idx, scheduler, indexTestHeader(3*4096, 100, 3))
-	require.True(t, idx.full())
-	require.False(t, idx.growable(), "growth cannot insert new slots into the middle of the FIFO")
-	evictIndexHeaders(t, idx, scheduler, 2)
-	var newer []RecordHeader
-	for i := range 3 {
-		newer = append(newer, putIndexHeader(t, idx, scheduler, indexTestHeader(uint64(i+4)*4096, 100, byte(i+4))))
-	}
-	require.EqualValues(t, 4, idx.slots)
-	require.EqualValues(t, 4*RecordHeaderSize, indexFileSize(t, idx))
-	evictIndexHeaders(t, idx, scheduler, 2)
-	require.Equal(t, newer[1:], indexReservations(reopenTestIndex(t, idx)))
+	require.Equal(t, want, indexReservations(idx))
 }

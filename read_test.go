@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/miretskiy/blobcache/blobstore"
 	"github.com/stretchr/testify/require"
@@ -40,27 +41,29 @@ func TestReadMemoryDiskAndRecovery(t *testing.T) {
 			c := newPutCache(t, dir, storeOpt(blobstore.TestingWithDirectIO(direct)), WithVerifyChecksums(true))
 			values := []struct {
 				key, value []byte
-				promised   int64
 			}{
-				{[]byte("empty"), nil, 0},
-				{[]byte("inline"), bytes.Repeat([]byte("inline"), 1000), 6000},
-				{[]byte("external"), bytes.Repeat([]byte("external"), 5000), 40000},
-				{[]byte("unknown"), []byte("small streamed object"), SizeUnknown},
-				{bytes.Repeat([]byte("k"), MaxKeyLen), []byte("long key"), SizeUnknown},
+				{[]byte("empty"), nil},
+				{[]byte("inline"), bytes.Repeat([]byte("inline"), 1000)},
+				{[]byte("external"), bytes.Repeat([]byte("external"), 5000)},
+				{bytes.Repeat([]byte("k"), MaxKeyLen), []byte("long key")},
 			}
 			putValue(t, c, "inline", []byte("superseded"))
 			for _, v := range values {
-				w, err := c.NewWriter(v.key, v.promised)
+				w, err := c.NewWriter(v.key)
 				require.NoError(t, err)
 				defer w.Close()
 				_, err = w.Write(v.value)
 				require.NoError(t, err)
-				require.NoError(t, c.Put(w))
+				err = c.Put(w)
+				require.NoError(t, err)
+
 				require.NoError(t, w.Close())
 				checkRead(t, c, v.key, v.value)
 			}
-			c.values.reclaimCacheMemory(c.memory.Capacity())
-			require.Zero(t, residentCount(c))
+			require.Eventually(t, func() bool {
+				c.values.reclaimCacheMemory(c.memory.Capacity())
+				return residentCount(c) == 0
+			}, 5*time.Second, time.Millisecond)
 			for _, v := range values {
 				checkRead(t, c, v.key, v.value)
 			}
@@ -101,7 +104,7 @@ func TestRead64BitKeyHash(t *testing.T) {
 			// Force a hash collision, with the mismatch beyond the first read.
 			wrong := bytes.Clone(key)
 			wrong[len(wrong)-1] ^= 1
-			c.values.replace(blobstore.HashKey(wrong), nil, entry.header)
+			c.values.replace(blobstore.HashKey(wrong), blobstore.Memory{}, entry.header, false)
 			r, err := c.Read(wrong)
 			require.Nil(t, r)
 			require.ErrorIs(t, err, ErrNotFound, "full keys must match even without integrity checks")
@@ -114,7 +117,7 @@ func TestReadPinsUntilClose(t *testing.T) {
 	c := newPutCache(t, t.TempDir())
 	value := bytes.Repeat([]byte("original"), 1000)
 	putValue(t, c, "key", value)
-	charged := c.memory.used.Load()
+	charged := (c.memory.Capacity() - c.memory.Available())
 	a, err := c.Read([]byte("key"))
 	require.NoError(t, err)
 	defer a.Close()
@@ -123,7 +126,7 @@ func TestReadPinsUntilClose(t *testing.T) {
 	defer b.Close()
 	require.Zero(t, c.values.reclaimCacheMemory(charged), "readers keep demoted buffers pinned")
 	require.Zero(t, residentCount(c))
-	require.Equal(t, charged, c.memory.used.Load())
+	require.Equal(t, charged, (c.memory.Capacity() - c.memory.Available()))
 	putValue(t, c, "key", []byte("replacement"))
 	checkRead(t, c, []byte("key"), []byte("replacement"))
 	for _, r := range []Reader{a, b} {
@@ -131,11 +134,11 @@ func TestReadPinsUntilClose(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, value, got, "open readers survive replacement and eviction")
 	}
-	before := c.memory.used.Load()
+	before := (c.memory.Capacity() - c.memory.Available())
 	require.NoError(t, a.Close())
-	require.Equal(t, before, c.memory.used.Load(), "EOF and closing one reader do not release the other pin")
+	require.Equal(t, before, (c.memory.Capacity() - c.memory.Available()), "EOF and closing one reader do not release the other pin")
 	require.NoError(t, b.Close())
-	require.Equal(t, before-charged, c.memory.used.Load())
+	require.Equal(t, before-charged, (c.memory.Capacity() - c.memory.Available()))
 	require.NoError(t, b.Close())
 }
 
@@ -144,13 +147,13 @@ func TestReadDiskEarlyCloseAndErrors(t *testing.T) {
 	putValue(t, c, "key", bytes.Repeat([]byte("data"), 2000))
 	c.values.reclaimCacheMemory(c.memory.Capacity())
 	require.Zero(t, residentCount(c))
-	before := c.memory.used.Load()
+	before := (c.memory.Capacity() - c.memory.Available())
 	r, err := c.Read([]byte("key"))
 	require.NoError(t, err)
 	defer r.Close()
-	require.Greater(t, c.memory.used.Load(), before, "disk reads acquire staging memory after eviction")
+	require.Greater(t, (c.memory.Capacity() - c.memory.Available()), before, "disk reads acquire staging memory after eviction")
 	require.NoError(t, r.Close())
-	require.Equal(t, before, c.memory.used.Load(), "early Close releases staging without draining")
+	require.Equal(t, before, (c.memory.Capacity() - c.memory.Available()), "early Close releases staging without draining")
 	for _, tc := range []struct {
 		key []byte
 		err error
@@ -170,7 +173,7 @@ func TestUnpublishedObjectsAreMisses(t *testing.T) {
 	dir := t.TempDir()
 	c := newPutCache(t, dir, WithInlineThreshold(0))
 	key := []byte("key")
-	w, err := c.NewWriter(key, 5)
+	w, err := c.NewWriter(key)
 	require.NoError(t, err)
 	defer w.Close()
 	_, err = w.Write([]byte("value"))
@@ -279,21 +282,21 @@ func TestReaderCloseReleasesAllocation(t *testing.T) {
 			defer r.Close()
 			var charged int64
 			if resident, ok := r.(*memoryReader); ok {
-				charged = resident.memory.Cap()
+				charged = resident.memory.Size()
 			} else {
-				charged = c.memory.used.Load()
+				charged = (c.memory.Capacity() - c.memory.Available())
 			}
 			if kind == "resident" {
 				require.Zero(t, c.values.reclaimCacheMemory(c.memory.Capacity()),
 					"an unread reader keeps the evicted buffer pinned")
 			}
-			before := c.memory.used.Load()
+			before := (c.memory.Capacity() - c.memory.Available())
 			n, readErr := io.Copy(io.Discard, r)
 			require.NoError(t, readErr)
 			require.EqualValues(t, len(value), n)
-			require.Equal(t, before, c.memory.used.Load(), "EOF currently retains the allocation")
+			require.Equal(t, before, (c.memory.Capacity() - c.memory.Available()), "EOF currently retains the allocation")
 			require.NoError(t, errors.Join(readErr, r.Close()))
-			require.Equal(t, before-charged, c.memory.used.Load())
+			require.Equal(t, before-charged, (c.memory.Capacity() - c.memory.Available()))
 			require.NoError(t, r.Close(), "double Close must not decrement twice")
 
 			// A consumer error still evaluates Close in errors.Join.
@@ -302,7 +305,7 @@ func TestReaderCloseReleasesAllocation(t *testing.T) {
 			failed := errors.New("consumer failed")
 			_, readErr = r.WriteTo(failingReadConsumer{failed})
 			require.ErrorIs(t, errors.Join(readErr, r.Close()), failed)
-			require.Zero(t, c.memory.used.Load())
+			require.Zero(t, (c.memory.Capacity() - c.memory.Available()))
 		})
 	}
 }

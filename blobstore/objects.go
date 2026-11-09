@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strconv"
 
@@ -30,36 +31,51 @@ func openError(err error) error {
 	return err
 }
 
-// Close is submitted after the writer's last I/O completes. Dio returns the
-// slot to its allocator when the close completes.
-func (st *Store) closeObject(scheduler iosched.Scheduler, vfd int, id uint64, remove bool) {
-	st.cleanup.Add(1)
-	complete := func(_ int, err error) {
+func (st *Store) closeObject(scheduler iosched.Scheduler, vfd int, id uint64) {
+	logError := func(_ int, err error) {
 		if err != nil && !errors.Is(err, unix.EBADF) {
 			metrics.CloseErrors.Add(1)
 			slog.Error("close object", "object", id, "error", err)
 		}
-		if remove {
-			st.unlinkObject(id)
-		}
-		st.cleanup.Done()
 	}
-	if _, err := iosched.SubmitNotify(scheduler, iosched.VCloseOp(uint32(vfd)), complete); err != nil {
-		// Nothing was submitted: the descriptor remains open until shutdown.
-		metrics.CloseErrors.Add(1)
-		slog.Error("submit object close", "object", id, "error", err)
-		st.cleanup.Done()
+	if _, err := iosched.SubmitNotify(scheduler, iosched.VCloseOp(uint32(vfd)), logError); err != nil {
+		logError(0, err) // The descriptor remains open until shutdown.
 	}
 }
 
-func (st *Store) unlinkObject(id uint64) {
-	st.cleanup.Add(1)
-	if _, err := iosched.SubmitNotify(st.writeScheduler(), iosched.UnlinkatOp(unix.AT_FDCWD, st.objectPath(id)),
-		func(_ int, err error) {
-			logUnlinkError(id, err)
-			st.cleanup.Done()
-		}); err != nil {
-		logUnlinkError(id, err)
-		st.cleanup.Done()
+// removeOrphans deletes object files the index does not reference: a crash
+// loses records since the last snapshot, and shutdown can cut removals short.
+func (st *Store) removeOrphans() error {
+	dir := filepath.Join(st.base, "objects")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	live := make(map[uint64]bool)
+	for h := range st.mu.index.headers() {
+		if h.Flags.IsExternal() {
+			live[h.ObjectID] = true
+		}
+	}
+	for _, entry := range entries {
+		if id, err := strconv.ParseUint(entry.Name(), 10, 64); err == nil && !live[id] {
+			if err := os.Remove(filepath.Join(dir, entry.Name())); err != nil {
+				metrics.UnlinkErrors.Add(1)
+				slog.Error("unlink object", "object", id, "error", err)
+			}
+		}
+	}
+	return nil
+}
+
+func (st *Store) unlinkObject(scheduler iosched.Scheduler, id uint64) {
+	logError := func(_ int, err error) {
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			metrics.UnlinkErrors.Add(1)
+			slog.Error("unlink object", "object", id, "error", err)
+		}
+	}
+	if _, err := iosched.SubmitNotify(scheduler, iosched.UnlinkatOp(unix.AT_FDCWD, st.objectPath(id)), logError); err != nil {
+		logError(0, err)
 	}
 }

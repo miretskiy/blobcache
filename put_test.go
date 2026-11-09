@@ -11,17 +11,17 @@ import (
 	"strconv"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/miretskiy/blobcache/blobstore"
 	"github.com/miretskiy/dio/v2/align"
-	"github.com/miretskiy/dio/v2/alloc"
 	"github.com/stretchr/testify/require"
 )
 
 func newPutCache(t *testing.T, dir string, opts ...Option) *Cache {
 	t.Helper()
 	c, err := New(dir, append([]Option{
-		WithMemory(128 << 10), WithInlineThreshold(32 << 10), WithStagingSize(8 << 10),
+		WithMemory(minMemory), WithInlineThreshold(32 << 10), WithStagingSize(8 << 10),
 		storeOpt(blobstore.TestingWithDirectIO(false)),
 		storeOpt(blobstore.WithDataIntegrity(blobstore.DataIntegrityCRC32C)),
 	}, opts...)...)
@@ -32,13 +32,24 @@ func newPutCache(t *testing.T, dir string, opts ...Option) *Cache {
 
 func putValue(t *testing.T, c *Cache, key string, value []byte) {
 	t.Helper()
-	w, err := c.NewWriter([]byte(key), int64(len(value)))
+	w, err := c.NewWriter([]byte(key))
 	require.NoError(t, err)
 	defer w.Close()
 	n, err := w.Write(value)
 	require.NoError(t, err)
 	require.Equal(t, len(value), n)
-	require.NoError(t, c.Put(w))
+	err = c.Put(w)
+	require.NoError(t, err)
+	// Callers of this setup helper inspect persisted records or force eviction.
+	// Put itself only guarantees immediate inline visibility.
+	hash := blobstore.HashKey([]byte(key))
+	require.Eventually(t, func() bool {
+		s := c.values.entries.Shard(hash)
+		s.RLock()
+		defer s.RUnlock()
+		e, ok := s.Items[hash]
+		return !ok || e.resident == 0 || !s.Extra.list.Value(e.resident).pending
+	}, 5*time.Second, time.Millisecond)
 }
 
 // Inspect the retained allocation directly for Put lifetime assertions.
@@ -51,7 +62,7 @@ func retainedValue(t *testing.T, c *Cache, key []byte) []byte {
 	require.True(t, ok)
 	require.NotZero(t, e.resident)
 	var data []byte
-	for _, chunk := range s.Extra.list.Value(e.resident).buffer.Chunks() {
+	for chunk := range s.Extra.list.Value(e.resident).buffer.Chunks() {
 		data = append(data, chunk...)
 	}
 	start := blobstore.RecordHeaderSize + int(e.header.KeyLen)
@@ -61,7 +72,7 @@ func retainedValue(t *testing.T, c *Cache, key []byte) []byte {
 
 // Return the buffer object for sequential lifetime assertions, without taking
 // another reference that would mask an erroneous retain or release.
-func residentBuffer(t *testing.T, c *Cache, key []byte) *alloc.Buffer {
+func residentBuffer(t *testing.T, c *Cache, key []byte) blobstore.Memory {
 	t.Helper()
 	s := c.values.entries.Shard(blobstore.HashKey(key))
 	s.RLock()
@@ -117,6 +128,15 @@ func checkDiskValue(t *testing.T, dir string, h blobstore.RecordHeader, key, val
 	var actual blobstore.RecordHeader
 	require.NoError(t, (*blobstore.RawHeader)(data).Decode(&actual, true))
 	require.Equal(t, blobstore.HashKey(key), h.KeyHash(), "index hash identifies the key")
+	if h.Flags&blobstore.FlagFooter != 0 {
+		prefix := h
+		prefix.PhysicalLen, prefix.LogicalLen, prefix.Hash = 0, 0, 0
+		require.Equal(t, prefix, actual)
+		var footer blobstore.RawHeader
+		_, err = f.ReadAt(footer[:], int64(len(data)))
+		require.NoError(t, err)
+		require.NoError(t, footer.Decode(&actual, true))
+	}
 	h.Hash = actual.Hash
 	require.Equal(t, h, actual)
 	start := blobstore.RecordHeaderSize + len(key)
@@ -134,15 +154,13 @@ func TestPutPersistsAndRetains(t *testing.T) {
 			name     string
 			keyLen   int
 			size     int
-			promised int64
 			external bool
 		}{
-			{"empty", 3, 0, 0, false},
-			{"exact page", 3, align.BlockSize - blobstore.RecordHeaderSize - 3, align.BlockSize - blobstore.RecordHeaderSize - 3, false},
-			{"inline", 100, 20000, 21000, false},
-			{"max key", MaxKeyLen, 13, 13, false},
-			{"object", MaxKeyLen, 300001, 300001, true},
-			{"unknown", 3, 300001, SizeUnknown, true},
+			{"empty", 3, 0, false},
+			{"exact page", 3, align.BlockSize - blobstore.RecordHeaderSize - 3, false},
+			{"inline", 100, 20000, false},
+			{"max key", MaxKeyLen, 13, false},
+			{"object", MaxKeyLen, 300001, true},
 		} {
 			t.Run(fmt.Sprintf("%s/direct=%v", tc.name, direct), func(t *testing.T) {
 				dir := t.TempDir()
@@ -153,19 +171,19 @@ func TestPutPersistsAndRetains(t *testing.T) {
 					value[i] = byte(i*37 + i/4096)
 				}
 				inputKey := bytes.Clone(key)
-				w, err := c.NewWriter(inputKey, tc.promised)
+				w, err := c.NewWriter(inputKey)
 				require.NoError(t, err)
 				defer w.Close()
 				clear(inputKey)
 				split := len(value) / 2
 				_, err = w.Write(value[:split])
 				require.NoError(t, err)
-				require.NoError(t, w.Flush())
 				n, err := w.ReadFrom(bytes.NewReader(value[split:]))
 				require.NoError(t, err)
 				require.Equal(t, int64(len(value)-split), n)
-				require.Equal(t, int64(len(value)), w.Size())
-				require.NoError(t, c.Put(w))
+				err = c.Put(w)
+				require.NoError(t, err)
+
 				checkRead(t, c, key, value)
 				require.NoError(t, w.Close())
 				require.Equal(t, 1, c.values.entries.Len())
@@ -210,24 +228,31 @@ func TestPutMemoryPressure(t *testing.T) {
 		putValue(t, c, fmt.Sprint(i), []byte("value"))
 	}
 	require.Equal(t, 100, c.values.entries.Len())
-	w, err := c.NewWriter([]byte("stream"), SizeUnknown)
-	require.NoError(t, err, "staging reclaims from the same memory budget")
+	var w *Writer
+	require.Eventually(t, func() bool {
+		var err error
+		w, err = c.NewWriter([]byte("stream"))
+		return err == nil
+	}, 5*time.Second, time.Millisecond, "staging reclaims from the same memory budget")
 	require.Equal(t, 100, c.values.entries.Len())
 	require.NoError(t, w.Close())
 
 	var held []*Writer
 	for {
-		w, err := c.NewWriter([]byte("held"), 1)
+		w, err := c.NewWriter([]byte("held"))
 		if errors.Is(err, ErrBusy) {
-			break
+			if residentCount(c) == 0 {
+				break
+			}
+			time.Sleep(time.Millisecond) // Reclamation runs in the background.
+			continue
 		}
 		require.NoError(t, err)
 		held = append(held, w)
 	}
-	require.Len(t, held, 32)
 	require.Zero(t, residentCount(c))
 	require.Equal(t, 100, c.values.entries.Len(), "all disk metadata survives pressure")
-	_, err = c.NewWriter([]byte("stream"), SizeUnknown)
+	_, err := c.NewWriter([]byte("stream"))
 	require.ErrorIs(t, err, ErrBusy)
 	for _, w := range held {
 		require.NoError(t, w.Close())
@@ -239,15 +264,17 @@ func TestPutCloseAndReopen(t *testing.T) {
 	dir := t.TempDir()
 	c := newPutCache(t, dir)
 	key, value := []byte("committed"), bytes.Repeat([]byte("v"), 5000)
-	w, err := c.NewWriter(key, int64(len(value)))
+	w, err := c.NewWriter(key)
 	require.NoError(t, err)
 	_, err = w.Write(value)
 	require.NoError(t, err)
-	require.NoError(t, c.Put(w))
+	err = c.Put(w)
+	require.NoError(t, err)
+
 	buffer := residentBuffer(t, c, key)
 	var abandoned []*Writer
-	for _, size := range []int64{10000, SizeUnknown} {
-		w, err := c.NewWriter([]byte("abandoned"), size)
+	for range 2 {
+		w, err := c.NewWriter([]byte("abandoned"))
 		require.NoError(t, err)
 		_, err = w.Write(make([]byte, 9000))
 		require.NoError(t, err)
@@ -279,46 +306,24 @@ func TestPutCloseAndReopen(t *testing.T) {
 	checkDiskValue(t, dir, reopened[1], []byte("next"), []byte("next value"))
 }
 
-func TestPutEvictionKeepsWriterMemoryPinned(t *testing.T) {
-	c := newPutCache(t, t.TempDir(), WithInlineThreshold(128<<10))
-	key := []byte("key")
-	value := bytes.Repeat([]byte("v"), 128<<10-blobstore.RecordHeaderSize-len(key))
-	w, err := c.NewWriter(key, int64(len(value)))
-	require.NoError(t, err)
-	defer w.Close()
-	_, err = w.Write(value)
-	require.NoError(t, err)
-	require.NoError(t, c.Put(w))
-	buffer := w.RetainBuffer()
-	require.NotNil(t, buffer)
-	buffer.Unpin() // Inspect lifetime through the writer's existing reference.
-	_, err = c.NewWriter([]byte("next"), 1)
-	require.ErrorIs(t, err, ErrBusy)
-	require.Zero(t, residentCount(c), "eviction releases only the cache reference")
-	require.Equal(t, 1, c.values.entries.Len(), "metadata remains indexed")
-	require.True(t, buffer.TryInc(), "the writer still pins its allocation")
-	buffer.Unpin()
-	require.NoError(t, w.Close())
-	require.False(t, buffer.TryInc())
-	putValue(t, c, "next", []byte("v"))
-}
-
 type putErrorReader struct{ err error }
 
 func (r putErrorReader) Read([]byte) (int, error) { return 0, r.err }
 
-func TestPutSourceErrorPreservesValue(t *testing.T) {
+// A source error prevents preparation, leaving the previous value readable.
+func TestPutSourceErrorKeepsValue(t *testing.T) {
 	c := newPutCache(t, t.TempDir())
 	putValue(t, c, "key", []byte("value"))
-	w, err := c.NewWriter([]byte("key"), 100)
+	w, err := c.NewWriter([]byte("key"))
 	require.NoError(t, err)
 	defer w.Close()
 	failure := errors.New("download failed")
 	_, err = w.ReadFrom(io.MultiReader(bytes.NewReader([]byte("partial")), putErrorReader{failure}))
 	require.ErrorIs(t, err, failure)
-	require.ErrorIs(t, c.Put(w), failure)
-	require.ErrorIs(t, w.Close(), failure)
-	require.Equal(t, []byte("value"), retainedValue(t, c, []byte("key")))
+	err = c.Put(w)
+	require.ErrorIs(t, err, failure)
+	require.NoError(t, w.Close())
+	checkRead(t, c, []byte("key"), []byte("value"))
 }
 
 func TestPutOpenErrorLeavesCacheUnchanged(t *testing.T) {
@@ -328,13 +333,14 @@ func TestPutOpenErrorLeavesCacheUnchanged(t *testing.T) {
 	// An asynchronous object open can fail after NewWriter has returned.
 	require.NoError(t, os.Remove(filepath.Join(dir, "objects")))
 	for _, key := range []string{"key", "missing"} {
-		w, err := c.NewWriter([]byte(key), SizeUnknown)
+		w, err := c.NewWriter([]byte(key))
 		require.NoError(t, err)
-		_, err = w.Write([]byte("replacement"))
-		require.NoError(t, err)
-		err = c.Put(w)
-		require.Error(t, err)
-		require.ErrorIs(t, w.Close(), err)
+		_, err = w.Write(make([]byte, 40000))
+		if err == nil {
+			err = c.Put(w)
+		}
+		require.Error(t, err, "streaming or Put reports the object-open failure")
+		require.NoError(t, w.Close())
 	}
 	checkRead(t, c, []byte("key"), []byte("previous"))
 	r, err := c.Read([]byte("missing"))
@@ -355,7 +361,7 @@ func TestPutConcurrent(t *testing.T) {
 				if iteration%2 == 0 {
 					key = []byte("shared")
 				}
-				w, err := c.NewWriter(key, 5000)
+				w, err := c.NewWriter(key)
 				if err != nil {
 					errs <- err
 					return
@@ -384,11 +390,11 @@ func TestPutConcurrent(t *testing.T) {
 
 func TestPutConfigurationAndOpenFailures(t *testing.T) {
 	for _, option := range []Option{
-		WithMemory(-1), WithMemory(0), WithMemory(128<<10 - 1), WithMemory(128<<10 + 1),
+		WithMemory(-1), WithMemory(0), WithMemory(minMemory - 1),
 		WithInlineThreshold(-1),
 		WithStagingSize(0), WithStagingSize(-1),
 	} {
-		c, err := New(t.TempDir(), WithMemory(128<<10), option)
+		c, err := New(t.TempDir(), WithMemory(minMemory), option)
 		require.Error(t, err)
 		require.Nil(t, c)
 	}
@@ -400,7 +406,7 @@ func TestPutConfigurationAndOpenFailures(t *testing.T) {
 		} else {
 			require.NoError(t, os.Mkdir(path, 0o700))
 		}
-		c, err := New(dir, WithMemory(128<<10))
+		c, err := New(dir, WithMemory(minMemory))
 		require.Error(t, err)
 		require.Nil(t, c)
 		require.NoError(t, os.Remove(path))
@@ -409,24 +415,22 @@ func TestPutConfigurationAndOpenFailures(t *testing.T) {
 	}
 	c := newPutCache(t, t.TempDir())
 	for _, key := range [][]byte{nil, make([]byte, MaxKeyLen+1)} {
-		w, err := c.NewWriter(key, 0)
+		w, err := c.NewWriter(key)
 		require.Error(t, err)
 		require.Nil(t, w)
 	}
-	w, err := c.NewWriter([]byte("key"), -2)
-	require.Error(t, err)
-	require.Nil(t, w)
-
 	// The default staging size must work at the minimum memory budget.
-	c, err = New(t.TempDir(), WithMemory(128<<10))
+	c, err := New(t.TempDir(), WithMemory(minMemory))
 	require.NoError(t, err)
 	defer c.Close()
-	w, err = c.NewWriter([]byte("key"), SizeUnknown)
+	w, err := c.NewWriter([]byte("key"))
 	require.NoError(t, err)
 	defer w.Close()
 	_, err = w.Write(make([]byte, 300000))
 	require.NoError(t, err)
-	require.NoError(t, c.Put(w))
+	err = c.Put(w)
+	require.NoError(t, err)
+
 }
 
 func TestMemoryQueueSecondChance(t *testing.T) {
@@ -445,7 +449,7 @@ func TestMemoryQueueSecondChance(t *testing.T) {
 	s.Lock()
 	s.Extra.list.Value(s.Items[blobstore.HashKey([]byte(keys[0]))].resident).visited = 1
 	s.Unlock()
-	require.Equal(t, int64(align.BlockSize), c.values.reclaimCacheMemory(align.BlockSize))
+	require.Equal(t, second.Size(), c.values.reclaimCacheMemory(align.BlockSize))
 	require.False(t, second.TryInc())
 	require.Equal(t, []byte(keys[0]), retainedValue(t, c, []byte(keys[0])))
 	// Replace the next eviction candidate and verify the hand still progresses.

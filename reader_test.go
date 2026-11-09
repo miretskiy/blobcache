@@ -6,14 +6,11 @@ import (
 
 	"github.com/miretskiy/blobcache/blobstore"
 	"github.com/miretskiy/dio/v2/align"
-	"github.com/miretskiy/dio/v2/alloc"
 	"github.com/stretchr/testify/require"
 )
 
 func TestMemoryReadWithoutStore(t *testing.T) {
-	pool, err := alloc.NewExtentAllocator(align.BlockSize, 8)
-	require.NoError(t, err)
-	defer pool.Close()
+	pool := newTestPool(t, 8*align.BlockSize)
 	// No Store, scheduler, or files: a resident hit must stay in blobcache.
 	c := &Cache{values: newMemoryCache()}
 	defer c.values.clear()
@@ -30,18 +27,16 @@ func TestMemoryReadWithoutStore(t *testing.T) {
 	framed := append(append(raw[:], key...), value...)
 	memory, err := pool.TryAcquire(int64(len(framed)))
 	require.NoError(t, err)
-	for rest, i := framed, 0; len(rest) != 0; i++ {
-		rest = rest[copy(memory.Chunks()[i], rest):]
-	}
-	c.values.replace(blobstore.HashKey(key), memory, h)
-	checkRead(t, c, key, value) // Full key and value span multiple chunks.
+	copy(singleMemoryChunk(memory), framed)
+	c.values.replace(blobstore.HashKey(key), memory, h, false)
+	checkRead(t, c, key, value)
 
-	// Simulate hash collisions, including a mismatch beyond the first chunk.
+	// Simulate hash collisions, including a mismatch beyond the first page.
 	other := bytes.Clone(key)
 	other[len(other)-1] ^= 1
 	for _, wrongKey := range [][]byte{key[:1], other} {
 		require.True(t, memory.TryInc())
-		c.values.replace(blobstore.HashKey(wrongKey), memory, h)
+		c.values.replace(blobstore.HashKey(wrongKey), memory, h, false)
 		r, err := c.Read(wrongKey)
 		require.Nil(t, r)
 		require.ErrorIs(t, err, ErrNotFound)

@@ -10,11 +10,13 @@ import (
 )
 
 // Records in index.db, data.db, and objects/ share this packed header.
-// index.db reuses retired header slots; ObjectID restores reservation order.
+// index.db is a snapshot of published headers; ObjectID restores reservation order.
 // ObjectIDs come from a counter seeded with the startup timestamp in nanoseconds.
 // FlagExternal distinguishes object files (named by decimal ObjectID) from data.db.
 // Offset records the data.db cursor at reservation; external file I/O starts at zero.
-// All integers are little endian.
+// Streamed objects set FlagFooter: their initial header has zero lengths and hash.
+// The final header follows the body at PageAlign(RecordHeaderSize + KeyLen + PhysicalLen).
+// Index metadata carries the final lengths. All integers are little endian.
 //
 // [ 0: 4) magic (0xB10BCAC6)
 // [ 4: 6) flags (RecordFlags, uint16)
@@ -25,7 +27,7 @@ import (
 // [32:40) original value size before compression
 // [40:42) key length
 // [42:50) Hash: key hash (XXH3-64 with FlagKeyHashXXH3) in index.db; CRC32C of key/value in data files
-// [50:60) reserved; pads index.db slots to 64 bytes so none crosses a sector
+// [50:60) reserved; pads headers to 64 bytes
 // [60:64) CRC32C of header[4:60) when FlagHeaderIntegrity is set; zero otherwise
 
 const RecordHeaderSize = 64
@@ -70,6 +72,8 @@ const (
 	FlagExternal RecordFlags = 0b0000_0000_0000_0100
 	// FlagKeyHashXXH3 marks an index Hash computed by HashKey (XXH3-64).
 	FlagKeyHashXXH3 RecordFlags = 0b0000_0000_0000_1000
+	// FlagFooter stores final metadata after the page-aligned body of a streamed object.
+	FlagFooter RecordFlags = 0b0000_0000_0001_0000
 
 	maskDataIntegrity  RecordFlags = 0b0000_0001_1000_0000
 	shiftDataIntegrity             = 7

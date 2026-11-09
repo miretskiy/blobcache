@@ -9,49 +9,49 @@ import (
 	"testing"
 
 	"github.com/miretskiy/dio/v2/align"
-	"github.com/miretskiy/dio/v2/alloc"
 	"github.com/stretchr/testify/require"
 )
 
 func publishForRead(t *testing.T, st *Store, key, value []byte) RecordHeader {
 	t.Helper()
-	w, err := st.NewWriter(key, int64(len(value)))
+	w, err := st.NewWriter(key)
 	require.NoError(t, err)
 	defer w.Close()
 	_, err = w.Write(value)
 	require.NoError(t, err)
-	require.NoError(t, st.Put(w))
-	return w.Header()
+	err = putStoreWriter(st, w)
+	require.NoError(t, err)
+
+	return w.wr.(*bufferSink).header
 }
 
 func TestReaderFragmentedBuffers(t *testing.T) {
 	for _, integrity := range []DataIntegrity{DataIntegrityNone, DataIntegrityCRC32C} {
 		t.Run(string(rune('0'+integrity)), func(t *testing.T) {
-			pool, err := alloc.NewExtentAllocator(align.BlockSize, 32)
-			require.NoError(t, err)
-			defer pool.Close()
-			st, err := Open(t.TempDir(), pool, pool, WithStagingSize(12<<10), WithDataIntegrity(integrity), WithVerifyChecksums(true))
+			pool := newStoreMemory(t, 32*align.BlockSize)
+			st, err := Open(t.TempDir(), pool, WithStagingSize(12<<10), WithInlineThreshold(32<<10), WithDataIntegrity(integrity), WithVerifyChecksums(true))
 			require.NoError(t, err)
 			defer st.Close()
 			key, value := bytes.Repeat([]byte("k"), 5000), bytes.Repeat([]byte("v"), 20000)
-			w, err := st.NewWriter(key, int64(len(value)))
+			w, err := st.NewWriter(key)
 			require.NoError(t, err)
 			defer w.Close()
 			_, err = w.Write(value)
 			require.NoError(t, err)
-			require.NoError(t, st.Put(w))
-			h := w.Header()
+			err = putStoreWriter(st, w)
+			require.NoError(t, err)
+
+			h := w.wr.(*bufferSink).header
 			require.NoError(t, w.Close())
 			r, err := st.NewReader(key, h)
 			require.NoError(t, err)
 			defer r.Close()
-			require.Greater(t, len(r.memory.Chunks()), 1)
+			staged := r.memory.Cap()
+			require.Less(t, int64(staged), int64(len(key)+len(value)), "staging is smaller than the record")
 			got, err := io.ReadAll(r)
 			require.NoError(t, err)
 			require.Equal(t, value, got)
-			for _, chunk := range r.memory.Chunks() {
-				require.Len(t, chunk, align.BlockSize, "I/O trimming must not change allocator chunks")
-			}
+			require.Equal(t, staged, r.memory.Cap(), "I/O trimming must not change the allocation")
 			require.NoError(t, r.Close())
 			require.Equal(t, pool.Capacity(), pool.Available())
 		})
@@ -71,20 +71,21 @@ func TestReaderStaleLocationAndMissingObject(t *testing.T) {
 	require.Nil(t, r)
 	require.ErrorIs(t, err, ErrNotFound)
 
-	object := putReclaimSizedRecord(t, st, "object", bytes.Repeat([]byte("v"), 40000), SizeUnknown)
+	object := putReclaimObject(t, st, "object", bytes.Repeat([]byte("v"), 40000))
 	r, err = st.NewReader([]byte("object"), object)
 	require.NoError(t, err)
 	defer r.Close()
-	// Each refill opens its own descriptor, so removing the object mid-stream
-	// fails the next refill rather than reading through a retained descriptor.
+	// The reader keeps its descriptor, so removing the object mid-stream does
+	// not affect a reader that has started.
 	require.NoError(t, os.Remove(filepath.Join(st.base, "objects", strconv.FormatUint(object.ObjectID, 10))))
-	_, err = io.Copy(io.Discard, r)
-	require.ErrorIs(t, err, os.ErrNotExist)
+	got, err := io.ReadAll(r)
+	require.NoError(t, err)
+	require.Equal(t, bytes.Repeat([]byte("v"), 40000), got)
 	require.NoError(t, r.Close())
 	r, err = st.NewReader([]byte("object"), object)
 	require.Nil(t, r)
 	require.ErrorIs(t, err, ErrNotFound)
-	pool := st.staging.(*alloc.ExtentAllocator)
+	pool := st.memory
 	require.Equal(t, pool.Capacity(), pool.Available(), "misses release staging memory")
 }
 
@@ -152,22 +153,21 @@ func TestHeaderChecksumPolicyAfterRestart(t *testing.T) {
 		h := publishForRead(t, st, key, value)
 		require.NoError(t, st.Close())
 		// Change only the CRC bytes, leaving decoded metadata and payload intact.
-		for name, offset := range map[string]int64{
-			"data.db":  RecordHeaderSize - 4,
-			"index.db": RecordHeaderSize - 4,
-		} {
+		corrupt := func(name string) {
 			f, err := os.OpenFile(filepath.Join(dir, name), os.O_RDWR, 0)
 			require.NoError(t, err)
 			var crc [1]byte
-			_, err = f.ReadAt(crc[:], offset)
+			_, err = f.ReadAt(crc[:], RecordHeaderSize-4)
 			require.NoError(t, err)
 			crc[0] ^= 1
-			_, err = f.WriteAt(crc[:], offset)
+			_, err = f.WriteAt(crc[:], RecordHeaderSize-4)
 			require.NoError(t, err)
 			require.NoError(t, f.Close())
 		}
+		corrupt("data.db")
 		for _, verify := range []bool{false, true} {
-			reopened, err := Open(dir, st.memory, st.staging, TestingWithDirectIO(false), WithVerifyChecksums(verify))
+			corrupt("index.db") // Close rewrites the snapshot with a valid CRC.
+			reopened, err := Open(dir, st.memory, TestingWithDirectIO(false), WithVerifyChecksums(verify))
 			if verify && flags.HasHeaderIntegrity() {
 				require.ErrorIs(t, err, ErrBadCRC)
 				continue

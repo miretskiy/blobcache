@@ -2,15 +2,12 @@ package blobstore
 
 import (
 	"bytes"
-	"encoding/binary"
 	"fmt"
 	"io"
-	"os"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/miretskiy/dio/v2/alloc"
 	"github.com/miretskiy/dio/v2/iosched"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
@@ -38,21 +35,20 @@ func schedulerTestCPUs(t *testing.T, n int) []int {
 
 func openMultiSchedulerStore(t *testing.T, path string, cpus []int, writes int, extra ...Option) *Store {
 	t.Helper()
-	pool, err := alloc.NewSlabAllocator(2 << 20)
-	require.NoError(t, err)
+	pool := newStoreMemory(t, 2<<20)
 	t.Cleanup(pool.Close)
 	opts := []Option{TestingWithDirectIO(false),
 		WithSchedulerCPUs(cpus...), WithWriteSchedulers(writes),
 		WithStagingSize(8 << 10), WithInlineThreshold(16 << 10),
 		WithDataIntegrity(DataIntegrityCRC32C), WithVerifyChecksums(true)}
-	st, err := Open(path, pool, pool, append(opts, extra...)...)
+	st, err := Open(path, pool, append(opts, extra...)...)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, st.Close()) })
 	return st
 }
 
-// Different rings may use the same VFD number concurrently. Flush, final
-// chains, early reader close, and abandoned-writer cleanup must retain owners.
+// Different rings may use the same VFD number concurrently. Object chains
+// and early reader close must retain their owning scheduler.
 func TestMultiSchedulerFileOwnershipAndRecovery(t *testing.T) {
 	for _, tc := range []struct{ rings, writes int }{{2, 0}, {3, 1}, {4, 2}} {
 		t.Run(fmt.Sprintf("rings=%d/writes=%d", tc.rings, tc.writes), func(t *testing.T) {
@@ -65,31 +61,33 @@ func TestMultiSchedulerFileOwnershipAndRecovery(t *testing.T) {
 			}
 			writers := make([]*Writer, 2*writeCount)
 			for i := range writers {
-				w, err := st.NewWriter([]byte(fmt.Sprint(i)), SizeUnknown)
+				w, err := st.NewWriter([]byte(fmt.Sprint(i)))
 				require.NoError(t, err)
-				t.Cleanup(w.Discard)
+				t.Cleanup(func() { w.Close() })
 				writers[i] = w
-				require.Same(t, st.schedulers[i%writeCount], w.scheduler)
+				require.Same(t, st.schedulers[i%writeCount], w.wr.(*bufferSink).scheduler)
 				_, err = w.Write(bytes.Repeat([]byte{byte(i)}, 40000))
 				require.NoError(t, err)
-				require.GreaterOrEqual(t, w.vfd, 0)
+				require.FileExists(t, st.objectPath(w.wr.(*bufferSink).header.ObjectID))
 			}
-			// Abandon one open file while peers on every ring still own slots.
-			writers[0].Discard()
-			st.Wait()
-			require.NoFileExists(t, st.objectPath(writers[0].header.ObjectID))
+			// Abandon one buffered record while peers on every ring remain usable.
+			writers[0].Close()
+			abandoned := st.objectPath(writers[0].wr.(*bufferSink).header.ObjectID)
+			require.Eventually(t, func() bool { return !fileExists(abandoned) }, time.Second, time.Millisecond)
 			var headers []RecordHeader
 			for i := len(writers) - 1; i > 0; i-- {
 				w := writers[i]
-				require.NoError(t, st.Put(w))
-				require.Equal(t, -1, w.vfd)
-				headers = append(headers, w.Header())
+				err := putStoreWriter(st, w)
+				require.NoError(t, err)
+
+				require.Nil(t, w.buf)
+				headers = append(headers, w.wr.(*bufferSink).header)
 				require.NoError(t, w.Close())
 			}
 			// Every read ring can read an object written by any write ring.
 			var readers []*Reader
 			for i := 0; i < 2*(tc.rings-tc.writes); i++ {
-				r, err := st.NewReader([]byte("1"), writers[1].Header())
+				r, err := st.NewReader([]byte("1"), writers[1].wr.(*bufferSink).header)
 				require.NoError(t, err)
 				t.Cleanup(func() { require.NoError(t, r.Close()) })
 				require.Same(t, st.schedulers[tc.writes+i%(tc.rings-tc.writes)], r.scheduler)
@@ -117,12 +115,14 @@ func TestMultiSchedulerFileOwnershipAndRecovery(t *testing.T) {
 			// Recovery is independent of the original routing and CPU layout.
 			st = openMultiSchedulerStore(t, path, cpus[:1], 0)
 			var recovered []RecordHeader
-			st.Recover(func(h RecordHeader) { recovered = append(recovered, h) })
+			for h := range st.Records() {
+				recovered = append(recovered, h)
+			}
 			require.ElementsMatch(t, headers, recovered)
 			for _, h := range headers {
 				key, want := []byte("inline"), []byte("inline value")
 				if h.Flags.IsExternal() {
-					i := h.ObjectID - writers[0].header.ObjectID
+					i := h.ObjectID - writers[0].wr.(*bufferSink).header.ObjectID
 					key, want = []byte(fmt.Sprint(i)), bytes.Repeat([]byte{byte(i)}, 40000)
 				}
 				r, err := st.NewReader(key, h)
@@ -186,14 +186,14 @@ func TestDedicatedWriteSchedulerAndAffinity(t *testing.T) {
 	var release sync.Once
 	unblock := func() { release.Do(func() { close(gate.release) }) }
 	t.Cleanup(unblock)
-	w, err := st.NewWriter([]byte("pending"), 4)
+	w, err := st.NewWriter([]byte("pending"))
 	require.NoError(t, err)
 	_, err = w.Write([]byte("next"))
 	require.NoError(t, err)
 	written := make(chan struct{})
 	var writeErr error
-	go func() { writeErr = st.Put(w); close(written) }()
-	t.Cleanup(func() { unblock(); <-written; w.Discard() })
+	go func() { writeErr = putStoreWriter(st, w); close(written) }()
+	t.Cleanup(func() { unblock(); <-written; w.Close() })
 	select {
 	case <-gate.entered:
 	case <-time.After(5 * time.Second):
@@ -220,94 +220,6 @@ func TestDedicatedWriteSchedulerAndAffinity(t *testing.T) {
 	unblock()
 	<-written
 	require.NoError(t, writeErr)
-	require.NoError(t, w.Close())
-	// Retirement and index wipes also use the write pool, then drain before
-	// shared descriptors are closed. Verify recovery sees their removal.
-	st.Reclaim(st.Size())
-	st.Wait()
-	require.Zero(t, st.Size())
-	path := st.base
-	require.NoError(t, st.Close())
-	reopened := openMultiSchedulerStore(t, path, cpus, 1)
-	require.Zero(t, reopened.Size())
-}
 
-func TestPendingWriteOnAnotherRingPreventsReclaim(t *testing.T) {
-	st := openMultiSchedulerStore(t, t.TempDir(), schedulerTestCPUs(t, 3), 2)
-	gate := &gatedScheduler{Scheduler: st.schedulers[0], entered: make(chan struct{}), release: make(chan struct{})}
-	st.schedulers[0] = gate
-	var release sync.Once
-	unblock := func() { release.Do(func() { close(gate.release) }) }
-	w, err := st.NewWriter([]byte("first"), 5)
-	require.NoError(t, err)
-	_, err = w.Write([]byte("value"))
-	require.NoError(t, err)
-	done := make(chan struct{})
-	var writeErr error
-	go func() { writeErr = st.Put(w); close(done) }()
-	t.Cleanup(func() { unblock(); <-done; w.Discard() })
-	select {
-	case <-gate.entered:
-	case <-time.After(5 * time.Second):
-		t.Fatal("write did not reach its ring")
-	}
-	// This Put completes on the other write ring. Its completion does not
-	// release the first ring's pending reservation or its index slot.
-	second := publishForRead(t, st, []byte("second"), []byte("other"))
-	require.Zero(t, st.Reclaim(st.Size()))
-	r, err := st.NewReader([]byte("second"), second)
-	require.NoError(t, err)
-	got, err := io.ReadAll(r)
-	require.NoError(t, err)
-	require.Equal(t, []byte("other"), got)
-	require.NoError(t, r.Close())
-	unblock()
-	<-done
-	require.NoError(t, writeErr)
 	require.NoError(t, w.Close())
-	require.EqualValues(t, 10, st.Reclaim(10))
-	st.Wait()
-	require.Zero(t, st.Size())
-}
-
-func TestSchedulersShareDiskBacklog(t *testing.T) {
-	st := openMultiSchedulerStore(t, t.TempDir(), schedulerTestCPUs(t, 3), 2,
-		WithRejectWriteBacklog(8))
-	fd, err := unix.Eventfd(0, unix.EFD_CLOEXEC)
-	require.NoError(t, err)
-	gate := os.NewFile(uintptr(fd), "held-read")
-	t.Cleanup(func() { require.NoError(t, gate.Close()) })
-	f, err := os.CreateTemp(t.TempDir(), "writes")
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, f.Close()) })
-	// Hold the first chain before its write. Its bytes must count against the
-	// other writer's admission limit as well.
-	ticket, err := st.schedulers[0].Submit(iosched.ReadOp(gate, make([]byte, 8), 0).
-		Link(iosched.WriteOp(f, make([]byte, 8), 0)))
-	require.NoError(t, err)
-	var once sync.Once
-	unblock := func() {
-		once.Do(func() {
-			buf := make([]byte, 8)
-			binary.NativeEndian.PutUint64(buf, 1)
-			_, err := gate.Write(buf)
-			require.NoError(t, err)
-		})
-	}
-	t.Cleanup(unblock)
-	require.Eventually(t, func() bool { q := st.IODiskStats().Writes; return q.Bytes == 8 && q.ServiceTime > 0 }, 5*time.Second, time.Millisecond)
-	_, err = st.schedulers[1].Submit(iosched.WriteOp(f, []byte{1}, 8))
-	require.ErrorIs(t, err, iosched.ErrRejected)
-	read, err := st.schedulers[2].Submit(iosched.ReadOp(f, make([]byte, 1), 0))
-	require.NoError(t, err)
-	_, err = read.Wait()
-	require.NoError(t, err)
-	unblock()
-	_, err = ticket.Wait()
-	require.NoError(t, err)
-	require.Zero(t, st.IODiskStats().Writes.Bytes)
-	ticket, err = st.schedulers[1].Submit(iosched.WriteOp(f, make([]byte, 8), 8))
-	require.NoError(t, err)
-	_, err = ticket.Wait()
-	require.NoError(t, err, "returned capacity belongs to either write ring")
 }

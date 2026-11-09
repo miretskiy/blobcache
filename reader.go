@@ -3,16 +3,16 @@ package blobcache
 import (
 	"bytes"
 	"io"
+	"slices"
 
 	"github.com/miretskiy/blobcache/blobstore"
 	"github.com/miretskiy/blobcache/metrics"
-	"github.com/miretskiy/dio/v2/alloc"
 )
 
 // memoryReader owns a pin on an immutable resident value. Its cursor borrows
 // allocation chunks; replacement and reclamation cannot release this pin.
 type memoryReader struct {
-	memory    *alloc.Buffer
+	memory    blobstore.Memory
 	chunks    [][]byte
 	offset    int
 	remaining int64
@@ -21,12 +21,12 @@ type memoryReader struct {
 
 // newMemoryReader takes ownership of memory, including on error. Resident
 // values are trusted; only disk reads verify checksums.
-func newMemoryReader(key []byte, h blobstore.RecordHeader, memory *alloc.Buffer) (_ Reader, err error) {
+func newMemoryReader(key []byte, h blobstore.RecordHeader, memory blobstore.Memory) (_ Reader, err error) {
 	r := &memoryReader{
-		memory: memory, chunks: memory.Chunks(), offset: blobstore.RecordHeaderSize,
+		memory: memory, chunks: slices.Collect(memory.Chunks()), offset: blobstore.RecordHeaderSize,
 		remaining: int64(h.KeyLen) + int64(h.PhysicalLen), size: int64(h.LogicalLen),
 	}
-	metrics.ResidentReadBytes.Add(memory.Cap())
+	metrics.ResidentReadBytes.Add(memory.Size())
 	metrics.ResidentReaders.Add(1)
 	defer func() {
 		if err != nil {
@@ -97,12 +97,12 @@ func (r *memoryReader) WriteTo(w io.Writer) (int64, error) {
 }
 
 func (r *memoryReader) Close() error {
-	if r.memory != nil {
-		allocated := r.memory.Cap()
+	if isResident(r.memory) {
+		allocated := r.memory.Size()
 		r.memory.Unpin()
 		metrics.ResidentReadBytes.Add(-allocated)
 		metrics.ResidentReaders.Add(-1)
-		r.memory = nil
+		r.memory = blobstore.Memory{}
 	}
 	r.chunks = nil
 	return nil

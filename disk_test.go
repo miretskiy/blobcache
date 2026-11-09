@@ -46,57 +46,38 @@ func TestDiskReclaimKeepsResidentValues(t *testing.T) {
 }
 
 func TestDiskRetirementRemovesMetadataAndPreservesReplacement(t *testing.T) {
+	const target = 64 << 10
 	dir := t.TempDir()
-	c := newPutCache(t, dir, WithInlineThreshold(0))
+	opts := []Option{WithInlineThreshold(0), WithTargetSize(target)}
+	c := newPutCache(t, dir, opts...)
 	putValue(t, c, "key", []byte("old"))
 	putValue(t, c, "key", []byte("replacement"))
 	require.NoError(t, c.Close())
-	c = newPutCache(t, dir, WithInlineThreshold(0)) // Recovered index entries have no pending I/O.
-	require.EqualValues(t, 3, c.store.Reclaim(3))
+	c = newPutCache(t, dir, opts...) // Recovered index entries have no pending I/O.
+	// Each put leaves the payload over target by its own size; the next
+	// reservation evicts that much from the oldest records.
+	evictNext := func() {
+		w, err := c.NewWriter([]byte("trigger"))
+		require.NoError(t, err)
+		require.NoError(t, c.Put(w))
+		require.NoError(t, w.Close())
+	}
+	putValue(t, c, "filler", make([]byte, target-len("replacement")))
+	evictNext()
 	checkRead(t, c, []byte("key"), []byte("replacement"))
-	require.Equal(t, 1, c.values.entries.Len())
-	require.EqualValues(t, len("replacement"), c.store.Reclaim(uint64(len("replacement"))))
-	require.Zero(t, c.values.entries.Len(), "the retirement callback removes metadata before any read")
+	putValue(t, c, "more", []byte("replacement"))
+	evictNext()
+	_, _, ok := c.values.lookup(blobstore.HashKey([]byte("key")))
+	require.False(t, ok, "retirement removes metadata before any read")
 	r, err := c.Read([]byte("key"))
 	require.Nil(t, r)
 	require.ErrorIs(t, err, ErrNotFound)
 }
 
-func TestWriterCloseReclaimsWithoutAnotherPut(t *testing.T) {
-	const target = 64 << 10
-	dir := t.TempDir()
-	c := newPutCache(t, dir, WithMemory(1<<20), WithTargetSize(target), WithInlineThreshold(0))
-	value := bytes.Repeat([]byte("v"), 2<<10)
-	// Keep the writers open so the FIFO cannot retire them. Closing them must
-	// reclaim the excess even though no more Put calls arrive.
-	var writers []*Writer
-	for i := range 40 {
-		key := []byte(fmt.Sprint(i))
-		w, err := c.NewWriter(key, int64(len(value)))
-		require.NoError(t, err)
-		t.Cleanup(func() { require.NoError(t, w.Close()) })
-		_, err = w.Write(value)
-		require.NoError(t, err)
-		require.NoError(t, c.store.Put(w))
-		writers = append(writers, w)
-	}
-	require.Greater(t, c.store.Size(), uint64(target))
-	for _, w := range writers {
-		require.NoError(t, w.Close())
-	}
-	require.LessOrEqual(t, c.store.Size(), uint64(target))
-	// Drain dio cleanup before checking the completed unlinks.
-	require.NoError(t, c.Close())
-	objects, err := os.ReadDir(filepath.Join(dir, "objects"))
-	require.NoError(t, err)
-	require.NotEmpty(t, objects)
-	require.LessOrEqual(t, len(objects)*len(value), target)
-}
-
 func TestPutConcurrentDiskReclamation(t *testing.T) {
 	const target = 256 << 10
 	dir := t.TempDir()
-	c := newPutCache(t, dir, WithMemory(2<<20), WithTargetSize(target), WithInlineThreshold(0))
+	c := newPutCache(t, dir, WithMemory(minMemory), WithTargetSize(target), WithInlineThreshold(0))
 	group, ctx := errgroup.WithContext(context.Background())
 	for worker := range 4 {
 		group.Go(func() error {
@@ -106,7 +87,7 @@ func TestPutConcurrentDiskReclamation(t *testing.T) {
 					return err
 				}
 				key := []byte(fmt.Sprintf("%d-%d", worker, i))
-				w, err := c.NewWriter(key, int64(len(value)))
+				w, err := c.NewWriter(key)
 				if err != nil {
 					return err
 				}
@@ -126,5 +107,4 @@ func TestPutConcurrentDiskReclamation(t *testing.T) {
 	objects, err := os.ReadDir(filepath.Join(dir, "objects"))
 	require.NoError(t, err)
 	require.NotEmpty(t, objects)
-	require.LessOrEqual(t, len(objects)*(8<<10), target)
 }

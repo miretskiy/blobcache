@@ -5,7 +5,6 @@ import (
 	"sync/atomic"
 
 	"github.com/miretskiy/blobcache/blobstore"
-	"github.com/miretskiy/dio/v2/alloc"
 	"github.com/miretskiy/dio/v2/collections"
 )
 
@@ -24,8 +23,9 @@ type memoryEntry struct {
 // Writers hold the exclusive lock, so they may move slots and clear visited.
 type residentEntry struct {
 	key     blobstore.KeyHash
-	buffer  *alloc.Buffer
+	buffer  blobstore.Memory
 	visited uint32
+	pending bool // Disk I/O still owns this inline record; it cannot become disk-only yet.
 }
 
 type memoryQueue struct {
@@ -40,6 +40,9 @@ type memoryCache struct {
 	next    atomic.Uint64
 }
 
+// isResident reports whether m holds a value: the zero Memory has no bytes.
+func isResident(m blobstore.Memory) bool { return m.Size() != 0 }
+
 func newMemoryCache() memoryCache {
 	return memoryCache{entries: collections.NewShardedMapWithExtra[blobstore.KeyHash, memoryEntry](
 		4, memoryQueue{},
@@ -49,12 +52,13 @@ func newMemoryCache() memoryCache {
 
 // lookup pins the resident buffer before releasing the shard lock, so neither
 // replacement nor reclamation can release it between lookup and acquisition.
-func (m *memoryCache) lookup(key blobstore.KeyHash) (*alloc.Buffer, blobstore.RecordHeader, bool) {
+// The zero Memory means the record is disk-only.
+func (m *memoryCache) lookup(key blobstore.KeyHash) (blobstore.Memory, blobstore.RecordHeader, bool) {
 	s := m.entries.Shard(key)
 	s.RLock()
 	defer s.RUnlock()
 	e, ok := s.Items[key]
-	var buffer *alloc.Buffer
+	var buffer blobstore.Memory
 	if e.resident != 0 {
 		resident := s.Extra.list.Value(e.resident)
 		buffer = resident.buffer
@@ -65,15 +69,16 @@ func (m *memoryCache) lookup(key blobstore.KeyHash) (*alloc.Buffer, blobstore.Re
 }
 
 // replace takes ownership of buffer and updates disk metadata even if buffer
-// is nil. Replacing or demoting a resident record returns its slot for reuse.
-func (m *memoryCache) replace(key blobstore.KeyHash, buffer *alloc.Buffer, header blobstore.RecordHeader) {
+// is the zero Memory. Replacing or demoting a resident record returns its slot
+// for reuse.
+func (m *memoryCache) replace(key blobstore.KeyHash, buffer blobstore.Memory, header blobstore.RecordHeader, pending bool) {
 	s := m.entries.Shard(key)
 	s.Lock()
 	defer s.Unlock()
 	q := &s.Extra
 	old := s.Items[key]
 	if old.header.ObjectID > header.ObjectID {
-		if buffer != nil {
+		if isResident(buffer) {
 			buffer.Unpin()
 		}
 		return // An older write completed after its replacement.
@@ -83,11 +88,30 @@ func (m *memoryCache) replace(key blobstore.KeyHash, buffer *alloc.Buffer, heade
 		oldBuffer.Unpin()
 	}
 	e := memoryEntry{header: header}
-	if buffer != nil {
-		e.resident = q.list.PushBack(residentEntry{key: key, buffer: buffer})
-		q.residentBytes += buffer.Cap()
+	if isResident(buffer) {
+		e.resident = q.list.PushBack(residentEntry{key: key, buffer: buffer, pending: pending})
+		q.residentBytes += buffer.Size()
 	}
 	s.Items[key] = e
+}
+
+// complete makes an inline record evictable after disk completion. A failed
+// disk write leaves its memory readable until normal eviction.
+func (m *memoryCache) complete(h blobstore.RecordHeader, err error) {
+	s := m.entries.Shard(h.KeyHash())
+	s.Lock()
+	defer s.Unlock()
+	e, ok := s.Items[h.KeyHash()]
+	if !ok || e.header.ObjectID != h.ObjectID {
+		return
+	}
+	if e.resident != 0 {
+		s.Extra.list.Value(e.resident).pending = false
+	}
+	if err != nil {
+		e.header.Flags |= blobstore.FlagDeleted
+		s.Items[h.KeyHash()] = e
+	}
 }
 
 // retire forgets this disk record without removing a newer mapping for its key.
@@ -109,12 +133,12 @@ func (m *memoryCache) retire(key blobstore.KeyHash, objectID uint64) {
 }
 
 // remove transfers the queue's buffer reference and its byte count to the caller.
-func (q *memoryQueue) remove(handle collections.Handle) (*alloc.Buffer, int64) {
+func (q *memoryQueue) remove(handle collections.Handle) (blobstore.Memory, int64) {
 	if q.hand == handle {
 		q.hand, _ = q.list.Next(handle)
 	}
 	buffer := q.list.Value(handle).buffer
-	size := buffer.Cap()
+	size := buffer.Size()
 	q.list.Remove(handle)
 	q.residentBytes -= size
 	return buffer, size
@@ -123,7 +147,8 @@ func (q *memoryQueue) remove(handle collections.Handle) (*alloc.Buffer, int64) {
 // reclaimCacheMemory distributes a byte target in proportion to each shard's
 // resident bytes, using SIEVE within each shard. Only final-reference releases
 // count; pinned victims are demoted too but contribute no reusable space.
-// Whole buffers can overshoot each shard's share. Disk metadata stays indexed.
+// Pending disk writes are skipped. Whole buffers can overshoot each shard's
+// share. Disk metadata stays indexed.
 //
 // Unmet shares are redistributed among remaining residents. At most ShardCount
 // passes run, each visiting at most twice each shard's initial resident count,
@@ -171,6 +196,9 @@ func reclaimShardMemory(s *collections.MapShard[blobstore.KeyHash, memoryEntry, 
 		handle := q.hand
 		e := q.list.Value(handle)
 		q.hand, _ = q.list.Next(handle)
+		if e.pending {
+			continue
+		}
 		if e.visited != 0 {
 			e.visited = 0
 			continue
@@ -182,10 +210,8 @@ func reclaimShardMemory(s *collections.MapShard[blobstore.KeyHash, memoryEntry, 
 			entry.resident = 0
 			s.Items[e.key] = entry
 		}
-		buffer, size := q.remove(handle)
-		if buffer.Unpin() {
-			released += size
-		}
+		buffer, _ := q.remove(handle)
+		released += buffer.Release()
 	}
 	return released
 }
@@ -200,5 +226,27 @@ func (m *memoryCache) clear() {
 		clear(s.Items)
 		s.Extra = memoryQueue{}
 		s.Unlock()
+	}
+}
+
+// startCacheReclaim never blocks; a queued request covers this one.
+func (c *Cache) startCacheReclaim(size int64) {
+	select {
+	case c.reclaimRequests <- size:
+	default:
+	}
+}
+
+func (c *Cache) reclaimLoop() {
+	for size := range c.reclaimRequests {
+		capacity := c.memory.Capacity()
+		available := c.memory.Available()
+		if size == 0 && available >= capacity/5 {
+			continue
+		}
+		target := min(capacity, max(capacity/4, size))
+		if needed := target - available; needed > 0 {
+			c.values.reclaimCacheMemory(needed)
+		}
 	}
 }

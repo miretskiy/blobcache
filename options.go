@@ -51,8 +51,9 @@ func WithRingDepth(n uint32) Option { return storeOpt(blobstore.WithRingDepth(n)
 func WithIOBudget(goal time.Duration) Option { return storeOpt(blobstore.WithIOBudget(goal)) }
 
 // WithMemory sets the memory limit for cached values and I/O buffers, excluding
-// metadata. bytes must be a page multiple of at least 128 KiB. Default: 1 GiB.
-// opts configure the memory allocator.
+// metadata. bytes must be at least 4 MiB; the allocator uses whole 128 KiB
+// spans of it. Default: 1 GiB. opts configure the memory allocator
+// (alloc.Allocator).
 func WithMemory(bytes int64, opts ...alloc.Option) Option {
 	return funcOpt(func(c *config) { c.memory, c.allocator = bytes, opts })
 }
@@ -61,66 +62,37 @@ func WithMemory(bytes int64, opts ...alloc.Option) Option {
 // records first. Default: 1 GiB, rounded up to a page with a 64 KiB minimum.
 func WithTargetSize(bytes int64) Option { return storeOpt(blobstore.WithTargetSize(bytes)) }
 
-// WithDurableIndex controls whether Put waits for index writes to be synced to
-// disk. Default: true.
-func WithDurableIndex(enabled bool) Option { return storeOpt(blobstore.WithDurableIndex(enabled)) }
-
 // WithVerifyChecksums enables verification of stored checksums on disk reads
 // and index recovery. Default: false.
 func WithVerifyChecksums(enabled bool) Option {
 	return storeOpt(blobstore.WithVerifyChecksums(enabled))
 }
 
-// WithInlineThreshold sets the largest known value stored in data.db and
-// retained in memory. Default: 1 MiB. Unknown sizes always use object files.
+// WithInlineThreshold sets the largest value stored in data.db and
+// retained in memory. Default: 1 MiB.
 func WithInlineThreshold(bytes int64) Option { return storeOpt(blobstore.WithInlineThreshold(bytes)) }
 
-// WithStagingSize sets the buffer size for disk reads and streaming writes.
+// WithStagingSize sets the disk-read buffer size and minimum writer capacity.
+// Writers also reserve enough capacity for one inline value and its framing.
 // Default: 256 KiB, reduced when needed to fit WithMemory. Must be positive.
 func WithStagingSize(bytes int64) Option { return storeOpt(blobstore.WithStagingSize(bytes)) }
 
-// WithRejectWriteQueueDepth closes write admission when coordinators observe this
-// many outstanding write operations across all schedulers. Counts last through
-// ticket completion, including sync. Staged requests may overshoot the threshold.
-// Zero disables it. Rejected submissions return ErrRejected.
-// Required index wipes bypass rejection; the POSIX fallback ignores this option.
-func WithRejectWriteQueueDepth(n int64) Option {
-	return storeOpt(blobstore.WithRejectWriteQueueDepth(n))
+// WithWriteBacklogLimit rejects writes with ErrRejected while the modeled
+// device time of admitted, unfinished writes across all schedulers is at least
+// limit. Zero, the default, disables it. The POSIX fallback ignores it.
+func WithWriteBacklogLimit(limit time.Duration) Option {
+	return storeOpt(blobstore.WithWriteBacklogLimit(limit))
 }
 
-// WithRejectWriteBacklog closes write admission when coordinators observe this
-// many outstanding write buffer bytes across all schedulers. Counts last through
-// ticket completion, including sync. Staged requests may overshoot the threshold.
-// Zero disables it. Rejected submissions return ErrRejected.
-// Required index wipes bypass rejection; the POSIX fallback ignores this option.
-func WithRejectWriteBacklog(bytes int64) Option {
-	return storeOpt(blobstore.WithRejectWriteBacklog(bytes))
+// WithWriteBacklogRecovery keeps writes rejected, once the backlog limit is
+// reached, until the backlog is modeled to drain to target, which must be below
+// the limit. Negative, the default, reopens admission as soon as the backlog
+// falls below the limit.
+func WithWriteBacklogRecovery(target time.Duration) Option {
+	return storeOpt(blobstore.WithWriteBacklogRecovery(target))
 }
 
-// WithWriteBacklogLowWatermark enables a timed pause at the write backlog
-// threshold. The coordinator closes admission for the estimated drain duration;
-// submissions return ErrRejected during the pause. Reads and required index wipes
-// continue. Set below WithRejectWriteBacklog; zero targets a full drain.
-// Default: -1 (disabled). The write time budget remains independent.
-// The POSIX fallback ignores this option.
-func WithWriteBacklogLowWatermark(bytes int64) Option {
-	return storeOpt(blobstore.WithWriteBacklogLowWatermark(bytes))
-}
-
-// WithRejectReadQueueDepth closes read admission when coordinators observe this
-// many outstanding read operations across all schedulers. Counts last through
-// ticket completion, including sync. Staged requests may overshoot the threshold.
-// Zero disables it. Rejected submissions return ErrRejected.
-// Required index wipes bypass rejection; the POSIX fallback ignores this option.
-func WithRejectReadQueueDepth(n int64) Option {
-	return storeOpt(blobstore.WithRejectReadQueueDepth(n))
-}
-
-// WithRejectReadBacklog closes read admission when coordinators observe this
-// many outstanding read buffer bytes across all schedulers. Counts last through
-// ticket completion, including sync. Staged requests may overshoot the threshold.
-// Zero disables it. Rejected submissions return ErrRejected.
-// Required index wipes bypass rejection; the POSIX fallback ignores this option.
-func WithRejectReadBacklog(bytes int64) Option {
-	return storeOpt(blobstore.WithRejectReadBacklog(bytes))
+// WithReadBacklogLimit is the read counterpart of WithWriteBacklogLimit.
+func WithReadBacklogLimit(limit time.Duration) Option {
+	return storeOpt(blobstore.WithReadBacklogLimit(limit))
 }

@@ -10,20 +10,17 @@ import (
 	"github.com/HdrHistogram/hdrhistogram-go"
 )
 
-// PutDuration covers Cache.Put, including I/O, cache publication, and errors.
+// PutDuration covers Cache.Put: inline submission or external I/O completion,
+// cache publication, and errors.
 // All durations are in nanoseconds.
 var PutDuration = newHistogram()
 
-// I/O durations are recorded when blobcache consumes an issued ticket. Slat
-// covers Submit entry to ring placement; Clat covers placement to completion,
-// including any Durable sync. Reads cover disk refills; writes cover staging
-// flushes and the final data/index chain. Streaming requests can produce several
-// samples; memory hits produce none. These exclude caller wakeup delay.
+// Read I/O durations come from completed refill tickets. Slat covers Submit
+// through ring placement; Clat covers placement through completion. Memory hits
+// produce no samples. These exclude caller wakeup delay.
 var (
-	ReadSlat  = newHistogram()
-	ReadClat  = newHistogram()
-	WriteSlat = newHistogram()
-	WriteClat = newHistogram()
+	ReadSlat = newHistogram()
+	ReadClat = newHistogram()
 )
 
 // ReadRetries counts disk refills resubmitted after an EAGAIN completion.
@@ -37,8 +34,6 @@ var (
 	ResidentReaders   atomic.Int64
 	DiskReadBytes     atomic.Int64
 	DiskReaders       atomic.Int64
-	WriterBytes       atomic.Int64
-	ActiveWriters     atomic.Int64
 )
 
 // Error counters count failed attempts, including attempts retried by callers.
@@ -77,7 +72,7 @@ func (h *Histogram) Snapshot() *hdrhistogram.Histogram {
 // gauges. Call once between workloads, after their workers have finished; the
 // reset is not an atomic boundary across all measurements during concurrent use.
 func Reset() {
-	for _, h := range []*Histogram{PutDuration, ReadSlat, ReadClat, WriteSlat, WriteClat} {
+	for _, h := range []*Histogram{PutDuration, ReadSlat, ReadClat} {
 		h.mu.Lock()
 		h.values.Reset()
 		h.mu.Unlock()

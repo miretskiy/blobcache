@@ -2,9 +2,11 @@ package blobstore
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/miretskiy/blobcache/metrics"
 	"github.com/miretskiy/dio/v2/iosched"
@@ -22,8 +24,8 @@ func (s *readFaultScheduler) Submit(op iosched.Op) (iosched.Ticket, error) {
 }
 
 // An incompatible file lease makes a nonblocking open complete with EAGAIN.
-// Substitute that operation for a refill's read, keeping an external refill's
-// open and hard-linked close so their descriptor effects remain real.
+// Substitute that operation for a refill's read, keeping an external reader's
+// first-refill open so its descriptor, held until Close, remains real.
 func TestReaderRetriesEAGAIN(t *testing.T) {
 	if !iosched.IOUringAvailable {
 		t.Skip("io_uring unavailable")
@@ -72,18 +74,17 @@ func TestReaderRetriesEAGAIN(t *testing.T) {
 					return base.Submit(op)
 				}
 				fault := iosched.OpenatOp(unix.AT_FDCWD, leased.Name(), os.O_RDONLY|unix.O_NONBLOCK, 0)
-				if tc.external {
-					fault = st.openObject(h.ObjectID, os.O_RDONLY).Link(
-						fault.HardLink(iosched.VCloseOp(iosched.AllocateVFD)))
+				opens := tc.external && calls == 1 // Only the first refill opens the object.
+				if opens {
+					fault = st.openObject(h.ObjectID, os.O_RDONLY).Link(fault)
 				}
 				ticket, err := base.Submit(fault)
 				require.NoError(t, err)
 				_, err = ticket.Wait()
 				require.ErrorIs(t, err, unix.EAGAIN)
-				if tc.external {
+				if opens {
 					results := ticket.AllResults()
 					require.NoError(t, results[0].Err)
-					require.NoError(t, results[2].Err, "the hard-linked close runs after the failed read")
 					opened = append(opened, uint32(results[0].N))
 				}
 				return ticket, nil
@@ -102,10 +103,13 @@ func TestReaderRetriesEAGAIN(t *testing.T) {
 				require.NoError(t, reader.Close())
 			}
 			for _, vfd := range opened {
-				ticket, err := base.Submit(iosched.VReadOp(vfd, make([]byte, 1), 0))
-				require.NoError(t, err)
-				_, err = ticket.Wait()
-				require.ErrorIs(t, err, unix.EBADF, "retry must not leak an opened slot")
+				// The reader's descriptor closes asynchronously.
+				require.Eventually(t, func() bool {
+					ticket, err := base.Submit(iosched.VReadOp(vfd, make([]byte, 1), 0))
+					require.NoError(t, err)
+					_, err = ticket.Wait()
+					return errors.Is(err, unix.EBADF)
+				}, time.Second, time.Millisecond, "Close must release the reader's descriptor")
 			}
 		})
 	}

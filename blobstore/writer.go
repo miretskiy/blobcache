@@ -5,341 +5,319 @@ import (
 	"hash/crc32"
 	"io"
 	"os"
+	"slices"
 
-	"github.com/miretskiy/blobcache/metrics"
 	"github.com/miretskiy/dio/v2/align"
 	"github.com/miretskiy/dio/v2/alloc"
 	"github.com/miretskiy/dio/v2/collections"
 	"github.com/miretskiy/dio/v2/iosched"
 )
 
-// SizeUnknown selects a dedicated object file with no promised value size.
-const SizeUnknown int64 = -1
-
-var ErrWriterFull = errors.New("blobstore: value exceeds writer reservation")
-
-// Writer owns the allocation until Discard. Obtain it from Store.NewWriter;
-// its zero value is not usable. Inline values retain all bytes;
-// external values reuse staging space after waiting for its writes. The first
-// page stays intact so finish can replace its header without rereading it.
-// Calls are sequential. Write, ReadFrom, and Flush require an open, unpublished
-// writer. Put may be called once; afterward only metadata access, RetainBuffer,
-// Close, and Discard are allowed. The reservation remains protected until Close.
+// Writer buffers writes in fixed allocator memory and flushes to its sink.
+// Close discards buffered bytes; Store.Put flushes and publishes the value.
+// Calls must be sequential.
 type Writer struct {
-	store       *Store
-	key         KeyHash
-	file        *os.File
-	vfd         int // -1 for inline records or an unopened/closed external descriptor
-	header      RecordHeader
-	reservation collections.Handle // protected until Close
-	committed   bool               // Close releases a committed record or discards an unfinished one
-	scheduler   iosched.Scheduler
-	memory      *alloc.Buffer // owns the allocation referenced by buffer
-	buffer      *Buffer
-	limit       int64 // maximum value size, or SizeUnknown; actual size is header.PhysicalLen
-	checksum    uint32
-	err         error
+	err error
+	buf *alloc.Buffer
+	wr  interface {
+		io.WriteCloser
+		Flush() error
+	}
 }
 
-// NewWriter reserves memory, a data location, and an index slot. The key is
-// copied before return. size is the expected value size, or SizeUnknown.
-// Inline writes are bounded by their reservation. Keys must fit MaxKeyLen.
-// Allocation exhaustion is returned to the caller. ErrBusy means reuse would
-// overlap an open writer. Reusing index slots waits if their wipe is in flight.
-// External files open with the first write; descriptor exhaustion returns ErrNoDescriptors.
-// The caller must Discard the writer when finished, including after Put.
-func (st *Store) NewWriter(key []byte, size int64) (*Writer, error) {
+func (b *Writer) Write(p []byte) (nn int, err error) {
+	for len(p) != 0 && b.err == nil {
+		available := b.buf.Cap() - b.buf.Len()
+		if available == 0 {
+			b.flush()
+			continue
+		}
+		n, err := b.buf.Write(p[:min(len(p), available)])
+		b.err = err
+		nn += n
+		p = p[n:]
+	}
+	return nn, b.err
+}
+
+func (b *Writer) ReadFrom(r io.Reader) (n int64, err error) {
+	if b.err != nil {
+		return 0, b.err
+	}
+	n, b.err = io.Copy(struct{ io.Writer }{b}, r)
+	return n, b.err
+}
+
+// flush is called on a full buffer, or once at Put before closing the writer.
+// This keeps intermediate direct-I/O writes page-aligned.
+func (b *Writer) flush() error {
+	if b.err != nil {
+		return b.err
+	}
+	_, err := b.buf.WriteTo(b.wr)
+	// Drain even after a submission fails, before reusing or releasing memory.
+	b.err = errors.Join(err, b.wr.Flush())
+	return b.err
+}
+
+func (b *Writer) Close() error {
+	if b.buf == nil {
+		return nil
+	}
+	err := b.wr.Close()
+	b.buf.Release()
+	b.buf = nil
+	b.err = io.ErrClosedPipe
+	return err
+}
+
+// bufferSink owns record placement and I/O. Write borrows its input until
+// Flush completes; Writer drains the sink before reusing its buffer.
+type bufferSink struct {
+	store       *Store
+	scheduler   iosched.Scheduler
+	header      RecordHeader
+	reservation collections.Handle
+	offset      int64
+	checksum    uint32
+	vfd         int
+	pending     []iosched.Ticket
+}
+
+func (st *Store) NewWriter(key []byte) (*Writer, error) {
 	if len(key) == 0 {
 		return nil, ErrEmptyKey
 	}
 	if len(key) > MaxKeyLen {
 		return nil, ErrKeyTooLarge
 	}
-	if size < SizeUnknown {
-		return nil, errors.New("blobstore: invalid value size")
+	// The fixed buffer holds any inline value, including its framing.
+	size := align.PageAlign(max(st.cfg.stagingSize, RecordHeaderSize+int64(len(key))+st.cfg.inlineThreshold))
+	b := alloc.NewAllocatingBuffer(st.memory)
+	if err := b.Grow(int(size)); err != nil {
+		b.Release()
+		return nil, err
 	}
-	allocator := st.memory
-	var bufferSize int64
-	var storeFile *os.File
-	external := size == SizeUnknown || size > st.cfg.inlineThreshold
+	b.Write(make([]byte, RecordHeaderSize))
+	b.Write(key)
+	return &Writer{buf: b, wr: &bufferSink{
+		store: st, scheduler: st.writeScheduler(), vfd: -1,
+		// Until Put supplies final metadata, a flush starts a streamed record.
+		header: RecordHeader{Flags: st.cfg.flags | FlagKeyHashXXH3 | FlagFooter, KeyLen: uint16(len(key)), Hash: HashKey(key)},
+	}}, nil
+}
 
-	if external {
-		allocator = st.staging
-		bufferSize = align.BlockSize + align.PageAlign(st.cfg.stagingSize)
-		size = SizeUnknown
-	} else {
-		bufferSize = align.PageAlign(RecordHeaderSize + int64(len(key)) + size)
-		storeFile = st.data
+// Put consumes w. publish receives ownership of inline memory before disk
+// submission, or nil memory after an external value has been written. complete
+// follows publish exactly once, including submission failures, and reports disk
+// persistence separately. Both callbacks must be brief; complete may run on the
+// scheduler. Inline Put returns after submission; external writes remain paced.
+func (st *Store) Put(w *Writer, publish func(RecordHeader, Memory), complete func(RecordHeader, error)) (err error) {
+	if w.buf == nil {
+		return io.ErrClosedPipe
 	}
-
-	memory, err := allocator.TryAcquire(bufferSize)
+	defer func() { err = errors.Join(err, w.Close()) }()
+	if w.err != nil {
+		return w.err
+	}
+	s := w.wr.(*bufferSink)
+	h := s.header
+	h.PhysicalLen = uint64(s.offset + int64(w.buf.Len()) - RecordHeaderSize - int64(h.KeyLen))
+	h.LogicalLen = h.PhysicalLen
+	if s.offset == 0 {
+		h.Flags &^= FlagFooter
+	}
+	if h.PhysicalLen > uint64(st.cfg.inlineThreshold) {
+		h.Flags |= FlagExternal
+	}
+	s.header = h
+	if h.Flags&FlagFooter == 0 && h.Flags.DataIntegrity() == DataIntegrityCRC32C {
+		// An unflushed record can carry its complete checksum in the header.
+		remaining := w.buf.Len()
+		for i, m := range w.buf.RawAllocations() {
+			p := m.Bytes()[:min(len(m.Bytes()), remaining)]
+			remaining -= len(p)
+			if i == 0 {
+				p = p[RecordHeaderSize:]
+			}
+			s.checksum = crc32.Update(s.checksum, crcTable, p)
+			if remaining == 0 {
+				break
+			}
+		}
+	}
+	if !h.Flags.IsExternal() {
+		w.buf.Trim()
+		if err := s.reserve(w.buf.RawAllocations()[0].Bytes()); err != nil {
+			return err
+		}
+		h = s.header
+		memory := Memory(slices.Clone(w.buf.RawAllocations()))
+		memory.TryInc() // Transferred to publish.
+		memory.TryInc() // Held by the completion until disk I/O is finished.
+		publish(h, memory)
+		chunks := slices.Collect(memory.Chunks())
+		last := chunks[len(chunks)-1]
+		clear(last[len(last)-(w.buf.Cap()-w.buf.Len()):])
+		size := w.buf.Cap()
+		reservation := s.reservation
+		s.reservation = 0 // The completion now owns the reservation.
+		finish := func(n int, writeErr error) {
+			if writeErr == nil && n != size {
+				writeErr = io.ErrShortWrite
+			}
+			st.mu.Lock()
+			if writeErr == nil {
+				st.mu.index.publish(reservation, h)
+			} else {
+				st.mu.index.remove(reservation)
+			}
+			st.mu.Unlock()
+			memory.Release()
+			complete(h, writeErr)
+		}
+		_, err := iosched.SubmitNotify(s.scheduler, iosched.WritevOp(st.data, chunks, h.fileOffset()), finish)
+		if err != nil {
+			finish(0, err)
+		}
+		return nil // The inline value was accepted in memory.
+	}
+	err = w.flush()
+	h = s.header
 	if err != nil {
-		return nil, err
+		return err
 	}
-
-	w := &Writer{
-		store: st,
-		key:   HashKey(key),
-		file:  storeFile,
-		vfd:   -1,
-		header: RecordHeader{
-			Flags: st.cfg.flags | FlagKeyHashXXH3,
-		},
-		scheduler: st.writeScheduler(),
-		memory:    memory,
-		buffer:    NewBuffer(memory.Chunks()),
-		limit:     size,
-	}
-	metrics.WriterBytes.Add(memory.Cap())
-	metrics.ActiveWriters.Add(1)
-	// Reserve space for the header that finish writes before publication.
-	w.buffer.wPos = bufferPosition{offset: RecordHeaderSize, pos: RecordHeaderSize}
-	if external {
-		w.header.Flags |= FlagExternal
-	}
-	var inlineSize uint64
-	if !external {
-		inlineSize = uint64(bufferSize)
-	}
-	w.reservation, err = st.reserve(&w.header, inlineSize)
-	if err != nil {
-		w.Discard()
-		return nil, err
-	}
-
-	if err := w.writeKey(key); err != nil {
-		w.Discard()
-		return nil, err
-	}
-	return w, nil
-}
-
-func (w *Writer) Size() int64 { return int64(w.header.PhysicalLen) }
-
-// KeyHash identifies the key copied by NewWriter.
-func (w *Writer) KeyHash() KeyHash { return w.key }
-
-// IsExternal reports whether the value is stored in a dedicated object file.
-func (w *Writer) IsExternal() bool { return w.header.Flags.IsExternal() }
-
-// Header returns the record's index metadata. The payload size is final after Put.
-func (w *Writer) Header() RecordHeader {
-	h := w.header
-	h.Hash = w.key
-	return h
-}
-
-// RetainBuffer pins the complete inline record, including header and key.
-// The caller owns the reference and must Unpin it. External records return nil.
-// Call after successful Put and before closing the writer.
-func (w *Writer) RetainBuffer() *alloc.Buffer {
-	if w.IsExternal() {
-		return nil
-	}
-	w.memory.TryInc() // The writer still owns a reference; Close cannot race this call.
-	return w.memory
-}
-
-func (w *Writer) endOffset() int64 {
-	return w.header.fileOffset() + RecordHeaderSize + int64(w.header.KeyLen) + w.Size()
-}
-
-func (w *Writer) writeKey(key []byte) error {
-	for len(key) != 0 {
-		data, err := w.writable()
+	if h.Flags&FlagFooter != 0 {
+		// All body I/O has completed, so reuse the same allocation for the footer.
+		page := w.buf.RawAllocations()[0].Bytes()[:align.BlockSize]
+		clear(page)
+		footer := h
+		footer.Hash = uint64(s.checksum)
+		footer.Encode((*RawHeader)(page))
+		err = errors.Join(s.write(page, align.PageAlign(s.offset)), s.Flush())
 		if err != nil {
 			return err
 		}
-		n := copy(data, key)
-		key = key[n:]
-		w.header.KeyLen += uint16(n)
-		w.advance(n)
+	}
+	st.mu.Lock()
+	st.mu.index.publish(s.reservation, h)
+	st.mu.Unlock()
+	s.reservation = 0
+	publish(h, nil)
+	complete(h, nil)
+	return nil
+}
+
+func (s *bufferSink) Write(p []byte) (int, error) {
+	n := len(p)
+	padded := p[:align.PageAlign(int64(n))]
+	clear(padded[n:])
+	if err := s.write(padded, s.offset); err != nil {
+		return 0, err
+	}
+	if s.header.Flags&FlagFooter != 0 && s.header.Flags.DataIntegrity() == DataIntegrityCRC32C {
+		if s.offset == 0 {
+			p = p[RecordHeaderSize:]
+		}
+		s.checksum = crc32.Update(s.checksum, crcTable, p)
+	}
+	s.offset += int64(n)
+	return n, nil
+}
+
+func (s *bufferSink) write(p []byte, offset int64) error {
+	if len(s.pending) == 2 {
+		if err := s.Flush(); err != nil {
+			return err
+		}
+	}
+	// Reservation and an external open are both part of the first write.
+	first := s.reservation == 0
+	if first {
+		if err := s.reserve(p); err != nil {
+			return err
+		}
+	}
+	op := iosched.WriteOp(s.store.data, p, s.header.fileOffset()+offset)
+	opening := first && s.header.Flags.IsExternal()
+	if s.header.Flags.IsExternal() {
+		op = iosched.VWriteOp(uint32(s.vfd), p, offset)
+		if opening {
+			op = s.store.openObject(s.header.ObjectID, os.O_CREATE|os.O_TRUNC|os.O_RDWR).Link(
+				iosched.VWriteOp(iosched.AllocateVFD, p, offset))
+		}
+	}
+	ticket, err := s.scheduler.Submit(op)
+	if err != nil {
+		return err
+	}
+	if !opening {
+		s.pending = append(s.pending, ticket)
+		return nil
+	}
+	// Resolve the external descriptor before submitting independent writes.
+	_, err = ticket.Wait()
+	results := ticket.AllResults()
+	if results[0].Err == nil {
+		s.vfd = results[0].N
+	}
+	n := results[len(results)-1].N
+	if err != nil {
+		return openError(err)
+	}
+	if n != len(p) {
+		return io.ErrShortWrite
 	}
 	return nil
 }
 
-func (w *Writer) Write(p []byte) (written int, err error) {
-	if w.err != nil {
-		return 0, w.err
+// reserve assigns placement and encodes the first page before it is shared.
+func (s *bufferSink) reserve(p []byte) error {
+	var inlineSize uint64
+	if s.header.Flags&FlagFooter != 0 {
+		s.header.Flags |= FlagExternal
+	} else if !s.header.Flags.IsExternal() {
+		inlineSize = uint64(align.PageAlign(RecordHeaderSize + int64(s.header.KeyLen) + int64(s.header.PhysicalLen)))
 	}
-	for len(p) != 0 {
-		if w.limit != SizeUnknown && w.Size() == w.limit {
-			w.err = ErrWriterFull
-			return written, w.err
-		}
-		data, err := w.writable()
-		if err != nil {
-			return written, err
-		}
-		if w.limit != SizeUnknown {
-			data = data[:min(int64(len(data)), w.limit-w.Size())]
-		}
-		n := copy(data, p)
-		written += n
-		p = p[n:]
-		w.header.PhysicalLen += uint64(n)
-		w.advance(n)
+	var err error
+	s.reservation, err = s.store.reserve(&s.header, inlineSize)
+	if err != nil {
+		return err
 	}
-	return written, w.err
+	prefix := s.header
+	prefix.Hash = uint64(s.checksum)
+	prefix.Encode((*RawHeader)(p))
+	return nil
 }
 
-// ReadFrom reads directly into allocator memory until EOF, an error, or the
-// reserved size. Source errors remain on the writer for Put to report.
-func (w *Writer) ReadFrom(r io.Reader) (int64, error) {
-	if w.err != nil {
-		return 0, w.err
+func (s *bufferSink) Flush() (err error) {
+	for _, ticket := range s.pending {
+		_, writeErr := ticket.Wait()
+		err = errors.Join(err, openError(writeErr))
 	}
-	start := w.Size()
-	for w.limit == SizeUnknown || w.Size() < w.limit {
-		data, err := w.writable()
-		if err != nil {
-			return w.Size() - start, err
-		}
-		if w.limit != SizeUnknown {
-			data = data[:min(int64(len(data)), w.limit-w.Size())]
-		}
-		n, readErr := r.Read(data)
-		w.header.PhysicalLen += uint64(n)
-		w.advance(n)
-		if readErr == io.EOF {
-			return w.Size() - start, nil
-		}
-		if readErr != nil {
-			w.err = readErr
-			return w.Size() - start, w.err
-		}
-	}
-	return w.Size() - start, w.err
-}
-
-func (w *Writer) writable() ([]byte, error) {
-	if w.buffer.Available() == 0 {
-		// External writers reuse staging only after its previous contents reach disk.
-		if err := w.Flush(); err != nil {
-			return nil, err
-		}
-		w.buffer.resetAt(align.BlockSize)
-	}
-	return w.buffer.writable(), nil
-}
-
-func (w *Writer) advance(n int) {
-	if w.header.Flags.DataIntegrity() == DataIntegrityCRC32C {
-		w.checksum = crc32.Update(w.checksum, crcTable, w.buffer.writable()[:n])
-	}
-	w.buffer.wPos.advance(w.buffer.chunks, n)
-}
-
-func (w *Writer) writeOp(data [][]byte, offset int64) iosched.Op {
-	if w.IsExternal() {
-		return iosched.VWritevOp(uint32(w.vfd), data, offset)
-	}
-	return iosched.WritevOp(w.file, data, offset)
-}
-
-// Flush writes buffered bytes, padding the final page, and waits before staging
-// can be reused. The partial page remains available for further writes. No fsync.
-// Put writes the final header and waits for both data and index completion.
-func (w *Writer) Flush() error {
-	if w.err != nil || w.buffer.Len() == 0 {
-		return w.err
-	}
-	b := w.buffer
-	err := w.submit(w.writeOp(b.padded(b.rPos.pos), w.endOffset()-b.Len()), false)
-	b.rPos = b.position(b.wPos.pos &^ align.BlockMask)
+	clear(s.pending)
+	s.pending = s.pending[:0]
 	return err
 }
 
-// submit links the first I/O to its open and records descriptor ownership from
-// individual results. A final chain ends with close -> index write.
-func (w *Writer) submit(op iosched.Op, final bool) error {
-	opening := w.IsExternal() && w.vfd < 0
-	if opening {
-		op = w.store.openObject(w.header.ObjectID, os.O_CREATE|os.O_TRUNC|os.O_RDWR).Link(op)
-	}
-	ticket, err := w.scheduler.Submit(op)
-	if err != nil {
-		w.err = err
-		return err
-	}
-	_, err = ticket.Wait()
-	if ticket.Slat > 0 {
-		metrics.WriteSlat.RecordValue(int64(ticket.Slat))
-		metrics.WriteClat.RecordValue(int64(ticket.Clat))
-	}
-	if opening || (final && w.IsExternal()) {
-		results := ticket.AllResults()
-		if opening && results[0].Err == nil {
-			w.vfd = results[0].N
+func (s *bufferSink) Close() (err error) {
+	err = s.Flush()
+	if s.vfd >= 0 {
+		ticket, closeErr := s.scheduler.Submit(iosched.VCloseOp(uint32(s.vfd)))
+		if closeErr == nil {
+			_, closeErr = ticket.Wait()
 		}
-		if final && results[len(results)-2].Err == nil {
-			w.vfd = -1 // Close succeeded even if the following index write failed.
+		err = errors.Join(err, closeErr)
+		s.vfd = -1
+	}
+	if s.reservation != 0 {
+		s.store.mu.Lock()
+		s.store.mu.index.remove(s.reservation)
+		s.store.mu.Unlock()
+		s.reservation = 0
+		if s.header.Flags.IsExternal() {
+			s.store.unlinkObject(s.scheduler, s.header.ObjectID)
 		}
 	}
-	w.err = openError(err)
-	return w.err
-}
-
-// finish encodes the final header before submitting the last data batch. Earlier
-// staging batches, if any, completed before their memory was reused.
-func (w *Writer) finish() (iosched.Op, error) {
-	if w.err != nil {
-		return iosched.Op{}, w.err
-	}
-	h := &w.header
-	h.LogicalLen = h.PhysicalLen
-	if h.Flags.DataIntegrity() == DataIntegrityCRC32C {
-		h.Hash = uint64(w.checksum)
-	}
-	h.Encode((*RawHeader)(w.memory.Chunks()[0]))
-	b := w.buffer
-	if !h.Flags.IsExternal() || w.endOffset() == b.wPos.pos {
-		return w.writeOp(b.padded(0), h.fileOffset()), nil
-	}
-	// The first page was preserved while external staging cycled. Its final
-	// header and the remaining tail occupy different file offsets.
-	header := w.writeOp([][]byte{b.chunks[0][:align.BlockSize]}, 0)
-	if b.Len() == 0 {
-		return header, nil
-	}
-	return w.writeOp(b.padded(b.rPos.pos), w.endOffset()-b.Len()).Link(header), nil
-}
-
-// Discard releases the caller's ownership and reclaims excess indexed payload.
-// Put has already completed data and index I/O; cleanup may continue afterward.
-func (w *Writer) Discard() {
-	if w.memory == nil {
-		return
-	}
-	if w.reservation != 0 {
-		w.store.mu.Lock()
-		if w.committed {
-			w.store.mu.index.records.Value(w.reservation).pending = false
-		} else {
-			w.store.mu.index.remove(w.reservation)
-		}
-		w.store.mu.Unlock()
-		w.reservation = 0
-	}
-	if w.vfd >= 0 {
-		w.store.closeObject(w.scheduler, w.vfd, w.header.ObjectID, !w.committed)
-		w.vfd = -1
-	} else if w.IsExternal() && !w.committed {
-		// A final chain can close the file successfully before its index fails.
-		w.store.unlinkObject(w.header.ObjectID)
-	}
-	w.file = nil
-	allocated := w.memory.Cap()
-	w.memory.Unpin()
-	metrics.WriterBytes.Add(-allocated)
-	metrics.ActiveWriters.Add(-1)
-	w.memory = nil
-	w.buffer = nil
-	w.store.reclaimExcess()
-}
-
-// Close releases the writer. It is safe to defer immediately after NewWriter.
-func (w *Writer) Close() error {
-	w.Discard()
-	return w.err
+	return err
 }

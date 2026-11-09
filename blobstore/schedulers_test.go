@@ -31,16 +31,15 @@ func TestSchedulerConfiguration(t *testing.T) {
 	WithWriteSchedulers(2).apply(&cfg)
 	require.NoError(t, cfg.validate())
 	require.Equal(t, []int{2, 3, -1}, cfg.schedulerCPUs, "option owns the CPU list")
-	for _, opt := range []Option{WithIOBudget(-1), WithRejectWriteQueueDepth(-1),
-		WithRejectWriteBacklog(-1), WithRejectReadQueueDepth(-1), WithRejectReadBacklog(-1)} {
+	for _, opt := range []Option{WithIOBudget(-1), WithWriteBacklogLimit(-1),
+		WithWriteBacklogRecovery(-5), WithReadBacklogLimit(-1)} {
 		opt.apply(&cfg)
 	}
 	require.NoError(t, cfg.validate())
 	require.Zero(t, cfg.ioBudget)
-	require.Zero(t, cfg.rejectWriteDepth)
-	require.Zero(t, cfg.rejectWriteBytes)
-	require.Zero(t, cfg.rejectReadDepth)
-	require.Zero(t, cfg.rejectReadBytes)
+	require.Zero(t, cfg.writeBacklog)
+	require.Zero(t, cfg.readBacklog)
+	require.EqualValues(t, -1, cfg.writeBacklogRecovery)
 }
 
 func TestSchedulerWriteBudget(t *testing.T) {

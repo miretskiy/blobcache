@@ -10,34 +10,32 @@ import (
 )
 
 type config struct {
-	directIO                           bool
-	ringDepth                          uint32
-	ioBudget                           time.Duration
-	targetSize                         int64
-	indexDurable                       bool
-	inlineThreshold                    int64
-	stagingSize                        int64
-	flags                              RecordFlags
-	verifyChecksums                    bool
-	schedulerCPUs                      []int
-	writeSchedulers                    int
-	rejectWriteDepth, rejectWriteBytes int64
-	writeBacklogLowWatermark           int64
-	rejectReadDepth, rejectReadBytes   int64
+	directIO                  bool
+	ringDepth                 uint32
+	ioBudget                  time.Duration
+	targetSize                int64
+	inlineThreshold           int64
+	stagingSize               int64
+	flags                     RecordFlags
+	verifyChecksums           bool
+	schedulerCPUs             []int
+	writeSchedulers           int
+	writeBacklog, readBacklog time.Duration // admission limits; zero disables
+	writeBacklogRecovery      time.Duration // timed-pause target; negative disables
+	onRetire                  func(RecordHeader)
 }
 
 func defaultConfig() config {
 	return config{
-		directIO:                 true,
-		ringDepth:                256,
-		ioBudget:                 iosched.DefaultLatencyGoal,
-		writeBacklogLowWatermark: -1,
-		targetSize:               1 << 30,
-		indexDurable:             true,
-		inlineThreshold:          1 << 20,
-		stagingSize:              256 << 10,
-		flags:                    FlagHeaderIntegrity,
-		schedulerCPUs:            []int{-1},
+		directIO:             true,
+		ringDepth:            256,
+		ioBudget:             iosched.DefaultLatencyGoal,
+		writeBacklogRecovery: -1,
+		targetSize:           1 << 30,
+		inlineThreshold:      1 << 20,
+		stagingSize:          256 << 10,
+		flags:                FlagHeaderIntegrity,
+		schedulerCPUs:        []int{-1},
 	}
 }
 
@@ -60,6 +58,9 @@ func (c *config) validate() error {
 	if c.stagingSize <= 0 {
 		return errors.New("blobstore: invalid staging size")
 	}
+	if c.writeBacklog > 0 && c.writeBacklogRecovery >= c.writeBacklog {
+		return errors.New("blobstore: write backlog recovery target must be below the limit")
+	}
 	return nil
 }
 
@@ -74,19 +75,20 @@ func (f funcOpt) apply(c *config) { f(c) }
 // records first. Default: 1 GiB, rounded up to a page with a 64 KiB minimum.
 func WithTargetSize(bytes int64) Option { return funcOpt(func(c *config) { c.targetSize = bytes }) }
 
-// WithDurableIndex controls whether Put waits for index writes to be synced to
-// disk. Default: true.
-func WithDurableIndex(enabled bool) Option {
-	return funcOpt(func(c *config) { c.indexDurable = enabled })
+// WithRetireFunc has f called for each record that eviction removes from the
+// index, outside the store lock and possibly concurrently.
+func WithRetireFunc(f func(RecordHeader)) Option {
+	return funcOpt(func(c *config) { c.onRetire = f })
 }
 
 // WithInlineThreshold sets the largest value stored in data.db. Default: 1 MiB.
-// Unknown sizes always use object files. bytes must be nonnegative.
+// bytes must be nonnegative.
 func WithInlineThreshold(bytes int64) Option {
 	return funcOpt(func(c *config) { c.inlineThreshold = bytes })
 }
 
-// WithStagingSize sets the buffer size for disk reads and streaming writes.
+// WithStagingSize sets the disk-read buffer size and minimum writer capacity.
+// Writers also reserve enough capacity for one inline value and its framing.
 // Default: 256 KiB. bytes must be positive.
 func WithStagingSize(bytes int64) Option {
 	return funcOpt(func(c *config) { c.stagingSize = bytes })
@@ -116,8 +118,8 @@ func WithSchedulerCPUs(cpus ...int) Option {
 	return funcOpt(func(c *config) { c.schedulerCPUs = cpus })
 }
 
-// WithWriteSchedulers reserves the first n schedulers for writes, index wipes,
-// and object removal. Remaining schedulers serve only reads. Default: zero,
+// WithWriteSchedulers reserves the first n schedulers for writes and object
+// removal. Remaining schedulers serve only reads. Default: zero,
 // which shares all schedulers between reads and writes. n must be less than
 // the number of CPUs supplied to WithSchedulerCPUs. Selection is round-robin
 // within each pool; it does not depend on a key or its previous writer.
@@ -140,48 +142,22 @@ func TestingWithDirectIO(enable bool) Option {
 	return funcOpt(func(c *config) { c.directIO = enable })
 }
 
-// WithRejectWriteQueueDepth closes write admission when coordinators observe this
-// many outstanding write operations across all schedulers. Counts last through
-// ticket completion, including sync. Staged requests may overshoot the threshold.
-// Zero disables it. Rejected submissions return ErrRejected.
-// Required index wipes bypass rejection; the POSIX fallback ignores this option.
-func WithRejectWriteQueueDepth(n int64) Option {
-	return funcOpt(func(c *config) { c.rejectWriteDepth = max(0, n) })
+// WithWriteBacklogLimit rejects writes with ErrRejected while the modeled
+// device time of admitted, unfinished writes across all schedulers is at least
+// limit. Zero, the default, disables it. The POSIX fallback ignores it.
+func WithWriteBacklogLimit(limit time.Duration) Option {
+	return funcOpt(func(c *config) { c.writeBacklog = max(0, limit) })
 }
 
-// WithRejectWriteBacklog closes write admission when coordinators observe this
-// many outstanding write buffer bytes across all schedulers. Counts last through
-// ticket completion, including sync. Staged requests may overshoot the threshold.
-// Zero disables it. Rejected submissions return ErrRejected.
-// Required index wipes bypass rejection; the POSIX fallback ignores this option.
-func WithRejectWriteBacklog(bytes int64) Option {
-	return funcOpt(func(c *config) { c.rejectWriteBytes = max(0, bytes) })
+// WithWriteBacklogRecovery keeps writes rejected, once the backlog limit is
+// reached, until the backlog is modeled to drain to target, which must be below
+// the limit. Negative, the default, reopens admission as soon as the backlog
+// falls below the limit.
+func WithWriteBacklogRecovery(target time.Duration) Option {
+	return funcOpt(func(c *config) { c.writeBacklogRecovery = max(-1, target) })
 }
 
-// WithWriteBacklogLowWatermark enables a timed pause at the write backlog
-// threshold. The coordinator closes admission for the estimated drain duration;
-// submissions return ErrRejected during the pause. Reads and required index wipes
-// continue. Set below WithRejectWriteBacklog; zero targets a full drain.
-// Default: -1 (disabled). The write time budget remains independent.
-// The POSIX fallback ignores this option.
-func WithWriteBacklogLowWatermark(bytes int64) Option {
-	return funcOpt(func(c *config) { c.writeBacklogLowWatermark = max(-1, bytes) })
-}
-
-// WithRejectReadQueueDepth closes read admission when coordinators observe this
-// many outstanding read operations across all schedulers. Counts last through
-// ticket completion, including sync. Staged requests may overshoot the threshold.
-// Zero disables it. Rejected submissions return ErrRejected.
-// Required index wipes bypass rejection; the POSIX fallback ignores this option.
-func WithRejectReadQueueDepth(n int64) Option {
-	return funcOpt(func(c *config) { c.rejectReadDepth = max(0, n) })
-}
-
-// WithRejectReadBacklog closes read admission when coordinators observe this
-// many outstanding read buffer bytes across all schedulers. Counts last through
-// ticket completion, including sync. Staged requests may overshoot the threshold.
-// Zero disables it. Rejected submissions return ErrRejected.
-// Required index wipes bypass rejection; the POSIX fallback ignores this option.
-func WithRejectReadBacklog(bytes int64) Option {
-	return funcOpt(func(c *config) { c.rejectReadBytes = max(0, bytes) })
+// WithReadBacklogLimit is the read counterpart of WithWriteBacklogLimit.
+func WithReadBacklogLimit(limit time.Duration) Option {
+	return funcOpt(func(c *config) { c.readBacklog = max(0, limit) })
 }

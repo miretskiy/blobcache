@@ -5,6 +5,7 @@ import (
 
 	"github.com/miretskiy/blobcache/blobstore"
 	"github.com/miretskiy/dio/v2/alloc"
+	"github.com/miretskiy/dio/v2/iosched"
 )
 
 type config struct {
@@ -50,6 +51,13 @@ func WithRingDepth(n uint32) Option { return storeOpt(blobstore.WithRingDepth(n)
 // All rings share one device model and allowance; adding rings does not multiply it.
 func WithIOBudget(goal time.Duration) Option { return storeOpt(blobstore.WithIOBudget(goal)) }
 
+// WithDiskPolicy uses a caller-built policy for all of the cache's schedulers.
+// Construct it with iosched.NewDiskPolicy and retain it for CanAdmit and Stats.
+// A non-nil policy takes precedence over WithIOBudget and the backlog options.
+func WithDiskPolicy(policy *iosched.DiskPolicy) Option {
+	return storeOpt(blobstore.WithDiskPolicy(policy))
+}
+
 // WithMemory sets the memory limit for cached values and I/O buffers, excluding
 // metadata. bytes must be at least 4 MiB; the allocator uses whole 128 KiB
 // spans of it. Default: 1 GiB. opts configure the memory allocator
@@ -68,20 +76,26 @@ func WithVerifyChecksums(enabled bool) Option {
 	return storeOpt(blobstore.WithVerifyChecksums(enabled))
 }
 
+// WithBufferedReads enables the kernel page cache for disk reads. Default: false.
+// Writes continue to use direct I/O.
+func WithBufferedReads(enabled bool) Option { return storeOpt(blobstore.WithBufferedReads(enabled)) }
+
 // WithInlineThreshold sets the largest value stored in data.db and
 // retained in memory. Default: 1 MiB.
 func WithInlineThreshold(bytes int64) Option { return storeOpt(blobstore.WithInlineThreshold(bytes)) }
-
-// WithStagingSize sets the disk-read buffer size and minimum writer capacity.
-// Writers also reserve enough capacity for one inline value and its framing.
-// Default: 256 KiB, reduced when needed to fit WithMemory. Must be positive.
-func WithStagingSize(bytes int64) Option { return storeOpt(blobstore.WithStagingSize(bytes)) }
 
 // WithWriteBacklogLimit rejects writes with ErrRejected while the modeled
 // device time of admitted, unfinished writes across all schedulers is at least
 // limit. Zero, the default, disables it. The POSIX fallback ignores it.
 func WithWriteBacklogLimit(limit time.Duration) Option {
 	return storeOpt(blobstore.WithWriteBacklogLimit(limit))
+}
+
+// WithSmallWriteAdmission admits values up to bytes through a full write backlog.
+// Their I/O remains accounted and waits for the normal dispatch allowance.
+// Default: disabled. Admitted writes can queue beyond WithWriteBacklogLimit.
+func WithSmallWriteAdmission(bytes int64) Option {
+	return storeOpt(blobstore.WithSmallWriteAdmission(bytes))
 }
 
 // WithWriteBacklogRecovery keeps writes rejected, once the backlog limit is

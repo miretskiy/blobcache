@@ -38,12 +38,12 @@ func putReclaimObject(t *testing.T, st *Store, key string, value []byte) RecordH
 
 func putReclaimRecord(t *testing.T, st *Store, key string, value []byte) RecordHeader {
 	t.Helper()
-	w, err := st.NewWriter([]byte(key))
+	w, err := st.NewWriter()
 	require.NoError(t, err)
-	defer w.Close()
+	defer w.Discard()
 	_, err = w.Write(value)
 	require.NoError(t, err)
-	err = putStoreWriter(st, w)
+	err = putStoreWriter(st, []byte(key), w)
 	require.NoError(t, err)
 
 	return checkWriterRecord(t, st, w, []byte(key), value)
@@ -116,7 +116,7 @@ func TestInlineRotationRetiresOverlapWithoutBackgroundEviction(t *testing.T) {
 	var retired []uint64
 	st := openTestStore(t, dir, WithTargetSize(16*page), WithInlineThreshold(16*page), retireInto(&retired))
 	put := func(key string, pages int) RecordHeader {
-		return putReclaimRecord(t, st, key, bytes.Repeat([]byte(key), pages*page-RecordHeaderSize-len(key)))
+		return putReclaimRecord(t, st, key, bytes.Repeat([]byte(key), pages*page-page))
 	}
 	a, b, c, d := put("a", 4), put("b", 4), put("c", 4), put("d", 4)
 	require.Empty(t, retired)
@@ -124,22 +124,22 @@ func TestInlineRotationRetiresOverlapWithoutBackgroundEviction(t *testing.T) {
 	require.Zero(t, e.Offset)
 	require.Equal(t, []uint64{a.ObjectID, b.ObjectID}, retired)
 	require.Equal(t, []RecordHeader{c, d, e}, liveStoreHeaders(st))
-	readReclaimRecord(t, st, "c", c, bytes.Repeat([]byte("c"), 4*page-RecordHeaderSize-1))
+	readReclaimRecord(t, st, "c", c, bytes.Repeat([]byte("c"), 4*page-page))
 	f := put("f", 10)
 	require.EqualValues(t, 6*page, f.Offset)
 	require.Equal(t, []RecordHeader{e, f}, liveStoreHeaders(st))
 	g := put("g", 4)
 	require.Zero(t, g.Offset)
 	require.Equal(t, []RecordHeader{f, g}, liveStoreHeaders(st))
-	readReclaimRecord(t, st, "f", f, bytes.Repeat([]byte("f"), 10*page-RecordHeaderSize-1))
+	readReclaimRecord(t, st, "f", f, bytes.Repeat([]byte("f"), 10*page-page))
 	info, err := st.data.Stat()
 	require.NoError(t, err)
 	require.EqualValues(t, 16*page, info.Size())
 	require.NoError(t, st.Close())
 	st = openTestStore(t, dir, WithTargetSize(16*page), WithInlineThreshold(16*page))
 	require.Equal(t, []RecordHeader{f, g}, recoveredStoreHeaders(t, st))
-	readReclaimRecord(t, st, "f", f, bytes.Repeat([]byte("f"), 10*page-RecordHeaderSize-1))
-	readReclaimRecord(t, st, "g", g, bytes.Repeat([]byte("g"), 4*page-RecordHeaderSize-1))
+	readReclaimRecord(t, st, "f", f, bytes.Repeat([]byte("f"), 10*page-page))
+	readReclaimRecord(t, st, "g", g, bytes.Repeat([]byte("g"), 4*page-page))
 }
 
 func TestInlineEvictionLeavesDataAndPlacement(t *testing.T) {
@@ -164,7 +164,7 @@ func TestRotationEvictsExternalRecordsInCoveredPrefix(t *testing.T) {
 	const page = align.BlockSize
 	st := openTestStore(t, t.TempDir(), WithTargetSize(16*page), WithInlineThreshold(16*page))
 	put := func(key string, pages int) RecordHeader {
-		return putReclaimRecord(t, st, key, bytes.Repeat([]byte(key), pages*page-RecordHeaderSize-1))
+		return putReclaimRecord(t, st, key, bytes.Repeat([]byte(key), pages*page-page))
 	}
 	put("a", 12)
 	put("b", 4)
@@ -173,7 +173,7 @@ func TestRotationEvictsExternalRecordsInCoveredPrefix(t *testing.T) {
 	d := put("d", 10) // Wrap again; retire that tail before overwriting c.
 	require.Zero(t, d.Offset)
 	require.Equal(t, []RecordHeader{d}, liveStoreHeaders(st))
-	readReclaimRecord(t, st, "d", d, bytes.Repeat([]byte("d"), 10*page-RecordHeaderSize-1))
+	readReclaimRecord(t, st, "d", d, bytes.Repeat([]byte("d"), 10*page-page))
 }
 
 func TestInlineSweepRetiresInterleavedExternalRecords(t *testing.T) {
@@ -182,7 +182,7 @@ func TestInlineSweepRetiresInterleavedExternalRecords(t *testing.T) {
 	var retired []uint64
 	st := openTestStore(t, dir, WithTargetSize(16*page), retireInto(&retired))
 	put := func(key string, pages int) RecordHeader {
-		return putReclaimRecord(t, st, key, bytes.Repeat([]byte(key), pages*page-RecordHeaderSize-len(key)))
+		return putReclaimRecord(t, st, key, bytes.Repeat([]byte(key), pages*page-page))
 	}
 	a := put("a", 4)
 	x := putReclaimObject(t, st, "x", []byte("x"))
@@ -200,8 +200,8 @@ func TestInlineSweepRetiresInterleavedExternalRecords(t *testing.T) {
 	st = openTestStore(t, dir, WithTargetSize(16*page))
 	require.Equal(t, []RecordHeader{y, c, next}, recoveredStoreHeaders(t, st))
 	readReclaimRecord(t, st, "y", y, []byte("y"))
-	readReclaimRecord(t, st, "c", c, bytes.Repeat([]byte("c"), 8*page-RecordHeaderSize-1))
-	readReclaimRecord(t, st, "n", next, bytes.Repeat([]byte("n"), 6*page-RecordHeaderSize-1))
+	readReclaimRecord(t, st, "c", c, bytes.Repeat([]byte("c"), 8*page-page))
+	readReclaimRecord(t, st, "n", next, bytes.Repeat([]byte("n"), 6*page-page))
 }
 
 func TestInlineAppendKeepsExternalOnlyIndex(t *testing.T) {
@@ -221,7 +221,7 @@ func TestInlineSweepPastExternalFromOlderLap(t *testing.T) {
 	const page = align.BlockSize
 	st := openTestStore(t, t.TempDir(), WithTargetSize(16*page))
 	put := func(key string, pages int) RecordHeader {
-		return putReclaimRecord(t, st, key, bytes.Repeat([]byte(key), pages*page-RecordHeaderSize-len(key)))
+		return putReclaimRecord(t, st, key, bytes.Repeat([]byte(key), pages*page-page))
 	}
 	put("a", 5)
 	put("b", 7)
@@ -237,8 +237,8 @@ func TestInlineSweepPastExternalFromOlderLap(t *testing.T) {
 	e := put("e", 8) // Wraps again and must retire c even if x is still ahead of it.
 	require.Equal(t, []RecordHeader{d, e}, liveStoreHeaders(st))
 	require.Eventually(t, func() bool { return !fileExists(st.objectPath(x.ObjectID)) }, time.Second, time.Millisecond)
-	readReclaimRecord(t, st, "d", d, bytes.Repeat([]byte("d"), 3*page-RecordHeaderSize-1))
-	readReclaimRecord(t, st, "e", e, bytes.Repeat([]byte("e"), 8*page-RecordHeaderSize-1))
+	readReclaimRecord(t, st, "d", d, bytes.Repeat([]byte("d"), 3*page-page))
+	readReclaimRecord(t, st, "e", e, bytes.Repeat([]byte("e"), 8*page-page))
 }
 
 func TestStoreFailedUnlinkIsLogged(t *testing.T) {
@@ -267,12 +267,12 @@ func TestInlineThresholdIndependentOfTarget(t *testing.T) {
 
 func TestWriteStatsPreserveIngressAcrossReclamation(t *testing.T) {
 	st := openTestStore(t, t.TempDir())
-	pending, err := st.NewWriter([]byte("pending"))
+	pending, err := st.NewWriter()
 	require.NoError(t, err)
 	live, published := st.WriteStats()
 	require.Zero(t, live)
 	require.Zero(t, published)
-	pending.Close()
+	pending.Discard()
 	putReclaimRecord(t, st, "inline", bytes.Repeat([]byte("i"), 100))
 	putReclaimRecord(t, st, "object", bytes.Repeat([]byte("o"), 40000))
 	require.EqualValues(t, 100, reclaim(st, 1))

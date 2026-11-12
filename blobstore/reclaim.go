@@ -1,6 +1,7 @@
 package blobstore
 
 import (
+	"github.com/miretskiy/dio/v2/align"
 	"github.com/miretskiy/dio/v2/collections"
 )
 
@@ -46,6 +47,40 @@ func (st *Store) evictLocked(bytes, inlineSize uint64) []RecordHeader {
 		retired = append(retired, h)
 	}
 	return retired
+}
+
+// reserveRecord assigns the final frame identity during Seal.
+func (st *Store) reserveRecord(key []byte, size int64) (collections.Handle, RecordHeader, error) {
+	if len(key) == 0 {
+		return 0, RecordHeader{}, ErrEmptyKey
+	}
+	if len(key) > MaxKeyLen {
+		return 0, RecordHeader{}, ErrKeyTooLarge
+	}
+	if size < 0 {
+		return 0, RecordHeader{}, ErrCorrupt
+	}
+	h := RecordHeader{Flags: st.cfg.flags | FlagKeyHashXXH3, PhysicalLen: uint64(size),
+		LogicalLen: uint64(size), KeyLen: uint16(len(key)), Hash: HashKey(key)}
+	var inlineSize uint64
+	if size > st.cfg.inlineThreshold {
+		h.Flags |= FlagExternal
+	} else {
+		inlineSize = uint64(align.PageAlign(h.FrameLen()))
+	}
+	reservation, err := st.reserve(&h, inlineSize)
+	return reservation, h, err
+}
+
+// complete follows cache publication so eviction cannot retire an unregistered value.
+func (st *Store) complete(reservation collections.Handle, h RecordHeader, err error) {
+	st.mu.Lock()
+	if err == nil {
+		st.mu.index.publish(reservation, h)
+	} else {
+		st.mu.index.remove(reservation)
+	}
+	st.mu.Unlock()
 }
 
 // reserve assigns an index entry and inline placement together. A data overlap

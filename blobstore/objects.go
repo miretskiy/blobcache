@@ -18,29 +18,21 @@ func (st *Store) objectPath(id uint64) string {
 }
 
 func (st *Store) openObject(id uint64, flags int) iosched.Op {
+	ioFlags := st.fileFlags()
+	if flags&(os.O_WRONLY|os.O_RDWR) == 0 {
+		ioFlags = st.readFileFlags()
+	}
 	return iosched.VOpenatOp(unix.AT_FDCWD, st.objectPath(id),
-		flags|st.fileFlags().OpenFlags(), 0o644, iosched.AllocateVFD)
+		flags|ioFlags.OpenFlags(), 0o644, iosched.AllocateVFD)
 }
 
-// openError reports descriptor exhaustion from an AllocateVFD open as
+// openError reports descriptor exhaustion as
 // ErrNoDescriptors, keeping ENFILE in the chain.
 func openError(err error) error {
 	if errors.Is(err, unix.ENFILE) {
 		return fmt.Errorf("%w: %w", ErrNoDescriptors, err)
 	}
 	return err
-}
-
-func (st *Store) closeObject(scheduler iosched.Scheduler, vfd int, id uint64) {
-	logError := func(_ int, err error) {
-		if err != nil && !errors.Is(err, unix.EBADF) {
-			metrics.CloseErrors.Add(1)
-			slog.Error("close object", "object", id, "error", err)
-		}
-	}
-	if _, err := iosched.SubmitNotify(scheduler, iosched.VCloseOp(uint32(vfd)), logError); err != nil {
-		logError(0, err) // The descriptor remains open until shutdown.
-	}
 }
 
 // removeOrphans deletes object files the index does not reference: a crash

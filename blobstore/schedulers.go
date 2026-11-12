@@ -8,20 +8,19 @@ import (
 	"github.com/miretskiy/dio/v2/iosched"
 )
 
-func (c *config) schedulerWriteBudget(i int) time.Duration {
-	if c.writeSchedulers > 0 && i >= c.writeSchedulers {
-		return 0
-	}
-	return c.ioBudget
-}
+// Slot zero serves data.db writes; reads use its separate read-only descriptor.
+const dataReadVFD = 1
 
 func (st *Store) openSchedulers() error {
-	st.disk = iosched.NewDiskPolicy(iosched.WithLatencyGoal(st.cfg.ioBudget), iosched.WithoutReadIOBudget(),
-		iosched.WithWriteBacklogLimit(st.cfg.writeBacklog), iosched.WithWriteBacklogRecovery(st.cfg.writeBacklogRecovery),
-		iosched.WithReadBacklogLimit(st.cfg.readBacklog))
+	st.disk = st.cfg.disk
+	if st.disk == nil {
+		st.disk = iosched.NewDiskPolicy(iosched.WithLatencyGoal(st.cfg.ioBudget), iosched.WithoutReadIOBudget(),
+			iosched.WithWriteBacklogLimit(st.cfg.writeBacklog), iosched.WithWriteBacklogRecovery(st.cfg.writeBacklogRecovery),
+			iosched.WithReadBacklogLimit(st.cfg.readBacklog))
+	}
 	for i, cpu := range st.cfg.schedulerCPUs {
 		opts := []iosched.Option{iosched.WithDiskPolicy(st.disk),
-			iosched.WithRingDepth(st.cfg.ringDepth), iosched.WithVFiles(1024)}
+			iosched.WithRingDepth(st.cfg.ringDepth), iosched.WithVFiles(1024), iosched.WithFiles(st.data, st.readData)}
 		// Preserve the default's POSIX fallback. Explicit multi-ring or pinned
 		// configurations must not silently run on a synchronous backend.
 		if len(st.cfg.schedulerCPUs) == 1 && cpu == -1 {
@@ -73,11 +72,13 @@ func (st *Store) IOSchedulerStats() []SchedulerStats {
 	for i, scheduler := range st.schedulers {
 		s := &stats[i]
 		s.CPU, s.Role, s.Backend = st.cfg.schedulerCPUs[i], "shared", "posix"
-		s.WriteIOBudget = st.cfg.schedulerWriteBudget(i)
+		s.WriteIOBudget = st.disk.LatencyGoal(iosched.OpWrite)
 		if st.cfg.writeSchedulers > 0 {
 			s.Role = "read"
 			if i < st.cfg.writeSchedulers {
 				s.Role = "write"
+			} else {
+				s.WriteIOBudget = 0
 			}
 		}
 		if _, ok := scheduler.(*iosched.URingScheduler); ok {

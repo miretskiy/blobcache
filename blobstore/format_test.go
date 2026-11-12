@@ -8,7 +8,7 @@ import (
 
 func goldenRecordHeader() RecordHeader {
 	return RecordHeader{
-		Flags:       0xa48f, // version 10, LZ4, CRC32C, XXH3 key hash, header CRC, external, deleted
+		Flags:       0x048f, // LZ4, CRC32C, XXH3 key hash, header CRC, external, deleted
 		ObjectID:    0x0706050403020100,
 		Offset:      0x3837363534333231,
 		PhysicalLen: 0x0807060504030201,
@@ -21,8 +21,8 @@ func goldenRecordHeader() RecordHeader {
 func goldenRawHeader(t *testing.T) RawHeader {
 	t.Helper()
 	// Fixed wire fixture: little-endian fields, numeric object ID and 64-bit hash,
-	// zero reserved bytes, and CRC32C 0x0dff3ae5 over bytes [4:60).
-	const wire = "c6ca0bb18fa40000" +
+	// zero reserved bytes, and CRC32C 0xab9fe2c2 over bytes [4:60).
+	const wire = "c6ca0bb18f040000" +
 		"0001020304050607" +
 		"3132333435363738" +
 		"0102030405060708" +
@@ -30,7 +30,7 @@ func goldenRawHeader(t *testing.T) RawHeader {
 		"1f20" +
 		"2122232425262728" +
 		"00000000000000000000" +
-		"e53aff0d"
+		"c2e29fab"
 	b, err := hex.DecodeString(wire)
 	if err != nil {
 		t.Fatal(err)
@@ -64,8 +64,8 @@ func TestRecordHeaderWireFormat(t *testing.T) {
 }
 
 func TestRecordHeaderRoundTrip(t *testing.T) {
-	if MaxKeyLen != math.MaxUint16 {
-		t.Fatalf("MaxKeyLen = %d; want %d", MaxKeyLen, math.MaxUint16)
+	if MaxKeyLen != 4096-RecordHeaderSize {
+		t.Fatalf("header plus maximum key must fit in one 4 KiB page")
 	}
 	for _, tc := range []struct {
 		name   string
@@ -191,10 +191,9 @@ func TestRecordFlagsGetters(t *testing.T) {
 			flags.HasHeaderIntegrity() != (bits&2 != 0) ||
 			flags.IsExternal() != (bits&4 != 0) ||
 			flags.DataIntegrity() != DataIntegrity((bits>>7)&3) ||
-			flags.Compression() != CompressionCodec((bits>>9)&7) ||
-			flags.Version() != uint8(bits>>12) {
-			t.Fatalf("flags %04x: deleted=%t, header integrity=%t, data integrity=%d, compression=%d, version=%d",
-				bits, flags.IsDeleted(), flags.HasHeaderIntegrity(), flags.DataIntegrity(), flags.Compression(), flags.Version())
+			flags.Compression() != CompressionCodec((bits>>9)&7) {
+			t.Fatalf("flags %04x: deleted=%t, header integrity=%t, data integrity=%d, compression=%d",
+				bits, flags.IsDeleted(), flags.HasHeaderIntegrity(), flags.DataIntegrity(), flags.Compression())
 		}
 	}
 }
@@ -235,7 +234,6 @@ func TestRecordFlagsFieldSetters(t *testing.T) {
 	}{
 		{"data_integrity", 0x0180, 7, func(f *RecordFlags, v uint8) { f.SetDataIntegrity(DataIntegrity(v)) }},
 		{"compression", 0x0e00, 9, func(f *RecordFlags, v uint8) { f.SetCompression(CompressionCodec(v)) }},
-		{"version", 0xf000, 12, (*RecordFlags).SetVersion},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			for _, initial := range []RecordFlags{0, 0xffff, 0xaaaa, 0x5555} {

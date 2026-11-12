@@ -6,23 +6,28 @@ import (
 	"time"
 
 	"github.com/miretskiy/dio/v2/align"
+	"github.com/miretskiy/dio/v2/alloc"
 	"github.com/miretskiy/dio/v2/iosched"
 )
 
 type config struct {
-	directIO                  bool
-	ringDepth                 uint32
-	ioBudget                  time.Duration
-	targetSize                int64
-	inlineThreshold           int64
-	stagingSize               int64
+	disk            *iosched.DiskPolicy
+	directIO        bool
+	bufferedReads   bool
+	ringDepth       uint32
+	ioBudget        time.Duration
+	targetSize      int64
+	inlineThreshold int64
+
 	flags                     RecordFlags
 	verifyChecksums           bool
 	schedulerCPUs             []int
 	writeSchedulers           int
 	writeBacklog, readBacklog time.Duration // admission limits; zero disables
 	writeBacklogRecovery      time.Duration // timed-pause target; negative disables
+	smallWriteAdmission       int64         // payload bytes allowed through a full backlog; zero disables
 	onRetire                  func(RecordHeader)
+	onRead                    func(RecordHeader, *alloc.ReadOnlyBuffer)
 }
 
 func defaultConfig() config {
@@ -33,9 +38,9 @@ func defaultConfig() config {
 		writeBacklogRecovery: -1,
 		targetSize:           1 << 30,
 		inlineThreshold:      1 << 20,
-		stagingSize:          256 << 10,
-		flags:                FlagHeaderIntegrity,
-		schedulerCPUs:        []int{-1},
+
+		flags:         FlagHeaderIntegrity,
+		schedulerCPUs: []int{-1},
 	}
 }
 
@@ -55,10 +60,7 @@ func (c *config) validate() error {
 	if c.inlineThreshold < 0 {
 		return errors.New("blobstore: invalid inline threshold")
 	}
-	if c.stagingSize <= 0 {
-		return errors.New("blobstore: invalid staging size")
-	}
-	if c.writeBacklog > 0 && c.writeBacklogRecovery >= c.writeBacklog {
+	if c.disk == nil && c.writeBacklog > 0 && c.writeBacklogRecovery >= c.writeBacklog {
 		return errors.New("blobstore: write backlog recovery target must be below the limit")
 	}
 	return nil
@@ -81,17 +83,17 @@ func WithRetireFunc(f func(RecordHeader)) Option {
 	return funcOpt(func(c *config) { c.onRetire = f })
 }
 
+// WithReadFunc calls f on first access after a disk record has been read and
+// validated. The buffer is borrowed; f must Retain it to keep it beyond the
+// callback. Calls from different readers may run concurrently.
+func WithReadFunc(f func(RecordHeader, *alloc.ReadOnlyBuffer)) Option {
+	return funcOpt(func(c *config) { c.onRead = f })
+}
+
 // WithInlineThreshold sets the largest value stored in data.db. Default: 1 MiB.
 // bytes must be nonnegative.
 func WithInlineThreshold(bytes int64) Option {
 	return funcOpt(func(c *config) { c.inlineThreshold = bytes })
-}
-
-// WithStagingSize sets the disk-read buffer size and minimum writer capacity.
-// Writers also reserve enough capacity for one inline value and its framing.
-// Default: 256 KiB. bytes must be positive.
-func WithStagingSize(bytes int64) Option {
-	return funcOpt(func(c *config) { c.stagingSize = bytes })
 }
 
 // WithDataIntegrity selects None (the default) or CRC32C for checksums written
@@ -104,6 +106,12 @@ func WithDataIntegrity(integrity DataIntegrity) Option {
 // index recovery. Default: false.
 func WithVerifyChecksums(enabled bool) Option {
 	return funcOpt(func(c *config) { c.verifyChecksums = enabled })
+}
+
+// WithBufferedReads enables the kernel page cache for disk reads. Default: false.
+// Writes continue to use direct I/O.
+func WithBufferedReads(enabled bool) Option {
+	return funcOpt(func(c *config) { c.bufferedReads = enabled })
 }
 
 // WithSchedulerCPUs creates one scheduler per CPU, in the supplied order.
@@ -137,6 +145,13 @@ func WithRingDepth(n uint32) Option { return funcOpt(func(c *config) { c.ringDep
 // All rings share one device model and allowance; adding rings does not multiply it.
 func WithIOBudget(d time.Duration) Option { return funcOpt(func(c *config) { c.ioBudget = max(0, d) }) }
 
+// WithDiskPolicy shares a caller-built policy across the store's schedulers.
+// Construct it with iosched.NewDiskPolicy. A non-nil policy takes precedence over
+// WithIOBudget and the backlog options; nil builds a policy from those options.
+func WithDiskPolicy(policy *iosched.DiskPolicy) Option {
+	return funcOpt(func(c *config) { c.disk = policy })
+}
+
 // TestingWithDirectIO enables or disables direct I/O for tests. Default: true.
 func TestingWithDirectIO(enable bool) Option {
 	return funcOpt(func(c *config) { c.directIO = enable })
@@ -147,6 +162,13 @@ func TestingWithDirectIO(enable bool) Option {
 // limit. Zero, the default, disables it. The POSIX fallback ignores it.
 func WithWriteBacklogLimit(limit time.Duration) Option {
 	return funcOpt(func(c *config) { c.writeBacklog = max(0, limit) })
+}
+
+// WithSmallWriteAdmission admits values up to bytes even when the write backlog
+// is full. These writes retain their backlog charges and normal dispatch limits.
+// Default: disabled. This can increase write queueing beyond WithWriteBacklogLimit.
+func WithSmallWriteAdmission(bytes int64) Option {
+	return funcOpt(func(c *config) { c.smallWriteAdmission = max(0, bytes) })
 }
 
 // WithWriteBacklogRecovery keeps writes rejected, once the backlog limit is

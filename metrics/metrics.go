@@ -15,7 +15,7 @@ import (
 // All durations are in nanoseconds.
 var PutDuration = newHistogram()
 
-// Read I/O durations come from completed refill tickets. Slat covers Submit
+// Read I/O durations come from completed read tickets. Slat covers Submit
 // through ring placement; Clat covers placement through completion. Memory hits
 // produce no samples. These exclude caller wakeup delay.
 var (
@@ -23,12 +23,9 @@ var (
 	ReadClat = newHistogram()
 )
 
-// ReadRetries counts disk refills resubmitted after an EAGAIN completion.
-var ReadRetries atomic.Int64
-
-// Live ownership gauges. Byte counts include allocation padding. Resident reads
-// can pin the same buffer more than once. These counts must not be added to
-// estimate unique memory usage.
+// Open-reader ownership gauges. Byte counts include allocation padding. Readers
+// can share buffers with the cache and other readers. Pending I/O may retain a
+// buffer after Close. These counts must not be added to estimate unique memory.
 var (
 	ResidentReadBytes atomic.Int64
 	ResidentReaders   atomic.Int64
@@ -81,5 +78,4 @@ func Reset() {
 	PutErrors.Store(0)
 	CloseErrors.Store(0)
 	UnlinkErrors.Store(0)
-	ReadRetries.Store(0)
 }

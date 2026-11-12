@@ -41,12 +41,13 @@ var (
 )
 
 // Store owns its files and schedulers, and borrows a dio allocator.
-// A cache directory must have one owner. Close all readers and writers before
-// closing Store; release retained buffers before closing the allocators.
+// A cache directory must have one owner. Close readers and discard abandoned
+// writers before closing Store; release retained buffers before closing allocators.
 type Store struct {
 	base       string
 	cfg        config
 	data       *os.File
+	readData   *os.File
 	schedulers []iosched.Scheduler
 	disk       *iosched.DiskPolicy
 	nextRead   atomic.Uint64
@@ -62,7 +63,7 @@ type Store struct {
 }
 
 // Open creates or opens data.db, index.db, and objects/ under path.
-// memory supplies writer buffers and disk-read staging. It must outlive Store
+// memory supplies writer and whole-record read buffers. It must outlive Store
 // and its readers/writers; Store does not close it.
 func Open(path string, memory *alloc.Allocator, opts ...Option) (_ *Store, err error) {
 	cfg := defaultConfig()
@@ -92,6 +93,10 @@ func Open(path string, memory *alloc.Allocator, opts ...Option) (_ *Store, err e
 			return nil, err
 		}
 	}
+	st.readData, err = sys.OpenDirect(filepath.Join(path, "data.db"), st.readFileFlags())
+	if err != nil {
+		return nil, err
+	}
 	st.mu.index, err = loadDiskIndex(filepath.Join(path, "index.db"), cfg.verifyChecksums)
 	if err != nil {
 		return nil, err
@@ -114,6 +119,13 @@ func (st *Store) fileFlags() sys.OpenFlag {
 	return 0
 }
 
+func (st *Store) readFileFlags() sys.OpenFlag {
+	if st.cfg.bufferedReads {
+		return 0
+	}
+	return st.fileFlags()
+}
+
 // Close drains every scheduler before
 // saving the index. It must not race other Store, reader, or writer calls.
 func (st *Store) Close() (err error) {
@@ -121,6 +133,10 @@ func (st *Store) Close() (err error) {
 		err = errors.Join(err, scheduler.Close())
 	}
 	st.schedulers = nil
+	if st.readData != nil {
+		err = errors.Join(err, st.readData.Close())
+		st.readData = nil
+	}
 	if st.data != nil {
 		err = errors.Join(err, st.data.Close())
 		st.data = nil

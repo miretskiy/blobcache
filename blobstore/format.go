@@ -4,19 +4,19 @@ import (
 	"encoding/binary"
 	"errors"
 	"hash/crc32"
-	"math"
 
 	"github.com/miretskiy/dio/v2/align"
 )
 
-// Records in index.db, data.db, and objects/ share this packed header.
-// index.db is a snapshot of published headers; ObjectID restores reservation order.
-// ObjectIDs come from a counter seeded with the startup timestamp in nanoseconds.
-// FlagExternal distinguishes object files (named by decimal ObjectID) from data.db.
-// Offset records the data.db cursor at reservation; external file I/O starts at zero.
-// Streamed objects set FlagFooter: their initial header has zero lengths and hash.
-// The final header follows the body at PageAlign(RecordHeaderSize + KeyLen + PhysicalLen).
-// Index metadata carries the final lengths. All integers are little endian.
+// index.db stores packed metadata in reservation order. The data.db and
+// object records store [header][key][page padding][value][page padding]. The
+// header and key occupy one 4 KiB page. Writers reserve that page before
+// receiving bytes and fill it before I/O. The key
+// is supplied at Put; no value bytes need to move. The header supplies all lengths
+// and identity needed to scan records and reconstruct index metadata after a
+// disaster. Hash is XXH3(key) in the index and CRC32C(key followed by value) in
+// data records.
+// All integers are little endian.
 //
 // [ 0: 4) magic (0xB10BCAC6)
 // [ 4: 6) flags (RecordFlags, uint16)
@@ -31,7 +31,11 @@ import (
 // [60:64) CRC32C of header[4:60) when FlagHeaderIntegrity is set; zero otherwise
 
 const RecordHeaderSize = 64
-const MaxKeyLen = math.MaxUint16
+
+const recordPrefixSize = align.BlockSize
+
+// MaxKeyLen leaves room for the header in the record's first page.
+const MaxKeyLen = recordPrefixSize - RecordHeaderSize
 
 const recordMagic uint32 = 0xB10BCAC6
 
@@ -48,7 +52,7 @@ type RawHeader [RecordHeaderSize]byte
 
 // RecordHeader is the safe, logical in-memory representation.
 // Magic and the optional header CRC are handled automatically during Encode/Decode.
-// A record occupies RecordHeaderSize + KeyLen + PhysicalLen bytes before I/O padding.
+// The value starts immediately after the header/key page.
 type RecordHeader struct {
 	Flags       RecordFlags
 	ObjectID    uint64
@@ -72,17 +76,12 @@ const (
 	FlagExternal RecordFlags = 0b0000_0000_0000_0100
 	// FlagKeyHashXXH3 marks an index Hash computed by HashKey (XXH3-64).
 	FlagKeyHashXXH3 RecordFlags = 0b0000_0000_0000_1000
-	// FlagFooter stores final metadata after the page-aligned body of a streamed object.
-	FlagFooter RecordFlags = 0b0000_0000_0001_0000
 
 	maskDataIntegrity  RecordFlags = 0b0000_0001_1000_0000
 	shiftDataIntegrity             = 7
 
 	maskCompression  RecordFlags = 0b0000_1110_0000_0000
 	shiftCompression             = 9
-
-	maskVersion  RecordFlags = 0b1111_0000_0000_0000
-	shiftVersion             = 12
 )
 
 type CompressionCodec uint8
@@ -154,12 +153,25 @@ func (raw *RawHeader) Decode(h *RecordHeader, verifyChecksums bool) error {
 	return nil
 }
 
+// ValueOffset returns the value's byte offset within its data record.
+func (h RecordHeader) ValueOffset() int64 {
+	return recordPrefixSize
+}
+
+// KeyOffset returns the key's byte offset within its data record.
+func (h RecordHeader) KeyOffset() int64 {
+	return RecordHeaderSize
+}
+
+// FrameLen includes the header/key prefix and value, excluding final I/O padding.
+func (h RecordHeader) FrameLen() int64 { return h.ValueOffset() + int64(h.PhysicalLen) }
+
 // dataEnd is the data.db append position recorded by this completed record.
 func (h RecordHeader) dataEnd() uint64 {
 	if h.Flags.IsExternal() {
 		return h.Offset
 	}
-	return h.Offset + uint64(align.PageAlign(RecordHeaderSize+int64(h.KeyLen)+int64(h.PhysicalLen)))
+	return h.Offset + uint64(align.PageAlign(h.FrameLen()))
 }
 
 func (h RecordHeader) fileOffset() int64 {
@@ -193,10 +205,6 @@ func (f RecordFlags) Compression() CompressionCodec {
 	return CompressionCodec((f & maskCompression) >> shiftCompression)
 }
 
-func (f RecordFlags) Version() uint8 {
-	return uint8((f & maskVersion) >> shiftVersion)
-}
-
 func (f *RecordFlags) SetDeleted(deleted bool) {
 	if deleted {
 		*f |= FlagDeleted
@@ -223,9 +231,4 @@ func (f *RecordFlags) SetDataIntegrity(algo DataIntegrity) {
 func (f *RecordFlags) SetCompression(codec CompressionCodec) {
 	shifted := (RecordFlags(codec) << shiftCompression) & maskCompression
 	*f = (*f &^ maskCompression) | shifted
-}
-
-func (f *RecordFlags) SetVersion(version uint8) {
-	shifted := (RecordFlags(version) << shiftVersion) & maskVersion
-	*f = (*f &^ maskVersion) | shifted
 }

@@ -2,115 +2,91 @@ package blobstore
 
 import (
 	"bytes"
-	"errors"
-	"io"
 	"os"
+	"strconv"
 	"testing"
 	"time"
 
-	"github.com/miretskiy/blobcache/metrics"
 	"github.com/miretskiy/dio/v2/iosched"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 )
 
-type readFaultScheduler struct {
-	iosched.Scheduler
-	submit func(iosched.Op) (iosched.Ticket, error)
+func leaseFile(t *testing.T, path string) *os.File {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	require.NoError(t, err)
+	t.Cleanup(func() { f.Close() })
+	_, err = unix.FcntlInt(f.Fd(), unix.F_SETSIG, int(unix.SIGURG))
+	require.NoError(t, err)
+	_, err = unix.FcntlInt(f.Fd(), unix.F_SETLEASE, unix.F_WRLCK)
+	require.NoError(t, err)
+	return f
 }
 
-func (s *readFaultScheduler) Submit(op iosched.Op) (iosched.Ticket, error) {
-	return s.submit(op)
-}
-
-// An incompatible file lease makes a nonblocking open complete with EAGAIN.
-// Substitute that operation for a refill's read, keeping an external reader's
-// first-refill open so its descriptor, held until Close, remains real.
-func TestReaderRetriesEAGAIN(t *testing.T) {
+// A completion error is returned on first access and remains sticky. The reader
+// must not resubmit an operation or expose bytes from the failed ticket.
+func TestReaderReportsEAGAIN(t *testing.T) {
 	if !iosched.IOUringAvailable {
 		t.Skip("io_uring unavailable")
 	}
-	for _, tc := range []struct {
-		name            string
-		external        bool
-		size, at, count int
-	}{
-		{"inline", false, 5000, 1, 2},
-		{"inline-continuation", false, 30000, 2, 1},
-		{"inline-exhausted", false, 5000, 1, readRetries + 1},
-		{"external", true, 5000, 1, 2},
-		{"external-continuation", true, 40000, 2, 1},
-		{"external-exhausted", true, 40000, 1, readRetries + 1},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
+	for _, external := range []bool{false, true} {
+		t.Run(strconv.FormatBool(external), func(t *testing.T) {
 			threshold := int64(64 << 10)
-			if tc.external {
+			if external {
 				threshold = 0
 			}
-			st := openTestStore(t, t.TempDir(), WithInlineThreshold(threshold), WithVerifyChecksums(true))
-			key := []byte("retry-key")
-			value := make([]byte, tc.size)
-			for i := range value {
-				value[i] = byte(i*31 + i/251)
-			}
+			st := openTestStore(t, t.TempDir(), WithInlineThreshold(threshold))
+			key, value := []byte("key"), bytes.Repeat([]byte("v"), 40000)
 			h := publishForRead(t, st, key, value)
-			require.Equal(t, tc.external, h.Flags.IsExternal())
-			leased, err := os.CreateTemp(t.TempDir(), "leased")
+			counted := &countingReadScheduler{Scheduler: st.schedulers[0]}
+			st.schedulers[0] = counted
+			r, err := st.NewReader(key, h)
 			require.NoError(t, err)
-			t.Cleanup(func() { leased.Close() })
-			// SIGURG is ignored outside Go's preemption handler, unlike the
-			// default lease-break SIGIO. The lease is released by Close.
-			_, err = unix.FcntlInt(leased.Fd(), unix.F_SETSIG, int(unix.SIGURG))
+			defer r.Close()
+			_, err = r.ticket.Wait()
 			require.NoError(t, err)
-			_, err = unix.FcntlInt(leased.Fd(), unix.F_SETLEASE, unix.F_WRLCK)
+			path := t.TempDir() + "/leased"
+			require.NoError(t, os.WriteFile(path, nil, 0600))
+			leaseFile(t, path)
+			r.ticket, err = counted.Submit(iosched.OpenatOp(unix.AT_FDCWD, path, os.O_RDONLY|unix.O_NONBLOCK, 0))
 			require.NoError(t, err)
-			base := st.schedulers[0]
-			calls := 0
-			var opened []uint32
-			before := metrics.ReadRetries.Load()
-			st.schedulers[0] = &readFaultScheduler{Scheduler: base, submit: func(op iosched.Op) (iosched.Ticket, error) {
-				calls++
-				if calls < tc.at || calls >= tc.at+tc.count {
-					return base.Submit(op)
-				}
-				fault := iosched.OpenatOp(unix.AT_FDCWD, leased.Name(), os.O_RDONLY|unix.O_NONBLOCK, 0)
-				opens := tc.external && calls == 1 // Only the first refill opens the object.
-				if opens {
-					fault = st.openObject(h.ObjectID, os.O_RDONLY).Link(fault)
-				}
-				ticket, err := base.Submit(fault)
-				require.NoError(t, err)
-				_, err = ticket.Wait()
+			for range 2 {
+				chunk, err := r.Next()
 				require.ErrorIs(t, err, unix.EAGAIN)
-				if opens {
-					results := ticket.AllResults()
-					require.NoError(t, results[0].Err)
-					opened = append(opened, uint32(results[0].N))
-				}
-				return ticket, nil
-			}}
-			reader, err := st.NewReader(key, h)
-			if tc.count > readRetries {
-				require.ErrorIs(t, err, unix.EAGAIN)
-				require.Nil(t, reader)
-				require.EqualValues(t, readRetries, metrics.ReadRetries.Load()-before)
-			} else {
-				require.NoError(t, err)
-				got, err := io.ReadAll(reader)
-				require.NoError(t, err)
-				require.True(t, bytes.Equal(value, got), "retry must not skip or duplicate bytes")
-				require.EqualValues(t, tc.count, metrics.ReadRetries.Load()-before)
-				require.NoError(t, reader.Close())
+				require.Nil(t, chunk)
 			}
-			for _, vfd := range opened {
-				// The reader's descriptor closes asynchronously.
-				require.Eventually(t, func() bool {
-					ticket, err := base.Submit(iosched.VReadOp(vfd, make([]byte, 1), 0))
-					require.NoError(t, err)
-					_, err = ticket.Wait()
-					return errors.Is(err, unix.EBADF)
-				}, time.Second, time.Millisecond, "Close must release the reader's descriptor")
-			}
+			require.Equal(t, 2, counted.submissions, "first access must not submit retries")
+			require.NoError(t, r.Close())
+			require.Equal(t, st.memory.Capacity(), st.memory.Available())
 		})
 	}
+}
+
+func TestReaderCloseDoesNotWaitForIO(t *testing.T) {
+	if !iosched.IOUringAvailable {
+		t.Skip("io_uring unavailable")
+	}
+	st := openTestStore(t, t.TempDir(), WithInlineThreshold(0))
+	key, value := []byte("key"), bytes.Repeat([]byte("v"), 48000)
+	h := publishForRead(t, st, key, value)
+	lease := leaseFile(t, st.objectPath(h.ObjectID))
+	r, err := st.NewReader(key, h)
+	require.NoError(t, err, "construction submits without waiting for the leased file")
+	ticket := r.ticket
+	available := st.memory.Available()
+	closed := make(chan error, 1)
+	go func() { closed <- r.Close() }()
+	select {
+	case err := <-closed:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("Close waited for pending I/O")
+	}
+	require.Equal(t, available, st.memory.Available(), "I/O retains the buffer after Close")
+	_, err = unix.FcntlInt(lease.Fd(), unix.F_SETLEASE, unix.F_UNLCK)
+	require.NoError(t, err)
+	_, err = ticket.Wait()
+	require.NoError(t, err)
+	require.Equal(t, st.memory.Capacity(), st.memory.Available(), "completion releases the last buffer reference")
 }

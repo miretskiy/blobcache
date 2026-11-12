@@ -29,7 +29,6 @@ func openTestStore(t *testing.T, path string, opts ...Option) *Store {
 	opts = append([]Option{
 		TestingWithDirectIO(false),
 		WithInlineThreshold(32 << 10),
-		WithStagingSize(8 << 10),
 		WithDataIntegrity(DataIntegrityCRC32C),
 	}, opts...)
 	st, err := Open(path, memory, opts...)
@@ -77,44 +76,44 @@ func TestStoreReopen(t *testing.T) {
 			for _, size := range []int{5000, 40000} {
 				key := []byte("key")
 				value := bytes.Repeat([]byte("v"), size)
-				w, err := st.NewWriter(key)
+				w, err := st.NewWriter()
 				require.NoError(t, err)
-				defer w.Close()
+				defer w.Discard()
 				_, err = w.Write(value)
 				require.NoError(t, err)
 
-				err = putStoreWriter(st, w)
+				err = putStoreWriter(st, key, w)
 				require.NoError(t, err)
 				if size == 40000 {
-					objectPath = st.objectPath(w.wr.(*bufferSink).header.ObjectID)
+					objectPath = st.objectPath(w.header.ObjectID)
 				}
 
 				h := checkWriterRecord(t, st, w, key, value)
-				w.Close()
+				w.Discard()
 				headers = append(headers, h)
 			}
 			before, err := os.ReadFile(filepath.Join(dir, "data.db"))
 			require.NoError(t, err)
-			require.Len(t, before, 2*align.BlockSize)
+			require.Len(t, before, 3*align.BlockSize)
 			objectBefore, err := os.ReadFile(objectPath)
 			require.NoError(t, err)
 			require.NoError(t, st.Close())
 
 			st = openTestStore(t, dir, TestingWithDirectIO(direct))
 			require.Equal(t, headers, indexReservations(st.mu.index))
-			require.Equal(t, uint64(2*align.BlockSize), st.mu.dataAppendOffset)
+			require.Equal(t, uint64(3*align.BlockSize), st.mu.dataAppendOffset)
 			require.Equal(t, uint64(45000), st.mu.index.size())
-			w, err := st.NewWriter([]byte("next"))
+			w, err := st.NewWriter()
 			require.NoError(t, err)
-			defer w.Close()
+			defer w.Discard()
 			_, err = w.Write([]byte("next value"))
 			require.NoError(t, err)
 
-			err = putStoreWriter(st, w)
+			err = putStoreWriter(st, []byte("next"), w)
 			require.NoError(t, err)
 
-			require.Greater(t, w.wr.(*bufferSink).header.ObjectID, headers[len(headers)-1].ObjectID)
-			require.Equal(t, uint64(len(before)), w.wr.(*bufferSink).header.Offset)
+			require.Greater(t, w.header.ObjectID, headers[len(headers)-1].ObjectID)
+			require.Equal(t, uint64(len(before)), w.header.Offset)
 			checkWriterRecord(t, st, w, []byte("next"), []byte("next value"))
 			after, err := os.ReadFile(filepath.Join(dir, "data.db"))
 			require.NoError(t, err)
@@ -135,20 +134,20 @@ func TestStoreConcurrentWrites(t *testing.T) {
 	var group errgroup.Group
 	for i := range count {
 		group.Go(func() error {
-			w, err := st.NewWriter([]byte("key"))
+			w, err := st.NewWriter()
 			if err != nil {
 				return err
 			}
 			writers[i] = w
-			t.Cleanup(func() { w.Close() })
+			t.Cleanup(func() { w.Discard() })
 			if _, err := w.Write([]byte("value")); err != nil {
 				return err
 			}
-			err = putStoreWriter(st, w)
+			err = putStoreWriter(st, []byte("key"), w)
 			if err != nil {
 				return err
 			}
-			sequences[i] = w.wr.(*bufferSink).header.ObjectID
+			sequences[i] = w.header.ObjectID
 			return err
 		})
 	}
@@ -158,12 +157,12 @@ func TestStoreConcurrentWrites(t *testing.T) {
 		sequence := sequences[i]
 		require.False(t, seen[sequence], "ObjectIDs must be unique")
 		seen[sequence] = true
-		require.Equal(t, (sequence-firstID)*align.BlockSize, w.wr.(*bufferSink).header.Offset)
+		require.Equal(t, (sequence-firstID)*2*align.BlockSize, w.header.Offset)
 		checkWriterRecord(t, st, w, []byte("key"), []byte("value"))
-		w.Close()
+		w.Discard()
 	}
 	require.Len(t, indexReservations(st.mu.index), count)
-	require.Equal(t, uint64(count*align.BlockSize), st.mu.dataAppendOffset)
+	require.Equal(t, uint64(count*2*align.BlockSize), st.mu.dataAppendOffset)
 	records := indexReservations(st.mu.index)
 	require.NoError(t, st.Close())
 	index, err := loadDiskIndex(filepath.Join(st.base, "index.db"), true)
@@ -175,18 +174,18 @@ func TestStoreConcurrentWrites(t *testing.T) {
 func TestPutIOError(t *testing.T) {
 	st := openTestStore(t, t.TempDir(), WithInlineThreshold(0))
 	key := []byte("key")
-	w, err := st.NewWriter(key)
+	w, err := st.NewWriter()
 	require.NoError(t, err)
-	defer w.Close()
+	defer w.Discard()
 	_, err = w.Write([]byte("value"))
 	require.NoError(t, err)
 
-	objectPath := st.objectPath(w.wr.(*bufferSink).header.ObjectID)
 	// Fail asynchronous open after the complete record has been submitted.
 	require.NoError(t, os.Remove(filepath.Join(st.base, "objects")))
-	err = putStoreWriter(st, w)
+	err = putStoreWriter(st, key, w)
+	objectPath := st.objectPath(w.header.ObjectID)
 	require.Error(t, err, "Put waits for the completion error")
-	require.NoError(t, w.Close())
+	w.Discard()
 	require.Empty(t, indexReservations(st.mu.index))
 	require.Zero(t, st.Size())
 	_, publishedBytes := st.WriteStats()
@@ -220,7 +219,7 @@ func TestPendingWriterDefersInlineRotation(t *testing.T) {
 	pending, err := st.reserve(&first, 4*page)
 	require.NoError(t, err)
 	for _, key := range []string{"b", "c", "d"} {
-		putReclaimRecord(t, st, key, bytes.Repeat([]byte(key), 4*page-RecordHeaderSize-1))
+		putReclaimRecord(t, st, key, bytes.Repeat([]byte(key), 4*page-page))
 	}
 	require.Zero(t, reclaim(st, 1))
 	var next RecordHeader
@@ -238,17 +237,17 @@ func TestCloseReleasesRejectedPutReservation(t *testing.T) {
 		t.Run(kind, func(t *testing.T) {
 			st := openTestStore(t, t.TempDir(), WithInlineThreshold(threshold))
 			scheduler := rejectTestIO(st)
-			w, err := st.NewWriter([]byte("key"))
+			w, err := st.NewWriter()
 			require.NoError(t, err)
 			_, err = w.Write([]byte("value"))
 			require.NoError(t, err)
 
-			path := st.objectPath(w.wr.(*bufferSink).header.ObjectID)
 			failure := errors.New("submission rejected")
 			scheduler.reject = failure
-			err = putStoreWriter(st, w)
+			err = putStoreWriter(st, []byte("key"), w)
 			require.ErrorIs(t, err, failure)
-			require.NoError(t, w.Close())
+			path := st.objectPath(w.header.ObjectID)
+			w.Discard()
 			require.NoFileExists(t, path)
 			require.Zero(t, st.Size())
 			_, publishedBytes := st.WriteStats()
@@ -272,12 +271,13 @@ func TestOpenRemovesUnindexedObjects(t *testing.T) {
 	readReclaimRecord(t, st, "kept", h, []byte("value"))
 }
 
-func putStoreWriter(st *Store, w *Writer) error {
-	done := make(chan error, 1)
-	err := st.Put(w, func(_ RecordHeader, memory Memory) { memory.Release() },
-		func(_ RecordHeader, err error) { done <- err })
+func putStoreWriter(st *Store, key []byte, w *Writer) error {
+	if err := w.Seal(key); err != nil {
+		return err
+	}
+	ticket, err := st.Put(w, nil)
 	if err != nil {
 		return err
 	}
-	return <-done
+	return ticket.Wait()
 }

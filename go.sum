@@ -17,6 +17,8 @@ github.com/miretskiy/dio/v2 v2.9.0 h1:vlWiXw3YmTNn+8umJAZTO+4G2GnwC5s6GxqxLQXhsa
 github.com/miretskiy/dio/v2 v2.9.0/go.mod h1:i795uMoYfrv9OnIbXzQaQ7hqMa+/1kJBx/YdMeXL/P4=
 github.com/miretskiy/dio/v2 v2.9.1-0.20261109015607-139e2758c4c8 h1:jg2WPX0xVPmuvacvTrFFbOtBe6i7d+jf1LRt5bLv6xc=
 github.com/miretskiy/dio/v2 v2.9.1-0.20261109015607-139e2758c4c8/go.mod h1:i795uMoYfrv9OnIbXzQaQ7hqMa+/1kJBx/YdMeXL/P4=
+github.com/miretskiy/dio/v2 v2.9.1-0.20261112002132-7de793510dea h1:L6TspkfUBrPpB3ZBl3/EexEu0FWWhlji0Dr4EHSSme4=
+github.com/miretskiy/dio/v2 v2.9.1-0.20261112002132-7de793510dea/go.mod h1:i795uMoYfrv9OnIbXzQaQ7hqMa+/1kJBx/YdMeXL/P4=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/rogpeppe/go-internal v1.14.1 h1:UQB4HGPB6osV0SQTLymcB4TgvyWu6ZyliaW0tI/otEQ=

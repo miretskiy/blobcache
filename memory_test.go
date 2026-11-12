@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/miretskiy/blobcache/blobstore"
-
+	"github.com/miretskiy/dio/v2/alloc"
 	"github.com/miretskiy/dio/v2/collections"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
@@ -24,16 +24,63 @@ func TestMemoryIgnoresOlderPublication(t *testing.T) {
 	m := newMemoryCache()
 	defer m.clear()
 	key := blobstore.HashKey([]byte("key"))
-	newer := newTestMemory(4096)
+	newer := newTestMemory(t, 4096)
 	m.replace(key, newer, blobstore.RecordHeader{ObjectID: 2}, false)
-	older := newTestMemory(4096)
+	older := newTestMemory(t, 4096)
 	m.replace(key, older, blobstore.RecordHeader{ObjectID: 1}, false)
-	require.False(t, older.TryInc(), "discard the older completion's reference")
+	require.Empty(t, older.First(), "discard the older completion's reference")
 	buffer, header, ok := m.lookup(key)
 	require.True(t, ok)
 	require.Equal(t, newer, buffer)
 	require.EqualValues(t, 2, header.ObjectID)
-	buffer.Unpin()
+	unpinMemory(buffer)
+}
+
+func TestMemoryReadAdmissionPreservesCurrentEntry(t *testing.T) {
+	for _, state := range []string{"disk-only", "resident", "replaced", "retired", "external"} {
+		t.Run(state, func(t *testing.T) {
+			m := newMemoryCache()
+			defer m.clear()
+			h := blobstore.RecordHeader{Hash: 1, ObjectID: 1}
+			if state == "external" {
+				h.Flags |= blobstore.FlagExternal
+			}
+			m.replace(h.KeyHash(), nil, h, false)
+			var existing *alloc.ReadOnlyBuffer
+			switch state {
+			case "resident":
+				existing = newTestMemory(t, 4096)
+				m.replace(h.KeyHash(), existing, h, false)
+			case "replaced":
+				newer := h
+				newer.ObjectID++
+				m.replace(h.KeyHash(), nil, newer, false)
+			case "retired":
+				m.retire(h.KeyHash(), h.ObjectID)
+			}
+			buffer := newTestMemory(t, 4096)
+			m.admit(h, buffer)
+			got, header, ok := m.lookup(h.KeyHash())
+			switch state {
+			case "disk-only":
+				require.Same(t, buffer, got)
+			case "resident":
+				require.Same(t, existing, got, "a duplicate read must not replace a resident buffer")
+			case "replaced":
+				require.Nil(t, got)
+				require.EqualValues(t, 2, header.ObjectID)
+			case "retired":
+				require.False(t, ok, "a read must not resurrect a retired record")
+			case "external":
+				require.Nil(t, got)
+			}
+			if got != nil {
+				got.Release()
+			}
+			m.clear()
+			require.EqualValues(t, 4096, buffer.Release(), "only the caller's buffer reference remains")
+		})
+	}
 }
 
 func TestMemoryHandlesSurviveGrowthAndEviction(t *testing.T) {
@@ -42,7 +89,7 @@ func TestMemoryHandlesSurviveGrowthAndEviction(t *testing.T) {
 	pool := newTestPool(t, count*4096)
 	defer m.clear()
 	keys := make([]blobstore.KeyHash, count)
-	buffers := make([]blobstore.Memory, count)
+	buffers := make([]*alloc.ReadOnlyBuffer, count)
 	for i := range keys {
 		// Exercise repeated list growth within one shard.
 		keys[i] = blobstore.KeyHash(i * m.entries.ShardCount())
@@ -57,7 +104,7 @@ func TestMemoryHandlesSurviveGrowthAndEviction(t *testing.T) {
 		require.Equal(t, uint64(i*4096), e.header.Offset)
 		r := s.Extra.list.Value(e.resident)
 		require.Equal(t, key, r.key)
-		require.Equal(t, buffers[i].Size(), r.buffer.Size())
+		require.Equal(t, memorySize(buffers[i]), memorySize(r.buffer))
 		require.Same(t, &singleMemoryChunk(buffers[i])[0], &singleMemoryChunk(r.buffer)[0])
 	}
 	old := s.Items[keys[0]].resident
@@ -90,14 +137,14 @@ func TestMemoryConcurrentReplacementAndEviction(t *testing.T) {
 	var wg sync.WaitGroup
 	for worker := range 8 {
 		wg.Go(func() {
-			buffer := newTestMemory(4096)
-			defer buffer.Unpin()
+			buffer := newTestMemory(t, 4096)
+			defer unpinMemory(buffer)
 			for i := range 256 {
 				key := blobstore.KeyHash(i % 32)
-				buffer.TryInc() // This goroutine owns a reference throughout.
+				buffer.Retain() // This goroutine owns a reference throughout.
 				m.replace(key, buffer, blobstore.RecordHeader{Offset: uint64(worker * 4096)}, false)
-				if pinned, _, _ := m.lookup(key); isResident(pinned) {
-					pinned.Unpin()
+				if pinned, _, _ := m.lookup(key); pinned != nil {
+					unpinMemory(pinned)
 				}
 				if i%2 == 0 {
 					m.reclaimCacheMemory(4096)
@@ -112,7 +159,7 @@ func TestMemoryConcurrentReplacementAndEviction(t *testing.T) {
 		var residentBytes int64
 		for handle, r := range s.Extra.list.All() {
 			require.Equal(t, handle, s.Items[r.key].resident)
-			residentBytes += r.buffer.Size()
+			residentBytes += memorySize(r.buffer)
 		}
 		require.Equal(t, residentBytes, s.Extra.residentBytes)
 		for key, e := range s.Items {
@@ -151,10 +198,10 @@ func TestMemoryReclaimRedistributesPinnedShare(t *testing.T) {
 	m := newMemoryCache()
 	pool := newTestPool(t, 16*page)
 	defer m.clear()
-	var pinned []blobstore.Memory
+	var pinned []*alloc.ReadOnlyBuffer
 	defer func() {
 		for _, b := range pinned {
-			b.Unpin()
+			unpinMemory(b)
 		}
 	}()
 	for shard, pages := range []int{4, 12} {
@@ -162,7 +209,7 @@ func TestMemoryReclaimRedistributesPinnedShare(t *testing.T) {
 			b, err := pool.TryAcquire(page)
 			require.NoError(t, err)
 			if shard == 0 {
-				require.True(t, b.TryInc())
+				b.Retain()
 				pinned = append(pinned, b)
 			}
 			m.replace(blobstore.KeyHash(i*m.entries.ShardCount()+shard), b, blobstore.RecordHeader{}, false)
@@ -221,7 +268,7 @@ func TestPutConcurrentMemoryPressure(t *testing.T) {
 					if err := ctx.Err(); err != nil {
 						return err
 					}
-					w, err = c.NewWriter(key)
+					w, err = c.NewWriter()
 					if !errors.Is(err, ErrBusy) {
 						break
 					}
@@ -232,9 +279,11 @@ func TestPutConcurrentMemoryPressure(t *testing.T) {
 				}
 				_, err = w.Write([]byte("v"))
 				if err == nil {
-					err = c.Put(w)
+					_, err = c.Put(key, w)
+				} else {
+					w.Discard()
 				}
-				if err = errors.Join(err, w.Close()); err != nil {
+				if err != nil {
 					return err
 				}
 			}
@@ -245,4 +294,59 @@ func TestPutConcurrentMemoryPressure(t *testing.T) {
 	require.Equal(t, workers*iterations, c.values.entries.Len())
 	require.NoError(t, c.Close())
 	require.Len(t, diskRecords(t, dir), workers*iterations)
+}
+
+func TestPendingMemoryTransfersOriginalOwnership(t *testing.T) {
+	for _, replaced := range []bool{false, true} {
+		t.Run(fmt.Sprint(replaced), func(t *testing.T) {
+			pool := newTestPool(t, 4<<20)
+			m := newMemoryCache()
+			defer m.clear()
+			buffer := alloc.NewAllocatingBuffer(pool.Allocator)
+			_, err := buffer.Write([]byte("original"))
+			require.NoError(t, err)
+			buffer.Trim()
+			memory := buffer.Freeze()
+			size := memorySize(memory)
+			h := blobstore.RecordHeader{Hash: 1, ObjectID: 1}
+			m.replace(1, memory, h, true)
+			shard := m.entries.Shard(1)
+			entry := shard.Extra.list.Value(shard.Items[1].resident)
+			require.Same(t, memory, entry.buffer, "publication borrows the original buffer")
+			if replaced {
+				m.replace(1, nil, blobstore.RecordHeader{Hash: 1, ObjectID: 2}, false)
+				require.Equal(t, pool.Capacity()-size, pool.Available(), "replacement must not release Put's in-flight buffer")
+			}
+			moved := memory
+			require.Equal(t, !replaced, m.complete(h, nil))
+			if replaced {
+				require.Equal(t, size, moved.Release(), "Put owns the only references")
+			} else {
+				require.Equal(t, size, m.reclaimCacheMemory(size), "the cache receives those same references")
+			}
+			require.Equal(t, pool.Capacity(), pool.Available())
+		})
+	}
+}
+
+func TestReaderOutlivesReplacedPendingMemory(t *testing.T) {
+	pool := newTestPool(t, 4<<20)
+	m := newMemoryCache()
+	defer m.clear()
+	buffer := alloc.NewAllocatingBuffer(pool.Allocator)
+	_, err := buffer.Write([]byte("borrowed by reader"))
+	require.NoError(t, err)
+	buffer.Trim()
+	h := blobstore.RecordHeader{Hash: 1, ObjectID: 1}
+	memory := buffer.Freeze()
+	m.replace(1, memory, h, true)
+	reader, _, ok := m.lookup(1)
+	require.True(t, ok)
+	m.replace(1, nil, blobstore.RecordHeader{Hash: 1, ObjectID: 2}, false)
+	moved := memory
+	require.False(t, m.complete(h, nil))
+	require.Zero(t, moved.Release(), "the reader alone keeps the replaced value alive")
+	require.Equal(t, "borrowed by reader", string(reader.First()[:18]))
+	require.True(t, unpinMemory(reader))
+	require.Equal(t, pool.Capacity(), pool.Available())
 }

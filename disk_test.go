@@ -3,7 +3,6 @@ package blobcache
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -37,7 +36,7 @@ func TestDiskReclaimKeepsResidentValues(t *testing.T) {
 	require.NoError(t, c.Close())
 	info, err := os.Stat(filepath.Join(dir, "data.db"))
 	require.NoError(t, err)
-	require.EqualValues(t, 3*align.PageAlign(blobstore.RecordHeaderSize+1+int64(len(value))), info.Size())
+	require.EqualValues(t, 3*align.PageAlign(align.BlockSize+int64(len(value))), info.Size())
 	for _, h := range diskRecords(t, dir) {
 		if h.Flags.IsDeleted() {
 			require.Equal(t, blobstore.RecordHeader{Flags: blobstore.FlagDeleted}, h)
@@ -57,10 +56,11 @@ func TestDiskRetirementRemovesMetadataAndPreservesReplacement(t *testing.T) {
 	// Each put leaves the payload over target by its own size; the next
 	// reservation evicts that much from the oldest records.
 	evictNext := func() {
-		w, err := c.NewWriter([]byte("trigger"))
+		w, err := c.NewWriter()
 		require.NoError(t, err)
-		require.NoError(t, c.Put(w))
-		require.NoError(t, w.Close())
+		ticket, putErr := c.Put([]byte("trigger"), w)
+		require.NoError(t, putErr)
+		require.NoError(t, ticket.Wait())
 	}
 	putValue(t, c, "filler", make([]byte, target-len("replacement")))
 	evictNext()
@@ -87,15 +87,16 @@ func TestPutConcurrentDiskReclamation(t *testing.T) {
 					return err
 				}
 				key := []byte(fmt.Sprintf("%d-%d", worker, i))
-				w, err := c.NewWriter(key)
+				w, err := c.NewWriter()
 				if err != nil {
 					return err
 				}
 				_, err = w.Write(value)
-				if err == nil {
-					err = c.Put(w)
+				if err != nil {
+					w.Discard()
+					return err
 				}
-				if err = errors.Join(err, w.Close()); err != nil {
+				if _, err = c.Put(key, w); err != nil {
 					return err
 				}
 			}

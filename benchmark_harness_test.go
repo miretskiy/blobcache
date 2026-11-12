@@ -6,13 +6,63 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"github.com/miretskiy/dio/v2/alloc"
+	"io"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/miretskiy/dio/v2/alloc"
 	"github.com/stretchr/testify/require"
 )
+
+func TestBenchmarkWarmupIndependentOfMemory(t *testing.T) {
+	for _, memory := range []int64{8 << 30, 16 << 30, 64 << 30} {
+		w := benchmarkWorkload{config: benchmarkConfig{memoryBytes: memory}}
+		require.Equal(t, benchmarkWarmupFills, w.warmupWrites())
+	}
+}
+
+func TestBenchmarkSizeHistogramIncludesLargeValues(t *testing.T) {
+	s := newBenchmarkStats()
+	for _, size := range []int64{16 << 20, (32 << 20) - 1} {
+		s.record(&benchmarkRequestStats{writes: benchmarkSample{recorded: true, bytes: size}})
+	}
+	require.EqualValues(t, 2, s.sizes.TotalCount())
+	require.GreaterOrEqual(t, s.sizes.ValueAtQuantile(99), int64((32<<20)-1))
+}
+
+func TestBenchmarkReadSizeStats(t *testing.T) {
+	s := newBenchmarkStats()
+	for _, tc := range []struct {
+		size int64
+		band int
+	}{
+		{8 << 10, 0}, {256 << 10, 0}, {256<<10 + 1, 1},
+		{1 << 20, 1}, {1<<20 + 1, 2}, {2 << 20, 2},
+		{2<<20 + 1, 3}, {4 << 20, 3}, {4<<20 + 1, 4},
+		{8 << 20, 4}, {8<<20 + 1, 5}, {32 << 20, 5},
+	} {
+		memory, file := s.readsBySize[tc.band].memory.count(), s.readsBySize[tc.band].file.count()
+		// The small consumed prefix must not determine the size bucket.
+		sample := benchmarkSample{latency: time.Millisecond, bytes: 1024, recorded: true}
+		s.record(&benchmarkRequestStats{readValueBytes: tc.size, memoryReads: sample})
+		require.Equal(t, memory+1, s.readsBySize[tc.band].memory.count())
+		require.Equal(t, file, s.readsBySize[tc.band].file.count())
+		s.record(&benchmarkRequestStats{readValueBytes: tc.size, diskReads: sample})
+		require.Equal(t, file+1, s.readsBySize[tc.band].file.count())
+	}
+	s.record(&benchmarkRequestStats{misses: 1})
+	var memory, file int64
+	for _, band := range s.readsBySize {
+		memory += band.memory.count()
+		file += band.file.count()
+	}
+	require.Equal(t, s.memoryReads.count(), memory)
+	require.Equal(t, s.diskReads.count(), file)
+	require.EqualValues(t, 12, memory)
+	require.EqualValues(t, 12, file)
+	require.EqualValues(t, 1, s.misses)
+}
 
 // benchmarkPlanDigest fingerprints an offered workload: every fill's arrival,
 // key, size and payload offset, every read's arrival and key, and the bursts.
@@ -76,10 +126,10 @@ func TestBenchmarkTraceDigests(t *testing.T) {
 }
 
 var benchmarkExpectedTraceDigests = map[string]string{
-	"warmup":         "8d31d491e8bd5418bd388e3fe3b782717292175b62b0efb0b6a6dc46baa0a0a0",
-	"bursty-1p2GBps": "72888d124a3e750114b4f5a02b80c0a945b0096607c912f54f2d47fb578f4c5d",
-	"steady-1GBps":   "9b0ae77ec2df20838b88e95bb15624bcc1eb02769cb7dd7461fac3ac70e2256b",
-	"production":     "3b60a2ea878b185d9c1f827a434b2931fd1a85782cc8ffc10874002e8675f7cd",
+	"warmup":         "e35640bfb3c7472e7f6b18290bed823b23d5ddadcd74f08e845eb70d9a2bb74b",
+	"bursty-1p2GBps": "66fa899d841803623a51ff76b7d31322a90a67de2f2d3a522bf44cd8365fe600",
+	"steady-1GBps":   "0397f744bb63534721f9792dd017ce9fb20b422734a82113899ac521980b5337",
+	"production":     "31eabc7f189adeaf1768d54fab939f2877dc3843a0cf74dfc1db183fb581b9b9",
 }
 
 func TestBenchmarkBurstPlan(t *testing.T) {
@@ -220,4 +270,53 @@ func TestBenchmarkBusyFinishesAtFirstAttempt(t *testing.T) {
 	require.Zero(t, stats.failures)
 	require.Zero(t, stats.writes.count())
 	require.Less(t, stats.elapsed, 500*time.Millisecond, "no one-second busy retry loop")
+}
+
+// Deliberately implements only Next: benchmark consumption must not use Read.
+type benchmarkChunkReader struct {
+	chunks [][]byte
+	err    error
+	calls  int
+}
+
+func (r *benchmarkChunkReader) Next() ([]byte, error) {
+	r.calls++
+	if len(r.chunks) > 0 {
+		p := r.chunks[0]
+		r.chunks = r.chunks[1:]
+		return p, nil
+	}
+	if r.err != nil {
+		return nil, r.err
+	}
+	return nil, io.EOF
+}
+
+func TestBenchmarkConsumeNext(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		limit, n int64
+		calls    int
+		chunks   [][]byte
+		end, err error
+	}{
+		{name: "empty", limit: 0, n: 0, calls: 0},
+		{name: "prefix", limit: 2, n: 2, calls: 1, chunks: [][]byte{[]byte("abcd"), []byte("ef")}},
+		{name: "fragmented", limit: 5, n: 5, calls: 2, chunks: [][]byte{[]byte("abc"), []byte("defg")}},
+		{name: "eof", limit: 10, n: 3, calls: 2, chunks: [][]byte{[]byte("abc")}},
+		{name: "error", limit: 10, n: 3, calls: 2, chunks: [][]byte{[]byte("abc")}, end: ErrCorrupt, err: ErrCorrupt},
+		{name: "no-progress", limit: 1, n: 0, calls: 1, chunks: [][]byte{nil}, err: io.ErrNoProgress},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &benchmarkChunkReader{chunks: tc.chunks, err: tc.end}
+			n, err := benchmarkConsume(r, tc.limit)
+			require.Equal(t, tc.n, n)
+			require.Equal(t, tc.calls, r.calls)
+			if tc.err == nil {
+				require.NoError(t, err)
+			} else {
+				require.ErrorIs(t, err, tc.err)
+			}
+		})
+	}
 }

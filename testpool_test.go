@@ -1,9 +1,10 @@
 package blobcache
 
 import (
-	"github.com/miretskiy/blobcache/blobstore"
-	"github.com/miretskiy/dio/v2/alloc"
 	"testing"
+
+	"github.com/miretskiy/dio/v2/alloc"
+	"github.com/stretchr/testify/require"
 )
 
 type testPool struct{ *alloc.Allocator }
@@ -13,17 +14,28 @@ func newTestPool(t testing.TB, size int64) *testPool {
 	t.Cleanup(a.Close)
 	return &testPool{a}
 }
-func (p *testPool) TryAcquire(n int64) (blobstore.Memory, error) {
-	m, err := p.Allocator.TryAcquire(n)
-	if err != nil {
+
+func (p *testPool) TryAcquire(n int64) (*alloc.ReadOnlyBuffer, error) {
+	b := alloc.NewAllocatingBuffer(p.Allocator)
+	if err := b.Grow(int(n)); err != nil {
+		b.Release()
 		return nil, err
 	}
-	return blobstore.Memory{m}, nil
+	return b.Freeze(), nil
 }
-func newTestMemory(size int64) blobstore.Memory { return blobstore.Memory{alloc.NewMemory(size)} }
-func singleMemoryChunk(m blobstore.Memory) []byte {
-	if len(m) != 1 {
+
+func newTestMemory(t *testing.T, size int64) *alloc.ReadOnlyBuffer {
+	b, err := newTestPool(t, size).TryAcquire(size)
+	require.NoError(t, err)
+	return b
+}
+
+func singleMemoryChunk(b *alloc.ReadOnlyBuffer) []byte {
+	if len(b.First()) != b.Cap() {
 		panic("test requires contiguous memory")
 	}
-	return m[0].Bytes()
+	return b.First()
 }
+
+func memorySize(b *alloc.ReadOnlyBuffer) int64 { return int64(b.Cap()) }
+func unpinMemory(b *alloc.ReadOnlyBuffer) bool { return b.Release() == int64(b.Cap()) }

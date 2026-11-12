@@ -4,13 +4,10 @@ import (
 	cryptorand "crypto/rand"
 	"errors"
 	"fmt"
-	"github.com/HdrHistogram/hdrhistogram-go"
 	"io"
 	"math"
 	"math/rand/v2"
-
 	"os"
-	"path/filepath"
 	"reflect"
 	"runtime"
 	"runtime/pprof"
@@ -22,45 +19,48 @@ import (
 	"testing"
 	"time"
 
+	"github.com/HdrHistogram/hdrhistogram-go"
 	"github.com/miretskiy/blobcache/blobstore"
 	"github.com/miretskiy/blobcache/metrics"
 	"github.com/miretskiy/dio/v2/alloc"
+	"github.com/miretskiy/dio/v2/iosched"
 )
 
 // BenchmarkBlobCache offers byte-paced fills and independently scheduled reads.
-// Each key gets one read (85%), two reads (10%), or 3–10 reads (5%), at
-// log-uniform ages from 100ms to two minutes. Failed fills remain eligible.
-// b.N is the offered fill count. Reads after the observation window are counted
-// as not yet due; late warmup reads carry into the measured phase.
-// Warmup populates 125% of memory with inline payload (bounded by b.N for short
-// calibration/smoke runs). Readers borrow reusable 128 KiB scratch buffers.
-//
+// The size mix, read quotas, and trace planner match ringcache's benchmark.
+// Every planned fill remains eligible for reads, including rejected fills.
+// Warmup uses a fixed 16 GiB reference so changing cache capacity cannot change
+// the offered trace. Readers consume borrowed chunks through Next without copying.
 // Each scheduled arrival starts its own goroutine, with no worker queue or
-// concurrency cap. Arrival-to-completion latency includes dispatch delay.
-// Pending bytes count active logical write payload. ErrRejected and ErrBusy
-// finish the attempt immediately and are counted separately; neither is retried.
+// concurrency cap. Admission failures are counted once, without sleeping or retrying.
+// Pending bytes include writes waiting for their I/O ticket; preparing bytes
+// cover NewWriter, Write, and Put through its return, excluding ticket waits.
 // One set of request histograms spans the entire measured workload. Burst
 // boundary snapshots report cumulative completions and backlog by wall time.
+// Successful read latencies are also reported by full value size and serving
+// path (all, memory, file); returned bytes may be a prefix of that value.
 // Burst counts/durations include only the scheduled observation window; a
 // burst cut short by that window is reported as partial, and drain is separate.
 //
 // Environment: BLOBCACHE_DISK_GIB (required), BLOBCACHE_CACHE_MEMORY_MB (16384),
-// BLOBCACHE_BENCH_DIR (persistent cache directory; a new directory if unset),
-// BLOBCACHE_FAIL_ON_ERROR (1), BLOBCACHE_DURABLE_INDEX (1),
+// BLOBCACHE_BENCH_DIR (parent of a fresh cache directory),
+// BLOBCACHE_FAIL_ON_ERROR (1),
 // BLOBCACHE_CHECKSUMS (0; 1 enables CRC32C payload checksums and verification),
 // BLOBCACHE_VERIFY_CHECKSUMS (defaults to BLOBCACHE_CHECKSUMS; 1 also verifies
 // header checksums when payload checksums are disabled),
+// BLOBCACHE_BUFFERED_READS (0; 1 uses the page cache for reads, keeping direct writes),
 // BLOBCACHE_SCHEDULER_CPUS (-1; comma-separated coordinator CPUs),
 // BLOBCACHE_WRITE_SCHEDULERS (0; first N schedulers serve only writes),
 // BLOBCACHE_RING_DEPTH (256 per ring), BLOBCACHE_IO_BUDGET_US (1500 for writes
 // shared across the disk; 0 disables). Reads are always unbudgeted.
 // BLOBCACHE_{WRITE,READ}_BACKLOG_MS (0: disabled) limit dio's admitted,
 // unfinished work across the disk in modeled device time, and
-// BLOBCACHE_WRITE_BACKLOG_RECOVERY_MS (-1: disabled) sets the timed-pause target. Both streams dispatch directly at scheduled arrival.
+// BLOBCACHE_WRITE_BACKLOG_RECOVERY_MS (-1: disabled) sets the timed-pause target.
 // bursty-variable uses configurable background, burst and cycle ranges; see
 // readBenchmarkBurstProfile. Expected dio rejections are counted, not retried.
+// BLOBCACHE_SMALL_WRITE_KIB (0) admits payloads up to this size through a full backlog.
 // BLOBCACHE_CPU_PROFILE records a Go CPU profile of the measured phase only.
-// Example: BLOBCACHE_DISK_GIB=750 BLOBCACHE_DURABLE_INDEX=0 go test -run '^$' -bench '^BenchmarkBlobCache/steady-1GBps$' -cpu=32 -benchtime=160000x -timeout=15m
+// Example: BLOBCACHE_DISK_GIB=750 go test -run '^$' -bench '^BenchmarkBlobCache/steady-1GBps$' -cpu=32 -benchtime=160000x -timeout=15m
 func BenchmarkBlobCache(b *testing.B) {
 
 	for _, scenario := range []benchmarkCase{
@@ -86,9 +86,9 @@ func BenchmarkBlobCache(b *testing.B) {
 				b.Fatalf("warmup: %v", warmup.err)
 			}
 			plan := makeBenchmarkPlan(b.N, uint64(len(workload.keys)), len(workload.data), scenario)
-			fmt.Printf("SCHEDULE: case=%s fills=%d reads=%d offered-bytes=%d duration=%s offered-average=%dB/s read-rate=%.3f/s dispatch=goroutine-per-arrival worker-queues=none\n",
+			fmt.Printf("SCHEDULE: case=%s fills=%d reads=%d offered-bytes=%d duration=%s offered-average=%dB/s read-rate=%.3f/s dispatch=goroutine-per-arrival worker-queues=none small-write-bytes=%d\n",
 				scenario.name, len(plan.writes), len(plan.reads), plan.bytes, plan.duration, int64(float64(plan.bytes)/plan.duration.Seconds()),
-				float64(len(plan.reads))/plan.duration.Seconds())
+				float64(len(plan.reads))/plan.duration.Seconds(), workload.config.smallWriteAdmission)
 			fmt.Printf("READ-PLAN: pattern=50%%-1,20%%-2,15%%-3..5,10%%-6..10,5%%-11..44 age=100ms..%s head=%d%%..%s prefix=50..100%% ",
 				scenario.maxAge(), scenario.readHeadShare, scenario.readHeadAge)
 			for i, count := range plan.readCounts {
@@ -136,6 +136,7 @@ func BenchmarkBlobCache(b *testing.B) {
 type benchmarkProgress struct {
 	requests, writes, bytes, misses, failures                                                 atomic.Int64
 	offeredBytes                                                                              atomic.Int64
+	preparingWrites, preparingBytes, maxPreparingWrites, maxPreparingBytes                    atomic.Int64
 	memoryReadBytes, diskReadBytes                                                            atomic.Int64
 	offeredWrites, offeredReads                                                               atomic.Int64
 	rejectedWrites, rejectedBytes, ioRejectedReads                                            atomic.Int64
@@ -145,13 +146,13 @@ type benchmarkProgress struct {
 
 type benchmarkWorkload struct {
 	cache  *Cache
+	disk   *iosched.DiskPolicy
 	config benchmarkConfig
 	data   []byte
 	// Immutable length during each phase; IDs are one-based indexes. State:
 	// 0 = pending, 1 = published, 2 = failed, 3 = rejected. Every offered fill stays.
-	keys        []atomic.Uint32
-	progress    benchmarkProgress
-	readBuffers sync.Pool
+	keys     []atomic.Uint32
+	progress benchmarkProgress
 }
 
 func benchmarkMaximum(counter *atomic.Int64, value int64) {
@@ -187,6 +188,7 @@ func (w *benchmarkWorkload) run(plan benchmarkPlan, b *testing.B) *benchmarkStat
 	w.keys = keys
 	// Each request owns one completion slot, even when arrivals overlap.
 	writeCompletedAt := make([]time.Duration, len(plan.writes))
+	writeOfferedAt := make([]time.Duration, len(plan.writes))
 	result := newBenchmarkStats()
 	var statsMu sync.Mutex
 	record := func(request *benchmarkRequest) {
@@ -203,10 +205,10 @@ func (w *benchmarkWorkload) run(plan benchmarkPlan, b *testing.B) *benchmarkStat
 	fmt.Printf("PHASE-START: utc=%s fills=%d reads=%d scheduled-duration=%s\n", start.UTC().Format(time.RFC3339Nano), len(plan.writes), len(plan.reads), plan.duration)
 	done := make(chan struct{})
 	boundary := func(at time.Duration, event string, burst int) {
-		fmt.Printf("BURST-BOUNDARY: elapsed=%s scheduled=%s event=%s burst-index=%d offered-bytes=%d completed-bytes=%d completed-writes=%d completed-memory-read-bytes=%d completed-disk-read-bytes=%d pending-bytes=%d rejected-writes=%d rejected-bytes=%d read-io-retries=%d\n",
+		fmt.Printf("BURST-BOUNDARY: elapsed=%s scheduled=%s event=%s burst-index=%d offered-bytes=%d completed-bytes=%d completed-writes=%d completed-memory-read-bytes=%d completed-disk-read-bytes=%d pending-bytes=%d rejected-writes=%d rejected-bytes=%d\n",
 			time.Since(start), at, event, burst, w.progress.offeredBytes.Load(), w.progress.bytes.Load(),
 			w.progress.writes.Load(), w.progress.memoryReadBytes.Load(), w.progress.diskReadBytes.Load(),
-			w.progress.pendingBytes.Load(), w.progress.rejectedWrites.Load(), w.progress.rejectedBytes.Load(), metrics.ReadRetries.Load())
+			w.progress.pendingBytes.Load(), w.progress.rejectedWrites.Load(), w.progress.rejectedBytes.Load())
 	}
 	boundary(0, "start", -1)
 	reporter.Go(func() {
@@ -267,6 +269,7 @@ func (w *benchmarkWorkload) run(plan benchmarkPlan, b *testing.B) *benchmarkStat
 	})
 	dispatch.Go(func() {
 		benchmarkDispatch(plan.writes, start, &group, func(index int, job benchmarkJob) {
+			writeOfferedAt[index] = time.Since(start)
 			w.progress.offeredWrites.Add(1)
 			w.progress.offeredBytes.Add(int64(job.size))
 			benchmarkMaximum(&w.progress.maxPendingBytes, w.progress.pendingBytes.Add(int64(job.size)))
@@ -300,11 +303,35 @@ func (w *benchmarkWorkload) run(plan benchmarkPlan, b *testing.B) *benchmarkStat
 	close(done)
 	reporter.Wait()
 	boundary(plan.duration, "complete", -1)
-	for i, drain := range plan.burstDrains(writeCompletedAt) {
-		fmt.Printf("BURST-DRAIN: index=%d end=%s last-completion=%s drain=%s partial=%t scope=all-write-outcomes-through-burst-end\n",
-			i, drain.end, drain.completed, max(0, drain.completed-drain.end), drain.partial)
+	for index, burst := range plan.bursts {
+		var first, last, completed time.Duration
+		var bytes int64
+		for i, job := range plan.writes {
+			if job.at < min(burst.end, plan.duration) {
+				completed = max(completed, writeCompletedAt[i])
+			}
+			if job.at >= burst.start && job.at < burst.end {
+				if bytes == 0 {
+					first = writeOfferedAt[i]
+				}
+				last = max(last, writeOfferedAt[i])
+				bytes += int64(job.size)
+			}
+		}
+		if bytes > 0 {
+			fmt.Printf("BURST-OFFERED: index=%d first=%s last=%s bytes=%d actual-GB/s=%.6f\n", index, first, last, bytes, float64(bytes)/max(time.Nanosecond, last-first).Seconds()/1e9)
+			fmt.Printf("BURST-DRAIN: index=%d scheduled-end=%s last-offer=%s last-completion=%s drain=%s partial=%t scope=all-write-outcomes-through-burst-end\n",
+				index, burst.end, last, completed, max(0, completed-last), burst.end > plan.duration)
+		}
 	}
 	w.reportIOQueue(elapsed)
+	result.maxPreparingWrites, result.maxPreparingBytes = w.progress.maxPreparingWrites.Load(), w.progress.maxPreparingBytes.Load()
+	for _, at := range writeOfferedAt {
+		result.offeredElapsed = max(result.offeredElapsed, at)
+	}
+	if len(plan.reads) > 0 {
+		result.offeredElapsed = max(result.offeredElapsed, plan.reads[len(plan.reads)-1].at)
+	}
 	result.elapsed = elapsed
 	result.scheduled = plan.duration
 	result.bursts, result.completeBursts, result.burstDuration = plan.burstSummary()
@@ -347,20 +374,11 @@ func (w *benchmarkRequest) write(job benchmarkJob, arrival time.Time) {
 			w.workload.keys[job.id-1].Store(2)
 		}
 	}()
-	writer, err := w.workload.cache.NewWriter(w.key)
-	if err != nil {
-		w.writeFailure(err, job, arrival)
-		return
-	}
-	value := w.workload.data[job.offset : job.offset+job.size]
-	n, err := writer.Write(value)
-	if err == nil && n != job.size {
-		err = io.ErrShortWrite
-	}
+	ticket, err := w.prepareWrite(job)
 	if err == nil {
-		err = w.workload.cache.Put(writer)
+		err = ticket.Wait()
 	}
-	if err = errors.Join(err, writer.Close()); err != nil {
+	if err != nil {
 		w.writeFailure(err, job, arrival)
 		return
 	}
@@ -370,6 +388,41 @@ func (w *benchmarkRequest) write(job benchmarkJob, arrival time.Time) {
 	w.stats.writes.record(elapsed, int64(job.size))
 	w.workload.progress.writes.Add(1)
 	w.workload.progress.bytes.Add(int64(job.size))
+}
+
+// Reject external values before allocating or copying them. Inline values can
+// remain readable in RAM even when their disk writes fail admission.
+func (w *benchmarkRequest) prepareWrite(job benchmarkJob) (Ticket, error) {
+	start := time.Now()
+	defer func() { w.stats.writePrepare.record(time.Since(start), 0) }()
+	if w.workload.disk != nil && job.size > max(benchmarkInlineSize, int(w.workload.config.smallWriteAdmission)) {
+		if err := w.workload.disk.CanAdmit(iosched.OpWrite); err != nil {
+			w.stats.preflightRejected++
+			w.stats.preflightRejectedBytes += int64(job.size)
+			return Ticket{}, err
+		}
+	}
+	progress := &w.workload.progress
+	benchmarkMaximum(&progress.maxPreparingWrites, progress.preparingWrites.Add(1))
+	benchmarkMaximum(&progress.maxPreparingBytes, progress.preparingBytes.Add(int64(job.size)))
+	defer func() {
+		progress.preparingWrites.Add(-1)
+		progress.preparingBytes.Add(-int64(job.size))
+	}()
+	writer, err := w.workload.cache.NewWriter()
+	if err != nil {
+		return Ticket{}, err
+	}
+	n, err := writer.Write(w.workload.data[job.offset : job.offset+job.size])
+	w.stats.copiedBytes = int64(n)
+	if err == nil && n != job.size {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
+		writer.Discard()
+		return Ticket{}, err
+	}
+	return w.workload.cache.Put(w.key, writer)
 }
 
 func (w *benchmarkRequest) recordError(err error) {
@@ -446,21 +499,20 @@ func (w *benchmarkRequest) readFailure(err error, arrival time.Time) {
 	w.workload.progress.ioRejectedReads.Add(1)
 }
 
-// Explicit Read calls avoid io.Copy's WriterTo/ReaderFrom shortcuts. In
-// particular, memoryReader.WriteTo(io.Discard) need not touch payload bytes.
-// It reads limit bytes, the planned prefix, or to EOF if that comes first.
-func benchmarkConsume(reader io.Reader, buffer []byte, limit int64) (int64, error) {
+// Consume the planned prefix through the cache's zero-copy API. The last
+// borrowed chunk may extend beyond the prefix; count only the requested bytes.
+func benchmarkConsume(reader interface{ Next() ([]byte, error) }, limit int64) (int64, error) {
 	var total int64
 	for total < limit {
-		n, err := reader.Read(buffer[:min(int64(len(buffer)), limit-total)])
-		total += int64(n)
+		data, err := reader.Next()
+		total += min(int64(len(data)), limit-total)
 		if err == io.EOF {
 			return total, nil
 		}
 		if err != nil {
 			return total, err
 		}
-		if n == 0 {
+		if len(data) == 0 {
 			return total, io.ErrNoProgress
 		}
 	}
@@ -499,20 +551,28 @@ func (w *benchmarkRequest) read(job benchmarkJob, arrival time.Time) {
 		return
 	}
 	expected := reader.Size()
-	scratch, _ := w.workload.readBuffers.Get().(*[128 << 10]byte)
-	if scratch == nil {
-		scratch = new([128 << 10]byte)
-	}
+	w.stats.readValueBytes = expected
 	if job.size > 0 { // a planned prefix, in per mille of the value
 		expected = (expected*int64(job.size) + 999) / 1000
 	}
-	n, err := benchmarkConsume(reader, scratch[:], expected)
-	w.workload.readBuffers.Put(scratch)
+	n, err := benchmarkConsume(reader, expected)
 	if err != nil {
 		err = fmt.Errorf("consume reader after %d/%d bytes: %w", n, expected, err)
 	}
 	if closeErr := reader.Close(); closeErr != nil {
 		err = errors.Join(err, fmt.Errorf("close reader: %w", closeErr))
+	}
+	if errors.Is(err, ErrNotFound) {
+		w.stats.misses++
+		if state == 3 {
+			w.stats.rejectedFillMisses++
+		}
+		if pending {
+			w.stats.pendingMisses++
+		}
+		w.stats.missLatency.record(time.Since(arrival), 0)
+		w.workload.progress.misses.Add(1)
+		return
 	}
 	if err == nil && n != expected {
 		err = io.ErrUnexpectedEOF
@@ -534,11 +594,13 @@ func (w *benchmarkRequest) read(job benchmarkJob, arrival time.Time) {
 const benchmarkInlineSize = 2 << 20
 
 type benchmarkConfig struct {
+	smallWriteAdmission                             int64
 	diskBytes, memoryBytes                          int64
 	directory                                       string
 	failOnError                                     bool
 	checksums                                       bool
 	verifyChecksums                                 bool
+	bufferedReads                                   bool
 	schedulerCPUs                                   []int
 	writeSchedulers                                 int
 	ringDepth                                       uint32
@@ -550,6 +612,7 @@ func readBenchmarkConfig(b *testing.B) benchmarkConfig {
 	b.Helper()
 	c := benchmarkConfig{diskBytes: benchmarkEnvInt(b, "BLOBCACHE_DISK_GIB", 0) << 30,
 		memoryBytes:          benchmarkEnvInt(b, "BLOBCACHE_CACHE_MEMORY_MB", 16384) << 20,
+		smallWriteAdmission:  benchmarkEnvInt(b, "BLOBCACHE_SMALL_WRITE_KIB", 0) << 10,
 		schedulerCPUs:        []int{-1},
 		writeSchedulers:      int(benchmarkEnvInt(b, "BLOBCACHE_WRITE_SCHEDULERS", 0)),
 		ringDepth:            uint32(benchmarkEnvInt(b, "BLOBCACHE_RING_DEPTH", 256)),
@@ -557,6 +620,7 @@ func readBenchmarkConfig(b *testing.B) benchmarkConfig {
 		writeBacklog:         time.Duration(benchmarkEnvInt(b, "BLOBCACHE_WRITE_BACKLOG_MS", 0)) * time.Millisecond,
 		writeBacklogRecovery: time.Duration(benchmarkEnvInt(b, "BLOBCACHE_WRITE_BACKLOG_RECOVERY_MS", -1)) * time.Millisecond,
 		readBacklog:          time.Duration(benchmarkEnvInt(b, "BLOBCACHE_READ_BACKLOG_MS", 0)) * time.Millisecond,
+		bufferedReads:        benchmarkEnvInt(b, "BLOBCACHE_BUFFERED_READS", 0) != 0,
 		directory:            os.Getenv("BLOBCACHE_BENCH_DIR"), failOnError: true}
 	if value := os.Getenv("BLOBCACHE_SCHEDULER_CPUS"); value != "" {
 		c.schedulerCPUs = nil
@@ -570,6 +634,9 @@ func readBenchmarkConfig(b *testing.B) benchmarkConfig {
 	}
 	if c.ringDepth < 2 {
 		b.Fatal("BLOBCACHE_RING_DEPTH must be at least 2")
+	}
+	if c.writeBacklog > 0 && c.writeBacklogRecovery >= c.writeBacklog {
+		b.Fatal("BLOBCACHE_WRITE_BACKLOG_RECOVERY_MS must be less than BLOBCACHE_WRITE_BACKLOG_MS")
 	}
 	if c.diskBytes <= 0 {
 		b.Fatal("set BLOBCACHE_DISK_GIB to the live disk target (e.g. 100)")
@@ -601,11 +668,7 @@ func readBenchmarkConfig(b *testing.B) benchmarkConfig {
 		if _, err := os.Stat("/instance_storage"); err == nil {
 			base = "/instance_storage"
 		}
-		var err error
-		c.directory, err = os.MkdirTemp(base, "bench-blobcache-")
-		if err != nil {
-			b.Fatal(err)
-		}
+		c.directory = base
 	}
 	return c
 }
@@ -626,24 +689,31 @@ func benchmarkEnvInt(b *testing.B, name string, fallback int64) int64 {
 func newBenchmarkWorkload(b *testing.B) *benchmarkWorkload {
 	b.Helper()
 	w := &benchmarkWorkload{config: readBenchmarkConfig(b), data: make([]byte, 32<<20)}
-	dir := w.config.directory
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(w.config.directory, 0o755); err != nil {
 		b.Fatal(err)
 	}
+	dir, err := os.MkdirTemp(w.config.directory, "bench-blobcache-")
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { os.RemoveAll(dir) })
+	w.config.directory = dir
 	opened := time.Now()
 	integrity := blobstore.DataIntegrityNone
 	if w.config.checksums {
 		integrity = blobstore.DataIntegrityCRC32C
 	}
-	var err error
+	w.disk = iosched.NewDiskPolicy(iosched.WithLatencyGoal(w.config.ioBudget), iosched.WithoutReadIOBudget(),
+		iosched.WithWriteBacklogLimit(w.config.writeBacklog), iosched.WithWriteBacklogRecovery(w.config.writeBacklogRecovery),
+		iosched.WithReadBacklogLimit(w.config.readBacklog))
 	w.cache, err = New(dir, WithTargetSize(w.config.diskBytes),
 		WithMemory(w.config.memoryBytes, alloc.WithWarmup()),
-		WithInlineThreshold(benchmarkInlineSize), WithStagingSize(1<<20),
+		WithInlineThreshold(benchmarkInlineSize),
 		WithSchedulerCPUs(w.config.schedulerCPUs...), WithWriteSchedulers(w.config.writeSchedulers),
-		WithRingDepth(w.config.ringDepth), WithIOBudget(w.config.ioBudget),
-		WithWriteBacklogLimit(w.config.writeBacklog), WithWriteBacklogRecovery(w.config.writeBacklogRecovery),
-		WithReadBacklogLimit(w.config.readBacklog),
+		WithRingDepth(w.config.ringDepth), WithDiskPolicy(w.disk),
+		WithSmallWriteAdmission(w.config.smallWriteAdmission),
 		WithVerifyChecksums(w.config.verifyChecksums),
+		WithBufferedReads(w.config.bufferedReads),
 		storeOpt(blobstore.WithDataIntegrity(integrity)))
 	if err != nil {
 		b.Fatal(err)
@@ -661,61 +731,20 @@ func newBenchmarkWorkload(b *testing.B) *benchmarkWorkload {
 		fmt.Printf("IO-SCHEDULER: id=%d role=%s cpu-requested=%d backend=%s ring-depth=%d read-io-budget=0s write-io-budget=%s budget-scope=disk write-backlog=%s write-backlog-recovery=%s read-backlog=%s\n",
 			i, s.Role, s.CPU, s.Backend, w.config.ringDepth, s.WriteIOBudget, w.config.writeBacklog, w.config.writeBacklogRecovery, w.config.readBacklog)
 	}
-	w.verifyRecovered(b)
 	if _, err := cryptorand.Read(w.data); err != nil {
 		b.Fatal(err)
 	}
 	fmt.Printf("KEY-LAYOUT: type=%s key-bytes=%d record-header-bytes=%d\n",
 		reflect.TypeFor[blobstore.KeyHash](), reflect.TypeFor[blobstore.KeyHash]().Size(), blobstore.RecordHeaderSize)
-	fmt.Printf("\nWORKLOAD: cpus=%d offered-fills=%d warmup-fills=%d locality=skewed-mean-3.6 sizes=8KiB..32MiB inline=2MiB memory=%dMiB disk=%dGiB direct-io=true checksums=%t verify-checksums=%t read-buffer=128KiB\n",
-		runtime.GOMAXPROCS(0), b.N, min(b.N, w.warmupWrites()), w.config.memoryBytes>>20, w.config.diskBytes>>30, w.config.checksums, w.config.verifyChecksums)
+	fmt.Printf("\nWORKLOAD: cpus=%d offered-fills=%d warmup-fills=%d locality=skewed-mean-3.6 sizes=8KiB..32MiB inline=2MiB memory=%dMiB disk=%dGiB direct-writes=true buffered-reads=%t checksums=%t verify-checksums=%t read-consumption=Next\n",
+		runtime.GOMAXPROCS(0), b.N, min(b.N, w.warmupWrites()), w.config.memoryBytes>>20, w.config.diskBytes>>30, w.config.bufferedReads, w.config.checksums, w.config.verifyChecksums)
 	return w
 }
 
-// Probe the oldest recovered records before any new writes can replace them.
-func (w *benchmarkWorkload) verifyRecovered(b *testing.B) {
-	b.Helper()
-	var headers []blobstore.RecordHeader
-	for h := range w.cache.store.Records() {
-		if len(headers) == 128 {
-			break
-		}
-		headers = append(headers, h)
-	}
-	var buffer [128 << 10]byte
-	var total int64
-	for _, h := range headers {
-		path, offset := filepath.Join(w.config.directory, "data.db"), int64(h.Offset)
-		if h.Flags.IsExternal() {
-			path, offset = filepath.Join(w.config.directory, "objects", strconv.FormatUint(h.ObjectID, 10)), 0
-		}
-		file, err := os.Open(path)
-		if err != nil {
-			b.Fatal(err)
-		}
-		key := make([]byte, h.KeyLen)
-		_, err = file.ReadAt(key, offset+blobstore.RecordHeaderSize)
-		err = errors.Join(err, file.Close())
-		if err != nil {
-			b.Fatal(err)
-		}
-		reader, err := w.cache.store.NewReader(key, h)
-		if err != nil {
-			b.Fatalf("recovered object %d: %v", h.ObjectID, err)
-		}
-		n, err := benchmarkConsume(reader, buffer[:], int64(h.LogicalLen))
-		err = errors.Join(err, reader.Close())
-		if err != nil || n != int64(h.LogicalLen) {
-			b.Fatalf("recovered object %d: read=%d expected=%d error=%v", h.ObjectID, n, h.LogicalLen, err)
-		}
-		total += n
-	}
-	fmt.Printf("RECOVERY-CHECK: records=%d bytes=%d verify-checksums=%t\n", len(headers), total, w.config.verifyChecksums)
-}
+// The fixed reference is shared with ringcache and independent of cache capacity.
+var benchmarkWarmupFills = benchmarkWarmupWrites(16<<30, benchmarkInlineSize)
 
-func (w *benchmarkWorkload) warmupWrites() int {
-	return benchmarkWarmupWrites(w.config.memoryBytes, benchmarkInlineSize)
-}
+func (w *benchmarkWorkload) warmupWrites() int { return benchmarkWarmupFills }
 
 type benchmarkMeasurements struct {
 	latency *hdrhistogram.Histogram
@@ -735,6 +764,9 @@ func (s *benchmarkSample) record(latency time.Duration, bytes int64) {
 }
 
 type benchmarkRequestStats struct {
+	readValueBytes                                                          int64
+	copiedBytes, preflightRejected, preflightRejectedBytes                  int64
+	writePrepare                                                            benchmarkSample
 	requests, failures, misses                                              int64
 	pendingReads, pendingMisses                                             int64
 	rejectedWrites, rejectedBytes, ioRejectedReads                          int64
@@ -754,6 +786,11 @@ func (m *benchmarkMeasurements) record(latency time.Duration, bytes int64) {
 }
 
 type benchmarkStats struct {
+	readsBySize                                                             [len(benchmarkReadSizeBands)]struct{ memory, file benchmarkMeasurements }
+	copiedBytes, preflightRejected, preflightRejectedBytes                  int64
+	maxPreparingWrites, maxPreparingBytes                                   int64
+	writePrepare                                                            benchmarkMeasurements
+	offeredElapsed                                                          time.Duration
 	requests, failures, misses                                              int64
 	elapsed, scheduled                                                      time.Duration
 	offeredWrites, offeredReads, offeredBytes                               int64
@@ -776,9 +813,27 @@ func newBenchmarkStats() *benchmarkStats {
 	latency := func() benchmarkMeasurements {
 		return benchmarkMeasurements{latency: hdrhistogram.New(1, math.MaxInt64, 3)}
 	}
-	return &benchmarkStats{writes: latency(), memoryReads: latency(), diskReads: latency(),
+	s := &benchmarkStats{writePrepare: latency(), writes: latency(), memoryReads: latency(), diskReads: latency(),
 		writeBusy: latency(), readBusy: latency(), writeRejected: latency(), readRejected: latency(), writeStartDelay: latency(), writeService: latency(), readStartDelay: latency(), readService: latency(), missLatency: latency(),
-		sizes: hdrhistogram.New(1, 8<<20, 3)}
+		sizes: hdrhistogram.New(1, 32<<20, 3)}
+	for i := range s.readsBySize {
+		s.readsBySize[i].memory, s.readsBySize[i].file = latency(), latency()
+	}
+	return s
+}
+
+// Bucket by the full value size, even when a read consumes only a prefix.
+// Bounds are inclusive above and exclusive below the preceding bound.
+var benchmarkReadSizeBands = [...]struct {
+	max   int64
+	label string
+}{
+	{256 << 10, "<=256KiB"},
+	{1 << 20, "256KiB..1MiB"},
+	{2 << 20, "1MiB..2MiB"},
+	{4 << 20, "2MiB..4MiB"},
+	{8 << 20, "4MiB..8MiB"},
+	{math.MaxInt64, ">8MiB"},
 }
 
 func (s *benchmarkStats) recordError(err error) {
@@ -792,6 +847,9 @@ func (s *benchmarkStats) record(other *benchmarkRequestStats) {
 	if s.err == nil {
 		s.err = other.err
 	}
+	s.copiedBytes += other.copiedBytes
+	s.preflightRejected += other.preflightRejected
+	s.preflightRejectedBytes += other.preflightRejectedBytes
 	s.requests += other.requests
 	s.failures += other.failures
 	s.misses += other.misses
@@ -812,7 +870,7 @@ func (s *benchmarkStats) record(other *benchmarkRequestStats) {
 		{&s.writeBusy, other.writeBusy}, {&s.readBusy, other.readBusy},
 		{&s.writeRejected, other.writeRejected}, {&s.readRejected, other.readRejected},
 		{&s.writes, other.writes}, {&s.memoryReads, other.memoryReads}, {&s.diskReads, other.diskReads},
-		{&s.writeStartDelay, other.writeStartDelay}, {&s.writeService, other.writeService},
+		{&s.writePrepare, other.writePrepare}, {&s.writeStartDelay, other.writeStartDelay}, {&s.writeService, other.writeService},
 		{&s.readStartDelay, other.readStartDelay}, {&s.readService, other.readService}, {&s.missLatency, other.missLatency},
 	} {
 		if pair.from.recorded {
@@ -822,14 +880,29 @@ func (s *benchmarkStats) record(other *benchmarkRequestStats) {
 	if other.writes.recorded {
 		s.sizes.RecordValue(other.writes.bytes)
 	}
+	if other.memoryReads.recorded || other.diskReads.recorded {
+		for i, band := range benchmarkReadSizeBands {
+			if other.readValueBytes > band.max {
+				continue
+			}
+			if sample := other.memoryReads; sample.recorded {
+				s.readsBySize[i].memory.record(sample.latency, sample.bytes)
+			}
+			if sample := other.diskReads; sample.recorded {
+				s.readsBySize[i].file.record(sample.latency, sample.bytes)
+			}
+			break
+		}
+	}
 }
 
 func (s *benchmarkStats) report(b *testing.B) {
-	fmt.Printf("ARRIVALS: writes=%d reads=%d bytes=%d scheduled=%s final-drain=%s write-GB/s=%.6f read-requests/s=%.3f\n",
-		s.offeredWrites, s.offeredReads, s.offeredBytes, s.scheduled, max(0, s.elapsed-s.scheduled),
-		float64(s.offeredBytes)/s.scheduled.Seconds()/1e9, float64(s.offeredReads)/s.scheduled.Seconds())
+	fmt.Printf("ARRIVALS: writes=%d reads=%d bytes=%d scheduled=%s offered-duration=%s final-drain=%s write-GB/s=%.6f read-requests/s=%.3f\n",
+		s.offeredWrites, s.offeredReads, s.offeredBytes, s.scheduled, s.offeredElapsed, max(0, s.elapsed-s.offeredElapsed),
+		float64(s.offeredBytes)/s.elapsed.Seconds()/1e9, float64(s.offeredReads)/s.elapsed.Seconds())
 	fmt.Printf("DISPATCH: mode=goroutine-per-arrival peak-pending-bytes=%d peak-active-writes=%d peak-active-reads=%d\n",
 		s.maxPendingBytes, s.maxActiveWrites, s.maxActiveReads)
+	fmt.Printf("WRITE-PREPARATION: copied-bytes=%d rejected-before-writer=%d rejected-before-writer-bytes=%d peak-writes=%d peak-bytes=%d scope=before-ticket-wait\n", s.copiedBytes, s.preflightRejected, s.preflightRejectedBytes, s.maxPreparingWrites, s.maxPreparingBytes)
 	fmt.Printf("REJECTIONS: writes=%d write-bytes=%d reads=%d scope=dio-admission no-retries=true\n", s.rejectedWrites, s.rejectedBytes, s.ioRejectedReads)
 	fmt.Printf("CACHE-BUSY: writes=%d write-bytes=%d reads=%d no-retries=true\n", s.busyWrites, s.busyBytes, s.busyReads)
 	fmt.Printf("REJECTED-FILL-READS: reads=%d misses=%d\n", s.rejectedFillReads, s.rejectedFillMisses)
@@ -842,7 +915,7 @@ func (s *benchmarkStats) report(b *testing.B) {
 	}{
 		{"write-cache-busy", s.writeBusy.latency}, {"read-cache-busy", s.readBusy.latency},
 		{"write-rejected", s.writeRejected.latency}, {"read-rejected", s.readRejected.latency},
-		{"write", s.writes.latency}, {"Put", metrics.PutDuration.Snapshot()},
+		{"write-prepare", s.writePrepare.latency}, {"write", s.writes.latency}, {"Put", metrics.PutDuration.Snapshot()},
 		{"write-start-delay", s.writeStartDelay.latency}, {"write-service", s.writeService.latency},
 		{"read-start-delay", s.readStartDelay.latency}, {"read-service-including-misses", s.readService.latency}, {"read-miss", s.missLatency.latency},
 		{"memory-read", s.memoryReads.latency}, {"disk-read", s.diskReads.latency},
@@ -853,13 +926,31 @@ func (s *benchmarkStats) report(b *testing.B) {
 			time.Duration(h.ValueAtQuantile(50)), time.Duration(h.ValueAtQuantile(99)), time.Duration(h.ValueAtQuantile(99.9)), time.Duration(h.Max()), time.Duration(h.Mean()))
 		b.ReportMetric(float64(h.ValueAtQuantile(99))/1e6, metric.name+"-p99-ms")
 	}
+	for i, band := range benchmarkReadSizeBands {
+		all := benchmarkMeasurements{
+			latency: hdrhistogram.New(1, math.MaxInt64, 3),
+			bytes:   s.readsBySize[i].memory.bytes + s.readsBySize[i].file.bytes,
+		}
+		all.latency.Merge(s.readsBySize[i].memory.latency)
+		all.latency.Merge(s.readsBySize[i].file.latency)
+		for _, path := range []struct {
+			name    string
+			samples benchmarkMeasurements
+		}{{"all", all}, {"memory", s.readsBySize[i].memory}, {"file", s.readsBySize[i].file}} {
+			h := path.samples.latency
+			if h.TotalCount() == 0 {
+				continue
+			}
+			fmt.Printf("READ-SIZE: value-size=%s path=%s n=%d returned-bytes=%d p50=%s p99=%s p99.9=%s mean=%s\n",
+				band.label, path.name, h.TotalCount(), path.samples.bytes,
+				time.Duration(h.ValueAtQuantile(50)), time.Duration(h.ValueAtQuantile(99)), time.Duration(h.ValueAtQuantile(99.9)), time.Duration(h.Mean()))
+		}
+	}
 	fmt.Printf("PENDING-READS: reads=%d misses=%d (fill-not-yet-published-at-read-start)\n", s.pendingReads, s.pendingMisses)
 	fmt.Printf("BURST-SUMMARY: count=%d complete=%d partial=%d total-duration=%s scheduled=%s\n",
 		s.bursts, s.completeBursts, s.bursts-s.completeBursts, s.burstDuration, s.scheduled)
 	b.ReportMetric(float64(s.bursts), "bursts")
 	b.ReportMetric(s.burstDuration.Seconds(), "burst-seconds")
-	fmt.Printf("READ-IO-RETRIES: eagain=%d\n", metrics.ReadRetries.Load())
-	b.ReportMetric(float64(metrics.ReadRetries.Load()), "read-io-retries")
 	seconds := s.elapsed.Seconds()
 	fmt.Printf("PAYLOAD: written=%.3fGiB disk-read=%.3fGiB memory-read=%.3fGiB write-size-p50=%.1fKiB p99=%.1fKiB\n",
 		float64(s.writes.bytes)/(1<<30), float64(s.diskReads.bytes)/(1<<30), float64(s.memoryReads.bytes)/(1<<30),
@@ -884,14 +975,15 @@ func (s *benchmarkStats) report(b *testing.B) {
 
 const benchmarkPeakRate = 2_000_000_000
 
-// Value sizes follow production puts (p50 ~29KB, p75 ~286KB, p90 ~1.1MB,
-// p95 ~1.6MB, p99 ~5MB, mean ~450KB), in round brackets, log-uniform within
-// each. Weights are per mille.
+// Shared size mix: 20% up to 256 KiB, 50% from 512 KiB to 1.5 MiB,
+// and an expected mean of about 912 KiB. Sizes are log-uniform within each
+// band; weights are per mille. Keep both cache benchmarks identical.
 var benchmarkSizeBands = [...]struct{ low, high, weight int }{
-	{8 << 10, 32 << 10, 500},
-	{32 << 10, 256 << 10, 250},
-	{256 << 10, 1 << 20, 150},
-	{1 << 20, 2 << 20, 50},
+	{8 << 10, 32 << 10, 50},
+	{32 << 10, 256 << 10, 150},
+	{256 << 10, 512 << 10, 200},
+	{512 << 10, 1536 << 10, 500},
+	{1536 << 10, 2 << 20, 50},
 	{2 << 20, 4 << 20, 30},
 	{4 << 20, 8 << 20, 15},
 	{8 << 20, 32 << 20, 5},

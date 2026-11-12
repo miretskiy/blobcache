@@ -5,6 +5,7 @@ import (
 	"sync/atomic"
 
 	"github.com/miretskiy/blobcache/blobstore"
+	"github.com/miretskiy/dio/v2/alloc"
 	"github.com/miretskiy/dio/v2/collections"
 )
 
@@ -23,9 +24,9 @@ type memoryEntry struct {
 // Writers hold the exclusive lock, so they may move slots and clear visited.
 type residentEntry struct {
 	key     blobstore.KeyHash
-	buffer  blobstore.Memory
+	buffer  *alloc.ReadOnlyBuffer
 	visited uint32
-	pending bool // Disk I/O still owns this inline record; it cannot become disk-only yet.
+	pending bool // Borrowed from Put until completion transfers ownership to this entry.
 }
 
 type memoryQueue struct {
@@ -40,9 +41,6 @@ type memoryCache struct {
 	next    atomic.Uint64
 }
 
-// isResident reports whether m holds a value: the zero Memory has no bytes.
-func isResident(m blobstore.Memory) bool { return m.Size() != 0 }
-
 func newMemoryCache() memoryCache {
 	return memoryCache{entries: collections.NewShardedMapWithExtra[blobstore.KeyHash, memoryEntry](
 		4, memoryQueue{},
@@ -52,66 +50,89 @@ func newMemoryCache() memoryCache {
 
 // lookup pins the resident buffer before releasing the shard lock, so neither
 // replacement nor reclamation can release it between lookup and acquisition.
-// The zero Memory means the record is disk-only.
-func (m *memoryCache) lookup(key blobstore.KeyHash) (blobstore.Memory, blobstore.RecordHeader, bool) {
+// A nil buffer means the record is disk-only.
+func (m *memoryCache) lookup(key blobstore.KeyHash) (*alloc.ReadOnlyBuffer, blobstore.RecordHeader, bool) {
 	s := m.entries.Shard(key)
 	s.RLock()
 	defer s.RUnlock()
 	e, ok := s.Items[key]
-	var buffer blobstore.Memory
+	var buffer *alloc.ReadOnlyBuffer
 	if e.resident != 0 {
 		resident := s.Extra.list.Value(e.resident)
 		buffer = resident.buffer
-		buffer.TryInc() // The queue owns a reference while the shard is locked.
+		buffer.Retain()
 		atomic.StoreUint32(&resident.visited, 1)
 	}
 	return buffer, e.header, ok
 }
 
-// replace takes ownership of buffer and updates disk metadata even if buffer
-// is the zero Memory. Replacing or demoting a resident record returns its slot
-// for reuse.
-func (m *memoryCache) replace(key blobstore.KeyHash, buffer blobstore.Memory, header blobstore.RecordHeader, pending bool) {
+// replace borrows a pending buffer; complete accepts ownership after I/O.
+// Nonpending buffers transfer ownership immediately. Replacing a pending entry
+// leaves its buffer with Put, whose completion will release it.
+func (m *memoryCache) replace(key blobstore.KeyHash, buffer *alloc.ReadOnlyBuffer, header blobstore.RecordHeader, pending bool) {
 	s := m.entries.Shard(key)
 	s.Lock()
 	defer s.Unlock()
 	q := &s.Extra
 	old := s.Items[key]
 	if old.header.ObjectID > header.ObjectID {
-		if isResident(buffer) {
-			buffer.Unpin()
+		if buffer != nil && !pending {
+			buffer.Release()
 		}
 		return // An older write completed after its replacement.
 	}
 	if old.resident != 0 {
+		owned := !q.list.Value(old.resident).pending
 		oldBuffer, _ := q.remove(old.resident)
-		oldBuffer.Unpin()
+		if owned {
+			oldBuffer.Release()
+		}
 	}
 	e := memoryEntry{header: header}
-	if isResident(buffer) {
+	if buffer != nil {
 		e.resident = q.list.PushBack(residentEntry{key: key, buffer: buffer, pending: pending})
-		q.residentBytes += buffer.Size()
+		q.residentBytes += int64(buffer.Cap())
 	}
 	s.Items[key] = e
 }
 
-// complete makes an inline record evictable after disk completion. A failed
-// disk write leaves its memory readable until normal eviction.
-func (m *memoryCache) complete(h blobstore.RecordHeader, err error) {
+// complete accepts Put's allocation ownership if this is still the current
+// inline value. A failed disk write remains readable until normal eviction.
+// False leaves ownership with Put, which releases a replaced buffer.
+func (m *memoryCache) complete(h blobstore.RecordHeader, err error) bool {
 	s := m.entries.Shard(h.KeyHash())
 	s.Lock()
 	defer s.Unlock()
 	e, ok := s.Items[h.KeyHash()]
-	if !ok || e.header.ObjectID != h.ObjectID {
-		return
+	if !ok || e.header.ObjectID != h.ObjectID || e.resident == 0 {
+		return false
 	}
-	if e.resident != 0 {
-		s.Extra.list.Value(e.resident).pending = false
-	}
+	s.Extra.list.Value(e.resident).pending = false
 	if err != nil {
 		e.header.Flags |= blobstore.FlagDeleted
 		s.Items[h.KeyHash()] = e
 	}
+	return true
+}
+
+// admit shares a validated inline read's buffer with the cache. Only the first
+// reader of the current disk-only record adds a reference; replacement and
+// retirement must not be undone by a read that was already in flight.
+func (m *memoryCache) admit(h blobstore.RecordHeader, buffer *alloc.ReadOnlyBuffer) {
+	if h.Flags.IsExternal() {
+		return
+	}
+	s := m.entries.Shard(h.KeyHash())
+	s.Lock()
+	defer s.Unlock()
+	e, ok := s.Items[h.KeyHash()]
+	if !ok || e.header.ObjectID != h.ObjectID || e.resident != 0 {
+		return
+	}
+	q := &s.Extra
+	e.resident = q.list.PushBack(residentEntry{key: h.KeyHash(), buffer: buffer.Retain(), visited: 1})
+	q.residentBytes += int64(buffer.Cap())
+	s.Items[h.KeyHash()] = e
 }
 
 // retire forgets this disk record without removing a newer mapping for its key.
@@ -133,12 +154,12 @@ func (m *memoryCache) retire(key blobstore.KeyHash, objectID uint64) {
 }
 
 // remove transfers the queue's buffer reference and its byte count to the caller.
-func (q *memoryQueue) remove(handle collections.Handle) (blobstore.Memory, int64) {
+func (q *memoryQueue) remove(handle collections.Handle) (*alloc.ReadOnlyBuffer, int64) {
 	if q.hand == handle {
 		q.hand, _ = q.list.Next(handle)
 	}
 	buffer := q.list.Value(handle).buffer
-	size := buffer.Size()
+	size := int64(buffer.Cap())
 	q.list.Remove(handle)
 	q.residentBytes -= size
 	return buffer, size
@@ -221,7 +242,9 @@ func (m *memoryCache) clear() {
 		s := m.entries.ShardAt(i)
 		s.Lock()
 		for _, e := range s.Extra.list.All() {
-			e.buffer.Unpin()
+			if !e.pending {
+				e.buffer.Release()
+			}
 		}
 		clear(s.Items)
 		s.Extra = memoryQueue{}

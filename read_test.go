@@ -6,10 +6,13 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/miretskiy/blobcache/blobstore"
+	"github.com/miretskiy/blobcache/metrics"
+	"github.com/miretskiy/dio/v2/align"
 	"github.com/stretchr/testify/require"
 )
 
@@ -49,15 +52,16 @@ func TestReadMemoryDiskAndRecovery(t *testing.T) {
 			}
 			putValue(t, c, "inline", []byte("superseded"))
 			for _, v := range values {
-				w, err := c.NewWriter(v.key)
-				require.NoError(t, err)
-				defer w.Close()
-				_, err = w.Write(v.value)
-				require.NoError(t, err)
-				err = c.Put(w)
+				w, err := c.NewWriter()
 				require.NoError(t, err)
 
-				require.NoError(t, w.Close())
+				_, err = w.Write(v.value)
+				require.NoError(t, err)
+				ticket, err := c.Put(v.key, w)
+				require.NoError(t, err)
+				require.NoError(t, ticket.Wait())
+				require.NoError(t, err)
+
 				checkRead(t, c, v.key, v.value)
 			}
 			require.Eventually(t, func() bool {
@@ -87,7 +91,7 @@ func TestRead64BitKeyHash(t *testing.T) {
 			dir := t.TempDir()
 			opts := []Option{storeOpt(blobstore.WithDataIntegrity(blobstore.DataIntegrityNone))}
 			c := newPutCache(t, dir, opts...)
-			key := bytes.Repeat([]byte("k"), 10000) // Exceeds the disk reader's staging size.
+			key := bytes.Repeat([]byte("k"), MaxKeyLen)
 			value := []byte("value")
 			if external {
 				value = bytes.Repeat(value, 8000)
@@ -99,15 +103,17 @@ func TestRead64BitKeyHash(t *testing.T) {
 			checkRead(t, c, key, value)
 			entry, ok := c.values.entries.Get(blobstore.HashKey(key))
 			require.True(t, ok, "persisted key hash recovers without reading the data files")
-			require.Zero(t, entry.resident, "read the actual disk record")
+			require.Equal(t, external, entry.resident == 0, "only inline disk reads enter the resident cache")
 
-			// Force a hash collision, with the mismatch beyond the first read.
+			// Force a hash collision, with the mismatch at the end of the key.
 			wrong := bytes.Clone(key)
 			wrong[len(wrong)-1] ^= 1
-			c.values.replace(blobstore.HashKey(wrong), blobstore.Memory{}, entry.header, false)
+			c.values.replace(blobstore.HashKey(wrong), nil, entry.header, false)
 			r, err := c.Read(wrong)
-			require.Nil(t, r)
+			require.NoError(t, err)
+			_, err = r.Next()
 			require.ErrorIs(t, err, ErrNotFound, "full keys must match even without integrity checks")
+			require.NoError(t, r.Close())
 			checkRead(t, c, key, value)
 		})
 	}
@@ -151,9 +157,9 @@ func TestReadDiskEarlyCloseAndErrors(t *testing.T) {
 	r, err := c.Read([]byte("key"))
 	require.NoError(t, err)
 	defer r.Close()
-	require.Greater(t, (c.memory.Capacity() - c.memory.Available()), before, "disk reads acquire staging memory after eviction")
+	require.Greater(t, (c.memory.Capacity() - c.memory.Available()), before, "disk reads acquire a whole-frame buffer after eviction")
 	require.NoError(t, r.Close())
-	require.Equal(t, before, (c.memory.Capacity() - c.memory.Available()), "early Close releases staging without draining")
+	require.Eventually(t, func() bool { return before == c.memory.Capacity()-c.memory.Available() }, time.Second, time.Millisecond, "completion releases the buffer after early Close")
 	for _, tc := range []struct {
 		key []byte
 		err error
@@ -173,12 +179,12 @@ func TestUnpublishedObjectsAreMisses(t *testing.T) {
 	dir := t.TempDir()
 	c := newPutCache(t, dir, WithInlineThreshold(0))
 	key := []byte("key")
-	w, err := c.NewWriter(key)
+	w, err := c.NewWriter()
 	require.NoError(t, err)
-	defer w.Close()
+	defer w.Discard()
 	_, err = w.Write([]byte("value"))
 	require.NoError(t, err)
-	require.NoError(t, w.Close())
+	w.Discard()
 	r, err := c.Read(key)
 	require.Nil(t, r)
 	require.ErrorIs(t, err, ErrNotFound)
@@ -210,8 +216,10 @@ func TestRecoveryUsesIndexWithoutDataFiles(t *testing.T) {
 		require.Zero(t, entry.resident)
 	}
 	r, err := c.Read([]byte("object"))
-	require.Nil(t, r)
+	require.NoError(t, err)
+	_, err = r.Next()
 	require.ErrorIs(t, err, ErrNotFound)
+	require.NoError(t, r.Close())
 	require.Equal(t, 1, c.values.entries.Len(), "the missing object is removed lazily on Read")
 }
 
@@ -235,7 +243,7 @@ func TestReadChecksumPolicyAfterRestart(t *testing.T) {
 			f, err := os.OpenFile(filepath.Join(dir, "data.db"), os.O_WRONLY, 0)
 			require.NoError(t, err)
 			value[len(value)-1] ^= 1
-			_, err = f.WriteAt(value[len(value)-1:], int64(blobstore.RecordHeaderSize+len(key)+len(value)-1))
+			_, err = f.WriteAt(value[len(value)-1:], int64(align.BlockSize+len(value)-1))
 			require.NoError(t, err)
 			require.NoError(t, f.Close())
 
@@ -256,6 +264,7 @@ func TestReadChecksumPolicyAfterRestart(t *testing.T) {
 			got, err := io.ReadAll(r)
 			if tc.verify && tc.integrity == blobstore.DataIntegrityCRC32C {
 				require.ErrorIs(t, err, ErrCorrupt)
+				require.Zero(t, residentCount(c), "failed validation must not admit the read buffer")
 			} else {
 				require.NoError(t, err)
 				require.Equal(t, value, got)
@@ -264,7 +273,7 @@ func TestReadChecksumPolicyAfterRestart(t *testing.T) {
 	}
 }
 
-func TestReaderCloseReleasesAllocation(t *testing.T) {
+func TestReaderCloseReleasesOwnership(t *testing.T) {
 	for _, kind := range []string{"resident", "inline-disk", "external"} {
 		t.Run(kind, func(t *testing.T) {
 			var opts []Option
@@ -282,7 +291,7 @@ func TestReaderCloseReleasesAllocation(t *testing.T) {
 			defer r.Close()
 			var charged int64
 			if resident, ok := r.(*memoryReader); ok {
-				charged = resident.memory.Size()
+				charged = memorySize(resident.memory)
 			} else {
 				charged = (c.memory.Capacity() - c.memory.Available())
 			}
@@ -296,6 +305,10 @@ func TestReaderCloseReleasesAllocation(t *testing.T) {
 			require.EqualValues(t, len(value), n)
 			require.Equal(t, before, (c.memory.Capacity() - c.memory.Available()), "EOF currently retains the allocation")
 			require.NoError(t, errors.Join(readErr, r.Close()))
+			if kind == "inline-disk" {
+				require.Equal(t, before, c.memory.Capacity()-c.memory.Available(), "the cache retains the admitted buffer")
+				require.Equal(t, charged, c.values.reclaimCacheMemory(charged))
+			}
 			require.Equal(t, before-charged, (c.memory.Capacity() - c.memory.Available()))
 			require.NoError(t, r.Close(), "double Close must not decrement twice")
 
@@ -305,9 +318,117 @@ func TestReaderCloseReleasesAllocation(t *testing.T) {
 			failed := errors.New("consumer failed")
 			_, readErr = r.WriteTo(failingReadConsumer{failed})
 			require.ErrorIs(t, errors.Join(readErr, r.Close()), failed)
+			c.values.reclaimCacheMemory(c.memory.Capacity())
 			require.Zero(t, (c.memory.Capacity() - c.memory.Available()))
 		})
 	}
+}
+
+func TestReadRepopulatesInlineBuffers(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		size int
+	}{
+		{"empty", 0},
+		{"inline", 12000},
+		{"threshold", 32 << 10},
+		{"external", (32 << 10) + 1},
+	} {
+		for _, method := range []string{"Next", "Read", "WriteTo"} {
+			t.Run(tc.name+"/"+method, func(t *testing.T) {
+				c := newPutCache(t, t.TempDir(), WithVerifyChecksums(true))
+				key, value := []byte("key"), bytes.Repeat([]byte("v"), tc.size)
+				putValue(t, c, string(key), value)
+				c.values.reclaimCacheMemory(c.memory.Capacity())
+				require.Zero(t, residentCount(c))
+				readBytes, readers := metrics.DiskReadBytes.Load(), metrics.DiskReaders.Load()
+				r, err := c.Read(key)
+				require.NoError(t, err)
+				defer r.Close()
+				require.Zero(t, residentCount(c), "admission waits for record validation")
+				var first, got []byte
+				switch method {
+				case "Next":
+					for {
+						chunk, err := r.Next()
+						if err == io.EOF {
+							break
+						}
+						require.NoError(t, err)
+						if first == nil {
+							first = chunk
+						}
+						got = append(got, chunk...)
+					}
+				case "Read":
+					got, err = io.ReadAll(r)
+					require.NoError(t, err)
+				case "WriteTo":
+					var dst bytes.Buffer
+					_, err = r.WriteTo(&dst)
+					require.NoError(t, err)
+					got = dst.Bytes()
+				}
+				require.True(t, bytes.Equal(value, got))
+				if tc.name == "external" {
+					require.Zero(t, residentCount(c))
+					require.NoError(t, r.Close())
+				} else {
+					require.Equal(t, 1, residentCount(c))
+					buffer := residentBuffer(t, c, key)
+					if len(first) > 0 {
+						require.Same(t, &first[0], &buffer.First()[align.BlockSize], "cache admission shares the disk-read allocation")
+					}
+					cached, err := c.Read(key)
+					require.NoError(t, err)
+					defer cached.Close()
+					resident, ok := cached.(*memoryReader)
+					require.True(t, ok, "the repeat read must use RAM")
+					require.Same(t, buffer, resident.memory)
+					require.NoError(t, r.Close())
+					require.NoError(t, cached.Close())
+					require.Equal(t, int64(buffer.Cap()), c.memory.Capacity()-c.memory.Available())
+					require.Equal(t, int64(buffer.Cap()), c.values.reclaimCacheMemory(c.memory.Capacity()))
+				}
+				require.Equal(t, c.memory.Capacity(), c.memory.Available())
+				require.Equal(t, readBytes, metrics.DiskReadBytes.Load(), "cache ownership must not leave disk-reader gauges charged")
+				require.Equal(t, readers, metrics.DiskReaders.Load())
+			})
+		}
+	}
+}
+
+func TestReadAdmissionConcurrentReaders(t *testing.T) {
+	c := newPutCache(t, t.TempDir())
+	key, value := []byte("key"), bytes.Repeat([]byte("v"), 12000)
+	putValue(t, c, string(key), value)
+	c.values.reclaimCacheMemory(c.memory.Capacity())
+	readers := make([]Reader, 8)
+	for i := range readers {
+		var err error
+		readers[i], err = c.Read(key)
+		require.NoError(t, err)
+		defer readers[i].Close()
+	}
+	require.Zero(t, residentCount(c))
+	var wg sync.WaitGroup
+	errs := make(chan error, len(readers))
+	for _, r := range readers {
+		wg.Go(func() {
+			_, err := r.WriteTo(io.Discard)
+			errs <- errors.Join(err, r.Close())
+		})
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+	require.Equal(t, 1, residentCount(c))
+	buffer := residentBuffer(t, c, key)
+	require.Equal(t, int64(buffer.Cap()), c.memory.Capacity()-c.memory.Available(), "duplicate disk readers retain only one cache buffer")
+	c.values.reclaimCacheMemory(c.memory.Capacity())
+	require.Equal(t, c.memory.Capacity(), c.memory.Available())
 }
 
 type failingReadConsumer struct{ err error }

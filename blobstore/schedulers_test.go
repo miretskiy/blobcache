@@ -42,18 +42,19 @@ func TestSchedulerConfiguration(t *testing.T) {
 	require.EqualValues(t, -1, cfg.writeBacklogRecovery)
 }
 
-func TestSchedulerWriteBudget(t *testing.T) {
-	cfg := defaultConfig()
-	WithSchedulerCPUs(-1, -1, -1, -1).apply(&cfg)
-	WithWriteSchedulers(1).apply(&cfg)
-	WithIOBudget(time.Millisecond).apply(&cfg)
-	require.NoError(t, cfg.validate())
-	require.Equal(t, time.Millisecond, cfg.schedulerWriteBudget(0))
-	for i := 1; i < 4; i++ {
-		require.Zero(t, cfg.schedulerWriteBudget(i))
+func TestSuppliedDiskPolicy(t *testing.T) {
+	provided := iosched.NewDiskPolicy(iosched.WithLatencyGoal(7*time.Millisecond), iosched.WithoutReadIOBudget())
+	for _, policy := range []*iosched.DiskPolicy{nil, provided} {
+		st := openTestStore(t, t.TempDir(), WithIOBudget(3*time.Millisecond), WithDiskPolicy(policy))
+		if policy == nil {
+			require.NotNil(t, st.disk)
+			require.Equal(t, 3*time.Millisecond, st.IOSchedulerStats()[0].WriteIOBudget)
+		} else {
+			require.Same(t, policy, st.disk)
+			require.Equal(t, 7*time.Millisecond, st.IOSchedulerStats()[0].WriteIOBudget)
+		}
+		require.Zero(t, st.disk.LatencyGoal(iosched.OpRead))
 	}
-	WithIOBudget(0).apply(&cfg)
-	require.Zero(t, cfg.schedulerWriteBudget(0))
 }
 
 type closeTrackingScheduler struct {

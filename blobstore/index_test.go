@@ -93,8 +93,8 @@ func TestIndexLoadReplaysInlinePlacement(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "index.db")
 	headers := []RecordHeader{
 		indexTestHeader(0, 7000, 1),
-		indexTestHeader(8192, 100, 2),
-		indexTestHeader(12288, 100, 3),
+		indexTestHeader(12288, 100, 2),
+		indexTestHeader(20480, 100, 3),
 		indexTestHeader(4096, 100, 5), // Wrapped; ObjectID 4 at offset 0 never published.
 	}
 	for i, id := range []uint64{1, 2, 3, 5} {
@@ -115,7 +115,7 @@ func TestIndexLoadsSlotFormatInBatches(t *testing.T) {
 	var want []RecordHeader
 	data := make([]byte, count*RecordHeaderSize+RecordHeaderSize/2)
 	for sequence := range count {
-		h := indexTestHeader(uint64(sequence)*4096, uint64(sequence+1), byte(sequence))
+		h := indexTestHeader(uint64(sequence)*8192, uint64(sequence+1), byte(sequence))
 		h.ObjectID = base + uint64(sequence)
 		switch {
 		case sequence%17 == 0:

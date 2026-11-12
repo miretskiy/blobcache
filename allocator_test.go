@@ -15,11 +15,11 @@ func TestMemoryReclaimCountsOnlyReleasedBytes(t *testing.T) {
 	pool := newTestPool(t, 9*page)
 	m := newMemoryCache()
 	defer m.clear()
-	var pinned []blobstore.Memory
+	var pinned []*alloc.ReadOnlyBuffer
 	defer func() {
 		for _, b := range pinned {
-			if isResident(b) {
-				b.Unpin()
+			if b != nil {
+				unpinMemory(b)
 			}
 		}
 	}()
@@ -27,7 +27,7 @@ func TestMemoryReclaimCountsOnlyReleasedBytes(t *testing.T) {
 		b, err := pool.TryAcquire(pages * page)
 		require.NoError(t, err)
 		if i < 2 {
-			require.True(t, b.TryInc())
+			b.Retain()
 			pinned = append(pinned, b)
 		}
 		// Keep order deterministic in one shard. The logical value is smaller
@@ -44,8 +44,8 @@ func TestMemoryReclaimCountsOnlyReleasedBytes(t *testing.T) {
 	require.Equal(t, 1, s.Extra.list.Len(), "stop after reaching the byte target")
 	require.Equal(t, 5, m.entries.Len(), "all disk metadata survives")
 	for i, b := range pinned {
-		require.True(t, b.Unpin(), "borrower's late release makes its allocation reusable")
-		pinned[i] = blobstore.Memory{}
+		require.True(t, unpinMemory(b), "borrower's late release makes its allocation reusable")
+		pinned[i] = nil
 	}
 	require.Equal(t, pool.Capacity()-page, pool.Available())
 	require.Equal(t, page, m.reclaimCacheMemory(1), "whole buffers can overshoot the target")
@@ -58,25 +58,26 @@ func TestCacheAllocatorHeadroom(t *testing.T) {
 	filled := 0
 	for ; ; filled++ {
 		// Fill without proactive requests to exercise reclamation on exhaustion.
-		buffer, err := c.memory.TryAcquire(align.BlockSize)
+		buffer := alloc.NewAllocatingBuffer(c.memory)
+		err := buffer.Grow(align.BlockSize)
 		if err != nil {
 			require.ErrorIs(t, err, alloc.ErrExhausted)
+			buffer.Release()
 			break
 		}
-		c.values.replace(blobstore.KeyHash(filled), blobstore.Memory{buffer}, blobstore.RecordHeader{}, false)
+		c.values.replace(blobstore.KeyHash(filled), buffer.Freeze(), blobstore.RecordHeader{}, false)
 	}
-	key := []byte("next")
-	_, err := c.NewWriter(key)
+	_, err := c.NewWriter()
 	require.ErrorIs(t, err, ErrBusy, "exhaustion does not wait for reclamation")
 	require.Eventually(t, func() bool {
 		return c.memory.Available() >= c.memory.Capacity()/4
 	}, 5*time.Second, time.Millisecond, "exhaustion starts background reclamation")
 	require.Less(t, residentCount(c), filled)
-	first, err := c.NewWriter(key)
+	first, err := c.NewWriter()
 	require.NoError(t, err)
-	defer first.Close()
-	second, err := c.NewWriter(key)
+	defer first.Discard()
+	second, err := c.NewWriter()
 	require.NoError(t, err, "the next request uses the reclaimed headroom")
-	defer second.Close()
+	defer second.Discard()
 	require.Equal(t, filled, c.values.entries.Len())
 }

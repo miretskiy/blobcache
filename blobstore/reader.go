@@ -1,11 +1,7 @@
 package blobstore
 
 import (
-	"bytes"
-	"errors"
-	"hash/crc32"
 	"io"
-	"os"
 
 	"github.com/miretskiy/blobcache/metrics"
 	"github.com/miretskiy/dio/v2/align"
@@ -13,144 +9,145 @@ import (
 	"github.com/miretskiy/dio/v2/iosched"
 )
 
-// Reader owns a whole record buffer. NewReader submits I/O immediately; first
-// access waits and verifies the record before exposing any value bytes. Next
-// returns immutable borrowed chunks valid until Close. Close never waits for I/O.
-// Methods on one Reader must not race each other or Store.Close.
+// Reader streams a range of a record's value. It reads the pages covering the
+// range one read window at a time, with the next window in flight while the
+// current one is consumed. Log positions are never reused, so a record still
+// live when its read completes is the record that was read; one the log has
+// overwritten is ErrNotFound.
+//
+// Next returns immutable chunks borrowed from the current window; they stay
+// valid until the next call. Close never waits for I/O. Methods on one Reader
+// must not race each other or Store.Close.
 type Reader struct {
-	frame  *alloc.ReadOnlyBuffer
-	value  alloc.BufferView
-	ticket iosched.Ticket
-	header RecordHeader
-	key    []byte
-	verify bool
-	onMiss func(RecordHeader)
-	onRead func(RecordHeader, *alloc.ReadOnlyBuffer)
-	ready  bool
-	err    error
+	st        *Store
+	header    RecordHeader
+	lo, hi    int64 // frame bytes of the range
+	pos, end  int64 // frame bytes not yet submitted
+	cur, next window
+	value     alloc.BufferView // unread range bytes in cur
+	err       error            // first failure, or io.EOF once the range is consumed
 }
 
-// NewReader submits one whole-frame read. External open, read and close share
-// one linked submission. Allocation and admission errors return immediately;
-// missing, stale, corrupt and failed disk records are reported on first access.
-// Close every returned Reader before closing Store or its allocator.
-// TODO: coordinate inline reads with data.db reuse during reclamation.
-func (st *Store) NewReader(key []byte, h RecordHeader) (*Reader, error) {
-	if len(key) > MaxKeyLen {
-		return nil, ErrKeyTooLarge
+// window is one read of frame bytes [lo, hi).
+type window struct {
+	buffer *alloc.ReadOnlyBuffer
+	ticket iosched.Ticket
+	lo, hi int64
+}
+
+// ValueRange clamps n bytes at off to the value and returns the clamped length.
+func (h RecordHeader) ValueRange(off, n int64) (int64, error) {
+	size := int64(h.LogicalLen)
+	if off < 0 || n < 0 || off > size {
+		return 0, ErrInvalidRange
 	}
-	if len(key) != int(h.KeyLen) {
-		return nil, ErrNotFound
-	}
-	if err := st.disk.CanAdmit(iosched.OpRead); err != nil {
-		return nil, err
-	}
-	buffer := alloc.NewAllocatingBuffer(st.memory)
-	length := int(align.PageAlign(h.FrameLen()))
-	if err := buffer.Grow(length); err != nil {
-		buffer.Release()
-		return nil, err
-	}
-	vfd := uint32(dataReadVFD)
-	if h.Flags.IsExternal() {
-		vfd = iosched.AllocateVFD
-	}
-	op := iosched.VReadBufferOp(vfd, buffer, length, h.fileOffset())
-	if h.Flags.IsExternal() {
-		op = st.openObject(h.ObjectID, os.O_RDONLY).Link(op.HardLink(iosched.VCloseOp(vfd)))
-	}
-	r := &Reader{frame: buffer.Freeze(),
-		header: h, key: bytes.Clone(key), verify: st.cfg.verifyChecksums, onMiss: st.cfg.onRetire, onRead: st.cfg.onRead}
-	metrics.DiskReadBytes.Add(int64(r.frame.Cap()))
-	metrics.DiskReaders.Add(1)
-	// I/O holds its own reference so Close can return while it is pending.
-	frame := r.frame.Retain()
-	ticket, err := iosched.SubmitNotify(st.readScheduler(), op, func(_ int, _ error) { frame.Release() })
+	return min(n, size-off), nil
+}
+
+// NewReader reads the whole value; see NewRangeReader.
+func (st *Store) NewReader(h RecordHeader) (*Reader, error) {
+	return st.NewRangeReader(h, 0, int64(h.LogicalLen))
+}
+
+// NewRangeReader reads n bytes of the value from off, clamped to its end, and
+// submits the first window. h is the record's index header. Close every
+// returned Reader before closing Store or its allocator.
+func (st *Store) NewRangeReader(h RecordHeader, off, n int64) (*Reader, error) {
+	n, err := h.ValueRange(off, n)
 	if err != nil {
-		frame.Release()
-		r.Close()
-		return nil, openError(err)
+		return nil, err
 	}
-	r.ticket = ticket
+	if !st.Live(h) {
+		return nil, st.miss(h)
+	}
+	lo := h.ValueOffset() + off
+	r := &Reader{st: st, header: h, lo: lo, hi: lo + n}
+	r.pos, r.end = lo&^(align.BlockSize-1), align.PageAlign(lo+n)
+	if n == 0 {
+		r.pos = r.end
+	}
+	if r.next, err = r.submit(); err != nil {
+		return nil, err
+	}
+	metrics.DiskReaders.Add(1)
 	return r, nil
 }
 
-func (r *Reader) Size() int64 { return int64(r.header.LogicalLen) }
+// miss reports a record the log no longer holds.
+func (st *Store) miss(h RecordHeader) error {
+	if st.cfg.onMiss != nil {
+		st.cfg.onMiss(h)
+	}
+	return ErrNotFound
+}
 
-func (r *Reader) load() error {
-	if r.ready {
-		return r.err
+// submit reads the next window of [pos, end) into a new buffer; it returns an
+// empty window once everything is submitted.
+func (r *Reader) submit() (window, error) {
+	if r.pos == r.end {
+		return window{}, nil
 	}
-	r.ready = true
-	r.err = r.wait()
-	if r.err == nil {
-		r.err = r.validate()
+	w := window{lo: r.pos, hi: min(r.end, r.pos+r.st.cfg.readWindow)}
+	r.pos = w.hi
+	buffer := alloc.NewAllocatingBuffer(r.st.memory)
+	if err := buffer.Grow(int(w.hi - w.lo)); err != nil {
+		buffer.Release()
+		return window{}, err
 	}
-	if r.err == nil && r.onRead != nil {
-		r.onRead(r.header, r.frame)
+	w.buffer = buffer.Freeze()
+	metrics.DiskReadBytes.Add(int64(w.buffer.Cap()))
+	// The I/O holds its own reference so Close can return while it is pending.
+	pinned := w.buffer.Retain()
+	op := iosched.NVMeReadBufferOp(r.st.device, buffer, int(w.hi-w.lo), r.st.geo.offset(r.header.Position)+w.lo)
+	var err error
+	w.ticket, err = iosched.SubmitNotify(r.st.readScheduler(), op, func(int, error) { pinned.Release() })
+	if err != nil {
+		pinned.Release()
+		w.release()
+		return window{}, err
 	}
-	if errors.Is(r.err, ErrNotFound) && r.onMiss != nil {
-		missing := r.header
-		missing.Hash = HashKey(r.key)
-		r.onMiss(missing)
+	return w, nil
+}
+
+func (w *window) release() {
+	if w.buffer != nil {
+		metrics.DiskReadBytes.Add(-int64(w.buffer.Cap()))
+		w.buffer.Release()
 	}
-	r.key, r.ticket, r.onMiss, r.onRead = nil, iosched.Ticket{}, nil, nil
+	*w = window{}
+}
+
+// advance moves to the next window holding range bytes: it waits for the read,
+// checks that the log still holds the record, and puts the following window in
+// flight. It reports io.EOF after the last window.
+func (r *Reader) advance() error {
+	for r.err == nil && r.value.Len() == 0 {
+		if r.next.buffer == nil {
+			r.err = io.EOF
+			break
+		}
+		r.cur.release()
+		r.cur, r.next = r.next, window{}
+		if _, err := r.cur.ticket.Wait(); err != nil {
+			r.err = err
+		} else if !r.st.Live(r.header) {
+			r.err = r.st.miss(r.header)
+		} else if r.next, r.err = r.submit(); r.err == nil {
+			lo, hi := max(r.cur.lo, r.lo), min(r.cur.hi, r.hi)
+			r.value = r.cur.buffer.View(int(lo-r.cur.lo), int(hi-lo))
+		}
+	}
+	if r.value.Len() != 0 {
+		return nil
+	}
 	return r.err
 }
 
-func (r *Reader) wait() error {
-	_, err := r.ticket.Wait()
-	if r.ticket.Slat > 0 {
-		metrics.ReadSlat.RecordValue(int64(r.ticket.Slat))
-		metrics.ReadClat.RecordValue(int64(r.ticket.Clat))
-	}
-	if errors.Is(err, os.ErrNotExist) {
-		return ErrNotFound
-	}
-	if err != nil {
-		return openError(err)
-	}
-	results := r.ticket.AllResults()
-	if r.header.Flags.IsExternal() {
-		results = results[1 : len(results)-1]
-	}
-	var read int64
-	for _, result := range results {
-		read += int64(result.N)
-	}
-	if read < r.header.FrameLen() {
-		return errors.Join(ErrCorrupt, io.ErrUnexpectedEOF)
-	}
-	return nil
-}
-
-func (r *Reader) validate() error {
-	prefix := r.frame.First()
-	var actual RecordHeader
-	if err := (*RawHeader)(prefix).Decode(&actual, r.verify); err != nil {
-		return errors.Join(ErrCorrupt, err)
-	}
-	expected := r.header
-	expected.Hash = actual.Hash // Index stores the key hash; disk stores the payload checksum.
-	if actual != expected || !bytes.Equal(r.key, prefix[RecordHeaderSize:RecordHeaderSize+len(r.key)]) {
-		return ErrNotFound
-	}
-	r.value = r.frame.View(int(expected.ValueOffset()), int(expected.PhysicalLen))
-	if r.verify && actual.Flags.DataIntegrity() == DataIntegrityCRC32C {
-		checksum := crc32.Checksum(r.key, crcTable)
-		view := r.value
-		for chunk, err := view.Next(); err == nil; chunk, err = view.Next() {
-			checksum = crc32.Update(checksum, crcTable, chunk)
-		}
-		if uint64(checksum) != actual.Hash {
-			return ErrCorrupt
-		}
-	}
-	return nil
-}
+// Size returns the length of the reader's range.
+func (r *Reader) Size() int64 { return r.hi - r.lo }
 
 func (r *Reader) Next() ([]byte, error) {
-	if err := r.load(); err != nil {
+	if err := r.advance(); err != nil {
 		return nil, err
 	}
 	return r.value.Next()
@@ -160,26 +157,35 @@ func (r *Reader) Read(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
-	if err := r.load(); err != nil {
+	if err := r.advance(); err != nil {
 		return 0, err
 	}
 	return r.value.Read(p)
 }
 
 func (r *Reader) WriteTo(w io.Writer) (int64, error) {
-	if err := r.load(); err != nil {
-		return 0, err
+	var total int64
+	for {
+		if err := r.advance(); err == io.EOF {
+			return total, nil
+		} else if err != nil {
+			return total, err
+		}
+		n, err := r.value.WriteTo(w)
+		total += n
+		if err != nil {
+			return total, err
+		}
 	}
-	return r.value.WriteTo(w)
 }
 
 func (r *Reader) Close() error {
-	if r.frame != nil {
-		metrics.DiskReadBytes.Add(-int64(r.frame.Cap()))
+	if r.st != nil {
 		metrics.DiskReaders.Add(-1)
-		r.frame.Release()
-		r.frame = nil
-		r.value, r.key, r.ticket, r.onMiss, r.onRead = alloc.BufferView{}, nil, iosched.Ticket{}, nil, nil
+		r.st = nil
 	}
+	r.cur.release()
+	r.next.release()
+	r.value = alloc.BufferView{}
 	return nil
 }

@@ -2,13 +2,9 @@ package blobstore
 
 import (
 	"errors"
-	"hash/crc32"
 	"io"
-	"os"
 
-	"github.com/miretskiy/dio/v2/align"
 	"github.com/miretskiy/dio/v2/alloc"
-	"github.com/miretskiy/dio/v2/collections"
 	"github.com/miretskiy/dio/v2/iosched"
 )
 
@@ -23,13 +19,14 @@ var (
 // Discard it, including on failure. Methods on one Writer must be sequential.
 // Values larger than available allocator memory fail with alloc.ErrExhausted.
 type Writer struct {
-	store       *Store
-	reservation collections.Handle
-	err         error
-	buf         *alloc.Buffer
-	frame       *alloc.ReadOnlyBuffer
-	header      RecordHeader
-	sealed      bool
+	store   *Store
+	segment *segment // reservation from Seal until Put or Discard reports it
+	slot    int
+	err     error
+	buf     *alloc.Buffer
+	frame   *alloc.ReadOnlyBuffer
+	header  RecordHeader
+	sealed  bool
 }
 
 func (w *Writer) Write(p []byte) (int, error) {
@@ -44,20 +41,8 @@ func (w *Writer) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// WriteTo drains a sealed frame to dest, excluding I/O padding.
-func (w *Writer) WriteTo(dest io.Writer) (int64, error) {
-	if w.err != nil {
-		return 0, w.err
-	}
-	if !w.sealed {
-		return 0, ErrUnsealed
-	}
-	return w.buf.WriteTo(dest)
-}
-
-// Seal assigns record placement and fills the header/key prefix without moving value bytes.
-// Sealing or writing again returns ErrSealed.
-// The data checksum covers key followed by value, excluding page padding.
+// Seal assigns the record's log position and fills the header/key prefix
+// without moving value bytes. Sealing or writing again returns ErrSealed.
 func (w *Writer) Seal(key []byte) error {
 	if w.err != nil {
 		return w.err
@@ -72,47 +57,20 @@ func (w *Writer) Seal(key []byte) error {
 		return ErrSealed
 	}
 	size := uint64(w.buf.Len() - recordPrefixSize)
-	reservation, h, err := w.store.reserveRecord(key, int64(size))
+	h := RecordHeader{Flags: FlagHeaderIntegrity, PhysicalLen: size,
+		LogicalLen: size, KeyLen: uint16(len(key)), Hash: HashKey(key)}
+	seg, slot, err := w.store.reserve(&h)
 	if err != nil {
 		return err
 	}
-	w.reservation, w.header = reservation, h
-	parts := w.buf.RawAllocations()
-	copy(parts[0].Bytes()[RecordHeaderSize:], key)
-	var checksum uint32
-	if w.header.Flags.DataIntegrity() == DataIntegrityCRC32C {
-		checksum = crc32.Checksum(key, crcTable)
-		left := int(size)
-		for i, memory := range parts {
-			p := memory.Bytes()
-			if i == 0 {
-				p = p[recordPrefixSize:]
-			}
-			p = p[:min(len(p), left)]
-			checksum = crc32.Update(checksum, crcTable, p)
-			left -= len(p)
-			if left == 0 {
-				break
-			}
-		}
-	}
-	h.Hash = uint64(checksum)
-	h.Encode((*RawHeader)(parts[0].Bytes()))
+	w.segment, w.slot, w.header = seg, slot, h
+	prefix := w.buf.RawAllocations()[0].Bytes()
+	h.Encode((*RawHeader)(prefix))
+	copy(prefix[RecordHeaderSize:], key)
 	w.buf.Trim()
 	w.frame = w.buf.Freeze()
 	w.sealed = true
 	return nil
-}
-
-// Size reports accumulated value bytes and any write error before reservation.
-func (w *Writer) Size() (int64, error) {
-	if w.err != nil {
-		return 0, w.err
-	}
-	if w.sealed {
-		return 0, ErrSealed
-	}
-	return int64(w.buf.Len() - recordPrefixSize), nil
 }
 
 // Header returns the final sealed record metadata.
@@ -130,9 +88,9 @@ func (w *Writer) TakeBuffer() *alloc.ReadOnlyBuffer {
 }
 
 func (w *Writer) Discard() {
-	if w.reservation != 0 {
-		w.store.complete(w.reservation, w.header, ErrUnsealed)
-		w.reservation = 0
+	if w.segment != nil {
+		w.store.finish(w.segment, w.slot, ErrUnsealed)
+		w.segment = nil
 	}
 	if w.frame != nil {
 		w.frame.Release()
@@ -165,50 +123,40 @@ func (t Ticket) Wait() error {
 		return ErrInvalidTicket
 	}
 	_, err := t.io.Wait()
-	return openError(err)
+	return err
 }
 
 // Put borrows a sealed writer until notification. It owns only the storage
-// reservation, which it completes after the caller's cache updates. The caller
+// reservation, which it reports after the caller's cache updates. The caller
 // owns the buffer throughout; notify may release it or transfer it to the cache.
-// The whole frame uses one linked submission and one admission decision.
+// The whole frame is one submission with one admission decision.
 func (st *Store) Put(w *Writer, notify func(error)) (Ticket, error) {
+	if w.sealed && w.segment == nil {
+		return Ticket{}, ErrSealed // Already put or discarded; the first Put's notify owns cleanup.
+	}
 	if !w.sealed {
 		if notify != nil {
 			notify(ErrUnsealed)
 		}
 		return Ticket{}, ErrUnsealed
 	}
-	h, reservation := w.header, w.reservation
-	w.reservation = 0
-	vfd := uint32(0)
-	if h.Flags.IsExternal() {
-		vfd = iosched.AllocateVFD
-	}
-	op := iosched.VWriteBufferOp(vfd, w.buf, int(align.PageAlign(h.FrameLen())), h.fileOffset())
-	if h.Flags.IsExternal() {
-		op = st.openObject(h.ObjectID, os.O_CREATE|os.O_TRUNC|os.O_RDWR).Link(
-			op.HardLink(iosched.VCloseOp(vfd)))
-	}
+	h, seg, slot := w.header, w.segment, w.slot
+	w.segment = nil
+	op := iosched.NVMeWriteBufferOp(st.device, w.buf, int(h.frameSize()), st.geo.offset(h.Position))
 	if st.cfg.smallWriteAdmission > 0 && h.PhysicalLen <= uint64(st.cfg.smallWriteAdmission) {
 		op = op.AllowBacklog()
 	}
 	ticket, err := iosched.SubmitNotify(st.writeScheduler(), op, func(_ int, err error) {
-		h := w.Header()
-		err = openError(err)
 		if notify != nil {
 			notify(err)
 		}
-		st.complete(reservation, h, err)
-		if err != nil && h.Flags.IsExternal() {
-			st.unlinkObject(st.writeScheduler(), h.ObjectID)
-		}
+		st.finish(seg, slot, err)
 	})
 	if err != nil {
 		if notify != nil {
-			notify(openError(err))
+			notify(err)
 		}
-		st.complete(reservation, h, err)
+		st.finish(seg, slot, err)
 	}
 	return Ticket{io: ticket}, err
 }

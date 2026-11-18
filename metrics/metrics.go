@@ -33,12 +33,25 @@ var (
 	DiskReaders       atomic.Int64
 )
 
+// Memory reclamation: calls and the bytes they asked for and freed, and queue
+// entries visited, evicted, spared for a recent read (second chance), skipped
+// while their write is pending, and evicted while a reader still pins them,
+// which frees nothing until the reader closes.
+var (
+	ReclaimCalls          atomic.Int64
+	ReclaimRequestedBytes atomic.Int64
+	ReclaimReleasedBytes  atomic.Int64
+	ReclaimVisited        atomic.Int64
+	ReclaimEvicted        atomic.Int64
+	ReclaimSpared         atomic.Int64
+	ReclaimPending        atomic.Int64
+	ReclaimPinned         atomic.Int64
+)
+
 // Error counters count failed attempts, including attempts retried by callers.
 var (
 	WriterErrors atomic.Int64
 	PutErrors    atomic.Int64
-	CloseErrors  atomic.Int64
-	UnlinkErrors atomic.Int64
 )
 
 // Histogram serializes access to HDR, which is not itself concurrency-safe.
@@ -76,6 +89,4 @@ func Reset() {
 	}
 	WriterErrors.Store(0)
 	PutErrors.Store(0)
-	CloseErrors.Store(0)
-	UnlinkErrors.Store(0)
 }

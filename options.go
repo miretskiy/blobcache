@@ -11,11 +11,12 @@ import (
 type config struct {
 	store     []blobstore.Option
 	memory    int64
+	inline    int64
 	allocator []alloc.Option
 }
 
 func defaultConfig() config {
-	return config{memory: 1 << 30}
+	return config{memory: 1 << 30, inline: 1 << 20}
 }
 
 // Option configures a Cache.
@@ -31,17 +32,16 @@ func storeOpt(o blobstore.Option) Option {
 	return funcOpt(func(c *config) { c.store = append(c.store, o) })
 }
 
-// WithSchedulerCPUs creates one scheduler per CPU. -1 leaves it unpinned.
-// Default: one unpinned scheduler. Pinning is best-effort; kernel workers may
-// inherit the coordinator's mask. Multiple schedulers or pinning require io_uring.
-func WithSchedulerCPUs(cpus ...int) Option { return storeOpt(blobstore.WithSchedulerCPUs(cpus...)) }
+// WithReadSchedulers sets how many io_uring schedulers serve reads; see
+// blobstore.WithReadSchedulers. Default: one.
+func WithReadSchedulers(n int) Option { return storeOpt(blobstore.WithReadSchedulers(n)) }
 
-// WithWriteSchedulers dedicates the first n schedulers to writes and cleanup;
-// the rest serve reads. Default: zero (all shared). At least one must serve
-// reads. Each reader/writer stays on one scheduler, selected round-robin.
+// WithWriteSchedulers sets how many io_uring schedulers serve writes, including
+// footer and directory writes. Default: one.
 func WithWriteSchedulers(n int) Option { return storeOpt(blobstore.WithWriteSchedulers(n)) }
 
-// WithRingDepth sets each io_uring's submission queue depth. Default: 256.
+// WithRingDepth sets each io_uring's submission queue depth, capped by the
+// device's request queue depth. Default: 256.
 func WithRingDepth(n uint32) Option { return storeOpt(blobstore.WithRingDepth(n)) }
 
 // WithIOBudget limits modeled in-flight write service time across all schedulers.
@@ -66,30 +66,31 @@ func WithMemory(bytes int64, opts ...alloc.Option) Option {
 	return funcOpt(func(c *config) { c.memory, c.allocator = bytes, opts })
 }
 
-// WithTargetSize sets a soft limit on cached disk payload, evicting oldest
-// records first. Default: 1 GiB, rounded up to a page with a 64 KiB minimum.
-func WithTargetSize(bytes int64) Option { return storeOpt(blobstore.WithTargetSize(bytes)) }
+// WithSealInterval bounds how long written records wait to become recoverable
+// after a crash; see blobstore.WithSealInterval. Default: one second.
+func WithSealInterval(d time.Duration) Option { return storeOpt(blobstore.WithSealInterval(d)) }
 
-// WithVerifyChecksums enables verification of stored checksums on disk reads
-// and index recovery. Default: false.
-func WithVerifyChecksums(enabled bool) Option {
-	return storeOpt(blobstore.WithVerifyChecksums(enabled))
-}
+// WithReadWindow sets how many bytes one disk read of a long range covers;
+// see blobstore.WithReadWindow. Default: 8 MiB.
+func WithReadWindow(bytes int64) Option { return storeOpt(blobstore.WithReadWindow(bytes)) }
 
-// WithBufferedReads enables the kernel page cache for disk reads. Default: false.
-// Writes continue to use direct I/O.
-func WithBufferedReads(enabled bool) Option { return storeOpt(blobstore.WithBufferedReads(enabled)) }
-
-// WithInlineThreshold sets the largest value stored in data.db and
-// retained in memory. Default: 1 MiB.
-func WithInlineThreshold(bytes int64) Option { return storeOpt(blobstore.WithInlineThreshold(bytes)) }
+// WithInlineThreshold sets the largest value kept resident in memory. Such
+// values are readable from memory as soon as Put returns; larger values are
+// published when their write completes and are read from disk. Every value is
+// stored the same way on disk. Default: 1 MiB.
+func WithInlineThreshold(bytes int64) Option { return funcOpt(func(c *config) { c.inline = bytes }) }
 
 // WithWriteBacklogLimit rejects writes with ErrRejected while the modeled
 // device time of admitted, unfinished writes across all schedulers is at least
-// limit. Zero, the default, disables it. The POSIX fallback ignores it.
+// limit. Zero, the default, disables it.
 func WithWriteBacklogLimit(limit time.Duration) Option {
 	return storeOpt(blobstore.WithWriteBacklogLimit(limit))
 }
+
+// WithRegisteredMemory registers the cache's memory with the io_uring
+// schedulers; see blobstore.WithRegisteredMemory. It requires WithMemory of
+// at most 2 GiB. Default: disabled.
+func WithRegisteredMemory() Option { return storeOpt(blobstore.WithRegisteredMemory()) }
 
 // WithSmallWriteAdmission admits values up to bytes through a full write backlog.
 // Their I/O remains accounted and waits for the normal dispatch allowance.

@@ -14,9 +14,14 @@ type memoryReader struct {
 	size   int64
 }
 
-// newMemoryReader consumes buffer, including on error. Resident values are
-// trusted; the full header and key must be cached.
-func newMemoryReader(key []byte, h blobstore.RecordHeader, buffer *alloc.ReadOnlyBuffer) (Reader, error) {
+// newMemoryReader exposes n bytes from off and consumes buffer, including on
+// error. Resident values are trusted; the full header and key must be cached.
+func newMemoryReader(key []byte, h blobstore.RecordHeader, buffer *alloc.ReadOnlyBuffer, off, n int64) (Reader, error) {
+	n, err := h.ValueRange(off, n)
+	if err != nil {
+		buffer.Release()
+		return nil, err
+	}
 	if len(key) != int(h.KeyLen) {
 		buffer.Release()
 		return nil, ErrNotFound
@@ -31,7 +36,7 @@ func newMemoryReader(key []byte, h blobstore.RecordHeader, buffer *alloc.ReadOnl
 	}
 	metrics.ResidentReadBytes.Add(int64(buffer.Cap()))
 	metrics.ResidentReaders.Add(1)
-	return &memoryReader{BufferView: buffer.View(int(h.ValueOffset()), int(h.PhysicalLen)), memory: buffer, size: int64(h.LogicalLen)}, nil
+	return &memoryReader{BufferView: buffer.View(int(h.ValueOffset()+off), int(n)), memory: buffer, size: n}, nil
 }
 
 func (r *memoryReader) Size() int64 { return r.size }

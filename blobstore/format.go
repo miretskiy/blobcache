@@ -6,27 +6,33 @@ import (
 	"hash/crc32"
 
 	"github.com/miretskiy/dio/v2/align"
+	"github.com/zeebo/xxh3"
 )
 
-// index.db stores packed metadata in reservation order. The data.db and
-// object records store [header][key][page padding][value][page padding]. The
-// header and key occupy one 4 KiB page. Writers reserve that page before
-// receiving bytes and fill it before I/O. The key
-// is supplied at Put; no value bytes need to move. The header supplies all lengths
-// and identity needed to scan records and reconstruct index metadata after a
-// disaster. Hash is XXH3(key) in the index and CRC32C(key followed by value) in
-// data records.
-// All integers are little endian.
+// KeyHash identifies a key in the index. Resident reads compare the full key;
+// disk reads trust the 64-bit hash and key length.
+type KeyHash = uint64
+
+// HashKey returns the XXH3-64 hash of key, stable across restarts for
+// recovered index lookups.
+func HashKey(key []byte) KeyHash { return xxh3.Hash(key) }
+
+// Records are frames in the log: [header][key][page padding][value][page
+// padding]. The header and key occupy one 4 KiB page; the value starts on the
+// next page. Writers reserve that page before receiving bytes and fill it at
+// Seal. Footers list the headers of their segment's records, from which open
+// rebuilds the index. All integers are little endian.
 //
-// [ 0: 4) magic (0xB10BCAC6)
+// [ 0: 4) magic (0xB10BCAC7)
 // [ 4: 6) flags (RecordFlags, uint16)
 // [ 6: 8) reserved
-// [ 8:16) ObjectID (uint64)
-// [16:24) data.db offset at reservation
+// [ 8:16) log position of the frame
+// [16:24) reserved
 // [24:32) stored value size, excluding header, key, and padding
-// [32:40) original value size before compression
+// [32:40) value size readers see; equal to the stored size. Footers keep their
+//         segment's start here.
 // [40:42) key length
-// [42:50) Hash: key hash (XXH3-64 with FlagKeyHashXXH3) in index.db; CRC32C of key/value in data files
+// [42:50) Hash: XXH3-64 of the key
 // [50:60) reserved; pads headers to 64 bytes
 // [60:64) CRC32C of header[4:60) when FlagHeaderIntegrity is set; zero otherwise
 
@@ -37,7 +43,7 @@ const recordPrefixSize = align.BlockSize
 // MaxKeyLen leaves room for the header in the record's first page.
 const MaxKeyLen = recordPrefixSize - RecordHeaderSize
 
-const recordMagic uint32 = 0xB10BCAC6
+const recordMagic uint32 = 0xB10BCAC7
 
 var (
 	ErrBadMagic = errors.New("invalid header magic")
@@ -55,12 +61,11 @@ type RawHeader [RecordHeaderSize]byte
 // The value starts immediately after the header/key page.
 type RecordHeader struct {
 	Flags       RecordFlags
-	ObjectID    uint64
-	Offset      uint64 // data.db cursor at reservation; external file I/O starts at zero
+	Position    uint64 // log position of the frame; its identity
 	PhysicalLen uint64 // stored value bytes; excludes header, key, and padding
-	LogicalLen  uint64 // original value bytes before compression
+	LogicalLen  uint64 // value bytes readers see
 	KeyLen      uint16
-	Hash        uint64 // index key hash; key/value CRC32C in data files
+	Hash        uint64 // XXH3-64 of the key
 }
 
 // KeyHash returns the lookup identity from an index header.
@@ -69,38 +74,13 @@ func (h RecordHeader) KeyHash() KeyHash { return h.Hash }
 type RecordFlags uint16
 
 const (
+	// FlagDeleted marks a record without a usable disk copy. Footers use it
+	// for failed writes; the cache uses it for retired resident values.
 	FlagDeleted RecordFlags = 0b0000_0000_0000_0001
 	// FlagHeaderIntegrity enables writing and verifying the header CRC32C.
 	FlagHeaderIntegrity RecordFlags = 0b0000_0000_0000_0010
-	// FlagExternal identifies records stored in a dedicated object file.
-	FlagExternal RecordFlags = 0b0000_0000_0000_0100
-	// FlagKeyHashXXH3 marks an index Hash computed by HashKey (XXH3-64).
-	FlagKeyHashXXH3 RecordFlags = 0b0000_0000_0000_1000
-
-	maskDataIntegrity  RecordFlags = 0b0000_0001_1000_0000
-	shiftDataIntegrity             = 7
-
-	maskCompression  RecordFlags = 0b0000_1110_0000_0000
-	shiftCompression             = 9
-)
-
-type CompressionCodec uint8
-
-const (
-	CompressionNone CompressionCodec = iota
-	CompressionZstd
-	CompressionLZ4
-
-	numCompressionCodec = 8
-)
-
-type DataIntegrity uint8
-
-const (
-	DataIntegrityNone DataIntegrity = iota
-	DataIntegrityCRC32C
-
-	numDataIntegrity = 4
+	// FlagFooter marks a segment footer: its value is the segment's headers.
+	FlagFooter RecordFlags = 0b0000_0000_0000_0100
 )
 
 // Encode serializes the logical header into the fixed-size raw array, clearing
@@ -112,9 +92,7 @@ func (h *RecordHeader) Encode(raw *RawHeader) {
 
 	binary.LittleEndian.PutUint16(raw[4:6], uint16(h.Flags))
 
-	binary.LittleEndian.PutUint64(raw[8:16], h.ObjectID)
-
-	binary.LittleEndian.PutUint64(raw[16:24], h.Offset)
+	binary.LittleEndian.PutUint64(raw[8:16], h.Position)
 	binary.LittleEndian.PutUint64(raw[24:32], h.PhysicalLen)
 	binary.LittleEndian.PutUint64(raw[32:40], h.LogicalLen)
 	binary.LittleEndian.PutUint16(raw[40:42], h.KeyLen)
@@ -143,8 +121,7 @@ func (raw *RawHeader) Decode(h *RecordHeader, verifyChecksums bool) error {
 	}
 
 	h.Flags = flags
-	h.ObjectID = binary.LittleEndian.Uint64(raw[8:16])
-	h.Offset = binary.LittleEndian.Uint64(raw[16:24])
+	h.Position = binary.LittleEndian.Uint64(raw[8:16])
 	h.PhysicalLen = binary.LittleEndian.Uint64(raw[24:32])
 	h.LogicalLen = binary.LittleEndian.Uint64(raw[32:40])
 	h.KeyLen = binary.LittleEndian.Uint16(raw[40:42])
@@ -166,24 +143,10 @@ func (h RecordHeader) KeyOffset() int64 {
 // FrameLen includes the header/key prefix and value, excluding final I/O padding.
 func (h RecordHeader) FrameLen() int64 { return h.ValueOffset() + int64(h.PhysicalLen) }
 
-// dataEnd is the data.db append position recorded by this completed record.
-func (h RecordHeader) dataEnd() uint64 {
-	if h.Flags.IsExternal() {
-		return h.Offset
-	}
-	return h.Offset + uint64(align.PageAlign(h.FrameLen()))
-}
+// frameSize is the frame's log footprint, padded to a page.
+func (h RecordHeader) frameSize() uint64 { return uint64(align.PageAlign(h.FrameLen())) }
 
-func (h RecordHeader) fileOffset() int64 {
-	if h.Flags.IsExternal() {
-		return 0
-	}
-	return int64(h.Offset)
-}
-
-func (f RecordFlags) IsExternal() bool {
-	return f&FlagExternal != 0
-}
+func (f RecordFlags) IsFooter() bool { return f&FlagFooter != 0 }
 
 func (f RecordFlags) IsDeleted() bool {
 	return f&FlagDeleted != 0
@@ -191,44 +154,4 @@ func (f RecordFlags) IsDeleted() bool {
 
 func (f RecordFlags) HasHeaderIntegrity() bool {
 	return f&FlagHeaderIntegrity != 0
-}
-
-func (f RecordFlags) HasXXH3KeyHash() bool {
-	return f&FlagKeyHashXXH3 != 0
-}
-
-func (f RecordFlags) DataIntegrity() DataIntegrity {
-	return DataIntegrity((f & maskDataIntegrity) >> shiftDataIntegrity)
-}
-
-func (f RecordFlags) Compression() CompressionCodec {
-	return CompressionCodec((f & maskCompression) >> shiftCompression)
-}
-
-func (f *RecordFlags) SetDeleted(deleted bool) {
-	if deleted {
-		*f |= FlagDeleted
-	} else {
-		*f &^= FlagDeleted
-	}
-}
-
-func (f *RecordFlags) SetHeaderIntegrity(enabled bool) {
-	if enabled {
-		*f |= FlagHeaderIntegrity
-	} else {
-		*f &^= FlagHeaderIntegrity
-	}
-}
-
-func (f *RecordFlags) SetDataIntegrity(algo DataIntegrity) {
-	// Shift the enum up, and explicitly mask it to prevent invalid
-	// enum values (>3) from spilling into the Compression bits.
-	shifted := (RecordFlags(algo) << shiftDataIntegrity) & maskDataIntegrity
-	*f = (*f &^ maskDataIntegrity) | shifted
-}
-
-func (f *RecordFlags) SetCompression(codec CompressionCodec) {
-	shifted := (RecordFlags(codec) << shiftCompression) & maskCompression
-	*f = (*f &^ maskCompression) | shifted
 }

@@ -8,9 +8,8 @@ import (
 
 func goldenRecordHeader() RecordHeader {
 	return RecordHeader{
-		Flags:       0x048f, // LZ4, CRC32C, XXH3 key hash, header CRC, external, deleted
-		ObjectID:    0x0706050403020100,
-		Offset:      0x3837363534333231,
+		Flags:       0x0087, // footer, header CRC, deleted, and reserved bit 7
+		Position:    0x0706050403020100,
 		PhysicalLen: 0x0807060504030201,
 		LogicalLen:  0x1817161514131211,
 		KeyLen:      0x201f,
@@ -20,17 +19,17 @@ func goldenRecordHeader() RecordHeader {
 
 func goldenRawHeader(t *testing.T) RawHeader {
 	t.Helper()
-	// Fixed wire fixture: little-endian fields, numeric object ID and 64-bit hash,
-	// zero reserved bytes, and CRC32C 0xab9fe2c2 over bytes [4:60).
-	const wire = "c6ca0bb18f040000" +
+	// Fixed wire fixture: little-endian fields, log position and 64-bit hash,
+	// zero reserved bytes, and CRC32C 0x20a61bcc over bytes [4:60).
+	const wire = "c7ca0bb187000000" +
 		"0001020304050607" +
-		"3132333435363738" +
+		"0000000000000000" +
 		"0102030405060708" +
 		"1112131415161718" +
 		"1f20" +
 		"2122232425262728" +
 		"00000000000000000000" +
-		"c2e29fab"
+		"cc1ba620"
 	b, err := hex.DecodeString(wire)
 	if err != nil {
 		t.Fatal(err)
@@ -73,12 +72,12 @@ func TestRecordHeaderRoundTrip(t *testing.T) {
 	}{
 		{name: "zero"},
 		{name: "empty_checked", header: RecordHeader{Flags: FlagHeaderIntegrity}},
-		{name: "inline", header: RecordHeader{Flags: FlagHeaderIntegrity, Offset: 1<<40 + 4096, PhysicalLen: 4096, LogicalLen: 4096, KeyLen: 1}},
-		{name: "external", header: RecordHeader{Flags: FlagExternal, ObjectID: uint64(math.MaxUint64), PhysicalLen: 1 << 33, LogicalLen: 1 << 33, KeyLen: 1}},
-		{name: "external_compressed", header: goldenRecordHeader()},
+		{name: "small", header: RecordHeader{Flags: FlagHeaderIntegrity, Position: 1<<40 + 4096, PhysicalLen: 4096, LogicalLen: 4096, KeyLen: 1}},
+		{name: "large", header: RecordHeader{Position: uint64(math.MaxUint64), PhysicalLen: 1 << 33, LogicalLen: 1 << 33, KeyLen: 1}},
+		{name: "golden", header: goldenRecordHeader()},
 		{name: "maximum", header: RecordHeader{
-			Flags: math.MaxUint16, ObjectID: uint64(math.MaxUint64),
-			Offset: math.MaxUint64, PhysicalLen: math.MaxUint64, LogicalLen: math.MaxUint64, KeyLen: math.MaxUint16,
+			Flags: math.MaxUint16, Position: uint64(math.MaxUint64),
+			PhysicalLen: math.MaxUint64, LogicalLen: math.MaxUint64, KeyLen: math.MaxUint16,
 			Hash: math.MaxUint64,
 		}},
 	} {
@@ -113,7 +112,7 @@ func TestRecordHeaderEncodeReusedBuffer(t *testing.T) {
 	// its old fields and CRC as well as the reserved bytes.
 	var empty RecordHeader
 	empty.Encode(&raw)
-	want = RawHeader{0xc6, 0xca, 0x0b, 0xb1}
+	want = RawHeader{0xc7, 0xca, 0x0b, 0xb1}
 	if raw != want {
 		t.Fatalf("encoding empty header into reused memory:\n got %x\nwant %x", raw, want)
 	}
@@ -121,7 +120,7 @@ func TestRecordHeaderEncodeReusedBuffer(t *testing.T) {
 
 func TestRecordHeaderDecodeRejectsCorruption(t *testing.T) {
 	valid := goldenRawHeader(t)
-	unchanged := RecordHeader{Flags: 0x5555, ObjectID: uint64(math.MaxUint64), Offset: 5, PhysicalLen: 1, LogicalLen: 2, KeyLen: 3, Hash: 4}
+	unchanged := RecordHeader{Flags: 0x5555, Position: uint64(math.MaxUint64), PhysicalLen: 1, LogicalLen: 2, KeyLen: 3, Hash: 4}
 	for offset := range valid {
 		for bit := range 8 {
 			if offset == 4 && bit == 1 {
@@ -158,7 +157,10 @@ func TestRecordHeaderDecodeRejectsCorruption(t *testing.T) {
 func TestRecordHeaderOptionalCRC(t *testing.T) {
 	for _, present := range []bool{false, true} {
 		want := goldenRecordHeader()
-		want.Flags.SetHeaderIntegrity(present)
+		want.Flags &^= FlagHeaderIntegrity
+		if present {
+			want.Flags |= FlagHeaderIntegrity
+		}
 		var raw RawHeader
 		want.Encode(&raw)
 		raw[60] ^= 1 // A bad CRC matters only when verification and its flag are set.
@@ -189,69 +191,9 @@ func TestRecordFlagsGetters(t *testing.T) {
 		flags := RecordFlags(bits)
 		if flags.IsDeleted() != (bits&1 != 0) ||
 			flags.HasHeaderIntegrity() != (bits&2 != 0) ||
-			flags.IsExternal() != (bits&4 != 0) ||
-			flags.DataIntegrity() != DataIntegrity((bits>>7)&3) ||
-			flags.Compression() != CompressionCodec((bits>>9)&7) {
-			t.Fatalf("flags %04x: deleted=%t, header integrity=%t, data integrity=%d, compression=%d",
-				bits, flags.IsDeleted(), flags.HasHeaderIntegrity(), flags.DataIntegrity(), flags.Compression())
+			flags.IsFooter() != (bits&4 != 0) {
+			t.Fatalf("flags %04x: deleted=%t, header integrity=%t, footer=%t",
+				bits, flags.IsDeleted(), flags.HasHeaderIntegrity(), flags.IsFooter())
 		}
-	}
-}
-
-func TestRecordFlagsBooleanSetters(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		mask RecordFlags
-		set  func(*RecordFlags, bool)
-	}{
-		{"deleted", 0x0001, (*RecordFlags).SetDeleted},
-		{"header_integrity", 0x0002, (*RecordFlags).SetHeaderIntegrity},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			for bits := 0; bits <= math.MaxUint16; bits++ {
-				for _, enabled := range []bool{false, true} {
-					want := RecordFlags(bits) &^ tc.mask
-					if enabled {
-						want |= tc.mask
-					}
-					got := RecordFlags(bits)
-					tc.set(&got, enabled)
-					if got != want {
-						t.Fatalf("flags %04x, enabled=%t: got %04x; want %04x", bits, enabled, got, want)
-					}
-				}
-			}
-		})
-	}
-}
-
-func TestRecordFlagsFieldSetters(t *testing.T) {
-	for _, tc := range []struct {
-		name  string
-		mask  RecordFlags
-		shift uint
-		set   func(*RecordFlags, uint8)
-	}{
-		{"data_integrity", 0x0180, 7, func(f *RecordFlags, v uint8) { f.SetDataIntegrity(DataIntegrity(v)) }},
-		{"compression", 0x0e00, 9, func(f *RecordFlags, v uint8) { f.SetCompression(CompressionCodec(v)) }},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			for _, initial := range []RecordFlags{0, 0xffff, 0xaaaa, 0x5555} {
-				// Include values wider than the field: high bits must be masked
-				// without changing neighboring fields or reserved boolean bits.
-				for value := 0; value <= math.MaxUint8; value++ {
-					want := (initial &^ tc.mask) | (RecordFlags(value)<<tc.shift)&tc.mask
-					got := initial
-					tc.set(&got, uint8(value))
-					if got != want {
-						t.Fatalf("flags %04x, value=%d: got %04x; want %04x", initial, value, got, want)
-					}
-					tc.set(&got, 0)
-					if got != initial&^tc.mask {
-						t.Fatalf("clearing field in %04x changed unrelated bits: got %04x", initial, got)
-					}
-				}
-			}
-		})
 	}
 }

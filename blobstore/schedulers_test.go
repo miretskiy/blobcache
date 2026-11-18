@@ -11,11 +11,9 @@ import (
 
 func TestSchedulerConfiguration(t *testing.T) {
 	for _, opts := range [][]Option{
-		{WithSchedulerCPUs()},
-		{WithSchedulerCPUs(-2)},
+		{WithReadSchedulers(0)},
+		{WithWriteSchedulers(0)},
 		{WithWriteSchedulers(-1)},
-		{WithWriteSchedulers(1)},
-		{WithSchedulerCPUs(0, 1), WithWriteSchedulers(2)},
 	} {
 		cfg := defaultConfig()
 		for _, opt := range opts {
@@ -23,14 +21,10 @@ func TestSchedulerConfiguration(t *testing.T) {
 		}
 		require.Error(t, cfg.validate())
 	}
-	cpus := []int{2, 3, -1}
-	option := WithSchedulerCPUs(cpus...)
-	cpus[0] = -2
 	cfg := defaultConfig()
-	option.apply(&cfg)
+	WithReadSchedulers(3).apply(&cfg)
 	WithWriteSchedulers(2).apply(&cfg)
 	require.NoError(t, cfg.validate())
-	require.Equal(t, []int{2, 3, -1}, cfg.schedulerCPUs, "option owns the CPU list")
 	for _, opt := range []Option{WithIOBudget(-1), WithWriteBacklogLimit(-1),
 		WithWriteBacklogRecovery(-5), WithReadBacklogLimit(-1)} {
 		opt.apply(&cfg)
@@ -45,7 +39,7 @@ func TestSchedulerConfiguration(t *testing.T) {
 func TestSuppliedDiskPolicy(t *testing.T) {
 	provided := iosched.NewDiskPolicy(iosched.WithLatencyGoal(7*time.Millisecond), iosched.WithoutReadIOBudget())
 	for _, policy := range []*iosched.DiskPolicy{nil, provided} {
-		st := openTestStore(t, t.TempDir(), WithIOBudget(3*time.Millisecond), WithDiskPolicy(policy))
+		st := openTestStore(t, testDevice(t, 16<<20), WithIOBudget(3*time.Millisecond), WithDiskPolicy(policy))
 		if policy == nil {
 			require.NotNil(t, st.disk)
 			require.Equal(t, 3*time.Millisecond, st.IOSchedulerStats()[0].WriteIOBudget)

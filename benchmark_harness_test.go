@@ -12,15 +12,9 @@ import (
 	"time"
 
 	"github.com/miretskiy/dio/v2/alloc"
+	"github.com/miretskiy/dio/v2/iosched"
 	"github.com/stretchr/testify/require"
 )
-
-func TestBenchmarkWarmupIndependentOfMemory(t *testing.T) {
-	for _, memory := range []int64{8 << 30, 16 << 30, 64 << 30} {
-		w := benchmarkWorkload{config: benchmarkConfig{memoryBytes: memory}}
-		require.Equal(t, benchmarkWarmupFills, w.warmupWrites())
-	}
-}
 
 func TestBenchmarkSizeHistogramIncludesLargeValues(t *testing.T) {
 	s := newBenchmarkStats()
@@ -42,25 +36,25 @@ func TestBenchmarkReadSizeStats(t *testing.T) {
 		{2<<20 + 1, 3}, {4 << 20, 3}, {4<<20 + 1, 4},
 		{8 << 20, 4}, {8<<20 + 1, 5}, {32 << 20, 5},
 	} {
-		memory, file := s.readsBySize[tc.band].memory.count(), s.readsBySize[tc.band].file.count()
+		memory, disk := s.readsBySize[tc.band].memory.count(), s.readsBySize[tc.band].disk.count()
 		// The small consumed prefix must not determine the size bucket.
 		sample := benchmarkSample{latency: time.Millisecond, bytes: 1024, recorded: true}
 		s.record(&benchmarkRequestStats{readValueBytes: tc.size, memoryReads: sample})
 		require.Equal(t, memory+1, s.readsBySize[tc.band].memory.count())
-		require.Equal(t, file, s.readsBySize[tc.band].file.count())
+		require.Equal(t, disk, s.readsBySize[tc.band].disk.count())
 		s.record(&benchmarkRequestStats{readValueBytes: tc.size, diskReads: sample})
-		require.Equal(t, file+1, s.readsBySize[tc.band].file.count())
+		require.Equal(t, disk+1, s.readsBySize[tc.band].disk.count())
 	}
 	s.record(&benchmarkRequestStats{misses: 1})
-	var memory, file int64
+	var memory, disk int64
 	for _, band := range s.readsBySize {
 		memory += band.memory.count()
-		file += band.file.count()
+		disk += band.disk.count()
 	}
 	require.Equal(t, s.memoryReads.count(), memory)
-	require.Equal(t, s.diskReads.count(), file)
+	require.Equal(t, s.diskReads.count(), disk)
 	require.EqualValues(t, 12, memory)
-	require.EqualValues(t, 12, file)
+	require.EqualValues(t, 12, disk)
 	require.EqualValues(t, 1, s.misses)
 }
 
@@ -149,7 +143,7 @@ func TestBenchmarkBurstPlan(t *testing.T) {
 					offered += int64(job.size)
 				}
 			}
-			// Whole objects straddling either boundary can differ by at most two
+			// Whole values straddling either boundary can differ by at most two
 			// maximum-sized writes from the byte-paced interval's exact target.
 			require.InDelta(t, (burst.end-burst.start).Seconds()*benchmarkPeakRate, offered, 2*(32<<20))
 		}
@@ -231,7 +225,7 @@ func TestBenchmarkReadQuotas(t *testing.T) {
 }
 
 func TestBenchmarkRejectedWriteAccounting(t *testing.T) {
-	cache := newPutCache(t, t.TempDir(), WithMemory(16<<20))
+	cache := newPutCache(t, testDevice(t, 64<<20), WithMemory(16<<20))
 	w := benchmarkWorkload{cache: cache, keys: make([]atomic.Uint32, 2)}
 	stats := newBenchmarkStats()
 	for _, job := range []benchmarkJob{{id: 1, size: 16384}, {id: 2, size: 40000}} {
@@ -255,7 +249,7 @@ func TestBenchmarkRejectedWriteAccounting(t *testing.T) {
 }
 
 func TestBenchmarkBusyFinishesAtFirstAttempt(t *testing.T) {
-	cache := newPutCache(t, t.TempDir())
+	cache := newPutCache(t, testDevice(t, 64<<20))
 	// Hold all allocator memory so this scheduled write encounters ErrBusy.
 	held := alloc.NewAllocatingBuffer(cache.memory)
 	require.NoError(t, held.Grow(int(cache.memory.Capacity())))
@@ -319,4 +313,40 @@ func TestBenchmarkConsumeNext(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestBenchmarkPreflightRejectsOnlyExternalValues(t *testing.T) {
+	policy := iosched.NewDiskPolicy(iosched.WithWriteBandwidth(64<<10), iosched.WithoutReadIOBudget(),
+		iosched.WithWriteBacklogLimit(time.Millisecond), iosched.WithWriteBacklogRecovery(0))
+	c := newPutCache(t, testDevice(t, 64<<20), WithMemory(16<<20), WithDiskPolicy(policy),
+		WithInlineThreshold(benchmarkInlineSize),
+		WithSmallWriteAdmission(64<<10))
+	putValue(t, c, "close-admission", make([]byte, benchmarkInlineSize))
+	require.ErrorIs(t, policy.CanAdmit(iosched.OpWrite), ErrRejected)
+	c.values.reclaimCacheMemory(c.memory.Capacity())
+	held := alloc.NewAllocatingBuffer(c.memory)
+	require.NoError(t, held.Grow(int(c.memory.Capacity())))
+	defer held.Release()
+	w := benchmarkWorkload{cache: c, disk: policy, data: make([]byte, benchmarkInlineSize+1),
+		config: benchmarkConfig{smallWriteAdmission: 64 << 10}, keys: make([]atomic.Uint32, 3)}
+	large := benchmarkRequest{workload: &w}
+	large.write(benchmarkJob{id: 1, size: benchmarkInlineSize + 1}, time.Now())
+	require.EqualValues(t, 1, large.stats.preflightRejected)
+	require.EqualValues(t, 1, large.stats.rejectedWrites)
+	require.Zero(t, large.stats.busyWrites, "admission is checked before the exhausted allocator")
+	require.Zero(t, large.stats.copiedBytes)
+	held.Release()
+	inline := benchmarkRequest{workload: &w}
+	inline.write(benchmarkJob{id: 2, size: benchmarkInlineSize}, time.Now())
+	require.Zero(t, inline.stats.preflightRejected)
+	require.EqualValues(t, benchmarkInlineSize, inline.stats.copiedBytes)
+	require.EqualValues(t, 1, inline.stats.rejectedWrites, "the disk write still observes admission")
+	checkRead(t, c, []byte("key-2"), w.data[:benchmarkInlineSize])
+
+	small := benchmarkRequest{workload: &w}
+	small.write(benchmarkJob{id: 3, size: 8192}, time.Now())
+	require.True(t, small.stats.writes.recorded)
+	require.EqualValues(t, 8192, small.stats.copiedBytes)
+	require.Zero(t, small.stats.preflightRejected)
+	require.ErrorIs(t, policy.CanAdmit(iosched.OpWrite), ErrRejected)
 }

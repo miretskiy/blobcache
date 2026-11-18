@@ -5,13 +5,15 @@ import (
 	"sync/atomic"
 
 	"github.com/miretskiy/blobcache/blobstore"
+	"github.com/miretskiy/blobcache/metrics"
 	"github.com/miretskiy/dio/v2/alloc"
 	"github.com/miretskiy/dio/v2/collections"
 )
 
 // Metadata stays in the sharded map by value, including disk-only records.
 // resident identifies a slot in the shard's SIEVE queue; zero means disk-only.
-// A deleted header marks a resident value whose disk record has been retired.
+// A deleted header marks a resident value without a usable disk copy. An entry
+// whose position the log has overwritten is dead unless it is resident.
 // Neither metadata nor queue entries require an individual heap allocation.
 type memoryEntry struct {
 	header   blobstore.RecordHeader
@@ -33,19 +35,47 @@ type memoryQueue struct {
 	list          collections.List[residentEntry]
 	hand          collections.Handle
 	residentBytes int64
-	_             [32]byte // Together with the shard's lock and map: 128 bytes.
+	pendingBytes  int64    // resident bytes still borrowed by Put: not evictable
+	_             [24]byte // Together with the shard's lock and map: 128 bytes.
 }
 
 type memoryCache struct {
-	entries *collections.ShardedMap[blobstore.KeyHash, memoryEntry, memoryQueue]
-	next    atomic.Uint64
+	entries   *collections.ShardedMap[blobstore.KeyHash, memoryEntry, memoryQueue]
+	next      atomic.Uint64
+	sweepNext atomic.Uint64
+	inline    int64                             // largest value kept resident
+	live      func(blobstore.RecordHeader) bool // the log still holds the record
 }
 
-func newMemoryCache() memoryCache {
+func newMemoryCache(inline int64) memoryCache {
 	return memoryCache{entries: collections.NewShardedMapWithExtra[blobstore.KeyHash, memoryEntry](
 		4, memoryQueue{},
 		collections.WithHasher(func(key blobstore.KeyHash) uint64 { return key }),
-	)}
+	), inline: inline, live: func(blobstore.RecordHeader) bool { return true }}
+}
+
+// resident reports whether a value of this record's size stays in memory.
+func (m *memoryCache) resident(h blobstore.RecordHeader) bool {
+	return int64(h.PhysicalLen) <= m.inline
+}
+
+// sweep drops up to n disk-only entries the log has overwritten, from one
+// shard in turn. Map iteration starts at a random entry, so repeated sweeps
+// sample whole shards; Put calls it, which keeps dead entries a small share
+// of the map without a full pass or a per-record eviction structure.
+func (m *memoryCache) sweep(n int) {
+	s := m.entries.ShardAt(int(m.sweepNext.Add(1) % uint64(m.entries.ShardCount())))
+	s.Lock()
+	defer s.Unlock()
+	for key, e := range s.Items {
+		if n == 0 {
+			return
+		}
+		n--
+		if e.resident == 0 && !m.live(e.header) {
+			delete(s.Items, key)
+		}
+	}
 }
 
 // lookup pins the resident buffer before releasing the shard lock, so neither
@@ -75,7 +105,7 @@ func (m *memoryCache) replace(key blobstore.KeyHash, buffer *alloc.ReadOnlyBuffe
 	defer s.Unlock()
 	q := &s.Extra
 	old := s.Items[key]
-	if old.header.ObjectID > header.ObjectID {
+	if old.header.Position > header.Position {
 		if buffer != nil && !pending {
 			buffer.Release()
 		}
@@ -83,7 +113,7 @@ func (m *memoryCache) replace(key blobstore.KeyHash, buffer *alloc.ReadOnlyBuffe
 	}
 	if old.resident != 0 {
 		owned := !q.list.Value(old.resident).pending
-		oldBuffer, _ := q.remove(old.resident)
+		oldBuffer := q.remove(old.resident)
 		if owned {
 			oldBuffer.Release()
 		}
@@ -92,6 +122,9 @@ func (m *memoryCache) replace(key blobstore.KeyHash, buffer *alloc.ReadOnlyBuffe
 	if buffer != nil {
 		e.resident = q.list.PushBack(residentEntry{key: key, buffer: buffer, pending: pending})
 		q.residentBytes += int64(buffer.Cap())
+		if pending {
+			q.pendingBytes += int64(buffer.Cap())
+		}
 	}
 	s.Items[key] = e
 }
@@ -104,10 +137,12 @@ func (m *memoryCache) complete(h blobstore.RecordHeader, err error) bool {
 	s.Lock()
 	defer s.Unlock()
 	e, ok := s.Items[h.KeyHash()]
-	if !ok || e.header.ObjectID != h.ObjectID || e.resident == 0 {
+	if !ok || e.header.Position != h.Position || e.resident == 0 {
 		return false
 	}
-	s.Extra.list.Value(e.resident).pending = false
+	resident := s.Extra.list.Value(e.resident)
+	resident.pending = false
+	s.Extra.pendingBytes -= int64(resident.buffer.Cap())
 	if err != nil {
 		e.header.Flags |= blobstore.FlagDeleted
 		s.Items[h.KeyHash()] = e
@@ -115,34 +150,14 @@ func (m *memoryCache) complete(h blobstore.RecordHeader, err error) bool {
 	return true
 }
 
-// admit shares a validated inline read's buffer with the cache. Only the first
-// reader of the current disk-only record adds a reference; replacement and
-// retirement must not be undone by a read that was already in flight.
-func (m *memoryCache) admit(h blobstore.RecordHeader, buffer *alloc.ReadOnlyBuffer) {
-	if h.Flags.IsExternal() {
-		return
-	}
-	s := m.entries.Shard(h.KeyHash())
-	s.Lock()
-	defer s.Unlock()
-	e, ok := s.Items[h.KeyHash()]
-	if !ok || e.header.ObjectID != h.ObjectID || e.resident != 0 {
-		return
-	}
-	q := &s.Extra
-	e.resident = q.list.PushBack(residentEntry{key: h.KeyHash(), buffer: buffer.Retain(), visited: 1})
-	q.residentBytes += int64(buffer.Cap())
-	s.Items[h.KeyHash()] = e
-}
-
 // retire forgets this disk record without removing a newer mapping for its key.
 // Resident bytes remain valid; their metadata leaves when the cache drops its pin.
-func (m *memoryCache) retire(key blobstore.KeyHash, objectID uint64) {
+func (m *memoryCache) retire(key blobstore.KeyHash, position uint64) {
 	s := m.entries.Shard(key)
 	s.Lock()
 	defer s.Unlock()
 	e, ok := s.Items[key]
-	if !ok || e.header.ObjectID != objectID {
+	if !ok || e.header.Position != position {
 		return
 	}
 	if e.resident == 0 {
@@ -153,29 +168,39 @@ func (m *memoryCache) retire(key blobstore.KeyHash, objectID uint64) {
 	}
 }
 
-// remove transfers the queue's buffer reference and its byte count to the caller.
-func (q *memoryQueue) remove(handle collections.Handle) (*alloc.ReadOnlyBuffer, int64) {
+func (q *memoryQueue) evictableBytes() int64 { return q.residentBytes - q.pendingBytes }
+
+// remove transfers the queue's buffer reference to the caller.
+func (q *memoryQueue) remove(handle collections.Handle) *alloc.ReadOnlyBuffer {
 	if q.hand == handle {
 		q.hand, _ = q.list.Next(handle)
 	}
-	buffer := q.list.Value(handle).buffer
-	size := int64(buffer.Cap())
+	entry := q.list.Value(handle)
+	buffer := entry.buffer
+	if entry.pending {
+		q.pendingBytes -= int64(buffer.Cap())
+	}
 	q.list.Remove(handle)
-	q.residentBytes -= size
-	return buffer, size
+	q.residentBytes -= int64(buffer.Cap())
+	return buffer
 }
 
 // reclaimCacheMemory distributes a byte target in proportion to each shard's
-// resident bytes, using SIEVE within each shard. Only final-reference releases
-// count; pinned victims are demoted too but contribute no reusable space.
-// Pending disk writes are skipped. Whole buffers can overshoot each shard's
-// share. Disk metadata stays indexed.
+// evictable bytes, using SIEVE within each shard. Values whose disk write is
+// pending are borrowed by Put and not evictable, so a cache full of them costs
+// a read of each shard's counters rather than a walk of its queue. Only
+// final-reference releases count; pinned victims are demoted too but
+// contribute no reusable space. Whole buffers can overshoot each shard's share.
+// Disk metadata stays indexed.
 //
 // Unmet shares are redistributed among remaining residents. At most ShardCount
 // passes run, each visiting at most twice each shard's initial resident count,
 // so concurrent insertions cannot keep reclamation running indefinitely. Byte
 // snapshots can change concurrently; the result does not reserve released space.
 func (m *memoryCache) reclaimCacheMemory(bytes int64) (released int64) {
+	metrics.ReclaimCalls.Add(1)
+	metrics.ReclaimRequestedBytes.Add(max(0, bytes))
+	defer func() { metrics.ReclaimReleasedBytes.Add(released) }()
 	count := m.entries.ShardCount()
 	start := int((m.next.Add(1) - 1) % uint64(count))
 	for pass := 0; pass < count && released < bytes; pass++ {
@@ -183,7 +208,7 @@ func (m *memoryCache) reclaimCacheMemory(bytes int64) (released int64) {
 		for i := range count {
 			s := m.entries.ShardAt(i)
 			s.RLock()
-			total += s.Extra.residentBytes
+			total += s.Extra.evictableBytes()
 			s.RUnlock()
 		}
 		if total == 0 {
@@ -193,24 +218,33 @@ func (m *memoryCache) reclaimCacheMemory(bytes int64) (released int64) {
 		for i := range count {
 			s := m.entries.ShardAt((start + i) % count)
 			s.Lock()
-			// ceil(target * residentBytes / total), without overflowing the
+			// ceil(target * evictable / total), without overflowing the
 			// multiplication for large memory budgets.
-			hi, lo := bits.Mul64(uint64(target), uint64(s.Extra.residentBytes))
+			hi, lo := bits.Mul64(uint64(target), uint64(s.Extra.evictableBytes()))
 			share, remainder := bits.Div64(hi, lo, uint64(total))
 			if remainder != 0 {
 				share++
 			}
-			released += reclaimShardMemory(s, int64(share))
+			released += m.reclaimShard(s, int64(share))
 			s.Unlock()
 		}
 	}
 	return released
 }
 
-// reclaimShardMemory runs with the shard locked by the caller.
-func reclaimShardMemory(s *collections.MapShard[blobstore.KeyHash, memoryEntry, memoryQueue], target int64) (released int64) {
+// reclaimShard runs with the shard locked by the caller.
+func (m *memoryCache) reclaimShard(s *collections.MapShard[blobstore.KeyHash, memoryEntry, memoryQueue], target int64) (released int64) {
 	q := &s.Extra
+	var visited, evicted, spared, pending, pinned int64
+	defer func() {
+		metrics.ReclaimVisited.Add(visited)
+		metrics.ReclaimEvicted.Add(evicted)
+		metrics.ReclaimSpared.Add(spared)
+		metrics.ReclaimPending.Add(pending)
+		metrics.ReclaimPinned.Add(pinned)
+	}()
 	for remaining := 2 * q.list.Len(); remaining > 0 && q.list.Len() != 0 && released < target; remaining-- {
+		visited++
 		if q.hand == 0 {
 			q.hand, _ = q.list.Front()
 		}
@@ -218,21 +252,27 @@ func reclaimShardMemory(s *collections.MapShard[blobstore.KeyHash, memoryEntry, 
 		e := q.list.Value(handle)
 		q.hand, _ = q.list.Next(handle)
 		if e.pending {
+			pending++
 			continue
 		}
 		if e.visited != 0 {
 			e.visited = 0
+			spared++
 			continue
 		}
 		entry := s.Items[e.key]
-		if entry.header.Flags.IsDeleted() {
+		if entry.header.Flags.IsDeleted() || !m.live(entry.header) {
 			delete(s.Items, e.key)
 		} else {
 			entry.resident = 0
 			s.Items[e.key] = entry
 		}
-		buffer, _ := q.remove(handle)
-		released += buffer.Release()
+		freed := q.remove(handle).Release()
+		evicted++
+		if freed == 0 {
+			pinned++
+		}
+		released += freed
 	}
 	return released
 }

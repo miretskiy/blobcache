@@ -5,12 +5,15 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/miretskiy/dio/v2/alloc"
 	"github.com/miretskiy/dio/v2/iosched"
 )
 
-// Slot zero serves data.db writes; reads use its separate read-only descriptor.
-const dataReadVFD = 1
+// maxRegisteredEntries is the kernel's limit on one ring's registered buffers.
+const maxRegisteredEntries = 1 << 14
 
+// openSchedulers creates the store's io_uring schedulers, which share one
+// device model and admission policy.
 func (st *Store) openSchedulers() error {
 	st.disk = st.cfg.disk
 	if st.disk == nil {
@@ -18,19 +21,25 @@ func (st *Store) openSchedulers() error {
 			iosched.WithWriteBacklogLimit(st.cfg.writeBacklog), iosched.WithWriteBacklogRecovery(st.cfg.writeBacklogRecovery),
 			iosched.WithReadBacklogLimit(st.cfg.readBacklog))
 	}
-	for i, cpu := range st.cfg.schedulerCPUs {
-		opts := []iosched.Option{iosched.WithDiskPolicy(st.disk),
-			iosched.WithRingDepth(st.cfg.ringDepth), iosched.WithVFiles(1024), iosched.WithFiles(st.data, st.readData)}
-		// Preserve the default's POSIX fallback. Explicit multi-ring or pinned
-		// configurations must not silently run on a synchronous backend.
-		if len(st.cfg.schedulerCPUs) == 1 && cpu == -1 {
-			st.schedulers = append(st.schedulers, iosched.NewDefaultScheduler(opts...))
-			continue
+	opts := []iosched.Option{iosched.WithDiskPolicy(st.disk), iosched.WithRingDepth(st.cfg.ringDepth),
+		iosched.WithNVMeCommands(st.device)}
+	if st.cfg.registerMemory {
+		region := st.memory.Region()
+		if len(region) > maxRegisteredEntries*alloc.MaxAllocationSize {
+			return fmt.Errorf("blobstore: %d bytes of memory exceed the %d registrable per ring",
+				len(region), maxRegisteredEntries*alloc.MaxAllocationSize)
 		}
-		scheduler, err := iosched.NewURingScheduler(append(opts, iosched.WithCoordinatorCPU(cpu))...)
+		entries := make([][]byte, 0, len(region)/alloc.MaxAllocationSize)
+		for start := 0; start < len(region); start += alloc.MaxAllocationSize {
+			entries = append(entries, region[start:min(len(region), start+alloc.MaxAllocationSize)])
+		}
+		opts = append(opts, iosched.WithDMABuffers(entries...))
+	}
+	for i := range st.cfg.writeSchedulers + st.cfg.readSchedulers {
+		scheduler, err := iosched.NewURingScheduler(opts...)
 		if err != nil {
 			// Open's deferred Close drains any schedulers already created.
-			return fmt.Errorf("blobstore: scheduler %d (CPU %d): %w", i, cpu, err)
+			return fmt.Errorf("blobstore: scheduler %d: %w", i, err)
 		}
 		st.schedulers = append(st.schedulers, scheduler)
 	}
@@ -48,46 +57,29 @@ func (st *Store) readScheduler() iosched.Scheduler {
 	return pickScheduler(st.schedulers[st.cfg.writeSchedulers:], &st.nextRead)
 }
 
+// writeScheduler picks a write ring; they come first in st.schedulers.
 func (st *Store) writeScheduler() iosched.Scheduler {
-	n := st.cfg.writeSchedulers
-	if n == 0 {
-		n = len(st.schedulers)
-	}
-	return pickScheduler(st.schedulers[:n], &st.nextWrite)
+	return pickScheduler(st.schedulers[:st.cfg.writeSchedulers], &st.nextWrite)
 }
 
-// SchedulerStats describes the configured role and backend of one ring.
-// CPU is the requested affinity (-1 means unpinned), not an observed CPU.
-// Role is "shared", "read", or "write". Backend is "uring" or "posix".
+// SchedulerStats describes the role of one ring: "read" or "write".
 type SchedulerStats struct {
-	CPU           int
 	Role          string
-	Backend       string
-	WriteIOBudget time.Duration // shared disk allowance; zero for read-only rings or disabled budgeting
+	WriteIOBudget time.Duration // shared disk allowance; zero for read rings or disabled budgeting
 }
 
-// IOSchedulerStats lists schedulers in WithSchedulerCPUs order.
+// IOSchedulerStats lists schedulers in creation order, write rings first.
 func (st *Store) IOSchedulerStats() []SchedulerStats {
 	stats := make([]SchedulerStats, len(st.schedulers))
-	for i, scheduler := range st.schedulers {
-		s := &stats[i]
-		s.CPU, s.Role, s.Backend = st.cfg.schedulerCPUs[i], "shared", "posix"
-		s.WriteIOBudget = st.disk.LatencyGoal(iosched.OpWrite)
-		if st.cfg.writeSchedulers > 0 {
-			s.Role = "read"
-			if i < st.cfg.writeSchedulers {
-				s.Role = "write"
-			} else {
-				s.WriteIOBudget = 0
-			}
-		}
-		if _, ok := scheduler.(*iosched.URingScheduler); ok {
-			s.Backend = "uring"
+	for i := range stats {
+		stats[i] = SchedulerStats{Role: "read"}
+		if i < st.cfg.writeSchedulers {
+			stats[i] = SchedulerStats{Role: "write", WriteIOBudget: st.disk.LatencyGoal(iosched.OpWrite)}
 		}
 	}
 	return stats
 }
 
 // IODiskStats reports outstanding admission charges across all rings.
-// Disabled limits and the POSIX backend report zeros.
+// Disabled limits report zeros.
 func (st *Store) IODiskStats() iosched.DiskStats { return st.disk.Stats() }
